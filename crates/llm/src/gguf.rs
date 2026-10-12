@@ -134,8 +134,10 @@ impl Gguf {
                     .get(start..end)
                     .ok_or_else(|| format!("tensor {name} runs past the end of the file"))?;
                 Some(
-                    raw.chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    raw.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
                         .collect(),
                 )
             } else {
