@@ -37,10 +37,12 @@ Before scoring anything, let the data say what's there, so we find axes the pack
 - In parallel, the LLM tags every line with free-form emotion words, and we cluster that vocabulary too.
 - Compare against the pack's variables. Clusters no axis covers become candidate axes (flustered, awed, determined, tender...), and you decide which to add to `states.toml`.
 
+**Audio language model.** An open-weight audio LLM (Qwen3-Omni class, or Qwen2.5-Omni 7B if memory is tight) listens to each clip and writes a short free-form description: delivery, laughter, whispering, slurring, shouting, background music or effects, other voices. It handles the open-ended jobs the fixed models can't: discovery captions, filtering bad clips, and spotting things like drunk delivery. It does not replace the acoustic emotion models. A 2025 benchmark (LISTEN) found current audio LLMs mostly judge emotion from the words rather than the sound, so delivery scores still come from emotion2vec and the arousal/valence model. We check this on Tali's own data: caption a sample with and without the transcript visible, and trust the audio LLM only on what it hears without the words.
+
 Clusters will also pick up things that aren't emotion: combat barks vs conversation, ME1 vs ME3 recording differences, line length. Those get labeled as such, and the useful ones become filters (combat barks out of most contrast sets) rather than axes.
 
 ### 4. Label (GPU)
-Three independent signals per line, fused:
+Independent signals per line, fused (plus the audio LLM's tags from discovery as a fourth, for the axes it proves it can hear):
 1. **Audio emotion**: emotion2vec+ large (angry, happy, neutral, sad), plus audeering's arousal, valence and dominance model. These hear the delivery.
 2. **Text and context judge**: an open-weight LLM on the worker reads the line with its context and scores each pack variable from 0 to 1, with a confidence, under constrained JSON output. It catches what audio models can't, like playfulness, worry and intoxication.
 3. **Scene priors**: tags like "Citadel party" set a prior for intoxication, which no emotion model detects.
