@@ -21,14 +21,17 @@ pub fn system_prompt(pack: &Pack, machine: &Machine, snap: &Snapshot) -> String 
         parts.push(drones.trim_end().to_string());
     }
 
+    if !pack.examples.trim().is_empty() {
+        parts.push(pack.examples.trim().to_string());
+    }
+
+    // What changes from turn to turn goes last, so the dialogue model's
+    // prompt cache keeps everything above it.
     if let Some(overlay) = pack.state_prompts.get(&snap.state) {
         parts.push(overlay.trim().to_string());
     }
     if let Some(line) = mood_line(machine, snap) {
         parts.push(format!("## Right now\n{line}"));
-    }
-    if !pack.examples.trim().is_empty() {
-        parts.push(pack.examples.trim().to_string());
     }
     parts.join("\n\n")
 }

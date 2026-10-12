@@ -22,12 +22,19 @@ Check a pack:
 
     cargo run -p vi -- pack check characters/tali
 
-Talk to a character through the full turn pipeline (placeholder dialogue and printed voice until the models are connected):
+Talk to a character through the full turn pipeline (placeholder dialogue and printed voice):
 
     cargo run -p vi -- chat characters/tali
+
+Or with a real dialogue model: any chat GGUF, run in-process by llama.cpp and steered by the control vectors in a folder (one `cvector-generator` file per vector name in the pack's `llm` mixing table, plus optional limits in `vectors.toml`; see `crates/llm/src/vectors.rs`):
+
+    cargo run --release -p vi -- chat characters/tali --model qwen3-8b.gguf --vectors vectors/qwen3-8b
+
+Building needs cmake and a C++ compiler, since llama.cpp is compiled from source. It runs on the CPU by default; add `--features cuda` (rented GPU) or `--features vulkan` (RX 480) for a GPU backend.
 
 ## Layout
 - `crates/charpack`: loads and validates character packs, and runs their state machines
 - `crates/engine`: the turn pipeline: director, prompt assembly, sentence streaming to the voice
+- `crates/llm`: the dialogue model: llama.cpp embedded, with control vectors blended per turn
 - `crates/vi`: the command-line tool
 - `docs/`: design notes, including how to extract game audio

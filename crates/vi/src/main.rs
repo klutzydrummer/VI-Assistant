@@ -9,7 +9,7 @@ mod harvest;
 
 const USAGE: &str = "usage:
   vi pack check <character-folder>
-  vi chat <character-folder>
+  vi chat <character-folder> [--model <file.gguf>] [--vectors <folder>] [--gpu-layers N] [--ctx N]
   vi dataset run <pipeline.toml> [stage] [--force]
   vi dataset status <pipeline.toml>
   vi dataset gc <pipeline.toml>
@@ -25,6 +25,12 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let force = take_flag(&mut args, "--force");
     let lines = take_option(&mut args, "--lines");
+    let model = chat::ModelArgs {
+        model: take_option(&mut args, "--model").map(PathBuf::from),
+        vectors: take_option(&mut args, "--vectors").map(PathBuf::from),
+        gpu_layers: take_option(&mut args, "--gpu-layers"),
+        ctx: take_option(&mut args, "--ctx"),
+    };
     let open = take_flag(&mut args, "--open");
     let id = take_option(&mut args, "--id");
     match args
@@ -34,7 +40,7 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["pack", "check", dir] => pack_check(PathBuf::from(dir)),
-        ["chat", dir] => chat::run(PathBuf::from(dir)),
+        ["chat", dir] => chat::run(PathBuf::from(dir), model),
         ["dataset", "run", p] => dataset::run(Path::new(p), None, force),
         ["dataset", "run", p, stage] => dataset::run(Path::new(p), Some(stage), force),
         ["dataset", "status", p] => dataset::status(Path::new(p)),

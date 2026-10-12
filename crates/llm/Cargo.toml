@@ -1,0 +1,23 @@
+[package]
+name = "llm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Embedded llama.cpp dialogue model with per-turn control vector blending"
+
+[features]
+# GPU backends for llama.cpp. CPU is always available.
+cuda = ["llama-cpp-sys-2/cuda"]
+vulkan = ["llama-cpp-sys-2/vulkan"]
+
+[dependencies]
+engine = { path = "../engine" }
+llama-cpp-sys-2 = { version = "0.1.159", default-features = false }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.8"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+charpack = { path = "../charpack" }
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
