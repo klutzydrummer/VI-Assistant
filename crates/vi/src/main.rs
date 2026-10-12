@@ -5,6 +5,7 @@ use charpack::Pack;
 
 mod chat;
 mod dataset;
+mod harvest;
 
 const USAGE: &str = "usage:
   vi pack check <character-folder>
@@ -14,6 +15,9 @@ const USAGE: &str = "usage:
   vi dataset gc <pipeline.toml>
   vi corpus check <harvest-output-folder>
   vi corpus synth [folder] [--lines N]
+  vi harvest scan <LE-install-folder> [--open]
+  vi harvest package <file.pcc>
+  vi harvest tlk <file.tlk | LE1-file.pcc> [--id N]
   vi review <corpus-folder> [--port N]
   vi review --demo <empty-folder> [--port N]";
 
@@ -21,6 +25,8 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let force = take_flag(&mut args, "--force");
     let lines = take_option(&mut args, "--lines");
+    let open = take_flag(&mut args, "--open");
+    let id = take_option(&mut args, "--id");
     match args
         .iter()
         .map(String::as_str)
@@ -36,6 +42,9 @@ fn main() -> ExitCode {
         ["corpus", "check", dir] => dataset::check(Path::new(dir)),
         ["corpus", "synth"] => dataset::synth(None, lines.as_deref()),
         ["corpus", "synth", dir] => dataset::synth(Some(dir), lines.as_deref()),
+        ["harvest", "scan", dir] => harvest::scan(Path::new(dir), open),
+        ["harvest", "package", file] => harvest::package(Path::new(file)),
+        ["harvest", "tlk", file] => harvest::tlk(Path::new(file), id.as_deref()),
         ["review", rest @ ..] => review(rest),
         _ => {
             eprintln!("{USAGE}");
