@@ -5,9 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "VI Assistant command-line tool"
 
+[features]
+# GPU backends for the embedded dialogue model.
+cuda = ["llm/cuda"]
+vulkan = ["llm/vulkan"]
+
 [dependencies]
 charpack = { path = "../charpack" }
 engine = { path = "../engine" }
+llm = { path = "../llm" }
 dataset = { path = "../dataset" }
 review = { path = "../review" }
 tokio = { version = "1", features = ["rt", "time"] }
