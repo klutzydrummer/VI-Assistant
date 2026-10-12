@@ -10,6 +10,7 @@ charpack = { path = "../charpack" }
 cloud = { path = "../cloud" }
 engine = { path = "../engine" }
 dataset = { path = "../dataset" }
+harvest = { path = "../harvest" }
 review = { path = "../review" }
 tokio = { version = "1", features = ["rt", "time"] }
 
