@@ -15,6 +15,7 @@ charpack = { path = "../charpack" }
 engine = { path = "../engine" }
 llm = { path = "../llm" }
 dataset = { path = "../dataset" }
+harvest = { path = "../harvest" }
 review = { path = "../review" }
 tokio = { version = "1", features = ["rt", "time"] }
 
