@@ -173,7 +173,7 @@ files = ["../../jobs/clean.py"]
 settings = { min_seconds = 1.0, max_seconds = 20.0, whisper = "large-v3" }
 
 [stage.label]
-command = ["../../jobs/on-worker.sh", "python3", "jobs/label.py"]
+command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/label.py"]
 inputs = ["clean"]
 files = ["../../jobs/label.py", "states.toml"]
 settings = { judge = "gemma-4-12b", audio = "emotion2vec_plus_large" }
@@ -199,7 +199,7 @@ Environment variables:
 
 A job exits 0 on success. Anything else marks the run failed: nothing becomes current, and the partial output stays in `stages/<stage>/.tmp-<key>/` for inspection until the next attempt or `gc`.
 
-A GPU job is the same contract wrapped: `jobs/on-worker.sh` rsyncs the input folders and settings to the worker, runs the command there, and rsyncs `VI_OUT` back. The runner doesn't know or care where the work ran.
+A GPU job is the same contract wrapped: `jobs/on-worker.sh` rsyncs the input folders, settings, `jobs/` and any `--put` files to the worker, runs the command there, rsyncs `VI_OUT` back, and deletes the worker's copy. The runner doesn't know or care where the work ran. Details in `docs/cloud-worker.md`.
 
 ## How caching works
 Each run has a key:

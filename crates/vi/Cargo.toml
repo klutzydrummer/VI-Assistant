@@ -7,6 +7,7 @@ description = "VI Assistant command-line tool"
 
 [dependencies]
 charpack = { path = "../charpack" }
+cloud = { path = "../cloud" }
 engine = { path = "../engine" }
 dataset = { path = "../dataset" }
 review = { path = "../review" }

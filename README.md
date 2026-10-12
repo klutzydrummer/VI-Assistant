@@ -26,8 +26,19 @@ Talk to a character through the full turn pipeline (placeholder dialogue and pri
 
     cargo run -p vi -- chat characters/tali
 
+## Cloud worker
+Heavy models and dataset jobs run on a rented Vast.ai GPU that releases itself when idle:
+
+    cargo run -p vi -- cloud offers
+    cargo run -p vi -- cloud up
+    cargo run -p vi -- cloud down
+
+See `docs/cloud-worker.md`.
+
 ## Layout
 - `crates/charpack`: loads and validates character packs, and runs their state machines
 - `crates/engine`: the turn pipeline: director, prompt assembly, sentence streaming to the voice
+- `crates/cloud`: rents, watches and releases the Vast.ai GPU worker
 - `crates/vi`: the command-line tool
+- `jobs/`: scripts that run on the worker, including `on-worker.sh`, which runs a dataset stage there
 - `docs/`: design notes, including how to extract game audio

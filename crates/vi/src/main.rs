@@ -4,9 +4,10 @@ use std::process::ExitCode;
 use charpack::Pack;
 
 mod chat;
+mod cloud;
 mod dataset;
 
-const USAGE: &str = "usage:
+pub(crate) const USAGE: &str = "usage:
   vi pack check <character-folder>
   vi chat <character-folder>
   vi dataset run <pipeline.toml> [stage] [--force]
@@ -15,7 +16,14 @@ const USAGE: &str = "usage:
   vi corpus check <harvest-output-folder>
   vi corpus synth [folder] [--lines N]
   vi review <corpus-folder> [--port N]
-  vi review --demo <empty-folder> [--port N]";
+  vi review --demo <empty-folder> [--port N]
+  vi cloud offers
+  vi cloud up [--offer ID] [--yes]
+  vi cloud down
+  vi cloud status
+  vi cloud reap
+  vi cloud ssh [command]
+  vi cloud env | touch";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,6 +45,7 @@ fn main() -> ExitCode {
         ["corpus", "synth"] => dataset::synth(None, lines.as_deref()),
         ["corpus", "synth", dir] => dataset::synth(Some(dir), lines.as_deref()),
         ["review", rest @ ..] => review(rest),
+        ["cloud", rest @ ..] => cloud::run(rest),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
