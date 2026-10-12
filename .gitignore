@@ -1,0 +1,7 @@
+/target
+
+# Game-derived material stays on your machine. The repo is public.
+characters/*/voice/*
+!characters/*/voice/README.md
+characters/*/*.local.md
+extracted/

@@ -1,0 +1,11 @@
+[package]
+name = "vi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "VI Assistant command-line tool"
+
+[dependencies]
+charpack = { path = "../charpack" }
+engine = { path = "../engine" }
+tokio = { version = "1", features = ["rt", "time"] }

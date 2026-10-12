@@ -1,0 +1,58 @@
+id = "tali"
+name = "Tali'Zorah vas Normandy"
+short_name = "Tali"
+source = "Mass Effect"
+persona = "persona.md"
+examples = "examples.md"
+agents = "drones.toml"
+states = "states.toml"
+
+# Voice clips are extracted from your own copy of the game and never
+# committed (see voice/README.md). 8-20 seconds of clean, single-speaker
+# speech per clip works best for zero-shot cloning.
+[voice]
+language = "en"
+default_emotion = "neutral"
+
+[[voice.refs]]
+emotion = "neutral"
+audio = "voice/neutral.wav"
+transcript = "TODO: exact words of the clip"
+
+[[voice.refs]]
+emotion = "happy"
+audio = "voice/happy.wav"
+transcript = "TODO: exact words of the clip"
+
+[[voice.refs]]
+emotion = "excited"
+audio = "voice/excited.wav"
+transcript = "TODO: exact words of the clip"
+
+[[voice.refs]]
+emotion = "worried"
+audio = "voice/worried.wav"
+transcript = "TODO: exact words of the clip"
+
+[[voice.refs]]
+emotion = "sad"
+audio = "voice/sad.wav"
+transcript = "TODO: exact words of the clip"
+
+[[voice.refs]]
+emotion = "angry"
+audio = "voice/angry.wav"
+transcript = "TODO: exact words of the clip"
+
+[[voice.refs]]
+emotion = "teasing"
+audio = "voice/teasing.wav"
+transcript = "TODO: exact words of the clip"
+
+# The Citadel DLC party in LE3 has her drunk lines. Pick one where the slur
+# is clear: zero-shot engines copy delivery from the reference clip.
+[[voice.refs]]
+emotion = "drunk"
+audio = "voice/drunk.wav"
+transcript = "TODO: exact words of the clip"
+

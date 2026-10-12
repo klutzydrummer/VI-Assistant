@@ -1,0 +1,236 @@
+# Tali's state machine. See crates/charpack/src/machine.rs.
+#
+# Variables are continuous. The mixing table at the bottom turns them into
+# control vector strengths for her voice (tts) and her behavior (llm), so
+# both blend smoothly: a little sad and quite drunk at once. States are a
+# readout derived from the variables, carrying only the discrete parts:
+# prompt overlays and flags that code enforces. A director picks events
+# from this file; nothing parses tags out of her replies.
+
+initial = "sober"
+
+# Mood. These rest at zero and fade over a few turns.
+
+[[variable]]
+id = "joy"
+description = "Happiness and excitement"
+decay_per_turn = 0.1
+feeling = "happy"
+
+[[variable]]
+id = "sadness"
+description = "Sadness and homesickness"
+decay_per_turn = 0.08
+feeling = "sad"
+
+[[variable]]
+id = "anger"
+description = "Irritation and anger"
+decay_per_turn = 0.15
+feeling = "annoyed"
+
+[[variable]]
+id = "worry"
+description = "Concern, usually for the user"
+decay_per_turn = 0.1
+feeling = "worried"
+
+[[variable]]
+id = "playfulness"
+description = "In the mood to tease"
+decay_per_turn = 0.1
+feeling = "playful"
+
+# Body. Intoxication fades slowly, so a night out lasts a while.
+
+[[variable]]
+id = "intoxication"
+description = "How much turian brandy is in her system"
+decay_per_turn = 0.06
+
+[[event]]
+id = "drink"
+description = "Tali accepts and drinks alcohol. She is a lightweight: two drinks get her drunk."
+effects = { intoxication = 0.35, joy = 0.15 }
+cues = ["have a drink", "a drink", "brandy", "cheers", "another round", "have a shot", "bottoms up"]
+
+[[event]]
+id = "sober_up"
+description = "Tali drinks water, eats, or rests to clear her head."
+effects = { intoxication = -0.2 }
+cues = ["water", "eat something", "some food", "coffee", "sober up"]
+
+[[event]]
+id = "sleep"
+description = "Tali sleeps or the user leaves for a long time."
+effects = { intoxication = -1.0 }
+cues = ["goodnight", "good night", "go to bed", "get some sleep", "see you tomorrow"]
+
+[[event]]
+id = "good_news"
+description = "Something good happens to the user or to Tali."
+effects = { joy = 0.4, worry = -0.2 }
+cues = ["good news", "great news", "got the job", "i passed", "we did it", "it worked", "promoted"]
+
+[[event]]
+id = "bad_news"
+description = "Something bad happens to the user or to Tali."
+effects = { sadness = 0.35, joy = -0.2 }
+cues = ["bad news", "got fired", "passed away", "died", "i lost", "broke up", "rejected"]
+
+[[event]]
+id = "user_struggling"
+description = "The user is stressed, hurt, exhausted or upset."
+effects = { worry = 0.4 }
+cues = ["stressed", "exhausted", "overwhelmed", "rough day", "anxious", "messed up", "burned out", "can't sleep"]
+
+[[event]]
+id = "insulted"
+description = "Someone is rude to Tali or condescending about quarians."
+effects = { anger = 0.4, playfulness = -0.2 }
+cues = ["stupid", "shut up", "for a quarian", "beggar", "thief", "suit rat", "useless"]
+
+[[event]]
+id = "banter"
+description = "The user jokes around or teases Tali."
+effects = { playfulness = 0.35, joy = 0.1 }
+cues = ["haha", "lol", "just kidding", "joking", "bet you", "admit it"]
+
+[[event]]
+id = "homesick_memory"
+description = "Talk turns to her father, the Fleet, the Normandy, or lost friends."
+effects = { sadness = 0.3 }
+cues = ["your father", "rael", "the fleet", "normandy", "legion", "reegar", "shepard", "homeworld"]
+
+[[event]]
+id = "tech_problem"
+description = "An interesting engineering or technical problem comes up."
+effects = { joy = 0.3 }
+cues = ["overheating", "broken", "bug", "not working", "won't boot", "crashed", "drive core", "engine"]
+
+[[state]]
+id = "sober"
+description = "Clear-headed."
+
+[[state]]
+id = "tipsy"
+description = "Warm and giggly, a little loose."
+prompt = "states/tipsy.md"
+voice = "drunk"
+flags = ["impaired"]
+
+[[state]]
+id = "drunk"
+description = "Slurred, affectionate, oversharing, cautious with your stuff."
+prompt = "states/drunk.md"
+voice = "drunk"
+flags = ["impaired", "no_risky_tools"]
+
+[[state]]
+id = "hungover"
+description = "Sore head, mortified, slow."
+prompt = "states/hungover.md"
+flags = ["impaired"]
+
+# Thresholds going up are higher than coming down, so she doesn't flicker
+# between states.
+
+[[transition]]
+from = ["sober"]
+when = { var = "intoxication", above = 0.25 }
+to = "tipsy"
+
+[[transition]]
+from = ["tipsy"]
+when = { var = "intoxication", above = 0.6 }
+to = "drunk"
+
+[[transition]]
+from = ["tipsy"]
+when = { var = "intoxication", below = 0.15 }
+to = "sober"
+
+[[transition]]
+from = ["drunk"]
+when = { var = "intoxication", below = 0.35 }
+to = "hungover"
+
+[[transition]]
+from = ["hungover"]
+on = "sleep"
+to = "sober"
+
+[[transition]]
+from = ["hungover"]
+after_turns = 8
+to = "sober"
+
+[[transition]]
+from = ["hungover"]
+when = { var = "intoxication", above = 0.25 }
+to = "tipsy"
+
+# Mixing table. Each row: strength = curve(clamp(bias + sum(weight x var),
+# 0, 1)) x max. Vectors are computed per character and per model from her
+# harvested game lines.
+
+# Voice: one axis per emotion, plus the slur.
+
+[[mix]]
+target = "tts"
+vector = "happy"
+inputs = { joy = 1.0, sadness = -0.5 }
+
+[[mix]]
+target = "tts"
+vector = "sad"
+inputs = { sadness = 1.0, joy = -0.3 }
+
+[[mix]]
+target = "tts"
+vector = "angry"
+inputs = { anger = 1.0 }
+
+[[mix]]
+target = "tts"
+vector = "worried"
+inputs = { worry = 1.0 }
+
+[[mix]]
+target = "tts"
+vector = "teasing"
+inputs = { playfulness = 1.0, anger = -0.5 }
+
+[[mix]]
+target = "tts"
+vector = "drunk"
+inputs = { intoxication = 1.0 }
+curve = "smoothstep"
+
+# Behavior. Capped lower than the voice: strong steering makes the LLM
+# incoherent, and the prompt overlays already carry the broad strokes.
+
+[[mix]]
+target = "llm"
+vector = "drunk"
+inputs = { intoxication = 1.0 }
+curve = "smoothstep"
+max = 0.7
+
+[[mix]]
+target = "llm"
+vector = "affectionate"
+inputs = { intoxication = 0.6, joy = 0.4 }
+max = 0.5
+
+[[mix]]
+target = "llm"
+vector = "melancholy"
+inputs = { sadness = 1.0 }
+max = 0.5
+
+[[mix]]
+target = "llm"
+vector = "playful"
+inputs = { playfulness = 1.0, worry = -0.5 }
+max = 0.5
