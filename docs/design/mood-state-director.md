@@ -1,6 +1,8 @@
 # Moods, states and voice direction
 
-Status: proposal for review. Nothing here is implemented yet.
+Status: the state machine is implemented (`crates/charpack/src/machine.rs`, Tali's in `characters/tali/states.toml`). The director, pipeline and voice adapters are not built yet.
+
+Decided 2026-10-12: harvest Tali's game lines and build per-character control vectors for every voice axis (happy, sad, drunk...). Continuous variables in the state machine set each vector's weight, so the voice blends smoothly instead of switching clips.
 
 ## Goals
 - The dialogue model writes only what the character says. No app tags in its output or its context.
@@ -9,74 +11,34 @@ Status: proposal for review. Nothing here is implemented yet.
 - Voice direction travels out of band, in whatever form each TTS engine wants.
 - First audio stays fast: target under 1.5 s from the end of the user's message.
 
-## Three layers
+## Variables, events and states
+Everything that changes over a conversation lives in the pack's `states.toml`:
 
-| Layer | What it is | Who changes it | Lifetime |
-|---|---|---|---|
-| **State** | Discrete mode from the pack's state machine: `sober`, `tipsy`, `drunk`, `hungover` | Events, validated by the machine | Until a transition fires |
-| **Mood** | Continuous vector, e.g. valence, arousal, plus named emotion weights (worried 0.6) | Director proposals, smoothed | Decays toward the character's baseline each turn |
-| **Delivery** | Per-sentence voice direction: emotion, intensity, style text, pace | Director, per sentence | One sentence |
+| Piece | What it is | Example |
+|---|---|---|
+| **Variable** | Continuous value with a range, a resting value and a per-turn decay toward rest. Can drive a voice control vector | `intoxication` 0..1, decays 0.06 a turn, drives `drunk`; `sadness` drives `sad` |
+| **Event** | Named thing that happened, with effects on variables. The only thing a director can emit | `drink`: intoxication +0.3, joy +0.15 |
+| **State** | Discrete mode derived through transitions. Carries a prompt overlay, a fallback clip bank and flags | `drunk`: `states/drunk.md`, flags `impaired`, `no_risky_tools` |
+| **Transition** | Fires when all its triggers hold: an event (`on`), a variable threshold (`when`), or time in state (`after_turns`) | tipsy to drunk when intoxication >= 0.6 |
 
-State changes what she *is* (prompt overlay, voice bank, tool permissions). Mood colors *how* she says things. Delivery is the concrete instruction to the voice engine.
-
-## The state machine (in the pack)
-Each pack gets a `states.toml`. The pack defines the vocabulary; the engine enforces it.
-
-```toml
-initial = "sober"
-
-[[event]]
-id = "drink"
-description = "Tali accepts and drinks alcohol."
-
-[[event]]
-id = "sober_up"
-description = "Tali drinks water, eats, or time passes without drinks."
-
-[[state]]
-id = "tipsy"
-prompt = "states/tipsy.md"
-voice = "drunk"            # voice bank to draw clips from
-voice_intensity = 0.4      # how hard to push it, for engines that take intensity
-flags = ["impaired"]
-
-[[state]]
-id = "drunk"
-prompt = "states/drunk.md"
-voice = "drunk"
-voice_intensity = 0.9
-flags = ["impaired", "no_risky_tools"]
-
-[[transition]]
-from = "sober"
-on = "drink"
-to = "tipsy"
-
-[[transition]]
-from = "tipsy"
-on = "drink"
-to = "drunk"
-
-[[transition]]            # time-based: no event needed
-from = "drunk"
-after_turns = 6
-to = "hungover"
-```
+Mood is just variables (joy, sadness, anger, worry, playfulness) that rest at zero and fade over a few turns. So "a little sad and quite drunk" is sadness 0.3 and intoxication 0.7, which become voice weights `sad` 0.3 and `drunk` 0.7.
 
 Rules:
-- Transitions fire on **events** (named in the pack) or **timers** (`after_turns`, `after_minutes`). Anything not listed is rejected, so a model can never put her in an invalid state.
-- **Flags** are what code checks. `no_risky_tools` blocks send, delete and spend tools in Rust, not in the prompt.
-- The user can always force an event or state with a command (`/state sober`). The machine is the single source of truth, saved with the conversation.
-- `vi pack check` validates the graph: unknown states or events, unreachable states, states with no way out.
+- Unknown events and states are rejected, so no model can put her in an invalid state.
+- Thresholds going up are higher than coming down (hysteresis), so she doesn't flicker between states.
+- Flags are what code checks: `no_risky_tools` blocks send, delete and spend tools in Rust, not in the prompt.
+- The user can force a state (`/state sober`). The snapshot (state, variables, turns in state) is saved with the conversation.
+- `vi pack check` validates the graph: duplicate ids, unknown references, transitions with no trigger, unreachable states.
+
+Per turn: the director's events are applied, then transitions settle (at most 8 chained). After her reply, `end_turn` decays variables, advances timers and settles again.
 
 ## The director
 One trait, several implementations:
 
 ```rust
 trait Director {
-    /// Before the reply: which pack events did the user's message trigger,
-    /// and how does mood shift?
-    async fn on_user_turn(&self, ctx: &TurnContext) -> TurnDirection; // events + mood delta
+    /// Before the reply: which pack events did the user's message trigger?
+    async fn on_user_turn(&self, ctx: &TurnContext) -> Vec<EventId>;
     /// Per sentence of the reply, as it streams: how should it sound?
     async fn on_sentence(&self, ctx: &SentenceContext) -> Delivery;
 }
@@ -87,14 +49,14 @@ Implementations, in the order we'd build them:
 2. **Small local model**: a 1.5 to 4B instruct model (Qwen3 class) with grammar-constrained JSON output, so it can only answer with event ids from the pack and emotion names from the voice bank. It's small enough for CPU or the RX 480 via llama.cpp Vulkan, or alongside everything else on the rented GPU.
 3. **Second LLM slot**: same prompt and schema, pointed at a bigger model when quality matters more than cost.
 
-Model output is a proposal. Mood deltas are clamped and smoothed (exponential moving average) so one odd guess doesn't swing her voice, and events still go through the state machine.
+Model output is a proposal: events go through the state machine, and their effects are fixed amounts set in the pack, so one odd guess nudges her mood rather than swinging it.
 
 ## The turn pipeline
 
 ```
 user message
   │
-  ├─▶ Director.on_user_turn ──▶ state machine applies events ──▶ mood update
+  ├─▶ Director.on_user_turn ──▶ state machine applies events
   │      (small model, ~100-300 ms)
   ▼
 dialogue LLM, streaming plain text
@@ -103,7 +65,7 @@ dialogue LLM, streaming plain text
   ├─ sentence 1 done ─▶ Director.on_sentence ─▶ normalize text ─▶ TTS ─▶ play
   ├─ sentence 2 done ─▶ ... (runs while sentence 1 is playing)
   ▼
-end of turn: timers tick, mood decays, state saved
+end of turn: variables decay, timers tick, snapshot saved
 ```
 
 **Is there a second pass that rewrites the dialogue? No.** Rewriting means waiting for the whole reply and risks a second model drifting her voice. The two extra steps are:
@@ -117,15 +79,16 @@ Delivery is engine-neutral:
 
 ```rust
 struct Delivery {
-    emotion: String,       // from the pack's voice bank
-    intensity: f32,        // 0..1
-    style: Option<String>, // free text, e.g. "slurred, giggling"
+    vectors: BTreeMap<String, f32>, // from the machine's variables, plus per-sentence nudges
+    emotion: String,                // dominant emotion, for clip-based fallbacks
+    style: Option<String>,          // free text, e.g. "slurred, giggling"
     pace: f32,
 }
 ```
 
-Each TTS engine gets an adapter that maps it to what that engine takes. Examples of the expected mappings, to confirm in the bake-off:
-- **Reference-clip engines** (Qwen3-TTS, OmniVoice): pick the clip from the state's voice bank and emotion; the clip carries the delivery.
+Each TTS engine gets an adapter that maps it to what that engine takes:
+- **Control vectors** (primary path): add each vector times its weight to the TTS model's activations.
+- **Reference-clip engines** without hooks (fallback): pick the clip from the state's voice bank and dominant emotion.
 - **IndexTTS-2**: an emotion vector or emotion text, plus a weight from intensity.
 - **Chatterbox**: an exaggeration level from intensity, plus the clip.
 
@@ -144,17 +107,12 @@ Three levels, cheapest first. None needs fine-tuning.
 
 All three need many labelled clips per emotion. The game has thousands of Tali lines, so after extraction an emotion classifier (emotion2vec class) can auto-label the corpus, and we spot-check.
 
-Using IndexTTS-2's eight emotions as the mood vector's axes would let mood drive it directly, and other engines just pick the nearest clip.
-
-The voice bank grows from "one clip per emotion" to clips tagged with emotion, intensity and state. The adapter picks the closest match.
-
-## Changes to what's in PR #1
-- Remove the `[emotion]` and `[state:...]` tag instructions from `persona.md` and the examples. Mood goes into the prompt as a plain-language line instead ("You're feeling a little worried").
-- Replace the flat `[[states]]` list in `character.toml` with `states.toml` as above, and add events.
-- Keep `drunk.md` as the overlay for `drunk`, and add `tipsy.md` and `hungover.md`.
+Level 3 is the chosen path. Levels 1 and 2 stay as fallbacks for engines we can't hook.
 
 ## Build order
-1. State machine, `states.toml` parsing and graph validation, rules director. Pure Rust, testable now.
-2. Sentence streaming pipeline with a stub TTS that prints the delivery for each sentence.
-3. Small-model director with constrained output.
-4. Real TTS adapters, after the bake-off picks the engine.
+1. ~~State machine, `states.toml` parsing and graph validation.~~ Done.
+2. Rules director, and the sentence streaming pipeline with a stub TTS that prints each sentence's delivery.
+3. Harvest and auto-label Tali's game lines (needs the game on Brandon's machine).
+4. Bake-off, now also scoring how well each engine takes control vectors.
+5. Compute control vectors per voice axis, then the real TTS adapter.
+6. Small-model director with constrained output.

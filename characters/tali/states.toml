@@ -1,0 +1,161 @@
+# Tali's state machine. See crates/charpack/src/machine.rs.
+#
+# Variables are continuous and drive voice control vectors, so her voice
+# blends smoothly (a little sad and quite drunk at once). States are derived
+# from them and carry the discrete parts: prompt overlays and flags that
+# code enforces. A director picks events from this file; nothing parses
+# tags out of her replies.
+
+initial = "sober"
+
+# Mood. These rest at zero and fade over a few turns.
+
+[[variable]]
+id = "joy"
+description = "Happiness and excitement"
+decay_per_turn = 0.1
+vector = "happy"
+
+[[variable]]
+id = "sadness"
+description = "Sadness and homesickness"
+decay_per_turn = 0.08
+vector = "sad"
+
+[[variable]]
+id = "anger"
+description = "Irritation and anger"
+decay_per_turn = 0.15
+vector = "angry"
+
+[[variable]]
+id = "worry"
+description = "Concern, usually for the user"
+decay_per_turn = 0.1
+vector = "worried"
+
+[[variable]]
+id = "playfulness"
+description = "In the mood to tease"
+decay_per_turn = 0.1
+vector = "teasing"
+
+# Body. Intoxication fades slowly, so a night out lasts a while.
+
+[[variable]]
+id = "intoxication"
+description = "How much turian brandy is in her system"
+decay_per_turn = 0.06
+vector = "drunk"
+
+[[event]]
+id = "drink"
+description = "Tali accepts and drinks alcohol."
+effects = { intoxication = 0.3, joy = 0.15 }
+
+[[event]]
+id = "sober_up"
+description = "Tali drinks water, eats, or rests to clear her head."
+effects = { intoxication = -0.2 }
+
+[[event]]
+id = "sleep"
+description = "Tali sleeps or the user leaves for a long time."
+effects = { intoxication = -1.0 }
+
+[[event]]
+id = "good_news"
+description = "Something good happens to the user or to Tali."
+effects = { joy = 0.4, worry = -0.2 }
+
+[[event]]
+id = "bad_news"
+description = "Something bad happens to the user or to Tali."
+effects = { sadness = 0.35, joy = -0.2 }
+
+[[event]]
+id = "user_struggling"
+description = "The user is stressed, hurt, exhausted or upset."
+effects = { worry = 0.4 }
+
+[[event]]
+id = "insulted"
+description = "Someone is rude to Tali or condescending about quarians."
+effects = { anger = 0.4, playfulness = -0.2 }
+
+[[event]]
+id = "banter"
+description = "The user jokes around or teases Tali."
+effects = { playfulness = 0.35, joy = 0.1 }
+
+[[event]]
+id = "homesick_memory"
+description = "Talk turns to her father, the Fleet, the Normandy, or lost friends."
+effects = { sadness = 0.3 }
+
+[[event]]
+id = "tech_problem"
+description = "An interesting engineering or technical problem comes up."
+effects = { joy = 0.3 }
+
+[[state]]
+id = "sober"
+description = "Clear-headed."
+
+[[state]]
+id = "tipsy"
+description = "Warm and giggly, a little loose."
+prompt = "states/tipsy.md"
+voice = "drunk"
+flags = ["impaired"]
+
+[[state]]
+id = "drunk"
+description = "Slurred, affectionate, oversharing, cautious with your stuff."
+prompt = "states/drunk.md"
+voice = "drunk"
+flags = ["impaired", "no_risky_tools"]
+
+[[state]]
+id = "hungover"
+description = "Sore head, mortified, slow."
+prompt = "states/hungover.md"
+flags = ["impaired"]
+
+# Thresholds going up are higher than coming down, so she doesn't flicker
+# between states.
+
+[[transition]]
+from = ["sober"]
+when = { var = "intoxication", above = 0.25 }
+to = "tipsy"
+
+[[transition]]
+from = ["tipsy"]
+when = { var = "intoxication", above = 0.6 }
+to = "drunk"
+
+[[transition]]
+from = ["tipsy"]
+when = { var = "intoxication", below = 0.15 }
+to = "sober"
+
+[[transition]]
+from = ["drunk"]
+when = { var = "intoxication", below = 0.35 }
+to = "hungover"
+
+[[transition]]
+from = ["hungover"]
+on = "sleep"
+to = "sober"
+
+[[transition]]
+from = ["hungover"]
+after_turns = 8
+to = "sober"
+
+[[transition]]
+from = ["hungover"]
+when = { var = "intoxication", above = 0.25 }
+to = "tipsy"

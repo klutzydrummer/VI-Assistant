@@ -5,14 +5,18 @@
 //! per emotion). Swapping characters means pointing the assistant at a
 //! different folder; nothing is trained.
 //!
-//! Packs may also define states (moods that persist across turns, like being
-//! drunk) and a pool of names the character gives the agents it dispatches.
+//! Packs may also define a state machine (see [`machine`]) and a pool of
+//! names the character gives the agents it dispatches.
+
+pub mod machine;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use machine::{Machine, MachineSpec};
 
 pub const MANIFEST: &str = "character.toml";
 
@@ -48,22 +52,9 @@ pub struct Manifest {
     /// Names the character gives the agents it sends out, relative to the
     /// pack folder.
     pub agents: Option<PathBuf>,
+    /// State machine definition, relative to the pack folder.
+    pub states: Option<PathBuf>,
     pub voice: Voice,
-    #[serde(default)]
-    pub states: Vec<State>,
-}
-
-/// A mood that lasts across turns until something ends it.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct State {
-    pub id: String,
-    pub description: String,
-    /// Extra persona instructions while the state is active.
-    pub prompt: PathBuf,
-    /// Voice clips to use for every line while active, whatever the
-    /// line's own emotion tag says.
-    pub voice_emotion: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,7 +80,7 @@ pub struct AgentName {
 pub struct Voice {
     /// BCP 47 language tag the clips are spoken in.
     pub language: String,
-    /// Emotion used when the model doesn't tag a line.
+    /// Emotion used when the director gives none.
     pub default_emotion: String,
     pub refs: Vec<VoiceRef>,
 }
@@ -110,6 +101,7 @@ pub struct Pack {
     pub manifest: Manifest,
     pub persona: String,
     pub examples: String,
+    pub machine_spec: Option<MachineSpec>,
     /// State id to that state's extra persona instructions.
     pub state_prompts: BTreeMap<String, String>,
     pub agents: Vec<AgentName>,
@@ -140,10 +132,21 @@ impl Pack {
             })?;
         let persona = read(&root.join(&manifest.persona))?;
         let examples = read(&root.join(&manifest.examples))?;
-        let state_prompts = manifest
-            .states
+        let machine_spec: Option<MachineSpec> = match &manifest.states {
+            Some(rel) => {
+                let path = root.join(rel);
+                Some(
+                    toml::from_str(&read(&path)?)
+                        .map_err(|source| Error::Parse { path, source })?,
+                )
+            }
+            None => None,
+        };
+        let state_prompts = machine_spec
             .iter()
-            .map(|st| Ok((st.id.clone(), read(&root.join(&st.prompt))?)))
+            .flat_map(|spec| &spec.states)
+            .filter_map(|st| st.prompt.as_ref().map(|p| (st, p)))
+            .map(|(st, p)| Ok((st.id.clone(), read(&root.join(p))?)))
             .collect::<Result<_, Error>>()?;
         let agents = match &manifest.agents {
             Some(rel) => {
@@ -159,6 +162,7 @@ impl Pack {
             manifest,
             persona,
             examples,
+            machine_spec,
             state_prompts,
             agents,
         })
@@ -192,12 +196,21 @@ impl Pack {
         }
     }
 
-    /// Reference clips for a line tagged `emotion` while `state` is active.
-    /// A state with its own voice overrides the line's emotion.
-    pub fn refs_in_state(&self, state: Option<&str>, emotion: &str) -> Vec<&VoiceRef> {
-        let voice = state
-            .and_then(|id| self.manifest.states.iter().find(|st| st.id == id))
-            .and_then(|st| st.voice_emotion.as_deref());
+    /// The pack's state machine, if it defines one, or why it is invalid.
+    pub fn machine(&self) -> Option<Result<Machine, Vec<String>>> {
+        self.machine_spec.clone().map(Machine::new)
+    }
+
+    /// Reference clips for a line with `emotion` while in `state`, for
+    /// engines that take clips rather than control vectors. A state with
+    /// its own voice overrides the line's emotion.
+    pub fn refs_in_state(&self, state: &str, emotion: &str) -> Vec<&VoiceRef> {
+        let voice = self
+            .machine_spec
+            .iter()
+            .flat_map(|spec| &spec.states)
+            .find(|st| st.id == state)
+            .and_then(|st| st.voice.as_deref());
         self.refs_for(voice.unwrap_or(emotion))
     }
 
@@ -238,15 +251,12 @@ impl Pack {
             }
         }
 
+        if let Some(Err(errors)) = self.machine() {
+            report.errors.extend(errors);
+        }
         let emotions = self.emotions();
-        let mut state_ids = BTreeSet::new();
-        for st in &m.states {
-            if !state_ids.insert(st.id.as_str()) {
-                report
-                    .errors
-                    .push(format!("state {:?} is defined twice", st.id));
-            }
-            if let Some(e) = &st.voice_emotion {
+        for st in self.machine_spec.iter().flat_map(|spec| &spec.states) {
+            if let Some(e) = &st.voice {
                 if !emotions.contains(e.as_str()) {
                     report.errors.push(format!(
                         "state {:?} uses voice {e:?}, which has no voice ref",
@@ -288,6 +298,7 @@ short_name = "Test"
 source = "Tests"
 persona = "persona.md"
 examples = "examples.md"
+states = "states.toml"
 
 [voice]
 language = "en"
@@ -302,12 +313,29 @@ transcript = "Hello there."
 emotion = "happy"
 audio = "voice/happy.wav"
 transcript = "Wonderful!"
+"#;
 
-[[states]]
+    const STATES_TOML: &str = r#"
+initial = "calm"
+
+[[event]]
+id = "good_news"
+description = "Hears good news"
+
+[[state]]
+id = "calm"
+description = "Even keel"
+
+[[state]]
 id = "giddy"
 description = "Overjoyed"
 prompt = "states/giddy.md"
-voice_emotion = "happy"
+voice = "happy"
+
+[[transition]]
+from = ["calm"]
+on = "good_news"
+to = "giddy"
 "#;
 
     fn pack_dir(manifest: &str) -> tempfile::TempDir {
@@ -316,6 +344,7 @@ voice_emotion = "happy"
         fs::write(dir.path().join("persona.md"), "You are Test.").unwrap();
         fs::write(dir.path().join("examples.md"), "").unwrap();
         fs::create_dir(dir.path().join("voice")).unwrap();
+        fs::write(dir.path().join("states.toml"), STATES_TOML).unwrap();
         fs::create_dir(dir.path().join("states")).unwrap();
         fs::write(dir.path().join("states/giddy.md"), "Everything is great.").unwrap();
         dir
@@ -344,18 +373,22 @@ voice_emotion = "happy"
         let dir = pack_dir(MANIFEST_TOML);
         let pack = Pack::load(dir.path()).unwrap();
         assert_eq!(pack.state_prompts["giddy"], "Everything is great.");
-        assert_eq!(
-            pack.refs_in_state(Some("giddy"), "neutral")[0].emotion,
-            "happy"
-        );
-        assert_eq!(pack.refs_in_state(None, "neutral")[0].emotion, "neutral");
+        assert_eq!(pack.refs_in_state("giddy", "neutral")[0].emotion, "happy");
+        assert_eq!(pack.refs_in_state("calm", "neutral")[0].emotion, "neutral");
+        let machine = pack.machine().unwrap().unwrap();
+        let mut snap = machine.start();
+        machine.apply(&mut snap, "good_news").unwrap();
+        assert_eq!(snap.state, "giddy");
     }
 
     #[test]
     fn flags_state_voice_without_clip() {
-        let dir = pack_dir(
-            &MANIFEST_TOML.replace("voice_emotion = \"happy\"", "voice_emotion = \"drunk\""),
-        );
+        let dir = pack_dir(MANIFEST_TOML);
+        fs::write(
+            dir.path().join("states.toml"),
+            STATES_TOML.replace("voice = \"happy\"", "voice = \"drunk\""),
+        )
+        .unwrap();
         let report = Pack::load(dir.path()).unwrap().check();
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("drunk"));
