@@ -5,6 +5,7 @@ This folder holds the reference clips listed in `../character.toml`. They come f
 For each emotion, pick one clip that is:
 - 8 to 20 seconds of Tali alone, with no music, effects or other speakers
 - clearly in that emotion
+- for `drunk`, taken from her lines at the Citadel DLC party in LE3, where the slur is clear
 - saved as mono WAV (the game's dialogue is 24 kHz mono, keep it as is)
 
 Then paste the exact spoken words into that clip's `transcript` in `character.toml` and run:

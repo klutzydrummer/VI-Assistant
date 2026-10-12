@@ -4,8 +4,11 @@
 //! example dialogue, and a small bank of voice reference clips (one or more
 //! per emotion). Swapping characters means pointing the assistant at a
 //! different folder; nothing is trained.
+//!
+//! Packs may also define states (moods that persist across turns, like being
+//! drunk) and a pool of names the character gives the agents it dispatches.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -42,7 +45,43 @@ pub struct Manifest {
     pub persona: PathBuf,
     /// Example dialogue file, relative to the pack folder.
     pub examples: PathBuf,
+    /// Names the character gives the agents it sends out, relative to the
+    /// pack folder.
+    pub agents: Option<PathBuf>,
     pub voice: Voice,
+    #[serde(default)]
+    pub states: Vec<State>,
+}
+
+/// A mood that lasts across turns until something ends it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    pub id: String,
+    pub description: String,
+    /// Extra persona instructions while the state is active.
+    pub prompt: PathBuf,
+    /// Voice clips to use for every line while active, whatever the
+    /// line's own emotion tag says.
+    pub voice_emotion: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentsFile {
+    agent: Vec<AgentName>,
+}
+
+/// One name from the character's pool for dispatched agents.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentName {
+    /// What the character calls it day to day.
+    pub name: String,
+    pub full_name: String,
+    /// The kind of job the character prefers to give it.
+    pub role: String,
+    pub temperament: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +110,9 @@ pub struct Pack {
     pub manifest: Manifest,
     pub persona: String,
     pub examples: String,
+    /// State id to that state's extra persona instructions.
+    pub state_prompts: BTreeMap<String, String>,
+    pub agents: Vec<AgentName>,
 }
 
 /// Problems found by [`Pack::check`]. Missing audio is reported separately
@@ -98,11 +140,27 @@ impl Pack {
             })?;
         let persona = read(&root.join(&manifest.persona))?;
         let examples = read(&root.join(&manifest.examples))?;
+        let state_prompts = manifest
+            .states
+            .iter()
+            .map(|st| Ok((st.id.clone(), read(&root.join(&st.prompt))?)))
+            .collect::<Result<_, Error>>()?;
+        let agents = match &manifest.agents {
+            Some(rel) => {
+                let path = root.join(rel);
+                let file: AgentsFile = toml::from_str(&read(&path)?)
+                    .map_err(|source| Error::Parse { path, source })?;
+                file.agent
+            }
+            None => Vec::new(),
+        };
         Ok(Self {
             root,
             manifest,
             persona,
             examples,
+            state_prompts,
+            agents,
         })
     }
 
@@ -132,6 +190,15 @@ impl Pack {
         } else {
             refs
         }
+    }
+
+    /// Reference clips for a line tagged `emotion` while `state` is active.
+    /// A state with its own voice overrides the line's emotion.
+    pub fn refs_in_state(&self, state: Option<&str>, emotion: &str) -> Vec<&VoiceRef> {
+        let voice = state
+            .and_then(|id| self.manifest.states.iter().find(|st| st.id == id))
+            .and_then(|st| st.voice_emotion.as_deref());
+        self.refs_for(voice.unwrap_or(emotion))
     }
 
     pub fn check(&self) -> Report {
@@ -170,6 +237,35 @@ impl Pack {
                 report.missing_audio.push(r.audio.clone());
             }
         }
+
+        let emotions = self.emotions();
+        let mut state_ids = BTreeSet::new();
+        for st in &m.states {
+            if !state_ids.insert(st.id.as_str()) {
+                report
+                    .errors
+                    .push(format!("state {:?} is defined twice", st.id));
+            }
+            if let Some(e) = &st.voice_emotion {
+                if !emotions.contains(e.as_str()) {
+                    report.errors.push(format!(
+                        "state {:?} uses voice {e:?}, which has no voice ref",
+                        st.id
+                    ));
+                }
+            }
+        }
+
+        let mut agent_names = BTreeSet::new();
+        for a in &self.agents {
+            if a.name.trim().is_empty() {
+                report.errors.push("an agent has an empty name".into());
+            } else if !agent_names.insert(a.name.to_lowercase()) {
+                report
+                    .errors
+                    .push(format!("agent name {:?} is used twice", a.name));
+            }
+        }
         report
     }
 }
@@ -206,6 +302,12 @@ transcript = "Hello there."
 emotion = "happy"
 audio = "voice/happy.wav"
 transcript = "Wonderful!"
+
+[[states]]
+id = "giddy"
+description = "Overjoyed"
+prompt = "states/giddy.md"
+voice_emotion = "happy"
 "#;
 
     fn pack_dir(manifest: &str) -> tempfile::TempDir {
@@ -214,6 +316,8 @@ transcript = "Wonderful!"
         fs::write(dir.path().join("persona.md"), "You are Test.").unwrap();
         fs::write(dir.path().join("examples.md"), "").unwrap();
         fs::create_dir(dir.path().join("voice")).unwrap();
+        fs::create_dir(dir.path().join("states")).unwrap();
+        fs::write(dir.path().join("states/giddy.md"), "Everything is great.").unwrap();
         dir
     }
 
@@ -233,6 +337,48 @@ transcript = "Wonderful!"
         let pack = Pack::load(dir.path()).unwrap();
         assert_eq!(pack.refs_for("happy")[0].transcript, "Wonderful!");
         assert_eq!(pack.refs_for("furious")[0].emotion, "neutral");
+    }
+
+    #[test]
+    fn state_voice_overrides_line_emotion() {
+        let dir = pack_dir(MANIFEST_TOML);
+        let pack = Pack::load(dir.path()).unwrap();
+        assert_eq!(pack.state_prompts["giddy"], "Everything is great.");
+        assert_eq!(
+            pack.refs_in_state(Some("giddy"), "neutral")[0].emotion,
+            "happy"
+        );
+        assert_eq!(pack.refs_in_state(None, "neutral")[0].emotion, "neutral");
+    }
+
+    #[test]
+    fn flags_state_voice_without_clip() {
+        let dir = pack_dir(
+            &MANIFEST_TOML.replace("voice_emotion = \"happy\"", "voice_emotion = \"drunk\""),
+        );
+        let report = Pack::load(dir.path()).unwrap().check();
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("drunk"));
+    }
+
+    #[test]
+    fn flags_duplicate_agent_names() {
+        let dir = pack_dir(&MANIFEST_TOML.replace(
+            "examples = \"examples.md\"",
+            "examples = \"examples.md\"\nagents = \"agents.toml\"",
+        ));
+        let agent = |name: &str| {
+            format!("[[agent]]\nname = \"{name}\"\nfull_name = \"{name} vas Test\"\nrole = \"r\"\ntemperament = \"t\"\n")
+        };
+        fs::write(
+            dir.path().join("agents.toml"),
+            agent("Zikka") + &agent("zikka"),
+        )
+        .unwrap();
+        let pack = Pack::load(dir.path()).unwrap();
+        assert_eq!(pack.agents.len(), 2);
+        let report = pack.check();
+        assert_eq!(report.errors, vec!["agent name \"zikka\" is used twice"]);
     }
 
     #[test]

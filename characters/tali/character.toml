@@ -4,6 +4,7 @@ short_name = "Tali"
 source = "Mass Effect"
 persona = "persona.md"
 examples = "examples.md"
+agents = "drones.toml"
 
 # Voice clips are extracted from your own copy of the game and never
 # committed (see voice/README.md). 8-20 seconds of clean, single-speaker
@@ -46,3 +47,16 @@ transcript = "TODO: exact words of the clip"
 emotion = "teasing"
 audio = "voice/teasing.wav"
 transcript = "TODO: exact words of the clip"
+
+# The Citadel DLC party in LE3 has her drunk lines. Pick one where the slur
+# is clear: zero-shot engines copy delivery from the reference clip.
+[[voice.refs]]
+emotion = "drunk"
+audio = "voice/drunk.wav"
+transcript = "TODO: exact words of the clip"
+
+[[states]]
+id = "drunk"
+description = "Tipsy on turian brandy: slurred, affectionate, oversharing, cautious with your stuff."
+prompt = "states/drunk.md"
+voice_emotion = "drunk"

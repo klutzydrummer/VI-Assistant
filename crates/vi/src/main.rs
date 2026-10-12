@@ -36,6 +36,15 @@ fn pack_check(dir: PathBuf) -> ExitCode {
         pack.emotions().into_iter().collect::<Vec<_>>().join(", ")
     );
 
+    if !m.states.is_empty() {
+        let ids: Vec<_> = m.states.iter().map(|st| st.id.as_str()).collect();
+        println!("states: {}", ids.join(", "));
+    }
+    if !pack.agents.is_empty() {
+        let names: Vec<_> = pack.agents.iter().map(|a| a.name.as_str()).collect();
+        println!("agents: {}", names.join(", "));
+    }
+
     let report = pack.check();
     for e in &report.errors {
         println!("error: {e}");

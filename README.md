@@ -12,6 +12,8 @@ A character is a folder under `characters/` (see `characters/tali/`):
 - `character.toml`: names, file paths, and voice reference clips per emotion
 - `persona.md`: the system prompt that defines who they are and how they speak
 - `examples.md`: example exchanges in their voice
+- `states/`: moods that last across turns, like Tali being drunk, each with its own voice clip
+- `drones.toml`: the names the character gives the agents it sends out
 - `voice/`: reference clips, extracted locally and never committed
 
 Swapping characters means pointing at a different folder. No fine-tuning is needed.
