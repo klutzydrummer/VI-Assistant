@@ -129,6 +129,15 @@ Each TTS engine gets an adapter that maps it to what that engine takes. Examples
 - **IndexTTS-2**: an emotion vector or emotion text, plus a weight from intensity.
 - **Chatterbox**: an exaggeration level from intensity, plus the clip.
 
+### Combining a state with an emotion (sad-drunk, happy-drunk)
+Engines differ in whether they can mix references:
+- **IndexTTS-2** takes the speaker clip and the emotion separately: a speaker reference, plus either an emotion reference clip with a 0 to 1 strength (`emo_alpha`) or an 8-value emotion vector (happy, angry, sad, afraid, disgusted, melancholic, surprised, calm). Sad-drunk = drunk clip as speaker + sad weight. The vector is continuous, so blends and gradual shifts come free. Open question for the bake-off: whether the slur survives when the emotion comes from elsewhere.
+- **CosyVoice 2/3** instruct mode takes a reference clip plus a text instruction, e.g. drunk clip + "speak sadly".
+- **XTTS-v2** accepts several reference files at once and lists interpolation between speakers as a feature, but it's older and lower quality.
+- **Qwen3-TTS, OmniVoice, F5-TTS and Chatterbox** take one reference, which carries timbre and delivery together. Mixing means picking the nearest clip from a bank tagged by state and emotion, or generating combination clips once with an engine that can mix and caching them.
+
+Using IndexTTS-2's eight emotions as the mood vector's axes would let mood drive it directly, and other engines just pick the nearest clip.
+
 The voice bank grows from "one clip per emotion" to clips tagged with emotion, intensity and state. The adapter picks the closest match.
 
 ## Changes to what's in PR #1
