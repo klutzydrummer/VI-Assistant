@@ -136,6 +136,14 @@ Engines differ in whether they can mix references:
 - **XTTS-v2** accepts several reference files at once and lists interpolation between speakers as a feature, but it's older and lower quality.
 - **Qwen3-TTS, OmniVoice, F5-TTS and Chatterbox** take one reference, which carries timbre and delivery together. Mixing means picking the nearest clip from a bank tagged by state and emotion, or generating combination clips once with an engine that can mix and caching them.
 
+### Character-specific emotion (Tali's sadness, not generic sadness)
+Three levels, cheapest first. None needs fine-tuning.
+1. **Her own clips as the emotion reference.** IndexTTS-2's emotion prompt can be one of Tali's sad lines instead of the generic vector: drunk clip as speaker, her sad clip as emotion.
+2. **Cached emotion embeddings.** Run each of her labelled clips through the engine's own emotion and speaker encoders once, then average per emotion to get a "Tali-sad" embedding, and blend embeddings for mixes. Needs a small hook into the engine's Python code.
+3. **Activation steering (control vectors).** The shortlisted engines are transformer LMs over audio tokens, so the text-LLM trick applies: generate the same lines with her neutral and her sad clips as references, record hidden states at a few layers, and take the mean difference as a "Tali-sad" direction. At inference add strength x direction to the residual stream with a forward hook. One GPU pass per character, composable (drunk reference + sad direction), adjustable strength. This is research: too much strength may cause audio artifacts, and we test it on whichever engine wins the bake-off.
+
+All three need many labelled clips per emotion. The game has thousands of Tali lines, so after extraction an emotion classifier (emotion2vec class) can auto-label the corpus, and we spot-check.
+
 Using IndexTTS-2's eight emotions as the mood vector's axes would let mood drive it directly, and other engines just pick the nearest clip.
 
 The voice bank grows from "one clip per emotion" to clips tagged with emotion, intensity and state. The adapter picks the closest match.
