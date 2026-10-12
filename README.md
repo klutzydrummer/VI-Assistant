@@ -32,9 +32,20 @@ Or with a real dialogue model: any chat GGUF, run in-process by llama.cpp and st
 
 Building needs cmake and a C++ compiler, since llama.cpp is compiled from source. It runs on the CPU by default; add `--features cuda` (rented GPU) or `--features vulkan` (RX 480) for a GPU backend.
 
+## Cloud worker
+Heavy models and dataset jobs run on a rented Vast.ai GPU that releases itself when idle:
+
+    cargo run -p vi -- cloud offers
+    cargo run -p vi -- cloud up
+    cargo run -p vi -- cloud down
+
+See `docs/cloud-worker.md`.
+
 ## Layout
 - `crates/charpack`: loads and validates character packs, and runs their state machines
 - `crates/engine`: the turn pipeline: director, prompt assembly, sentence streaming to the voice
+- `crates/cloud`: rents, watches and releases the Vast.ai GPU worker
 - `crates/llm`: the dialogue model: llama.cpp embedded, with control vectors blended per turn
 - `crates/vi`: the command-line tool
+- `jobs/`: scripts that run on the worker, including `on-worker.sh`, which runs a dataset stage there
 - `docs/`: design notes, including how to extract game audio

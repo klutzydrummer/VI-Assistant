@@ -4,10 +4,11 @@ use std::process::ExitCode;
 use charpack::Pack;
 
 mod chat;
+mod cloud;
 mod dataset;
 mod harvest;
 
-const USAGE: &str = "usage:
+pub(crate) const USAGE: &str = "usage:
   vi pack check <character-folder>
   vi chat <character-folder> [--model <file.gguf>] [--vectors <folder>] [--gpu-layers N] [--ctx N]
   vi dataset run <pipeline.toml> [stage] [--force]
@@ -19,7 +20,14 @@ const USAGE: &str = "usage:
   vi harvest package <file.pcc>
   vi harvest tlk <file.tlk | LE1-file.pcc> [--id N]
   vi review <corpus-folder> [--port N]
-  vi review --demo <empty-folder> [--port N]";
+  vi review --demo <empty-folder> [--port N]
+  vi cloud offers
+  vi cloud up [--offer ID] [--yes]
+  vi cloud down
+  vi cloud status
+  vi cloud reap
+  vi cloud ssh [command]
+  vi cloud env | touch";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -52,6 +60,7 @@ fn main() -> ExitCode {
         ["harvest", "package", file] => harvest::package(Path::new(file)),
         ["harvest", "tlk", file] => harvest::tlk(Path::new(file), id.as_deref()),
         ["review", rest @ ..] => review(rest),
+        ["cloud", rest @ ..] => cloud::run(rest),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

@@ -1,6 +1,6 @@
 # Local state, cloud compute
 
-Status: proposal. Nothing here is built yet.
+Status: proposal. The lifecycle (`vi cloud up`, `down`, the idle timeout) and offline jobs over rsync are built; see `docs/cloud-worker.md`. The turn protocol isn't yet.
 
 The heavy models (LLM, TTS, control vector generation) run on rented Vast.ai GPUs, and those instances can vanish at any moment. So everything durable lives on Brandon's machine, and the cloud worker is stateless: a fresh instance can pick up the next turn with nothing carried over.
 
@@ -35,8 +35,8 @@ SQLite in one file: conversations, turns, snapshots, and a vector index (name, t
 Home always dials out to the worker, so home can stay behind NAT. Traffic goes over an SSH tunnel or WireGuard to the instance's exposed port, plus a per-instance token. Text and audio are visible to the rented machine while it computes, so nothing is written to its disk and logs stay off.
 
 ## Lifecycle
-- `vi cloud up` rents an instance through the Vast API from a saved template, waits for the models to load, and connects.
-- `vi cloud down` releases it, and an idle timeout releases it automatically to protect the budget.
+- `vi cloud up` rents an instance through the Vast API (image and boot script from the repo rather than a saved template), waits for ssh, and connects. Waiting for models to load comes with the turn server.
+- `vi cloud down` releases it, and an idle timeout releases it automatically to protect the budget: a watchdog on the instance destroys it, and `vi cloud reap` does the same from home.
 - Weights come from Hugging Face on boot. If that's too slow, we bake them into the instance image.
 - Offline jobs (harvest labelling, control vector generation, the bake-off) use the same worker with a batch endpoint, and their outputs are pulled home.
 

@@ -12,6 +12,7 @@ vulkan = ["llm/vulkan"]
 
 [dependencies]
 charpack = { path = "../charpack" }
+cloud = { path = "../cloud" }
 engine = { path = "../engine" }
 llm = { path = "../llm" }
 dataset = { path = "../dataset" }
