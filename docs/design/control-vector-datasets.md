@@ -1,6 +1,8 @@
 # Control vector datasets
 
-Status: plan for review. Nothing here is built yet.
+Status: plan approved 2026-10-12. Nothing here is built yet.
+
+Decided: clips move only by direct rsync to the rented GPU, never through a third-party host (copyrighted material). Brandon will do about an hour of label review.
 
 Goal: from a character's own recorded lines, produce one control vector per mixing-table row (`tts`/`sad`, `llm`/`drunk`, ...) for the chosen models, with a tested maximum strength for each. Same pipeline for every character; Tali first.
 
@@ -80,7 +82,7 @@ The highest strength that passes all checks becomes the suggested `max` for that
 Harvest, clean and label first. The labeled clips feed the TTS bake-off, which narrows the field to one or two engines whose backbone we can hook. Only then extract and evaluate vectors, so we pay for extraction once per engine we'd actually use.
 
 ## Moving data
-Clips go from home to the worker by rsync over the same SSH tunnel as everything else, roughly a few hundred MB as FLAC for Tali. Results (labels, vectors, reports) come back home. Nothing stays on the worker. A private Hugging Face dataset is possible as a staging area, but it's a third party holding game audio, so the default is direct transfer.
+Clips go from home to the worker by rsync over the same SSH tunnel as everything else, roughly a few hundred MB as FLAC for Tali. Results (labels, vectors, reports) come back home. Nothing stays on the worker. Game audio never goes through a third-party host.
 
 ## Rough cost
 On a rented RTX 3090 at about $0.14/hour, my estimates:
