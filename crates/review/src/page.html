@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Label review</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --changed: #b8701a; --changed-soft: #f7e7d1; --flag: #b3392f;
+    --positive: rgba(47, 111, 179, .10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --changed: #e0a253; --changed-soft: #3d2f1c; --flag: #e57b70;
+      --positive: rgba(127, 176, 230, .12);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; margin: 10px 0 18px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .why { display: inline-block; background: var(--accent-soft); color: var(--text); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+  .context { margin: 12px 0 4px; }
+  .context p { margin: 2px 0; color: var(--muted); }
+  .say { font-size: 19px; margin: 6px 0 12px; }
+  .speaker { font-weight: 600; }
+  .row { display: grid; grid-template-columns: 22px 110px 1fr 46px; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 8px; cursor: pointer; }
+  .row.sel { outline: 2px solid var(--accent); }
+  .row.changed { background: var(--changed-soft); }
+  .row .key { color: var(--muted); font-size: 12px; text-align: right; }
+  .row .val { font-variant-numeric: tabular-nums; text-align: right; }
+  .row.changed .val { color: var(--changed); font-weight: 600; }
+  .row .detail { grid-column: 3 / 5; font-size: 12px; color: var(--muted); margin-top: -4px; }
+  .track { position: relative; height: 22px; }
+  .track .pos { position: absolute; top: 0; bottom: 0; right: 0; background: var(--positive); border-radius: 4px; }
+  .track .model { position: absolute; top: 2px; bottom: 2px; width: 2px; background: var(--muted); }
+  .track input { position: absolute; inset: 0; width: 100%; margin: 0; background: transparent; accent-color: var(--accent); }
+  .row.changed input { accent-color: var(--changed); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+  button, select {
+    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 8px; padding: 7px 12px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+  button.flag { color: var(--flag); }
+  button.primary kbd { color: inherit; border-color: currentColor; opacity: .8; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: var(--muted); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+  @media (max-width: 600px) {
+    .grid2 { grid-template-columns: 1fr; }
+    .row { grid-template-columns: 18px 84px 1fr 40px; gap: 6px; }
+  }
+  .help p { margin: 3px 0; }
+  .corr p { margin: 3px 0; font-variant-numeric: tabular-nums; }
+  .done { text-align: center; padding: 40px 0; }
+  .prev { margin-left: 8px; color: var(--changed); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Label review</h1>
+    <span id="progress" class="muted small"></span>
+  </header>
+  <div class="bar"><div id="bar"></div></div>
+
+  <section id="clip" class="panel" hidden>
+    <div>
+      <span id="why" class="why"></span>
+      <span id="prev" class="prev"></span>
+    </div>
+    <div id="meta" class="muted small" style="margin-top:8px"></div>
+    <div id="context" class="context small"></div>
+    <p class="say"><span id="speaker" class="speaker"></span> <span id="text"></span></p>
+    <p id="notes" class="muted small" style="margin:-6px 0 12px"></p>
+    <audio id="audio" controls preload="auto" style="width:100%"></audio>
+    <div id="axes" style="margin-top:12px"></div>
+    <div class="actions">
+      <button class="primary" id="keep">Keep <kbd>Enter</kbd></button>
+      <button id="skip">Skip <kbd>S</kbd></button>
+      <button id="back">Back <kbd>B</kbd></button>
+      <span style="flex:1"></span>
+      <select id="reason" title="Why the clip is bad">
+        <option value="wrong_clip">wrong clip for the subtitle</option>
+        <option value="music">music or effects over it</option>
+        <option value="other_voice">another voice on it</option>
+        <option value="bad_audio">bad audio</option>
+        <option value="other">other</option>
+      </select>
+      <button class="flag" id="flag">Flag bad clip <kbd>F</kbd></button>
+    </div>
+  </section>
+
+  <section id="finished" class="panel done" hidden>
+    <p><strong>Queue empty.</strong> Every labelled clip has a verdict.</p>
+    <p class="muted small">Reviews are saved in reviews.jsonl at the corpus root.</p>
+  </section>
+
+  <div class="grid2">
+    <section class="panel help small">
+      <p><kbd>Space</kbd> replay &nbsp; <kbd>1</kbd>–<kbd>9</kbd> pick axis &nbsp; <kbd>↑</kbd><kbd>↓</kbd> move</p>
+      <p><kbd>←</kbd><kbd>→</kbd> nudge 0.05 &nbsp; <kbd>Shift</kbd> for 0.2 &nbsp; <kbd>0</kbd> reset axis</p>
+      <p class="muted">The grey tick is the model's score. The shaded end of each track is where a line becomes a positive for that axis's vector.</p>
+    </section>
+    <section class="panel corr small">
+      <p><strong>Your corrections so far</strong></p>
+      <div id="corrections" class="muted">None yet.</div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const IDLE_CAP = 120; // seconds; time beyond this on one clip is treated as a break
+
+let session = null;   // from /api/session
+let current = null;   // { line, label, review, why }
+let values = {};      // axis -> reviewer value
+let selected = 0;
+let shownAt = 0;
+const history = [];   // ids reviewed this sitting, for Back
+const PAST = { keep: 'kept', flag: 'flagged', skip: 'skipped' };
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function fmtMin(s) { return Math.round(s / 60) + ' min'; }
+
+function renderSession() {
+  const s = session;
+  const done = s.kept + s.flagged;
+  const pace = done ? s.seconds / done : null;
+  const left = Math.max(0, s.budget_seconds - s.seconds);
+  let text = `${done} reviewed · ${fmtMin(s.seconds)} of ${fmtMin(s.budget_seconds)}`;
+  if (pace && done >= 5) text += ` · ${Math.round(pace)} s per clip, about ${Math.floor(left / pace)} more in the hour`;
+  text += ` · ${s.queue.length} in queue`;
+  if (s.dropped) text += ` · ${s.dropped} dropped by clean`;
+  $('progress').textContent = text;
+  $('bar').style.width = Math.min(100, 100 * s.seconds / s.budget_seconds) + '%';
+
+  // Only axes the reviewer actually moved; the rest are agreement.
+  const rows = Object.entries(s.corrections).filter(([, c]) => c.size >= 0.005);
+  const box = $('corrections');
+  box.replaceChildren();
+  if (!rows.length) { box.textContent = 'None yet.'; return; }
+  for (const [axis, c] of rows) {
+    const p = document.createElement('p');
+    const sign = c.bias >= 0 ? '+' : '';
+    p.textContent = `${axis}: ${sign}${c.bias.toFixed(2)} on average, ${c.size.toFixed(2)} typical nudge, over ${c.count} kept`;
+    box.append(p);
+  }
+}
+
+function modelValue(axis) {
+  return current.label?.scores?.[axis]?.value ?? 0;
+}
+
+function axisIds() {
+  return session.axes.map((a) => a.id);
+}
+
+function renderAxes() {
+  const box = $('axes');
+  box.replaceChildren();
+  session.axes.forEach(({ id: axis, description }, i) => {
+    const score = current.label?.scores?.[axis];
+    const v = values[axis];
+    const changed = Math.abs(v - modelValue(axis)) > 0.001;
+    const row = document.createElement('div');
+    row.className = 'row' + (i === selected ? ' sel' : '') + (changed ? ' changed' : '');
+    row.onclick = () => { selected = i; renderAxes(); };
+
+    const key = document.createElement('span');
+    key.className = 'key'; key.textContent = i < 9 ? i + 1 : '';
+    const name = document.createElement('span');
+    name.textContent = axis;
+    name.title = description || '';
+
+    const track = document.createElement('div');
+    track.className = 'track';
+    const pos = document.createElement('div');
+    pos.className = 'pos';
+    pos.style.width = (100 * (1 - session.positive_from)) + '%';
+    const tick = document.createElement('div');
+    tick.className = 'model';
+    tick.style.left = `calc(${100 * modelValue(axis)}% - 1px)`;
+    const input = document.createElement('input');
+    input.type = 'range'; input.min = 0; input.max = 1; input.step = 0.01; input.value = v;
+    input.setAttribute('aria-label', axis);
+    input.oninput = () => { values[axis] = +input.value; selected = i; renderAxes(); };
+    track.append(pos, tick, input);
+
+    const val = document.createElement('span');
+    val.className = 'val'; val.textContent = v.toFixed(2);
+
+    row.append(key, name, track, val);
+    if (score) {
+      const detail = document.createElement('span');
+      detail.className = 'detail';
+      const sig = Object.entries(score.signals || {})
+        .filter(([, x]) => x !== null && x !== undefined)
+        .map(([k, x]) => `${k} ${x.toFixed(2)}`).join(', ');
+      detail.textContent = `model ${score.value.toFixed(2)}, confidence ${score.confidence.toFixed(2)}` + (sig ? ` · ${sig}` : '');
+      row.append(document.createElement('span'), document.createElement('span'), detail);
+    }
+    box.append(row);
+  });
+}
+
+async function show(id) {
+  current = await api('/api/clip/' + encodeURIComponent(id));
+  const { line, clip, label, review, why } = current;
+  values = {};
+  for (const axis of axisIds()) {
+    values[axis] = review?.verdict === 'keep' && axis in review.scores ? review.scores[axis] : modelValue(axis);
+  }
+  selected = why ? Math.max(0, axisIds().indexOf(why.axis)) : 0;
+
+  $('why').textContent = why ? why.reason : 'no labels';
+  $('prev').textContent = review ? 'already ' + PAST[review.verdict] : '';
+  $('meta').textContent = [
+    line.source?.game?.toUpperCase(), line.source?.conversation, line.id,
+    ...(line.scene_tags || []), ...(label?.tags || []),
+  ].filter(Boolean).join(' · ');
+  const ctx = $('context');
+  ctx.replaceChildren();
+  for (const c of line.context || []) {
+    const p = document.createElement('p');
+    p.textContent = `${c.speaker}: ${c.text}`;
+    ctx.append(p);
+  }
+  $('speaker').textContent = (line.speaker || 'Speaker') + ':';
+  $('text').textContent = line.text;
+  const notes = [];
+  if (clip?.transcript && clip.transcript !== line.text) notes.push(`Spoken: “${clip.transcript}”`);
+  if (line.stage_direction) notes.push(`Direction: ${line.stage_direction}`);
+  $('notes').textContent = notes.join(' · ');
+  $('notes').hidden = !notes.length;
+  renderAxes();
+
+  const audio = $('audio');
+  audio.src = '/audio/' + encodeURIComponent(line.id);
+  audio.play().catch(() => {}); // autoplay may need one click first
+  shownAt = performance.now();
+  $('clip').hidden = false;
+  $('finished').hidden = true;
+}
+
+async function next() {
+  const item = session.queue[0];
+  if (!item) {
+    $('clip').hidden = true; $('finished').hidden = false; current = null;
+    return;
+  }
+  await show(item.id);
+}
+
+async function submit(verdict) {
+  if (!current) return;
+  const seconds = Math.min(IDLE_CAP, (performance.now() - shownAt) / 1000);
+  const body = { id: current.line.id, verdict, seconds };
+  if (verdict === 'keep') body.scores = values;
+  if (verdict === 'flag') body.flag = $('reason').value;
+  session = await api('/api/review', body);
+  history.push(current.line.id);
+  renderSession();
+  await next();
+}
+
+async function back() {
+  const id = history.pop();
+  if (id) await show(id);
+}
+
+function nudge(delta) {
+  const axis = axisIds()[selected];
+  values[axis] = Math.min(1, Math.max(0, Math.round((values[axis] + delta) * 100) / 100));
+  renderAxes();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!current || e.target.tagName === 'SELECT' || e.metaKey || e.ctrlKey || e.altKey) return;
+  const step = e.shiftKey ? 0.2 : 0.05;
+  const k = e.key;
+  if (k === ' ') { const a = $('audio'); a.currentTime = 0; a.play(); }
+  else if (k === 'Enter') submit('keep');
+  else if (k === 's' || k === 'S') submit('skip');
+  else if (k === 'f' || k === 'F') submit('flag');
+  else if (k === 'b' || k === 'B' || k === 'Backspace') back();
+  else if (k === 'ArrowLeft') nudge(-step);
+  else if (k === 'ArrowRight') nudge(step);
+  else if (k === 'ArrowUp') { selected = (selected + session.axes.length - 1) % session.axes.length; renderAxes(); }
+  else if (k === 'ArrowDown') { selected = (selected + 1) % session.axes.length; renderAxes(); }
+  else if (k === '0') { const a = axisIds()[selected]; values[a] = modelValue(a); renderAxes(); }
+  else if (/^[1-9]$/.test(k) && +k <= session.axes.length) { selected = +k - 1; renderAxes(); }
+  else return;
+  e.preventDefault();
+});
+
+$('keep').onclick = () => submit('keep');
+$('skip').onclick = () => submit('skip');
+$('flag').onclick = () => submit('flag');
+$('back').onclick = back;
+
+(async () => {
+  session = await api('/api/session');
+  renderSession();
+  await next();
+})();
+</script>
+</body>
+</html>
