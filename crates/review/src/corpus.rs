@@ -1,20 +1,19 @@
-//! Reading the label stage's output and recording review verdicts.
+//! Reading the pipeline's output and recording review verdicts.
 //!
-//! PROVISIONAL: the corpus format is being designed separately
-//! (`corpus-format.md`). Until it lands this module assumes the shape below,
-//! and it is the only place that knows it, so adapting means editing this
-//! file alone.
+//! Follows corpus format v1 (`docs/design/corpus-format.md`, "What the
+//! review page reads"):
 //!
 //! ```text
-//! <corpus>/lines.jsonl    one Line per clip (harvest + clean)
-//! <corpus>/labels.jsonl   one Label per clip (label stage)
-//! <corpus>/reviews.jsonl  appended by the review page; latest per id wins
-//! <corpus>/audio/...      clips, referenced by Line::audio
+//! <corpus>/stages/<stage>/current          key of the latest successful run
+//! <corpus>/stages/<stage>/<key>/out/       that run's files
+//!   harvest: lines.jsonl, audio/<id>.wav
+//!   clean:   clips.jsonl, audio/<id>.flac   (optional)
+//!   label:   labels.jsonl, axes.json
+//! <corpus>/reviews.jsonl                   appended here; latest per id wins
 //! ```
 //!
-//! Reviews never rewrite the label stage's output. They are a separate,
-//! append-only file, so the stage runner can treat them as one more input
-//! (to contrast sets and to recalibrating the fusion weights).
+//! Reviews never rewrite a stage's output. They are human input that later
+//! stages (contrast sets, fusion recalibration) list as a file.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -24,7 +23,9 @@ use std::path::{Component, Path, PathBuf};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const LINES: &str = "lines.jsonl";
+pub const CLIPS: &str = "clips.jsonl";
 pub const LABELS: &str = "labels.jsonl";
+pub const AXES: &str = "axes.json";
 pub const REVIEWS: &str = "reviews.jsonl";
 
 #[derive(Debug, thiserror::Error)]
@@ -40,27 +41,47 @@ pub enum Error {
         line: usize,
         source: serde_json::Error,
     },
+    #[error("the {0} stage has not run yet (no stages/{0}/current)")]
+    NotRun(&'static str),
 }
 
-/// One spoken line, with the clip and the game's own transcript.
+/// One spoken line from harvest, with the game's own subtitle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Line {
     pub id: String,
-    /// Clip path relative to the corpus folder.
-    pub audio: String,
-    pub text: String,
     #[serde(default)]
     pub speaker: String,
-    /// Game, conversation and anything else worth showing, e.g. "LE2".
     #[serde(default)]
-    pub game: Option<String>,
+    pub text: String,
     #[serde(default)]
-    pub conversation: Option<String>,
+    pub flags: Vec<String>,
+    pub audio: Audio,
+    #[serde(default)]
+    pub source: Source,
     /// The lines just before this one, oldest first.
     #[serde(default)]
     pub context: Vec<ContextLine>,
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub scene_tags: Vec<String>,
+    /// LE3's voice director note, verbatim.
+    #[serde(default)]
+    pub stage_direction: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Audio {
+    /// Relative to the `out/` folder of the stage that wrote the record.
+    pub path: String,
+    #[serde(default)]
+    pub duration_s: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Source {
+    #[serde(default)]
+    pub game: Option<String>,
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,12 +90,28 @@ pub struct ContextLine {
     pub text: String,
 }
 
+/// Clean's verdict on one clip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Clip {
+    pub id: String,
+    pub keep: bool,
+    pub audio: Audio,
+    /// What was actually spoken, when it differs from the subtitle.
+    #[serde(default)]
+    pub transcript: Option<String>,
+    #[serde(default)]
+    pub flags: Vec<String>,
+}
+
 /// The label stage's fused scores for one clip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Label {
     pub id: String,
     /// Pack variable id (joy, intoxication, ...) to its score.
     pub scores: BTreeMap<String, AxisScore>,
+    /// Non-emotion labels from discovery, like `combat_bark`.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,9 +120,24 @@ pub struct AxisScore {
     pub value: f32,
     /// How much the fusion trusts it, 0 to 1.
     pub confidence: f32,
-    /// Each signal's own score (audio, text, prior, audio_llm), when known.
+    /// Each signal's own score (audio, text, prior, audio_llm); null when a
+    /// signal didn't score this axis.
     #[serde(default)]
-    pub signals: BTreeMap<String, f32>,
+    pub signals: BTreeMap<String, Option<f32>>,
+}
+
+impl AxisScore {
+    /// The signals that did score this axis.
+    pub fn scored(&self) -> impl Iterator<Item = f32> + '_ {
+        self.signals.values().filter_map(|v| *v)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Axis {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,9 +162,9 @@ pub struct Review {
     /// even after the labels are regenerated.
     #[serde(default)]
     pub model: BTreeMap<String, f32>,
-    /// Why a clip was flagged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    /// Why a clip was flagged: `wrong_clip`, `music`, `other_voice`, ...
+    #[serde(default)]
+    pub flag: Option<String>,
     /// Time spent on the clip, for pacing the hour.
     #[serde(default)]
     pub seconds: f32,
@@ -123,20 +175,71 @@ pub struct Review {
 
 pub struct Corpus {
     pub root: PathBuf,
+    /// Lines with a playable clip; ones clean dropped are left out.
     pub lines: Vec<Line>,
+    /// How many lines clean dropped.
+    pub dropped: usize,
     pub labels: HashMap<String, Label>,
+    /// Axes in the pack's order.
+    pub axes: Vec<Axis>,
     /// Every review in file order; use [`Corpus::latest`] for current ones.
     pub reviews: Vec<Review>,
+    harvest_out: PathBuf,
+    clean: Option<(PathBuf, HashMap<String, Clip>)>,
+}
+
+/// A stage's current output folder, or None if it hasn't run.
+pub fn current_out(corpus: &Path, stage: &str) -> Result<Option<PathBuf>, Error> {
+    let stage_dir = corpus.join("stages").join(stage);
+    let current = stage_dir.join("current");
+    match fs::read_to_string(&current) {
+        Ok(key) => Ok(Some(stage_dir.join(key.trim()).join("out"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Io {
+            path: current,
+            source,
+        }),
+    }
 }
 
 impl Corpus {
     pub fn load(root: impl AsRef<Path>) -> Result<Self, Error> {
         let root = root.as_ref().to_path_buf();
-        let lines = read_jsonl(&root.join(LINES))?;
-        let labels = read_jsonl::<Label>(&root.join(LABELS))?
+        let harvest_out = current_out(&root, "harvest")?.ok_or(Error::NotRun("harvest"))?;
+        let label_out = current_out(&root, "label")?.ok_or(Error::NotRun("label"))?;
+
+        let clean = match current_out(&root, "clean")? {
+            Some(out) => {
+                let clips: HashMap<String, Clip> = read_jsonl::<Clip>(&out.join(CLIPS))?
+                    .into_iter()
+                    .map(|c| (c.id.clone(), c))
+                    .collect();
+                Some((out, clips))
+            }
+            None => None,
+        };
+        let mut lines: Vec<Line> = read_jsonl(&harvest_out.join(LINES))?;
+        let before = lines.len();
+        if let Some((_, clips)) = &clean {
+            lines.retain(|l| clips.get(&l.id).is_some_and(|c| c.keep));
+        }
+        let dropped = before - lines.len();
+
+        let labels = read_jsonl::<Label>(&label_out.join(LABELS))?
             .into_iter()
             .map(|l| (l.id.clone(), l))
             .collect();
+        let axes_path = label_out.join(AXES);
+        let axes_json = fs::read_to_string(&axes_path).map_err(|source| Error::Io {
+            path: axes_path.clone(),
+            source,
+        })?;
+        let axes = serde_json::from_str(&axes_json).map_err(|source| Error::Parse {
+            path: axes_path,
+            line: 1,
+            source,
+        })?;
+
         let reviews_path = root.join(REVIEWS);
         let reviews = if reviews_path.exists() {
             read_jsonl(&reviews_path)?
@@ -146,8 +249,12 @@ impl Corpus {
         Ok(Self {
             root,
             lines,
+            dropped,
             labels,
+            axes,
             reviews,
+            harvest_out,
+            clean,
         })
     }
 
@@ -155,19 +262,9 @@ impl Corpus {
         self.lines.iter().find(|l| l.id == id)
     }
 
-    /// Axis ids in the order the labels use them.
-    pub fn axes(&self) -> Vec<String> {
-        let mut axes: Vec<String> = Vec::new();
-        for line in &self.lines {
-            if let Some(label) = self.labels.get(&line.id) {
-                for axis in label.scores.keys() {
-                    if !axes.contains(axis) {
-                        axes.push(axis.clone());
-                    }
-                }
-            }
-        }
-        axes
+    /// Clean's record for a line, if clean has run.
+    pub fn clip(&self, id: &str) -> Option<&Clip> {
+        self.clean.as_ref().and_then(|(_, clips)| clips.get(id))
     }
 
     /// The most recent review of each clip.
@@ -195,13 +292,18 @@ impl Corpus {
         Ok(())
     }
 
-    /// Where a line's clip lives, refusing paths that escape the corpus.
+    /// Where a line's clip lives: clean's FLAC if clean has run, otherwise
+    /// harvest's WAV. Refuses paths that escape the stage folder.
     pub fn audio_path(&self, line: &Line) -> Option<PathBuf> {
-        let rel = Path::new(&line.audio);
+        let (out, rel) = match &self.clean {
+            Some((out, clips)) => (out, &clips.get(&line.id)?.audio.path),
+            None => (&self.harvest_out, &line.audio.path),
+        };
+        let rel = Path::new(rel);
         let inside = rel
             .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-        inside.then(|| self.root.join(rel))
+        inside.then(|| out.join(rel))
     }
 }
 

@@ -5,17 +5,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::corpus::{write_jsonl, AxisScore, ContextLine, Label, Line, LABELS, LINES};
+use crate::corpus::{
+    write_jsonl, Audio, Axis, AxisScore, Clip, ContextLine, Label, Line, Source, AXES as AXES_FILE,
+    CLIPS, LABELS, LINES,
+};
 
-/// The label axes from Tali's pack variables.
-pub const AXES: [&str; 6] = [
-    "joy",
-    "sadness",
-    "anger",
-    "worry",
-    "playfulness",
-    "intoxication",
+/// The label axes from Tali's pack variables, in the pack's order.
+pub const AXES: [(&str, &str); 6] = [
+    ("joy", "Happiness and excitement"),
+    ("sadness", "Sadness and homesickness"),
+    ("anger", "Irritation and anger"),
+    ("worry", "Concern, usually for the user"),
+    ("playfulness", "In the mood to tease"),
+    ("intoxication", "How much turian brandy is in her system"),
 ];
+
+/// Every 25th clip is one clean dropped.
+const DROP_EVERY: usize = 25;
 
 const TEXTS: [&str; 12] = [
     "The coolant loop is holding, for now.",
@@ -32,34 +38,40 @@ const TEXTS: [&str; 12] = [
     "Everyone is singing. Why is everyone singing?",
 ];
 
-const SCENES: [&str; 4] = ["engineering", "combat", "party", "conversation"];
+const SCENES: [&str; 4] = ["engineering", "combat", "citadel_party", "normandy"];
 
-/// Write `count` synthetic clips with labels into `dir`.
+/// Write a corpus of `count` synthetic clips into `dir`, laid out like the
+/// stage runner's output: harvest, clean (dropping a few) and label.
 pub fn write(dir: &Path, count: usize) -> std::io::Result<()> {
-    fs::create_dir_all(dir.join("audio"))?;
+    let harvest = stage(dir, "harvest")?;
+    let clean = stage(dir, "clean")?;
+    let label = stage(dir, "label")?;
     let mut rng = Rng(0x5eed);
     let mut lines = Vec::new();
+    let mut clips = Vec::new();
     let mut labels = Vec::new();
     for i in 0..count {
-        let id = format!("fx{i:04}");
+        let game = format!("le{}", 1 + i % 3);
+        let id = format!("{game}.s9{i:05}");
         let text = TEXTS[i % TEXTS.len()];
         let scene = SCENES[rng.below(SCENES.len())];
-        let audio = format!("audio/{id}.wav");
+        let party = scene == "citadel_party";
+        let path = format!("audio/{id}.wav");
         let seconds = 1.0 + rng.unit() * 2.5;
-        fs::write(
-            dir.join(&audio),
-            tone(220.0 + 40.0 * (i % 7) as f32, seconds),
-        )?;
+        let wav = tone(220.0 + 40.0 * (i % 7) as f32, seconds);
+        fs::write(harvest.join(&path), &wav)?;
+        // Real clean writes FLAC; a copy of the WAV stands in for it.
+        fs::write(clean.join(&path), &wav)?;
 
         let mut scores = BTreeMap::new();
-        let lead = AXES[rng.below(AXES.len())];
-        for axis in AXES {
+        let lead = AXES[rng.below(AXES.len())].0;
+        for (axis, _) in AXES {
             let base = if axis == lead {
                 0.4 + 0.6 * rng.unit()
             } else {
                 0.25 * rng.unit()
             };
-            let base = if axis == "intoxication" && scene == "party" {
+            let base = if axis == "intoxication" && party {
                 (base + 0.4).min(1.0)
             } else {
                 base
@@ -68,11 +80,12 @@ pub fn write(dir: &Path, count: usize) -> std::io::Result<()> {
             let text_says = (base + (rng.unit() - 0.5) * 0.6 * rng.unit()).clamp(0.0, 1.0);
             let agreement = 1.0 - (audio_says - text_says).abs();
             let mut signals = BTreeMap::from([
-                ("audio".to_string(), round(audio_says)),
-                ("text".to_string(), round(text_says)),
+                ("audio".to_string(), Some(round(audio_says))),
+                ("text".to_string(), Some(round(text_says))),
+                ("prior".to_string(), None),
             ]);
-            if axis == "intoxication" && scene == "party" {
-                signals.insert("prior".into(), 0.5);
+            if axis == "intoxication" && party {
+                signals.insert("prior".into(), Some(0.5));
             }
             scores.insert(
                 axis.to_string(),
@@ -84,29 +97,71 @@ pub fn write(dir: &Path, count: usize) -> std::io::Result<()> {
             );
         }
 
+        let audio = Audio {
+            path,
+            duration_s: Some(round(seconds)),
+        };
+        let keep = i % DROP_EVERY != DROP_EVERY - 1;
+        clips.push(Clip {
+            id: id.clone(),
+            keep,
+            audio: audio.clone(),
+            transcript: Some(text.to_string()),
+            flags: if keep { vec![] } else { vec!["music".into()] },
+        });
         lines.push(Line {
             id: id.clone(),
-            audio,
+            speaker: "fixture".into(),
             text: text.to_string(),
-            speaker: "Fixture".into(),
-            game: Some(format!("SYN{}", 1 + i % 3)),
-            conversation: Some(format!("synthetic_{scene}_{}", i / 4)),
+            flags: vec![],
+            audio,
+            source: Source {
+                game: Some(game),
+                conversation: Some(format!("synthetic_{scene}_{}", i / 4)),
+            },
             context: vec![
                 ContextLine {
-                    speaker: "Commander".into(),
+                    speaker: "commander".into(),
                     text: "How are we looking?".into(),
                 },
                 ContextLine {
-                    speaker: "Pilot".into(),
+                    speaker: "pilot".into(),
                     text: "Better than last time.".into(),
                 },
             ],
-            tags: vec![scene.to_string()],
+            scene_tags: vec![scene.to_string()],
+            stage_direction: (i % 9 == 0).then(|| "quietly, a little tired".to_string()),
         });
-        labels.push(Label { id, scores });
+        let tags = if scene == "combat" {
+            vec!["combat_bark".to_string()]
+        } else {
+            vec![]
+        };
+        labels.push(Label { id, scores, tags });
     }
-    write_jsonl(&dir.join(LINES), &lines)?;
-    write_jsonl(&dir.join(LABELS), &labels)
+    write_jsonl(&harvest.join(LINES), &lines)?;
+    write_jsonl(&clean.join(CLIPS), &clips)?;
+    write_jsonl(&label.join(LABELS), &labels)?;
+    let axes: Vec<Axis> = AXES
+        .iter()
+        .map(|(id, description)| Axis {
+            id: id.to_string(),
+            description: description.to_string(),
+        })
+        .collect();
+    fs::write(
+        label.join(AXES_FILE),
+        serde_json::to_string_pretty(&axes).expect("axes serialize"),
+    )
+}
+
+/// Make `stages/<name>/synthetic/out/audio` and point `current` at it.
+fn stage(dir: &Path, name: &str) -> std::io::Result<std::path::PathBuf> {
+    let stage_dir = dir.join("stages").join(name);
+    let out = stage_dir.join("synthetic").join("out");
+    fs::create_dir_all(out.join("audio"))?;
+    fs::write(stage_dir.join("current"), "synthetic\n")?;
+    Ok(out)
 }
 
 fn round(v: f32) -> f32 {

@@ -12,6 +12,7 @@ pub use corpus::Corpus;
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
 
     use serde_json::Value;
 
@@ -30,7 +31,8 @@ mod tests {
         let signals = signals
             .iter()
             .enumerate()
-            .map(|(i, v)| (format!("s{i}"), *v))
+            .map(|(i, v)| (format!("s{i}"), Some(*v)))
+            .chain([("unscored".to_string(), None)])
             .collect();
         Label {
             id: "x".into(),
@@ -42,6 +44,7 @@ mod tests {
                     signals,
                 },
             )]),
+            tags: vec![],
         }
     }
 
@@ -54,14 +57,13 @@ mod tests {
 
     #[test]
     fn fixture_loads_with_pack_axes() {
-        let (_dir, corpus) = demo(30);
-        assert_eq!(corpus.lines.len(), 30);
-        assert_eq!(corpus.labels.len(), 30);
-        let mut axes = corpus.axes();
-        axes.sort();
-        let mut want: Vec<String> = fixture::AXES.iter().map(|s| s.to_string()).collect();
-        want.sort();
-        assert_eq!(axes, want);
+        let (_dir, corpus) = demo(50);
+        assert_eq!(corpus.dropped, 2, "clean drops every 25th clip");
+        assert_eq!(corpus.lines.len(), 48);
+        assert_eq!(corpus.labels.len(), 50);
+        let axes: Vec<&str> = corpus.axes.iter().map(|a| a.id.as_str()).collect();
+        let want: Vec<&str> = fixture::AXES.iter().map(|a| a.0).collect();
+        assert_eq!(axes, want, "pack order from axes.json");
         assert!(corpus
             .lines
             .iter()
@@ -89,7 +91,7 @@ mod tests {
     fn queue_is_sorted_and_skips_go_last() {
         let (_dir, mut corpus) = demo(20);
         let q = queue::build(&corpus);
-        assert_eq!(q.len(), 20);
+        assert_eq!(q.len(), 20, "none dropped below 25");
         assert!(q.windows(2).all(|w| w[0].priority >= w[1].priority));
 
         let first = q[0].id.clone();
@@ -99,7 +101,7 @@ mod tests {
                 verdict: Verdict::Skip,
                 scores: BTreeMap::new(),
                 model: BTreeMap::new(),
-                reason: None,
+                flag: None,
                 seconds: 1.0,
                 at: 0,
             })
@@ -177,16 +179,44 @@ mod tests {
     }
 
     #[test]
-    fn audio_paths_stay_inside_the_corpus() {
-        let (_dir, mut corpus) = demo(2);
-        corpus.lines[0].audio = "../../etc/passwd".into();
-        corpus.lines[1].audio = "/etc/passwd".into();
-        assert!(corpus.audio_path(&corpus.lines[0]).is_none());
-        assert!(corpus.audio_path(&corpus.lines[1]).is_none());
+    fn audio_paths_stay_inside_the_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture::write(dir.path(), 2).unwrap();
+        let clips = dir.path().join("stages/clean/synthetic/out/clips.jsonl");
+        let text = fs::read_to_string(&clips).unwrap();
+        let mut rows = text.lines();
+        let (a, b) = (rows.next().unwrap(), rows.next().unwrap());
+        let a = a.replacen("\"audio/", "\"../../../../", 1);
+        let b = b.replacen("\"audio/", "\"/etc/", 1);
+        fs::write(&clips, format!("{a}\n{b}\n")).unwrap();
+
+        let mut corpus = Corpus::load(dir.path()).unwrap();
+        assert!(corpus.lines.iter().all(|l| corpus.audio_path(l).is_none()));
         let id = corpus.lines[0].id.clone();
         assert!(matches!(
             handle(&mut corpus, false, &format!("/audio/{id}"), ""),
             Reply::NotFound
         ));
+    }
+
+    #[test]
+    fn without_clean_plays_harvest_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture::write(dir.path(), 30).unwrap();
+        fs::remove_dir_all(dir.path().join("stages/clean")).unwrap();
+        let corpus = Corpus::load(dir.path()).unwrap();
+        assert_eq!(corpus.lines.len(), 30);
+        let path = corpus.audio_path(&corpus.lines[0]).unwrap();
+        assert!(path.starts_with(dir.path().join("stages/harvest")));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn missing_stage_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture::write(dir.path(), 3).unwrap();
+        fs::remove_file(dir.path().join("stages/label/current")).unwrap();
+        let err = Corpus::load(dir.path()).err().unwrap();
+        assert!(err.to_string().contains("label stage has not run"));
     }
 }

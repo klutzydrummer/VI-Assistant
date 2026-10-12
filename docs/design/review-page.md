@@ -1,6 +1,6 @@
 # Label review page
 
-Status: built (`crates/review`, `vi review`), tested on synthetic clips only. Reads a provisional corpus layout until `corpus-format.md` lands.
+Status: built (`crates/review`, `vi review`), tested on synthetic clips only. Reads corpus format v1 (`corpus-format.md`).
 
 Stage 5 of [control-vector-datasets.md](control-vector-datasets.md). You listen to a clip, see the label stage's scores, and keep, nudge, flag or skip it. About an hour of your time should cover the clips that matter.
 
@@ -8,7 +8,7 @@ Stage 5 of [control-vector-datasets.md](control-vector-datasets.md). You listen 
 
 ```
 vi review <corpus-folder>            # serves http://127.0.0.1:8737/
-vi review --demo <empty-folder>      # writes 120 synthetic clips first, then serves
+vi review --demo <empty-folder>      # writes a synthetic corpus (harvest, clean, label) first
 ```
 
 It binds to localhost only and the page loads nothing from the internet, so game audio stays on your machine. Every verdict is written as you go; stop with Ctrl+C and rerun to pick up where you left off.
@@ -38,25 +38,20 @@ Each clip shows which axis put it in the queue and why. Kept and flagged clips l
 
 ## Data
 
-Provisional, isolated in `crates/review/src/corpus.rs` so the real corpus format only touches that file:
+The page follows "What the review page reads" in `corpus-format.md`; `crates/review/src/corpus.rs` is the only code that knows the layout.
+- **harvest** (`stages/harvest/current`): `lines.jsonl` for the subtitle, speaker, `source.game`, `source.conversation`, context, `scene_tags` and `stage_direction`.
+- **clean**, if it has run: `clips.jsonl`. Clips with `keep: false` are left out (the header counts them) and audio plays from clean's output. Without clean, harvest's WAV plays. A clean transcript that differs from the subtitle is shown as "Spoken".
+- **label**: `labels.jsonl` for scores and non-emotion `tags`, and `axes.json` for axis order and descriptions (hover an axis name). Null signals are ignored.
+- **reviews**: appended to `<corpus>/reviews.jsonl`, the last record per id wins.
 
-```
-<corpus>/lines.jsonl    {"id","audio","text","speaker","game","conversation","context":[{"speaker","text"}],"tags":[]}
-<corpus>/labels.jsonl   {"id","scores":{"<axis>":{"value","confidence","signals":{"audio","text","prior",...}}}}
-<corpus>/reviews.jsonl  written by the page, append-only, latest per id wins
-```
-
-Axes are whatever keys the labels carry, so they follow the pack's variables automatically.
-
-A review records the verdict, your scores for every axis, the model scores you were shown, a flag reason, seconds spent and a timestamp:
+A review records the verdict, your scores for every axis, the model scores you were shown, a `flag` reason (`wrong_clip`, `music`, `other_voice`, `bad_audio`, `other`), seconds spent and a timestamp:
 
 ```json
-{"id":"fx0022","verdict":"keep","scores":{"joy":0.0,...},"model":{"joy":0.07,...},"seconds":8.4,"at":1791828624}
+{"id":"le2.s348112_f","verdict":"keep","scores":{"joy":0.0,...},"model":{"joy":0.07,...},"flag":null,"seconds":8.4,"at":1791828624}
 ```
 
-Reviews never rewrite the label stage's output. The stage runner can treat `reviews.jsonl` as an input to contrast sets (your scores override the model's, flagged clips are dropped) and to recalibrating the fusion weights. Keeping the shown model scores means each correction stays measurable after labels are regenerated. The page shows the running bias per axis ("playfulness: +0.12 on average"), which is a first look at what recalibration will find; the recalibration itself belongs to the label stage.
+Contrast sets and fusion recalibration list `corpus:reviews.jsonl` as an input, so a new review reruns them and nothing upstream. The page shows the running bias per axis ("playfulness: +0.12 on average"), a first look at what recalibration will find; the recalibration itself belongs to the label stage.
 
-## Open with the corpus format
-- Real paths and field names for lines, labels and reviews, and where the review stage's output lives in the content-addressed layout.
-- Whether the page should take axis order and descriptions from the pack rather than the labels (today it sorts them alphabetically).
+## Not done
 - Audio is served whole without range requests, which is fine for clips under 20 seconds.
+- `current_out` is a few lines in `corpus.rs`; once `crates/dataset` merges, it can call `dataset::runner::current_out` instead.

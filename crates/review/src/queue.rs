@@ -24,17 +24,9 @@ pub struct Item {
 /// How unsure the label stage is about an axis: low confidence, or signals
 /// that disagree with each other.
 pub fn uncertainty(score: &crate::corpus::AxisScore) -> f32 {
-    let lo = score
-        .signals
-        .values()
-        .copied()
-        .fold(f32::INFINITY, f32::min);
-    let hi = score
-        .signals
-        .values()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let spread = if score.signals.len() > 1 {
+    let lo = score.scored().fold(f32::INFINITY, f32::min);
+    let hi = score.scored().fold(f32::NEG_INFINITY, f32::max);
+    let spread = if score.scored().count() > 1 {
         hi - lo
     } else {
         0.0

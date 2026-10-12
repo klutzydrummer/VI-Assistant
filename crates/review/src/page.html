@@ -85,6 +85,7 @@
     <div id="meta" class="muted small" style="margin-top:8px"></div>
     <div id="context" class="context small"></div>
     <p class="say"><span id="speaker" class="speaker"></span> <span id="text"></span></p>
+    <p id="notes" class="muted small" style="margin:-6px 0 12px"></p>
     <audio id="audio" controls preload="auto" style="width:100%"></audio>
     <div id="axes" style="margin-top:12px"></div>
     <div class="actions">
@@ -93,11 +94,11 @@
       <button id="back">Back <kbd>B</kbd></button>
       <span style="flex:1"></span>
       <select id="reason" title="Why the clip is bad">
-        <option>wrong clip for the subtitle</option>
-        <option>music or effects over it</option>
-        <option>not the character</option>
-        <option>combat bark, not dialogue</option>
-        <option>other</option>
+        <option value="wrong_clip">wrong clip for the subtitle</option>
+        <option value="music">music or effects over it</option>
+        <option value="other_voice">another voice on it</option>
+        <option value="bad_audio">bad audio</option>
+        <option value="other">other</option>
       </select>
       <button class="flag" id="flag">Flag bad clip <kbd>F</kbd></button>
     </div>
@@ -105,7 +106,7 @@
 
   <section id="finished" class="panel done" hidden>
     <p><strong>Queue empty.</strong> Every labelled clip has a verdict.</p>
-    <p class="muted small">Reviews are saved in reviews.jsonl next to the labels.</p>
+    <p class="muted small">Reviews are saved in reviews.jsonl at the corpus root.</p>
   </section>
 
   <div class="grid2">
@@ -151,6 +152,7 @@ function renderSession() {
   let text = `${done} reviewed · ${fmtMin(s.seconds)} of ${fmtMin(s.budget_seconds)}`;
   if (pace && done >= 5) text += ` · ${Math.round(pace)} s per clip, about ${Math.floor(left / pace)} more in the hour`;
   text += ` · ${s.queue.length} in queue`;
+  if (s.dropped) text += ` · ${s.dropped} dropped by clean`;
   $('progress').textContent = text;
   $('bar').style.width = Math.min(100, 100 * s.seconds / s.budget_seconds) + '%';
 
@@ -171,10 +173,14 @@ function modelValue(axis) {
   return current.label?.scores?.[axis]?.value ?? 0;
 }
 
+function axisIds() {
+  return session.axes.map((a) => a.id);
+}
+
 function renderAxes() {
   const box = $('axes');
   box.replaceChildren();
-  session.axes.forEach((axis, i) => {
+  session.axes.forEach(({ id: axis, description }, i) => {
     const score = current.label?.scores?.[axis];
     const v = values[axis];
     const changed = Math.abs(v - modelValue(axis)) > 0.001;
@@ -186,6 +192,7 @@ function renderAxes() {
     key.className = 'key'; key.textContent = i < 9 ? i + 1 : '';
     const name = document.createElement('span');
     name.textContent = axis;
+    name.title = description || '';
 
     const track = document.createElement('div');
     track.className = 'track';
@@ -208,7 +215,9 @@ function renderAxes() {
     if (score) {
       const detail = document.createElement('span');
       detail.className = 'detail';
-      const sig = Object.entries(score.signals || {}).map(([k, x]) => `${k} ${x.toFixed(2)}`).join(', ');
+      const sig = Object.entries(score.signals || {})
+        .filter(([, x]) => x !== null && x !== undefined)
+        .map(([k, x]) => `${k} ${x.toFixed(2)}`).join(', ');
       detail.textContent = `model ${score.value.toFixed(2)}, confidence ${score.confidence.toFixed(2)}` + (sig ? ` · ${sig}` : '');
       row.append(document.createElement('span'), document.createElement('span'), detail);
     }
@@ -218,16 +227,19 @@ function renderAxes() {
 
 async function show(id) {
   current = await api('/api/clip/' + encodeURIComponent(id));
-  const { line, review, why } = current;
+  const { line, clip, label, review, why } = current;
   values = {};
-  for (const axis of session.axes) {
+  for (const axis of axisIds()) {
     values[axis] = review?.verdict === 'keep' && axis in review.scores ? review.scores[axis] : modelValue(axis);
   }
-  selected = why ? Math.max(0, session.axes.indexOf(why.axis)) : 0;
+  selected = why ? Math.max(0, axisIds().indexOf(why.axis)) : 0;
 
   $('why').textContent = why ? why.reason : 'no labels';
   $('prev').textContent = review ? 'already ' + PAST[review.verdict] : '';
-  $('meta').textContent = [line.game, line.conversation, line.id, ...(line.tags || [])].filter(Boolean).join(' · ');
+  $('meta').textContent = [
+    line.source?.game?.toUpperCase(), line.source?.conversation, line.id,
+    ...(line.scene_tags || []), ...(label?.tags || []),
+  ].filter(Boolean).join(' · ');
   const ctx = $('context');
   ctx.replaceChildren();
   for (const c of line.context || []) {
@@ -237,6 +249,11 @@ async function show(id) {
   }
   $('speaker').textContent = (line.speaker || 'Speaker') + ':';
   $('text').textContent = line.text;
+  const notes = [];
+  if (clip?.transcript && clip.transcript !== line.text) notes.push(`Spoken: “${clip.transcript}”`);
+  if (line.stage_direction) notes.push(`Direction: ${line.stage_direction}`);
+  $('notes').textContent = notes.join(' · ');
+  $('notes').hidden = !notes.length;
   renderAxes();
 
   const audio = $('audio');
@@ -261,7 +278,7 @@ async function submit(verdict) {
   const seconds = Math.min(IDLE_CAP, (performance.now() - shownAt) / 1000);
   const body = { id: current.line.id, verdict, seconds };
   if (verdict === 'keep') body.scores = values;
-  if (verdict === 'flag') body.reason = $('reason').value;
+  if (verdict === 'flag') body.flag = $('reason').value;
   session = await api('/api/review', body);
   history.push(current.line.id);
   renderSession();
@@ -274,7 +291,7 @@ async function back() {
 }
 
 function nudge(delta) {
-  const axis = session.axes[selected];
+  const axis = axisIds()[selected];
   values[axis] = Math.min(1, Math.max(0, Math.round((values[axis] + delta) * 100) / 100));
   renderAxes();
 }
@@ -292,7 +309,7 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'ArrowRight') nudge(step);
   else if (k === 'ArrowUp') { selected = (selected + session.axes.length - 1) % session.axes.length; renderAxes(); }
   else if (k === 'ArrowDown') { selected = (selected + 1) % session.axes.length; renderAxes(); }
-  else if (k === '0') { const a = session.axes[selected]; values[a] = modelValue(a); renderAxes(); }
+  else if (k === '0') { const a = axisIds()[selected]; values[a] = modelValue(a); renderAxes(); }
   else if (/^[1-9]$/.test(k) && +k <= session.axes.length) { selected = +k - 1; renderAxes(); }
   else return;
   e.preventDefault();

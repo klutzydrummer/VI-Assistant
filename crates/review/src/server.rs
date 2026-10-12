@@ -143,7 +143,8 @@ fn session(corpus: &Corpus) -> Value {
         .collect();
 
     json!({
-        "axes": corpus.axes(),
+        "axes": corpus.axes,
+        "dropped": corpus.dropped,
         "queue": queue::build(corpus),
         "labelled": corpus.labels.len(),
         "kept": kept,
@@ -164,6 +165,7 @@ fn clip(corpus: &Corpus, id: &str) -> Reply {
     let why = label.and_then(queue::rank);
     Reply::Json(json!({
         "line": line,
+        "clip": corpus.clip(id),
         "label": label,
         "review": review,
         "why": why,
@@ -194,6 +196,9 @@ fn record(corpus: &mut Corpus, body: &str) -> Result<(), String> {
         }
     } else {
         review.scores.clear();
+    }
+    if review.verdict != Verdict::Flag {
+        review.flag = None;
     }
     review.seconds = review.seconds.clamp(0.0, 300.0);
     review.at = SystemTime::now()
