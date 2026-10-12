@@ -1,16 +1,24 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use charpack::Pack;
 
 mod chat;
+mod dataset;
 
 const USAGE: &str = "usage:
   vi pack check <character-folder>
-  vi chat <character-folder>";
+  vi chat <character-folder>
+  vi dataset run <pipeline.toml> [stage] [--force]
+  vi dataset status <pipeline.toml>
+  vi dataset gc <pipeline.toml>
+  vi corpus check <harvest-output-folder>
+  vi corpus synth [folder] [--lines N]";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let force = take_flag(&mut args, "--force");
+    let lines = take_option(&mut args, "--lines");
     match args
         .iter()
         .map(String::as_str)
@@ -19,11 +27,30 @@ fn main() -> ExitCode {
     {
         ["pack", "check", dir] => pack_check(PathBuf::from(dir)),
         ["chat", dir] => chat::run(PathBuf::from(dir)),
+        ["dataset", "run", p] => dataset::run(Path::new(p), None, force),
+        ["dataset", "run", p, stage] => dataset::run(Path::new(p), Some(stage), force),
+        ["dataset", "status", p] => dataset::status(Path::new(p)),
+        ["dataset", "gc", p] => dataset::gc(Path::new(p)),
+        ["corpus", "check", dir] => dataset::check(Path::new(dir)),
+        ["corpus", "synth"] => dataset::synth(None, lines.as_deref()),
+        ["corpus", "synth", dir] => dataset::synth(Some(dir), lines.as_deref()),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
     }
+}
+
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != flag);
+    args.len() != before
+}
+
+fn take_option(args: &mut Vec<String>, name: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == name)?;
+    args.remove(i);
+    (i < args.len()).then(|| args.remove(i))
 }
 
 fn pack_check(dir: PathBuf) -> ExitCode {

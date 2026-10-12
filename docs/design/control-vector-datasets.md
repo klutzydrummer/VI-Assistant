@@ -16,7 +16,7 @@ harvest -> clean -> discover -> label -> review -> contrast sets -> extract -> e
  (home)    (home)    (GPU)      (GPU)    (home)       (home)         (GPU)     (GPU)
 ```
 
-Each stage writes content-addressed output and records the hashes of its inputs and settings, so rerunning only redoes stages whose inputs changed (a new label rule doesn't re-harvest). A `vi dataset <stage>` command in Rust orchestrates; GPU stages are Python jobs, since the models are PyTorch, sent to the same rented worker as batch work.
+Each stage writes content-addressed output and records the hashes of its inputs and settings, so rerunning only redoes stages whose inputs changed (a new label rule doesn't re-harvest). `vi dataset run` in Rust orchestrates (file formats and caching rules: [corpus-format.md](corpus-format.md)); GPU stages are Python jobs, since the models are PyTorch, sent to the same rented worker as batch work.
 
 ### 1. Harvest (home)
 Extract every line the character speaks, plus the lines around it, from the game files:

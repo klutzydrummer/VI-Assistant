@@ -8,4 +8,8 @@ description = "VI Assistant command-line tool"
 [dependencies]
 charpack = { path = "../charpack" }
 engine = { path = "../engine" }
+dataset = { path = "../dataset" }
 tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
