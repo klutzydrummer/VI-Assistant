@@ -2,7 +2,9 @@
 
 Status: the state machine is implemented (`crates/charpack/src/machine.rs`, Tali's in `characters/tali/states.toml`). The director, pipeline and voice adapters are not built yet.
 
-Decided 2026-10-12: harvest Tali's game lines and build per-character control vectors for every voice axis (happy, sad, drunk...). Continuous variables in the state machine set each vector's weight, so the voice blends smoothly instead of switching clips.
+Decided 2026-10-12: state is continuous. Harvest Tali's game lines and build per-character control vectors for her voice (TTS) and her behavior (LLM). A mixing table in the pack turns the continuous variables into each vector's strength, per model, so voice and behavior blend smoothly instead of switching. Discrete states are only a readout for what has to be yes/no.
+
+Where this runs: see `local-cloud-split.md`. State lives at home, models on a stateless rented GPU.
 
 ## Goals
 - The dialogue model writes only what the character says. No app tags in its output or its context.
@@ -16,12 +18,17 @@ Everything that changes over a conversation lives in the pack's `states.toml`:
 
 | Piece | What it is | Example |
 |---|---|---|
-| **Variable** | Continuous value with a range, a resting value and a per-turn decay toward rest. Can drive a voice control vector | `intoxication` 0..1, decays 0.06 a turn, drives `drunk`; `sadness` drives `sad` |
+| **Variable** | Continuous value with a range, a resting value and a per-turn decay toward rest | `intoxication` 0..1, decays 0.06 a turn |
 | **Event** | Named thing that happened, with effects on variables. The only thing a director can emit | `drink`: intoxication +0.3, joy +0.15 |
 | **State** | Discrete mode derived through transitions. Carries a prompt overlay, a fallback clip bank and flags | `drunk`: `states/drunk.md`, flags `impaired`, `no_risky_tools` |
 | **Transition** | Fires when all its triggers hold: an event (`on`), a variable threshold (`when`), or time in state (`after_turns`) | tipsy to drunk when intoxication >= 0.6 |
+| **Mix** | One row of the mixing table: a target model, a reference vector, input weights per variable, a bias, a curve and a cap | `llm`/`affectionate` = 0.6 intoxication + 0.4 joy, capped at 0.5 |
 
-Mood is just variables (joy, sadness, anger, worry, playfulness) that rest at zero and fade over a few turns. So "a little sad and quite drunk" is sadness 0.3 and intoxication 0.7, which become voice weights `sad` 0.3 and `drunk` 0.7.
+Mood is just variables (joy, sadness, anger, worry, playfulness) that rest at zero and fade over a few turns. So "a little sad and quite drunk" is sadness 0.3 and intoxication 0.7.
+
+The mixing table maps that state to strengths for each model: strength = curve(clamp(bias + sum(weight x variable), 0, 1)) x max. One variable can feed several vectors and one vector can draw on several variables, with negative weights to suppress (joy damps `sad`). LLM vectors get lower caps than voice ones, because strong steering makes an LLM incoherent. A richer state later (more variables, or a learned embedding) just means more inputs to the same table.
+
+Applying the strengths: llama.cpp's `llama_set_adapter_cvec` takes the whole blended vector as a float buffer, so we compute sum(strength x vector) ourselves and set it before generating. For an 8B model that's about half a megabyte, so changing it every turn costs nothing noticeable. Stock `llama-server` only loads vectors at startup, so the worker embeds llama.cpp directly. Vectors apply during generation only, not prompt processing, so the cached persona prompt stays valid when the blend changes. On the TTS side a PyTorch forward hook adds the blended vector; updating it is a tensor write.
 
 Rules:
 - Unknown events and states are rejected, so no model can put her in an invalid state.
@@ -110,9 +117,10 @@ All three need many labelled clips per emotion. The game has thousands of Tali l
 Level 3 is the chosen path. Levels 1 and 2 stay as fallbacks for engines we can't hook.
 
 ## Build order
-1. ~~State machine, `states.toml` parsing and graph validation.~~ Done.
+1. ~~State machine, `states.toml` parsing, graph validation, mixing table.~~ Done.
 2. Rules director, and the sentence streaming pipeline with a stub TTS that prints each sentence's delivery.
 3. Harvest and auto-label Tali's game lines (needs the game on Brandon's machine).
 4. Bake-off, now also scoring how well each engine takes control vectors.
-5. Compute control vectors per voice axis, then the real TTS adapter.
-6. Small-model director with constrained output.
+5. Compute control vectors per axis: TTS by contrasting her clips, LLM with llama.cpp's `cvector-generator` on contrasting dialogue. Then the real adapters.
+6. Stateless cloud worker and `vi cloud up/down` (see `local-cloud-split.md`).
+7. Small-model director with constrained output.

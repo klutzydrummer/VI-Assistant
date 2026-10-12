@@ -1,11 +1,12 @@
 //! A character's state machine: continuous variables plus discrete states.
 //!
 //! Variables (like intoxication) move continuously: events nudge them and
-//! they drift back toward a resting value every turn. Each variable can
-//! drive a voice control vector, so the voice blends smoothly. Discrete
-//! states (sober, tipsy, drunk) are derived from the variables, events and
-//! timers through explicit transitions, and carry what has to be discrete:
-//! prompt overlays and flags that code enforces.
+//! they drift back toward a resting value every turn. A mixing table turns
+//! the variables into control vector strengths for each model (the LLM,
+//! the TTS engine), so behavior and voice blend smoothly. Discrete states
+//! (sober, tipsy, drunk) are a readout derived from the variables, events
+//! and timers through explicit transitions, and carry only what has to be
+//! discrete: prompt overlays and flags that code enforces.
 //!
 //! Nothing here parses model output. A director (rules, a small model, or a
 //! second LLM) picks events from the pack's vocabulary, and the machine
@@ -32,6 +33,8 @@ pub struct MachineSpec {
     pub states: Vec<StateSpec>,
     #[serde(default, rename = "transition")]
     pub transitions: Vec<TransitionSpec>,
+    #[serde(default, rename = "mix")]
+    pub mixes: Vec<MixSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,9 +54,47 @@ pub struct VariableSpec {
     /// How far it moves toward `rest` at the end of each turn.
     #[serde(default)]
     pub decay_per_turn: f32,
-    /// Voice control vector this variable drives, weighted by how far the
-    /// variable sits between `min` and `max`.
-    pub vector: Option<String>,
+}
+
+/// One row of the mixing table: how strongly one reference control vector
+/// is applied to one model, as a function of the variables.
+///
+/// strength = curve(clamp(bias + sum(input weight * variable), 0, 1)) * max
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MixSpec {
+    /// Which model receives the vector, e.g. "llm" or "tts".
+    pub target: String,
+    /// Reference control vector name, computed per character and model.
+    pub vector: String,
+    /// Variable id to its weight. Negative weights suppress.
+    pub inputs: BTreeMap<String, f32>,
+    #[serde(default)]
+    pub bias: f32,
+    #[serde(default)]
+    pub curve: Curve,
+    /// Strength at full input. Caps how hard a vector can push, since too
+    /// much steering makes models incoherent.
+    #[serde(default = "one")]
+    pub max: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Curve {
+    #[default]
+    Linear,
+    /// Eases in and out: small inputs barely register, large ones saturate.
+    Smoothstep,
+}
+
+impl Curve {
+    fn apply(self, x: f32) -> f32 {
+        match self {
+            Curve::Linear => x,
+            Curve::Smoothstep => x * x * (3.0 - 2.0 * x),
+        }
+    }
 }
 
 fn one() -> f32 {
@@ -222,19 +263,29 @@ impl Machine {
             .unwrap_or_default()
     }
 
-    /// Control vector name to weight in 0..=1, from the variables that
-    /// drive vectors. Several variables driving one vector add up, capped
-    /// at 1.
-    pub fn vector_weights(&self, snap: &Snapshot) -> BTreeMap<String, f32> {
-        let mut weights = BTreeMap::new();
-        for v in &self.spec.variables {
-            let Some(vector) = &v.vector else { continue };
-            let value = snap.vars.get(&v.id).copied().unwrap_or(v.rest);
-            let w = ((value - v.min) / (v.max - v.min)).clamp(0.0, 1.0);
-            let total = weights.entry(vector.clone()).or_insert(0.0);
-            *total = (*total + w).min(1.0);
-        }
-        weights
+    /// Models the mixing table sends vectors to, e.g. "llm" and "tts".
+    pub fn targets(&self) -> BTreeSet<&str> {
+        self.spec.mixes.iter().map(|m| m.target.as_str()).collect()
+    }
+
+    /// Reference vector name to strength for one model, from the current
+    /// variables. Zero-strength vectors are included so callers can clear
+    /// them.
+    pub fn mix(&self, snap: &Snapshot, target: &str) -> BTreeMap<String, f32> {
+        self.spec
+            .mixes
+            .iter()
+            .filter(|m| m.target == target)
+            .map(|m| {
+                let sum: f32 = m
+                    .inputs
+                    .iter()
+                    .map(|(var, w)| w * snap.vars.get(var).copied().unwrap_or_default())
+                    .sum();
+                let x = (m.bias + sum).clamp(0.0, 1.0);
+                (m.vector.clone(), m.curve.apply(x) * m.max)
+            })
+            .collect()
     }
 
     fn variable(&self, id: &str) -> &VariableSpec {
@@ -347,6 +398,25 @@ fn validate(spec: &MachineSpec) -> Vec<String> {
         }
     }
 
+    let mut mixes = BTreeSet::new();
+    for m in &spec.mixes {
+        let name = format!("mix {}/{}", m.target, m.vector);
+        if !mixes.insert((m.target.as_str(), m.vector.as_str())) {
+            errors.push(format!("{name} is defined twice"));
+        }
+        if m.inputs.is_empty() {
+            errors.push(format!("{name} has no inputs"));
+        }
+        for var in m.inputs.keys() {
+            if !vars.contains(var) {
+                errors.push(format!("{name}: unknown variable {var:?}"));
+            }
+        }
+        if m.max <= 0.0 {
+            errors.push(format!("{name}: max must be positive"));
+        }
+    }
+
     // Every state should be reachable from the initial one.
     let mut reached = BTreeSet::from([spec.initial.clone()]);
     loop {
@@ -379,7 +449,10 @@ initial = "sober"
 id = "intoxication"
 description = "How drunk"
 decay_per_turn = 0.1
-vector = "drunk"
+
+[[variable]]
+id = "joy"
+description = "Happiness"
 
 [[event]]
 id = "drink"
@@ -437,6 +510,23 @@ to = "sober"
 from = ["hungover"]
 on = "sleep"
 to = "sober"
+
+[[mix]]
+target = "tts"
+vector = "drunk"
+inputs = { intoxication = 1.0 }
+
+[[mix]]
+target = "llm"
+vector = "drunk"
+inputs = { intoxication = 1.0 }
+max = 0.8
+
+[[mix]]
+target = "llm"
+vector = "affectionate"
+inputs = { intoxication = 0.5, joy = 0.5 }
+curve = "smoothstep"
 "#;
 
     fn machine() -> Machine {
@@ -461,11 +551,33 @@ to = "sober"
                 to: "tipsy".into()
             }]
         );
-        assert!(approx(m.vector_weights(&s)["drunk"], 0.35));
+        assert!(approx(m.mix(&s, "tts")["drunk"], 0.35));
 
         m.apply(&mut s, "drink").unwrap();
         assert_eq!(s.state, "drunk");
         assert!(m.flags(&s).contains("no_risky_tools"));
+    }
+
+    #[test]
+    fn mixing_table_blends_variables_per_target() {
+        let m = machine();
+        let mut s = m.start();
+        assert_eq!(m.targets(), BTreeSet::from(["llm", "tts"]));
+        assert!(approx(m.mix(&s, "llm")["affectionate"], 0.0));
+
+        s.vars.insert("intoxication".into(), 0.5);
+        s.vars.insert("joy".into(), 0.5);
+        let llm = m.mix(&s, "llm");
+        assert!(approx(llm["drunk"], 0.4)); // 0.5, capped by max 0.8
+        assert!(approx(llm["affectionate"], 0.5)); // smoothstep(0.5) = 0.5
+
+        s.vars.insert("joy".into(), 1.0);
+        let x: f32 = 0.75;
+        assert!(approx(
+            m.mix(&s, "llm")["affectionate"],
+            x * x * (3.0 - 2.0 * x)
+        ));
+        assert!(m.mix(&s, "nope").is_empty());
     }
 
     #[test]
@@ -531,6 +643,7 @@ to = "sober"
         let broken = SPEC
             .replace("on = \"sleep\"", "on = \"nap\"")
             .replace(", above = 0.6", "")
+            .replace("joy = 0.5 }", "joy = 0.5, mood = 1.0 }")
             + "\n[[state]]\nid = \"lost\"\ndescription = \"Nowhere\"\n";
         let mut spec: MachineSpec = toml::from_str(&broken).unwrap();
         spec.transitions[0].to = "tipsy".into();
@@ -549,6 +662,12 @@ to = "sober"
             errors
                 .iter()
                 .any(|e| e.contains("\"lost\" can never be reached")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("mix llm/affectionate: unknown variable \"mood\"")),
             "{errors:?}"
         );
     }

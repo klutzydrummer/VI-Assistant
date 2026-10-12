@@ -1,10 +1,11 @@
 # Tali's state machine. See crates/charpack/src/machine.rs.
 #
-# Variables are continuous and drive voice control vectors, so her voice
-# blends smoothly (a little sad and quite drunk at once). States are derived
-# from them and carry the discrete parts: prompt overlays and flags that
-# code enforces. A director picks events from this file; nothing parses
-# tags out of her replies.
+# Variables are continuous. The mixing table at the bottom turns them into
+# control vector strengths for her voice (tts) and her behavior (llm), so
+# both blend smoothly: a little sad and quite drunk at once. States are a
+# readout derived from the variables, carrying only the discrete parts:
+# prompt overlays and flags that code enforces. A director picks events
+# from this file; nothing parses tags out of her replies.
 
 initial = "sober"
 
@@ -14,31 +15,26 @@ initial = "sober"
 id = "joy"
 description = "Happiness and excitement"
 decay_per_turn = 0.1
-vector = "happy"
 
 [[variable]]
 id = "sadness"
 description = "Sadness and homesickness"
 decay_per_turn = 0.08
-vector = "sad"
 
 [[variable]]
 id = "anger"
 description = "Irritation and anger"
 decay_per_turn = 0.15
-vector = "angry"
 
 [[variable]]
 id = "worry"
 description = "Concern, usually for the user"
 decay_per_turn = 0.1
-vector = "worried"
 
 [[variable]]
 id = "playfulness"
 description = "In the mood to tease"
 decay_per_turn = 0.1
-vector = "teasing"
 
 # Body. Intoxication fades slowly, so a night out lasts a while.
 
@@ -46,7 +42,6 @@ vector = "teasing"
 id = "intoxication"
 description = "How much turian brandy is in her system"
 decay_per_turn = 0.06
-vector = "drunk"
 
 [[event]]
 id = "drink"
@@ -159,3 +154,68 @@ to = "sober"
 from = ["hungover"]
 when = { var = "intoxication", above = 0.25 }
 to = "tipsy"
+
+# Mixing table. Each row: strength = curve(clamp(bias + sum(weight x var),
+# 0, 1)) x max. Vectors are computed per character and per model from her
+# harvested game lines.
+
+# Voice: one axis per emotion, plus the slur.
+
+[[mix]]
+target = "tts"
+vector = "happy"
+inputs = { joy = 1.0, sadness = -0.5 }
+
+[[mix]]
+target = "tts"
+vector = "sad"
+inputs = { sadness = 1.0, joy = -0.3 }
+
+[[mix]]
+target = "tts"
+vector = "angry"
+inputs = { anger = 1.0 }
+
+[[mix]]
+target = "tts"
+vector = "worried"
+inputs = { worry = 1.0 }
+
+[[mix]]
+target = "tts"
+vector = "teasing"
+inputs = { playfulness = 1.0, anger = -0.5 }
+
+[[mix]]
+target = "tts"
+vector = "drunk"
+inputs = { intoxication = 1.0 }
+curve = "smoothstep"
+
+# Behavior. Capped lower than the voice: strong steering makes the LLM
+# incoherent, and the prompt overlays already carry the broad strokes.
+
+[[mix]]
+target = "llm"
+vector = "drunk"
+inputs = { intoxication = 1.0 }
+curve = "smoothstep"
+max = 0.7
+
+[[mix]]
+target = "llm"
+vector = "affectionate"
+inputs = { intoxication = 0.6, joy = 0.4 }
+max = 0.5
+
+[[mix]]
+target = "llm"
+vector = "melancholy"
+inputs = { sadness = 1.0 }
+max = 0.5
+
+[[mix]]
+target = "llm"
+vector = "playful"
+inputs = { playfulness = 1.0, worry = -0.5 }
+max = 0.5

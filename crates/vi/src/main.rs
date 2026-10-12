@@ -50,6 +50,20 @@ fn pack_check(dir: PathBuf) -> ExitCode {
             "events: {}",
             ids(spec.events.iter().map(|e| e.id.as_str()).collect())
         );
+        for target in spec
+            .mixes
+            .iter()
+            .map(|m| m.target.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let vectors: Vec<_> = spec
+                .mixes
+                .iter()
+                .filter(|m| m.target == target)
+                .map(|m| m.vector.as_str())
+                .collect();
+            println!("{target} vectors: {}", vectors.join(", "));
+        }
     }
     if !pack.agents.is_empty() {
         let names: Vec<_> = pack.agents.iter().map(|a| a.name.as_str()).collect();
