@@ -54,6 +54,9 @@ pub struct VariableSpec {
     /// How far it moves toward `rest` at the end of each turn.
     #[serde(default)]
     pub decay_per_turn: f32,
+    /// How the character would name this feeling ("sad"), for the plain
+    /// mood line added to the prompt. Variables without one stay out of it.
+    pub feeling: Option<String>,
 }
 
 /// One row of the mixing table: how strongly one reference control vector
@@ -110,6 +113,10 @@ pub struct EventSpec {
     /// Variable id to the amount added when the event happens.
     #[serde(default)]
     pub effects: BTreeMap<String, f32>,
+    /// Phrases in the user's message that trigger the event under the
+    /// rules director. Matched case-insensitively on whole words.
+    #[serde(default)]
+    pub cues: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

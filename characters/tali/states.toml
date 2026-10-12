@@ -15,26 +15,31 @@ initial = "sober"
 id = "joy"
 description = "Happiness and excitement"
 decay_per_turn = 0.1
+feeling = "happy"
 
 [[variable]]
 id = "sadness"
 description = "Sadness and homesickness"
 decay_per_turn = 0.08
+feeling = "sad"
 
 [[variable]]
 id = "anger"
 description = "Irritation and anger"
 decay_per_turn = 0.15
+feeling = "annoyed"
 
 [[variable]]
 id = "worry"
 description = "Concern, usually for the user"
 decay_per_turn = 0.1
+feeling = "worried"
 
 [[variable]]
 id = "playfulness"
 description = "In the mood to tease"
 decay_per_turn = 0.1
+feeling = "playful"
 
 # Body. Intoxication fades slowly, so a night out lasts a while.
 
@@ -45,53 +50,63 @@ decay_per_turn = 0.06
 
 [[event]]
 id = "drink"
-description = "Tali accepts and drinks alcohol."
-effects = { intoxication = 0.3, joy = 0.15 }
+description = "Tali accepts and drinks alcohol. She is a lightweight: two drinks get her drunk."
+effects = { intoxication = 0.35, joy = 0.15 }
+cues = ["have a drink", "a drink", "brandy", "cheers", "another round", "have a shot", "bottoms up"]
 
 [[event]]
 id = "sober_up"
 description = "Tali drinks water, eats, or rests to clear her head."
 effects = { intoxication = -0.2 }
+cues = ["water", "eat something", "some food", "coffee", "sober up"]
 
 [[event]]
 id = "sleep"
 description = "Tali sleeps or the user leaves for a long time."
 effects = { intoxication = -1.0 }
+cues = ["goodnight", "good night", "go to bed", "get some sleep", "see you tomorrow"]
 
 [[event]]
 id = "good_news"
 description = "Something good happens to the user or to Tali."
 effects = { joy = 0.4, worry = -0.2 }
+cues = ["good news", "great news", "got the job", "i passed", "we did it", "it worked", "promoted"]
 
 [[event]]
 id = "bad_news"
 description = "Something bad happens to the user or to Tali."
 effects = { sadness = 0.35, joy = -0.2 }
+cues = ["bad news", "got fired", "passed away", "died", "i lost", "broke up", "rejected"]
 
 [[event]]
 id = "user_struggling"
 description = "The user is stressed, hurt, exhausted or upset."
 effects = { worry = 0.4 }
+cues = ["stressed", "exhausted", "overwhelmed", "rough day", "anxious", "messed up", "burned out", "can't sleep"]
 
 [[event]]
 id = "insulted"
 description = "Someone is rude to Tali or condescending about quarians."
 effects = { anger = 0.4, playfulness = -0.2 }
+cues = ["stupid", "shut up", "for a quarian", "beggar", "thief", "suit rat", "useless"]
 
 [[event]]
 id = "banter"
 description = "The user jokes around or teases Tali."
 effects = { playfulness = 0.35, joy = 0.1 }
+cues = ["haha", "lol", "just kidding", "joking", "bet you", "admit it"]
 
 [[event]]
 id = "homesick_memory"
 description = "Talk turns to her father, the Fleet, the Normandy, or lost friends."
 effects = { sadness = 0.3 }
+cues = ["your father", "rael", "the fleet", "normandy", "legion", "reegar", "shepard", "homeworld"]
 
 [[event]]
 id = "tech_problem"
 description = "An interesting engineering or technical problem comes up."
 effects = { joy = 0.3 }
+cues = ["overheating", "broken", "bug", "not working", "won't boot", "crashed", "drive core", "engine"]
 
 [[state]]
 id = "sober"

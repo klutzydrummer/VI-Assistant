@@ -12,7 +12,7 @@ A character is a folder under `characters/` (see `characters/tali/`):
 - `character.toml`: names, file paths, and voice reference clips per emotion
 - `persona.md`: the system prompt that defines who they are and how they speak
 - `examples.md`: example exchanges in their voice
-- `states/`: moods that last across turns, like Tali being drunk, each with its own voice clip
+- `states.toml` and `states/`: the state machine (continuous mood and intoxication, derived states, and the mixing table to control vectors) and per-state prompt overlays
 - `drones.toml`: the names the character gives the agents it sends out
 - `voice/`: reference clips, extracted locally and never committed
 
@@ -22,7 +22,12 @@ Check a pack:
 
     cargo run -p vi -- pack check characters/tali
 
+Talk to a character through the full turn pipeline (placeholder dialogue and printed voice until the models are connected):
+
+    cargo run -p vi -- chat characters/tali
+
 ## Layout
-- `crates/charpack`: loads and validates character packs
+- `crates/charpack`: loads and validates character packs, and runs their state machines
+- `crates/engine`: the turn pipeline: director, prompt assembly, sentence streaming to the voice
 - `crates/vi`: the command-line tool
 - `docs/`: design notes, including how to extract game audio

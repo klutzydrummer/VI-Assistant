@@ -3,7 +3,11 @@ use std::process::ExitCode;
 
 use charpack::Pack;
 
-const USAGE: &str = "usage: vi pack check <character-folder>";
+mod chat;
+
+const USAGE: &str = "usage:
+  vi pack check <character-folder>
+  vi chat <character-folder>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -14,6 +18,7 @@ fn main() -> ExitCode {
         .as_slice()
     {
         ["pack", "check", dir] => pack_check(PathBuf::from(dir)),
+        ["chat", dir] => chat::run(PathBuf::from(dir)),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

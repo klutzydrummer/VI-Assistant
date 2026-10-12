@@ -1,6 +1,6 @@
 # Moods, states and voice direction
 
-Status: the state machine is implemented (`crates/charpack/src/machine.rs`, Tali's in `characters/tali/states.toml`). The director, pipeline and voice adapters are not built yet.
+Status: the state machine (`crates/charpack/src/machine.rs`), the rules director and the streaming turn pipeline (`crates/engine`) are implemented, runnable with `vi chat` against placeholder dialogue and voice. The model director, real dialogue and voice adapters are not built yet.
 
 Decided 2026-10-12: state is continuous. Harvest Tali's game lines and build per-character control vectors for her voice (TTS) and her behavior (LLM). A mixing table in the pack turns the continuous variables into each vector's strength, per model, so voice and behavior blend smoothly instead of switching. Discrete states are only a readout for what has to be yes/no.
 
@@ -118,7 +118,7 @@ Level 3 is the chosen path. Levels 1 and 2 stay as fallbacks for engines we can'
 
 ## Build order
 1. ~~State machine, `states.toml` parsing, graph validation, mixing table.~~ Done.
-2. Rules director, and the sentence streaming pipeline with a stub TTS that prints each sentence's delivery.
+2. ~~Rules director (event cues in `states.toml`), and the sentence streaming pipeline with a stub TTS that prints each sentence's delivery.~~ Done.
 3. Harvest and auto-label Tali's game lines (needs the game on Brandon's machine).
 4. Bake-off, now also scoring how well each engine takes control vectors.
 5. Compute control vectors per axis: TTS by contrasting her clips, LLM with llama.cpp's `cvector-generator` on contrasting dialogue. Then the real adapters.

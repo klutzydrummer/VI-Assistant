@@ -7,3 +7,5 @@ description = "VI Assistant command-line tool"
 
 [dependencies]
 charpack = { path = "../charpack" }
+engine = { path = "../engine" }
+tokio = { version = "1", features = ["rt", "time"] }
