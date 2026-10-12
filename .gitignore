@@ -5,3 +5,6 @@ characters/*/voice/*
 !characters/*/voice/README.md
 characters/*/*.local.md
 extracted/
+
+# Dataset corpora hold extracted game audio.
+corpus/
