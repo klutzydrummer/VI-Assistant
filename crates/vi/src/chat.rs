@@ -1,7 +1,8 @@
-//! `vi chat`: talk to a character through the full turn pipeline. Until
-//! the models are connected, the dialogue is a placeholder and the voice
-//! prints each sentence with its delivery, so you can watch events, state
-//! and control vector strengths move.
+//! `vi chat`: talk to a character through the full turn pipeline. With
+//! `--model`, the dialogue comes from a GGUF model run in-process by
+//! llama.cpp and steered by the control vectors in `--vectors`; without it,
+//! from a placeholder. The voice prints each sentence with its delivery, so
+//! you can watch events, state and control vector strengths move.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -10,9 +11,12 @@ use std::time::Duration;
 
 use charpack::Pack;
 use engine::director::RulesDirector;
-use engine::pipeline::Session;
+use engine::pipeline::{Dialogue, Session};
 use engine::prompt::mood_line;
 use engine::stub::{PrintVoice, ScriptedDialogue};
+use llm::llama::{Llama, ModelConfig};
+use llm::vectors::VectorBank;
+use llm::LlamaDialogue;
 
 const HELP: &str = "Type to talk. Commands:
   /event <id>   apply an event directly, e.g. /event drink
@@ -20,7 +24,63 @@ const HELP: &str = "Type to talk. Commands:
   /status       show state, variables and vector strengths
   /quit         leave";
 
-pub fn run(dir: PathBuf) -> ExitCode {
+pub struct ModelArgs {
+    pub model: Option<PathBuf>,
+    pub vectors: Option<PathBuf>,
+    pub gpu_layers: Option<String>,
+    pub ctx: Option<String>,
+}
+
+/// Something that can report what the last turn did beyond the pipeline's
+/// own report.
+trait Explain {
+    fn explain(&self) {}
+}
+
+impl Explain for ScriptedDialogue {}
+
+impl Explain for LlamaDialogue {
+    fn explain(&self) {
+        let info = self.last_turn();
+        println!(
+            "  steering: {} | prompt cache {} tokens, reply {} tokens",
+            strengths(&info.applied),
+            info.reused_tokens,
+            info.generated_tokens
+        );
+        if !info.missing.is_empty() {
+            println!("  no vector yet for: {}", info.missing.join(", "));
+        }
+    }
+}
+
+fn load_model(args: &ModelArgs, path: &PathBuf) -> Result<LlamaDialogue, String> {
+    let mut config = ModelConfig::new(path);
+    if let Some(n) = &args.gpu_layers {
+        config.n_gpu_layers = n.parse().map_err(|_| format!("--gpu-layers {n}?"))?;
+    }
+    if let Some(n) = &args.ctx {
+        config.n_ctx = n.parse().map_err(|_| format!("--ctx {n}?"))?;
+    }
+    println!("Loading {}...", path.display());
+    let llama = Llama::load(&config)?;
+    let bank = match &args.vectors {
+        Some(dir) => VectorBank::load_dir(dir, llama.n_embd(), llama.n_layer())?,
+        None => VectorBank::empty(llama.n_embd(), llama.n_layer()),
+    };
+    let names: Vec<_> = bank.names().collect();
+    println!(
+        "Control vectors: {}",
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        }
+    );
+    Ok(LlamaDialogue::new(llama, bank))
+}
+
+pub fn run(dir: PathBuf, args: ModelArgs) -> ExitCode {
     let pack = match Pack::load(&dir) {
         Ok(pack) => pack,
         Err(e) => {
@@ -41,18 +101,33 @@ pub fn run(dir: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let director = RulesDirector::new(machine.spec());
-    let mut dialogue = ScriptedDialogue::new(Vec::<String>::new());
-    dialogue.word_delay = Duration::from_millis(40);
+    let session = Session::new(pack, machine);
+    match &args.model {
+        Some(path) => match load_model(&args, path) {
+            Ok(dialogue) => talk(session, &dialogue, "printed voice"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            let mut dialogue = ScriptedDialogue::new(Vec::<String>::new());
+            dialogue.word_delay = Duration::from_millis(40);
+            talk(session, &dialogue, "placeholder dialogue, printed voice")
+        }
+    }
+}
+
+fn talk<L: Dialogue + Explain>(mut session: Session, dialogue: &L, setup: &str) -> ExitCode {
+    let director = RulesDirector::new(session.machine.spec());
     let voice = PrintVoice;
-    let mut session = Session::new(pack, machine);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .expect("tokio runtime");
 
     println!(
-        "Talking to {} (placeholder dialogue, printed voice).\n{HELP}\n",
+        "Talking to {} ({setup}).\n{HELP}\n",
         session.pack.manifest.short_name
     );
     let stdin = std::io::stdin();
@@ -87,7 +162,7 @@ pub fn run(dir: PathBuf) -> ExitCode {
                 status(&session);
             }
             _ => {
-                let report = rt.block_on(session.turn(line, &director, &dialogue, &voice));
+                let report = rt.block_on(session.turn(line, &director, dialogue, &voice));
                 match report {
                     Ok(r) => {
                         if !r.events.is_empty() {
@@ -100,6 +175,7 @@ pub fn run(dir: PathBuf) -> ExitCode {
                             println!("  state: {} -> {}", c.from, c.to);
                         }
                         println!("  llm vectors: {}", strengths(&r.llm_vectors));
+                        dialogue.explain();
                         status(&session);
                     }
                     Err(e) => println!("  turn failed, nothing saved: {e}"),
