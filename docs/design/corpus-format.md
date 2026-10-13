@@ -96,12 +96,20 @@ Harvest writes WAV because it's the simplest thing to check and decode. Clean wr
 ```
 `keep: false` records stay in the file with a reason in `flags` (`too_short`, `too_long`, `subtitle_mismatch`, `music`, `effects`, `other_voice`), so the review page can show what was dropped. `transcript` is what later stages should treat as the words spoken.
 
-### discover: `captions.jsonl`, `clusters.jsonl`
+### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
+Written by `jobs/discover.py`.
 ```json
-{"id": "...", "caption": "quiet, breathy, slight laugh at the end", "tags": ["laughing"], "heard_without_text": true}
-{"id": "...", "cluster": 7, "x": 1.23, "y": -0.4}
+{"id": "...", "caption": "quiet, breathy, slight laugh at the end", "emotions": ["tender", "amused"], "tags": ["laughing"],
+ "scores": {"joy": 0.4, "sadness": 0.1}, "heard_without_text": true,
+ "with_text": {"caption": "...", "emotions": [], "tags": [], "scores": {}}}
+{"id": "...", "cluster": 7, "x": 1.23, "y": -0.4, "text_cluster": 3}
+{"id": "...", "duration_s": 1.42, "f0_median_hz": 231.0, "f0_range_st": 6.2, "loudness_db": -24.1, "loudness_range_db": 5.3, "voiced_fraction": 0.71, "words_per_s": 2.8}
 ```
-plus `clusters.md`, the LLM's summary per cluster. Advisory only; nothing downstream depends on it automatically.
+- `captions.jsonl`: the audio LLM's description of each clip from its sound alone (clips over 30 s are skipped). `tags` come from a fixed delivery list (`laughing`, `sighing`, `crying`, `whispering`, `shouting`, `breathy`, `strained`, `effort`, `pain`, `slurred`, `sarcastic`, `music`, `effects`, `other_voice`). `scores` are its per-axis guesses without the words, which label uses as the `audio_llm` signal. A sample also has `with_text`, the same prompt with the words shown, to measure how much the words sway it.
+- `clusters.jsonl`: clusters by sound (emotion2vec embedding plus prosody); `cluster` -1 is unclustered, `x`/`y` a 2D map. `text_cluster` clusters the words, for lines that have them.
+- `prosody.jsonl`: pitch, loudness and pace, for matching negatives to positives later.
+
+Plus `clusters.md` (what each cluster seems to be, examples, and the audio LLM's emotion vocabulary grouped by meaning) and `discover.json` (counts and the with/without-words comparison). Advisory only; nothing downstream depends on it automatically, except label reading `captions.jsonl` when discover is one of its inputs.
 
 ### label: `labels.jsonl` + `axes.json`
 ```json
@@ -112,10 +120,16 @@ plus `clusters.md`, the LLM's summary per cluster. Advisory only; nothing downst
                 "signals": {"audio": 0.80, "text": 0.60, "prior": null, "audio_llm": 0.75}},
     "intoxication": {"value": 0.05, "confidence": 0.90, "signals": {"audio": null, "text": 0.05, "prior": 0.0}}
   },
-  "tags": ["combat_bark"]
+  "tags": ["combat_bark"],
+  "audio_classes": {"angry": 0.01, "happy": 0.02, "neutral": 0.31, "sad": 0.64},
+  "dimensions": {"arousal": 0.31, "dominance": 0.42, "valence": 0.28}
 }
 ```
-`scores` keys are the variable ids from the pack's `states.toml`. Signals are `audio` (acoustic emotion models), `text` (the LLM judge reading line and context), `prior` (scene tags and LE3 stage directions) and `audio_llm` (the audio LLM, only for axes it proved it can hear); a signal that didn't score an axis is `null` or absent, and new signal names may appear. `tags` are non-emotion labels from discovery, used as filters.
+`scores` keys are the variable ids from the pack's `states.toml`. Signals are `audio` (acoustic emotion models), `text` (the LLM judge reading line and context), `prior` (scene tags and LE3 stage directions) and `audio_llm` (the audio LLM, only for axes it proved it can hear); a signal that didn't score an axis is `null` or absent, and new signal names may appear. `tags` are non-emotion labels used as filters: discovery's delivery tags, plus `combat_bark` (harvest flag `bark`), `nonverbal`, and `short` (under a second). `audio_classes` (emotion2vec+ probabilities) and `dimensions` (arousal, dominance, valence) are the raw acoustic outputs, kept for matching and recalibration.
+
+How `jobs/label.py` treats special lines: barks have no subtitle, so they get no `text` signal unless clean transcribed words for them. Nonverbal lines (`{Sighs}`) go to the judge described as a sound rather than words. Both still get the acoustic and audio LLM signals.
+
+Beside them, `fusion.json` reports per axis how many clips each signal scored, how well each pair of signals agrees (Spearman), and how many clips came out low-confidence, for tuning the fusion weights.
 
 `axes.json` lists the axes in the pack's order with their descriptions, so readers don't need the pack:
 ```json

@@ -23,3 +23,5 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Python job tests
+        run: python3 -m unittest discover -s jobs

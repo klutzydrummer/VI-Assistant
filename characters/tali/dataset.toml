@@ -1,0 +1,41 @@
+# Tali's dataset pipeline. `vi dataset run characters/tali/dataset.toml`.
+# Formats and caching: docs/design/corpus-format.md. Plan:
+# docs/design/control-vector-datasets.md.
+
+corpus = "../../corpus/tali"
+
+# For now harvest imports the LE2/LE3 extraction already in the corpus
+# (corpus/tali/harvest, made by `vi extract` with conversation
+# context). Once that extractor is merged this becomes
+# ["vi", "extract", "--character", ".", "<LE install>"].
+[stage.harvest]
+command = ["sh", "-c", "cp -a \"$VI_CORPUS/harvest/.\" \"$VI_OUT/\""]
+files = ["corpus:harvest"]
+
+# GPU. Embeds and clusters every clip and captions it from its sound alone.
+[stage.discover]
+command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/discover.py"]
+inputs = ["harvest"]
+files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
+
+[stage.discover.settings]
+emotion = "emotion2vec/emotion2vec_base"
+text_embed = "sentence-transformers/all-MiniLM-L6-v2"
+audio_llm = "google/gemma-4-12B-it"
+compare = 200       # clips also captioned with their words shown
+min_cluster = 15
+batch = 8
+
+# GPU. Scores every clip on the variables in states.toml.
+[stage.label]
+command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/label.py"]
+inputs = ["harvest", "discover"]
+files = ["../../jobs/label.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
+
+[stage.label.settings]
+audio = "emotion2vec/emotion2vec_plus_large"
+dimensions = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
+judge = "google/gemma-4-12B-it"
+batch = 8
