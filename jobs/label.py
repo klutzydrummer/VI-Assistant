@@ -13,7 +13,9 @@ they're tagged combat_bark so contrast sets can leave them out. Nonverbal
 lines ({Sighs}) go to the judge as a sound, not words, and are tagged
 nonverbal.
 
-Outputs: labels.jsonl, axes.json, and fusion.json (how often each signal
+Outputs: labels.jsonl, axes.json, embeddings.jsonl ({id, audio}: the
+emotion2vec+ utterance vector, for probes trained on reviewed clips), and
+fusion.json (how often each signal
 scored each axis and how well the signals agree, to tune weights).
 
 Settings: backend ("fake" for tests), audio, dimensions, judge, batch,
@@ -26,6 +28,7 @@ import json
 import fusion
 import models
 from vi_job import (
+    compact,
     ensure_packages,
     env_path,
     fake_models,
@@ -68,9 +71,9 @@ def main():
     dims = (models.FakeDimensions if fake else models.Dimensions)(
         s.get("dimensions", "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim")
     )
-    probs, adv = {}, {}
+    probs, adv, emb = {}, {}, {}
     for i, clip in enumerate(clips):
-        probs[clip.id] = e2v(clip)[0]
+        probs[clip.id], emb[clip.id] = e2v(clip)
         adv[clip.id] = dims(clip)
         if i % 250 == 0:
             log(f"acoustic: {i}/{len(clips)}")
@@ -135,8 +138,11 @@ def main():
         )
 
     write_jsonl(out / "labels.jsonl", labels)
+    write_jsonl(out / "embeddings.jsonl", [{"id": c.id, "audio": compact(emb[c.id])} for c in clips])
     write_axes(out, axes)
-    (out / "fusion.json").write_text(json.dumps(report(labels, axes, unparsed), indent=1, sort_keys=True) + "\n")
+    summary = report(labels, axes, unparsed)
+    summary["embedding_model"] = s.get("audio", "emotion2vec/emotion2vec_plus_large")
+    (out / "fusion.json").write_text(json.dumps(summary, indent=1, sort_keys=True) + "\n")
     log(f"label: wrote {len(labels)} labels, {unparsed} unparsed judge replies")
 
 

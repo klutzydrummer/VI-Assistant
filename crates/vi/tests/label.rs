@@ -86,6 +86,7 @@ settings = {{ backend = "fake" }}
         "captions.jsonl",
         "clusters.jsonl",
         "prosody.jsonl",
+        "embeddings.jsonl",
         "clusters.md",
         "discover.json",
     ] {
@@ -96,6 +97,8 @@ settings = {{ backend = "fake" }}
 
     let label = dataset::runner::current_out(&corpus, "label").unwrap();
     assert!(label.join("fusion.json").is_file());
+    let embeddings = fs::read_to_string(label.join("embeddings.jsonl")).unwrap();
+    assert_eq!(embeddings.lines().count(), 24);
 
     // The review page reads the result.
     let loaded = review::corpus::Corpus::load(&corpus).unwrap();

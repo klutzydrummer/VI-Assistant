@@ -56,6 +56,11 @@ def write_jsonl(path, records):
             f.write("\n")
 
 
+def compact(vector):
+    """An embedding rounded to 4 significant digits, to keep JSONL small."""
+    return [float(f"{x:.4g}") for x in vector]
+
+
 # --- inputs -----------------------------------------------------------------
 
 

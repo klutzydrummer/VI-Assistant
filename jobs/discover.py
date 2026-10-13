@@ -10,6 +10,8 @@ cluster. Plan: docs/design/control-vector-datasets.md, step 3. Outputs
                     without the words; label uses them as its audio_llm signal
   clusters.jsonl   {id, cluster, x, y, text_cluster}  cluster -1 is noise
   prosody.jsonl    {id, duration_s, f0_median_hz, ..., words_per_s}
+  embeddings.jsonl {id, emotion, text?}  the emotion2vec and text-embedding
+                    vectors behind the clusters, for probes and matching later
   clusters.md      what each cluster seems to be, and the emotion vocabulary
   discover.json    counts and the with/without-words comparison
 
@@ -26,6 +28,7 @@ from collections import Counter
 import fusion
 import models
 from vi_job import (
+    compact,
     ensure_packages,
     fake_models,
     load_axes,
@@ -108,6 +111,14 @@ def main():
             captions[clip.id]["with_text"] = clean_caption(r, axes)
 
     write_jsonl(
+        out / "embeddings.jsonl",
+        [
+            {"id": c.id, "emotion": compact(emotion[c.id]),
+             **({"text": compact(text_emb[c.id])} if c.id in text_emb else {})}
+            for c in clips
+        ],
+    )  # fmt: skip
+    write_jsonl(
         out / "captions.jsonl",
         [{"id": c.id, "heard_without_text": True, **captions[c.id]} for c in clips if c.id in captions],
     )
@@ -158,6 +169,10 @@ def main():
         json.dumps(
             {
                 "clips": len(clips),
+                "embedding_models": {
+                    "emotion": s.get("emotion", "emotion2vec/emotion2vec_base"),
+                    "text": s.get("text_embed", "sentence-transformers/all-MiniLM-L6-v2"),
+                },
                 "captioned": len(captions),
                 "caption_failures": failed,
                 "too_long_for_audio_llm": len(clips) - len(hearable),

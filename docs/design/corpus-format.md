@@ -96,7 +96,7 @@ Harvest writes WAV because it's the simplest thing to check and decode. Clean wr
 ```
 `keep: false` records stay in the file with a reason in `flags` (`too_short`, `too_long`, `subtitle_mismatch`, `music`, `effects`, `other_voice`), so the review page can show what was dropped. `transcript` is what later stages should treat as the words spoken.
 
-### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
+### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`, `embeddings.jsonl`
 Written by `jobs/discover.py`.
 ```json
 {"id": "...", "caption": "quiet, breathy, slight laugh at the end", "emotions": ["tender", "amused"], "tags": ["laughing"],
@@ -108,10 +108,11 @@ Written by `jobs/discover.py`.
 - `captions.jsonl`: the audio LLM's description of each clip from its sound alone (clips over 30 s are skipped). `tags` come from a fixed delivery list (`laughing`, `sighing`, `crying`, `whispering`, `shouting`, `breathy`, `strained`, `effort`, `pain`, `slurred`, `sarcastic`, `music`, `effects`, `other_voice`). `scores` are its per-axis guesses without the words, which label uses as the `audio_llm` signal. A sample also has `with_text`, the same prompt with the words shown, to measure how much the words sway it.
 - `clusters.jsonl`: clusters by sound (emotion2vec embedding plus prosody); `cluster` -1 is unclustered, `x`/`y` a 2D map. `text_cluster` clusters the words, for lines that have them.
 - `prosody.jsonl`: pitch, loudness and pace, for matching negatives to positives later.
+- `embeddings.jsonl`: `{"id": "...", "emotion": [...], "text": [...]}`, the emotion2vec vector of the sound and the text-embedding vector of the words (lines without words have no `text`), rounded to 4 significant digits. They're what the clusters were built from, kept for probes trained on reviewed clips and for nearest-neighbour matching. `discover.json` names the two models under `embedding_models`.
 
 Plus `clusters.md` (what each cluster seems to be, examples, and the audio LLM's emotion vocabulary grouped by meaning) and `discover.json` (counts and the with/without-words comparison). Advisory only; nothing downstream depends on it automatically, except label reading `captions.jsonl` when discover is one of its inputs.
 
-### label: `labels.jsonl` + `axes.json`
+### label: `labels.jsonl` + `axes.json` + `embeddings.jsonl`
 ```json
 {
   "id": "...",
@@ -130,6 +131,8 @@ Plus `clusters.md` (what each cluster seems to be, examples, and the audio LLM's
 How `jobs/label.py` treats special lines: barks have no subtitle, so they get no `text` signal unless clean transcribed words for them. Nonverbal lines (`{Sighs}`) go to the judge described as a sound rather than words. Both still get the acoustic and audio LLM signals.
 
 Beside them, `fusion.json` reports per axis how many clips each signal scored, how well each pair of signals agrees (Spearman), and how many clips came out low-confidence, for tuning the fusion weights.
+
+`embeddings.jsonl` holds `{"id": "...", "audio": [...]}`, the emotion2vec+ utterance vector each clip's `audio_classes` came from, rounded to 4 significant digits; `fusion.json` names the model under `embedding_model`. A small per-axis classifier trained on these and the reviewed clips can give every axis an audio signal, including the ones no emotion2vec+ class maps to.
 
 `axes.json` lists the axes in the pack's order with their descriptions, so readers don't need the pack:
 ```json
