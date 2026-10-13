@@ -6,9 +6,13 @@
 //! gender, the TLK gives the subtitle, and the `.afc` gives the audio,
 //! decoded with `vgmstream-cli` and resampled to 24 kHz mono 16-bit.
 //!
-//! Not yet here: LE1 (its audio is ISACT, reached through FaceFX), the
-//! conversation graph (context, `prev`/`next`, node indices), scene tags
-//! and LE3 stage directions. Records leave those fields out.
+//! The line's `BioConversation` (see [`crate::conversation`]) gives its
+//! node, listener, `prev`/`next`, the canonical preceding `context`, and in
+//! LE3 the stage direction; each conversation's full graph goes to
+//! `conversations/<name>.json`.
+//!
+//! Not yet here: LE1 (its audio is ISACT, reached through FaceFX) and scene
+//! tags.
 //!
 //! Reads the install only; everything is written under `out`.
 
@@ -21,6 +25,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Map, Value};
 
+use crate::conversation::{self, Conversation, Kind, Node, OWNER, SHEPARD};
 use crate::install::GameDir;
 use crate::tlk::{Gender, TalkFile};
 use crate::{wwise, Game, Package};
@@ -178,6 +183,10 @@ pub struct GameReport {
     pub merged_duplicates: usize,
     pub no_subtitle: usize,
     pub missing_afc: usize,
+    /// Conversations the character speaks in.
+    pub conversations: usize,
+    /// Lines whose string id isn't a node of their conversation.
+    pub without_node: usize,
     /// Ids of streams skipped as placeholders (see [`MIN_SECONDS`]).
     pub placeholders: Vec<String>,
     pub errors: Vec<String>,
@@ -214,7 +223,7 @@ pub fn run(
             game.game,
             subs.male.len()
         ));
-        let recordings = find(game, tags, &mut report, progress);
+        let (recordings, graphs) = find(game, tags, &mut report, progress);
         progress(&format!(
             "{}: {} streams, {} recordings, decoding",
             game.game,
@@ -230,6 +239,16 @@ pub fn run(
             out,
             &tmp,
             &mut report,
+        )?;
+        report.conversations = graphs.conversations.len();
+        report.without_node = attach_context(
+            game.game,
+            character,
+            &subs,
+            &graphs,
+            &mut game_lines,
+            out,
+            root,
         )?;
         report.lines = game_lines.len();
         report.no_subtitle = game_lines
@@ -256,6 +275,8 @@ pub fn run(
                     "merged_duplicates": r.merged_duplicates,
                     "no_subtitle": r.no_subtitle,
                     "missing_afc": r.missing_afc,
+                    "conversations": r.conversations,
+                    "lines_without_node": r.without_node,
                     "placeholders_skipped": r.placeholders,
                     "errors": r.errors,
                 }),
@@ -267,7 +288,7 @@ pub fn run(
         "version": VERSION,
         "character": character.id,
         "games": per_game,
-        "not_covered": ["le1 audio", "conversation context", "scene tags", "stage directions", "barks without a stream name"],
+        "not_covered": ["le1 audio", "scene tags", "barks without a stream name"],
     });
     let path = out.join("harvest.json");
     fs::write(
@@ -278,14 +299,26 @@ pub fn run(
     Ok(reports)
 }
 
+/// The conversations the character speaks in, and who speaks each line.
+#[derive(Default)]
+struct Graphs {
+    /// By conversation name as streams spell it (`nortla_debrief_d`, the
+    /// export name without `_dlg`), lowercase; the first package wins.
+    conversations: BTreeMap<String, (Conversation, PathBuf)>,
+    /// Speaker tag of every line that has a stream, by conversation and
+    /// string id. This is how owner lines (speaker index -1) get a name.
+    tags: BTreeMap<(String, i32), String>,
+}
+
 /// Every stream spoken under one of `tags`, grouped into distinct
-/// recordings.
+/// recordings, plus the conversations they're in.
 fn find(
     game: &GameDir,
     tags: &[String],
     report: &mut GameReport,
     progress: &dyn Fn(&str),
-) -> Vec<Recording> {
+) -> (Vec<Recording>, Graphs) {
+    let mut graphs = Graphs::default();
     // `.afc` files by lowercase name; base game first so DLC can't shadow it.
     let mut afcs: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     let mut sorted: Vec<_> = game.files.afcs.iter().map(|f| f.path.clone()).collect();
@@ -322,6 +355,8 @@ fn find(
                 continue;
             }
         };
+        let mut here = 0;
+        let mut speakers = Vec::new();
         for i in pkg.exports_of_class("WwiseStream").collect::<Vec<_>>() {
             let stream = match wwise::read_stream(&pkg, i) {
                 Ok(Some(s)) => s,
@@ -334,6 +369,10 @@ fn find(
             let Some(name) = wwise::parse_name(&stream.name, stream.bank.as_deref()) else {
                 continue;
             };
+            speakers.push((
+                (name.conversation.to_ascii_lowercase(), name.string_id),
+                name.speaker_tag.to_ascii_lowercase(),
+            ));
             if !tags
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(&name.speaker_tag))
@@ -341,6 +380,7 @@ fn find(
                 continue;
             }
             report.streams += 1;
+            here += 1;
             // Prefer the AFC beside the package.
             let candidates = afcs
                 .get(&stream.filename.to_ascii_lowercase())
@@ -394,8 +434,29 @@ fn find(
                 });
             }
         }
+        if here == 0 {
+            continue;
+        }
+        for (key, tag) in speakers {
+            graphs.tags.entry(key).or_insert(tag);
+        }
+        for (path, conversation) in conversation::all(&pkg) {
+            match conversation {
+                Ok(c) => {
+                    let key = c.name.to_ascii_lowercase();
+                    let key = key.strip_suffix("_dlg").unwrap_or(&key).to_string();
+                    graphs
+                        .conversations
+                        .entry(key)
+                        .or_insert_with(|| (c, info.path.clone()));
+                }
+                Err(e) => report
+                    .errors
+                    .push(format!("{} {path}: {e}", info.path.display())),
+            }
+        }
     }
-    by_key.into_values().flatten().collect()
+    (by_key.into_values().flatten().collect(), graphs)
 }
 
 fn read_slice(path: &Path, offset: usize, size: usize) -> Result<Vec<u8>, String> {
@@ -574,6 +635,267 @@ fn decode_all(
     Ok(results.into_inner().unwrap())
 }
 
+/// Most lines a context path keeps.
+const CONTEXT: usize = dataset::corpus::MAX_CONTEXT;
+
+/// How a speaker index reads in records: the character's pack id for
+/// their own tags, `shepard`, or the speaker tag.
+fn speaker_label(
+    character: &Character,
+    game: Game,
+    conversation: &Conversation,
+    conversation_key: &str,
+    graphs: &Graphs,
+    node: &Node,
+) -> String {
+    let tag = match node.speaker_index {
+        SHEPARD => return "shepard".into(),
+        OWNER => graphs
+            .tags
+            .get(&(conversation_key.to_string(), node.string_id))
+            .cloned(),
+        i => conversation.speaker_tag(i).map(str::to_ascii_lowercase),
+    };
+    let Some(tag) = tag else {
+        return "owner".into();
+    };
+    let ours = character
+        .tags
+        .get(&game)
+        .is_some_and(|t| t.iter().any(|x| x.eq_ignore_ascii_case(&tag)));
+    if ours {
+        character.id.clone()
+    } else {
+        tag
+    }
+}
+
+/// A listener index as a label (no stream to resolve the owner by).
+fn listener_label(conversation: &Conversation, index: i32) -> String {
+    match index {
+        SHEPARD => "shepard".into(),
+        OWNER => "owner".into(),
+        i => conversation
+            .speaker_tag(i)
+            .map_or_else(|| format!("speaker_{i}"), str::to_ascii_lowercase),
+    }
+}
+
+/// The text of a node, if it has a line.
+fn node_text<'a>(subs: &'a Subtitles, node: &Node, gender: Gender) -> Option<&'a str> {
+    if node.string_id < 0 {
+        return None;
+    }
+    subs.get(node.string_id, gender)
+        .map(|(t, _)| t.as_str())
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// The nearest nodes with a line in one direction, passing through nodes
+/// without one (autocontinues, cut lines).
+fn nearest_lines(
+    c: &Conversation,
+    subs: &Subtitles,
+    gender: Gender,
+    start: (Kind, usize),
+    backwards: bool,
+) -> Vec<(Kind, usize)> {
+    let step = |k: Kind, i: usize| -> Vec<(Kind, usize)> {
+        if backwards {
+            c.predecessors(k, i)
+        } else {
+            c.node(k, i).map(|n| c.successors(n)).unwrap_or_default()
+        }
+    };
+    let mut seen = std::collections::BTreeSet::from([start]);
+    let mut queue: std::collections::VecDeque<_> = step(start.0, start.1).into();
+    let mut out = Vec::new();
+    while let Some(at) = queue.pop_front() {
+        if !seen.insert(at) {
+            continue;
+        }
+        let Some(node) = c.node(at.0, at.1) else {
+            continue;
+        };
+        if node_text(subs, node, gender).is_some() {
+            out.push(at);
+        } else {
+            queue.extend(step(at.0, at.1));
+        }
+    }
+    out
+}
+
+/// The shortest path from a starting entry to `target`, oldest first,
+/// target excluded.
+fn path_to(c: &Conversation, target: (Kind, usize)) -> Vec<(Kind, usize)> {
+    let mut parent: BTreeMap<(Kind, usize), Option<(Kind, usize)>> = BTreeMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    for &s in &c.starting {
+        if c.node(Kind::Entry, s).is_some() && !parent.contains_key(&(Kind::Entry, s)) {
+            parent.insert((Kind::Entry, s), None);
+            queue.push_back((Kind::Entry, s));
+        }
+    }
+    while let Some(at) = queue.pop_front() {
+        if at == target {
+            let mut path = Vec::new();
+            let mut cur = parent[&at];
+            while let Some(p) = cur {
+                path.push(p);
+                cur = parent[&p];
+            }
+            path.reverse();
+            return path;
+        }
+        let Some(node) = c.node(at.0, at.1) else {
+            continue;
+        };
+        for next in c.successors(node) {
+            if let std::collections::btree_map::Entry::Vacant(e) = parent.entry(next) {
+                e.insert(Some(at));
+                queue.push_back(next);
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn line_id(game: Game, string_id: i32, gender: Gender) -> String {
+    format!("{}.s{}_{}", game.id(), string_id, gender.suffix())
+}
+
+/// Fill in each line's node, listener, `prev`/`next`, `context` and stage
+/// direction, and write `conversations/<name>.json`. Returns how many
+/// lines had no node.
+fn attach_context(
+    game: Game,
+    character: &Character,
+    subs: &Subtitles,
+    graphs: &Graphs,
+    lines: &mut [dataset::corpus::Line],
+    out: &Path,
+    root: &Path,
+) -> Result<usize, String> {
+    let mut missing = 0;
+    let mut used = std::collections::BTreeSet::new();
+    for line in lines.iter_mut() {
+        let key = line
+            .source
+            .extra
+            .get("conversation")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let string_id = line
+            .source
+            .extra
+            .get("string_id")
+            .and_then(Value::as_i64)
+            .unwrap_or(-1) as i32;
+        let gender = match line.source.extra.get("gender").and_then(Value::as_str) {
+            Some("f") => Gender::Female,
+            _ => Gender::Male,
+        };
+        let Some((c, _)) = graphs.conversations.get(&key) else {
+            missing += 1;
+            continue;
+        };
+        // Prefer an entry (NPC line) over a reply with the same string.
+        let node = c
+            .entries
+            .iter()
+            .chain(&c.replies)
+            .find(|n| n.string_id == string_id);
+        let Some(node) = node else {
+            missing += 1;
+            continue;
+        };
+        used.insert(key.clone());
+        let at = (node.kind, node.index);
+        let s = &mut line.source.extra;
+        s.insert(
+            "node".into(),
+            json!({"kind": node.kind.as_str(), "index": node.index}),
+        );
+        s.insert("speaker_index".into(), json!(node.speaker_index));
+        s.insert(
+            "listener".into(),
+            json!(listener_label(c, node.listener_index)),
+        );
+        let ids = |nodes: Vec<(Kind, usize)>| -> Value {
+            Value::Array(
+                nodes
+                    .into_iter()
+                    .filter_map(|(k, i)| c.node(k, i))
+                    .map(|n| json!(line_id(game, n.string_id, gender)))
+                    .collect(),
+            )
+        };
+        line.extra
+            .insert("prev".into(), ids(nearest_lines(c, subs, gender, at, true)));
+        line.extra.insert(
+            "next".into(),
+            ids(nearest_lines(c, subs, gender, at, false)),
+        );
+        let path: Vec<&Node> = path_to(c, at)
+            .into_iter()
+            .filter_map(|(k, i)| c.node(k, i))
+            .filter(|n| node_text(subs, n, gender).is_some())
+            .collect();
+        line.context = path[path.len().saturating_sub(CONTEXT)..]
+            .iter()
+            .map(|n| dataset::corpus::ContextLine {
+                id: Some(line_id(game, n.string_id, gender)),
+                speaker: speaker_label(character, game, c, &key, graphs, n),
+                text: node_text(subs, n, gender).unwrap_or("").to_string(),
+                string_id: u64::try_from(n.string_id).ok(),
+                extra: Map::new(),
+            })
+            .collect();
+        line.stage_direction = c.stage_direction(string_id).map(str::to_string);
+    }
+
+    let dir = out.join("conversations");
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for key in used {
+        let (c, package) = &graphs.conversations[&key];
+        let node = |n: &Node| {
+            let text = node_text(subs, n, Gender::Male);
+            json!({
+                "kind": n.kind.as_str(),
+                "index": n.index,
+                "string_id": n.string_id,
+                "speaker": speaker_label(character, game, c, &key, graphs, n),
+                "speaker_index": n.speaker_index,
+                "listener": listener_label(c, n.listener_index),
+                "text": text,
+                "links": n.links,
+                "paraphrases": n.paraphrases,
+                "reply_type": n.reply_type,
+                "non_text_line": n.non_text_line,
+                "conditional": [n.conditional_func, n.conditional_param],
+                "transition": [n.state_transition, n.state_transition_param],
+                "stage_direction": c.stage_direction(n.string_id),
+            })
+        };
+        let graph = json!({
+            "game": game.id(),
+            "conversation": key,
+            "export": c.name,
+            "package": package.strip_prefix(root).unwrap_or(package).to_string_lossy(),
+            "speakers": c.speakers,
+            "starting": c.starting,
+            "entries": c.entries.iter().map(node).collect::<Vec<_>>(),
+            "replies": c.replies.iter().map(node).collect::<Vec<_>>(),
+        });
+        let path = dir.join(format!("{key}.json"));
+        fs::write(&path, serde_json::to_string_pretty(&graph).unwrap() + "\n")
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(missing)
+}
+
 /// Corpus flags for a line: `no_subtitle` for empty text, `nonverbal` for
 /// subtitles that only describe a sound (`{Sighs}`), `bark` for the squad
 /// sound sets (`ss_global_hench_tali`, `ss_tali_minimal`), which have no
@@ -702,6 +1024,88 @@ mod tests {
         assert_eq!(c.tags[&Game::Le3], ["hench_tali", "x"]);
         assert!(!c.tags.contains_key(&Game::Le1));
         assert!(Character::from_sources("t", "[le2]\n").is_err());
+    }
+
+    fn node(kind: Kind, index: usize, string_id: i32, speaker: i32, links: &[usize]) -> Node {
+        Node {
+            kind,
+            index,
+            string_id,
+            speaker_index: speaker,
+            listener_index: -1,
+            links: links.to_vec(),
+            paraphrases: vec![],
+            reply_type: None,
+            non_text_line: false,
+            conditional_func: -1,
+            conditional_param: -1,
+            state_transition: -1,
+            state_transition_param: -1,
+            export_id: -1,
+        }
+    }
+
+    #[test]
+    fn context_skips_lines_without_text() {
+        // entry 0 (owner, 10) -> reply 0 (no text) -> entry 1 (tali, 11)
+        //   -> reply 1 (shepard, 12) -> entry 2 (tali, 13)
+        let c = Conversation {
+            name: "t_d_dlg".into(),
+            speakers: vec!["hench_tali".into()],
+            starting: vec![0],
+            entries: vec![
+                node(Kind::Entry, 0, 10, OWNER, &[0]),
+                node(Kind::Entry, 1, 11, 0, &[1]),
+                node(Kind::Entry, 2, 13, 0, &[]),
+            ],
+            replies: vec![
+                node(Kind::Reply, 0, -1, SHEPARD, &[1]),
+                node(Kind::Reply, 1, 12, SHEPARD, &[2]),
+            ],
+            stage_directions: vec![],
+        };
+        let mut subs = Subtitles {
+            male: BTreeMap::new(),
+            female: BTreeMap::new(),
+        };
+        for (id, t) in [
+            (10, "Owner."),
+            (11, "Tali."),
+            (12, "Shepard."),
+            (13, "Tali again."),
+        ] {
+            subs.male.insert(id, (t.to_string(), "x.tlk".into()));
+        }
+        let g = Gender::Male;
+        assert_eq!(
+            nearest_lines(&c, &subs, g, (Kind::Entry, 1), true),
+            [(Kind::Entry, 0)]
+        );
+        assert_eq!(
+            nearest_lines(&c, &subs, g, (Kind::Entry, 1), false),
+            [(Kind::Reply, 1)]
+        );
+        assert_eq!(
+            path_to(&c, (Kind::Entry, 2)),
+            [
+                (Kind::Entry, 0),
+                (Kind::Reply, 0),
+                (Kind::Entry, 1),
+                (Kind::Reply, 1)
+            ]
+        );
+        let mut graphs = Graphs::default();
+        graphs
+            .tags
+            .insert(("t_d".into(), 10), "cit_diplomat".into());
+        let tali = Character {
+            id: "tali".into(),
+            tags: BTreeMap::from([(Game::Le3, vec!["hench_tali".into()])]),
+        };
+        let label = |n: &Node| speaker_label(&tali, Game::Le3, &c, "t_d", &graphs, n);
+        assert_eq!(label(&c.entries[0]), "cit_diplomat");
+        assert_eq!(label(&c.entries[1]), "tali");
+        assert_eq!(label(&c.replies[1]), "shepard");
     }
 
     #[test]
