@@ -30,6 +30,7 @@ from pathlib import Path
 import fusion
 import models
 from vi_job import (
+    Checkpoint,
     ensure_packages,
     fake_models,
     load_axes,
@@ -65,18 +66,18 @@ def main():
 
     # 1. Acoustic emotion embeddings.
     emotion_model = s.get("emotion", "emotion2vec/emotion2vec_base")
-    e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(emotion_model)
-    emotion = {}
-    for i, clip in enumerate(clips):
-        emotion[clip.id] = e2v(clip)[1]
-        if i % 250 == 0:
-            log(f"emotion embeddings: {i}/{len(clips)}")
-    del e2v
-    free()
+    embedded = Checkpoint("emotion")
+    if embedded.todo(clips):
+        e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(emotion_model)
+        embedded.run(clips, lambda part: [e2v(c)[1] for c in part])
+        del e2v
+        free()
+    emotion = embedded.run(clips, None)
     embeddings = {"emotion": write_embeddings(out / "embeddings", "emotion", emotion_model, emotion)}
 
     # 2. Prosody.
-    pros = {c.id: (models.fake_prosody if fake else models.prosody)(c) for c in clips}
+    measure = models.fake_prosody if fake else models.prosody
+    pros = Checkpoint("prosody").run(clips, lambda part: [measure(c) for c in part])
     write_jsonl(out / "prosody.jsonl", [{"id": cid, **p} for cid, p in pros.items()])
 
     # 3. Text embeddings, for lines with words.
@@ -99,23 +100,32 @@ def main():
     # Short clips padded with silence, outside VI_OUT so they aren't outputs.
     pad_dir = tempfile.TemporaryDirectory()
     audio = {c.id: c.audio if fake else models.padded(c, Path(pad_dir.name)) for c in hearable}
-    replies = gemma.json([models.caption_prompt(c, axes, audio=audio[c.id]) for c in hearable], max_new_tokens=200)
+    replies = Checkpoint("captions").run(
+        hearable,
+        lambda part: gemma.json([models.caption_prompt(c, axes, audio=audio[c.id]) for c in part], max_new_tokens=200),
+        chunk=64,
+    )
     captions = {}
     failed = 0
-    for clip, r in zip(hearable, replies):
-        if r is None:
+    for clip in hearable:
+        r = replies[clip.id]
+        if not isinstance(r, dict):
             failed += 1
             continue
         captions[clip.id] = clean_caption(r, axes)
 
     sample = spread([c for c in hearable if c.id in captions and c.id in text_emb], int(s.get("compare", 200)))
     log(f"captioning {len(sample)} clips again with their words shown")
-    replies = gemma.json(
-        [models.caption_prompt(c, axes, with_text=True, audio=audio[c.id]) for c in sample], max_new_tokens=200
+    replies = Checkpoint("captions_with_text").run(
+        sample,
+        lambda part: gemma.json(
+            [models.caption_prompt(c, axes, with_text=True, audio=audio[c.id]) for c in part], max_new_tokens=200
+        ),
+        chunk=64,
     )
-    for clip, r in zip(sample, replies):
-        if r is not None:
-            captions[clip.id]["with_text"] = clean_caption(r, axes)
+    for clip in sample:
+        if isinstance(replies[clip.id], dict):
+            captions[clip.id]["with_text"] = clean_caption(replies[clip.id], axes)
 
     write_jsonl(
         out / "captions.jsonl",

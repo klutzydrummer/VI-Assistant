@@ -211,12 +211,13 @@ Environment variables:
 | `VI_OUT` | empty folder to write outputs into |
 | `VI_INPUT_<NAME>` | each upstream stage's `out/` folder, name uppercased with `-` as `_` (read-only by convention) |
 | `VI_SETTINGS` | path to a JSON file holding `settings` |
+| `VI_CHECKPOINT` | a folder for work to resume from: it keeps whatever earlier failed runs of the same key left there, and is deleted when the run succeeds |
 | `VI_CORPUS` | the corpus folder |
 | `VI_BIN` | the running `vi` binary |
 
-A job exits 0 on success. Anything else marks the run failed: nothing becomes current, and the partial output stays in `stages/<stage>/.tmp-<key>/` for inspection until the next attempt or `gc`.
+A job exits 0 on success. Anything else marks the run failed: nothing becomes current, and the partial output stays in `stages/<stage>/.tmp-<key>/` for inspection until the next attempt or `gc`. A job that saves per-item results in `VI_CHECKPOINT` (the GPU jobs use `vi_job.Checkpoint`) picks up where it stopped when rerun; changing the stage's settings, inputs or files gives a new key and starts over. `gc` deletes checkpoints too.
 
-A GPU job is the same contract wrapped: `jobs/on-worker.sh` rsyncs the input folders, settings, `jobs/` and any `--put` files to the worker, runs the command there, rsyncs `VI_OUT` back, and deletes the worker's copy. The runner doesn't know or care where the work ran. Details in `docs/cloud-worker.md`.
+A GPU job is the same contract wrapped: `jobs/on-worker.sh` rsyncs the input folders, settings, `jobs/` and any `--put` files to the worker, runs the command there, copies `VI_CHECKPOINT` home every minute while it runs, rsyncs `VI_OUT` back, and deletes the worker's copy. The runner doesn't know or care where the work ran. Details in `docs/cloud-worker.md`.
 
 ## How caching works
 Each run has a key:
