@@ -43,8 +43,9 @@ from vi_job import (
     write_jsonl,
 )
 
-# Clips at least this long set her median voice; shorter ones give noisy
-# speaker embeddings.
+# Spoken clips at least this long set her median voice and are the only ones
+# judged against it: on the smoke test every clip under 1.6 s and every sigh
+# scored far from her, without being anyone else.
 SPEAKER_REFERENCE_MIN_S = 1.5
 
 
@@ -103,10 +104,11 @@ def main():
     voice = saved.run(live, lambda part: [spk(c) for c in part])
     del spk
     free()
-    reference = [voice[c.id] for c in live if c.duration_s >= SPEAKER_REFERENCE_MIN_S] or list(voice.values())
+    judged = {c.id for c in live if c.duration_s >= SPEAKER_REFERENCE_MIN_S and not c.nonverbal}
+    reference = [voice[cid] for cid in judged] or list(voice.values())
     centre = unit([statistics.median(col) for col in zip(*reference)]) if reference else []
     similarity = {cid: round(dot(unit(v), centre), 4) for cid, v in voice.items()}
-    ref_sims = [similarity[c.id] for c in live if c.duration_s >= SPEAKER_REFERENCE_MIN_S] or list(similarity.values())
+    ref_sims = [similarity[cid] for cid in judged] or list(similarity.values())
     med = statistics.median(ref_sims) if ref_sims else 0.0
     mad = statistics.median(abs(x - med) for x in ref_sims) if ref_sims else 0.0
     far_below = med - float(s.get("far_voice_mads", 4)) * max(mad, 1e-3)
@@ -135,7 +137,7 @@ def main():
                 r["transcript"] = heard[c.id]
                 r["flags"].append("asr_only")
         r["speaker_similarity"] = similarity[c.id]
-        if similarity[c.id] < far_below:
+        if c.id in judged and similarity[c.id] < far_below:
             r["flags"].append("far_voice")
         r["quality"] = mos[c.id]
         records.append(r)

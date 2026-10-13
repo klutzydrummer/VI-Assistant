@@ -106,7 +106,7 @@ Written by `jobs/clean.py`.
 - `flags`:
   - `silent`: trimmed to nothing; the only reason for `keep: false` so far.
   - `subtitle_mismatch`: WER above `mismatch_wer`, for subtitles of three or more words.
-  - `far_voice`: similarity more than `far_voice_mads` median absolute deviations below her median.
+  - `far_voice`: similarity more than `far_voice_mads` median absolute deviations below her median. Only spoken clips of 1.5 s or more are judged; shorter clips and sighs give speaker embeddings too noisy to mean anything.
   - `asr_only`: the transcript came from Whisper.
 
 Mismatches and far voices are flagged, not dropped, until their thresholds are set from what the flagged clips turn out to be. `clean.json` holds counts, the distributions of WER, similarity and quality, and the 20 clips least like her, for that.

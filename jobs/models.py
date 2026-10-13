@@ -453,7 +453,7 @@ class Speaker:
 
         self.torch = torch
         save = Path.home() / ".cache" / "vi" / "speechbrain" / model_id.replace("/", "--")
-        self.model = EncoderClassifier.from_hparams(source=model_id, savedir=str(save), run_opts={"device": device()})
+        self.model = EncoderClassifier.from_hparams(source=model_id, savedir=str(save), run_opts={"device": "cuda:0" if device() == "cuda" else "cpu"})
 
     def __call__(self, clip):
         wav = self.torch.from_numpy(load_audio(clip.audio)).unsqueeze(0)
