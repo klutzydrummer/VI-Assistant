@@ -132,6 +132,9 @@ Run the LLM sweep on open-ended chat prompts, not single sentences: steering wor
 ### TTS bake-off
 Harvest, clean and label first. The labeled clips feed the TTS bake-off, which narrows the field to one or two engines whose backbone we can hook. Only then extract and evaluate vectors, so we pay for extraction once per engine we'd actually use.
 
+
+**Steering test first** (decided 2026-10-13). Before labelling grows, the manual `steer` stage (`jobs/steer.py`) checks the riskiest assumption on the leading candidate, Qwen3-TTS 1.7B: does a vector added to its backbone move her cloned voice along an axis, keep her voice and the words, and beat simply cloning from an emotional clip of hers? It builds anger and intoxication vectors two ways, from her own top-labelled clips and from VoiceDesign pairs (the same sentence spoken with and without the emotion), and scores the results with Empathic-Insight-Voice, emotion2vec+, ECAPA and Whisper. If no axis steers, the voice side falls back to choosing reference clips by mood, which needs far fewer labels.
+
 ## Moving data
 Clips go from home to the worker by rsync over the same SSH tunnel as everything else, roughly a few hundred MB as FLAC for Tali. Results (labels, vectors, reports) come back home. Nothing stays on the worker. Game audio never goes through a third-party host.
 
