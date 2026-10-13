@@ -11,6 +11,7 @@ fake-model test runs work anywhere, including CI.
 import hashlib
 import json
 import os
+import struct
 import subprocess
 import sys
 import tomllib
@@ -54,6 +55,25 @@ def write_jsonl(path, records):
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False, sort_keys=True))
             f.write("\n")
+
+
+
+def write_embeddings(folder, name, model, vectors):
+    """Save {id: vector} as <name>.npy (float32, one row per clip) and
+    <name>.ids (the row order), readable with numpy.load without numpy here."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ids = list(vectors)
+    dim = len(vectors[ids[0]]) if ids else 0
+    header = "{'descr': '<f4', 'fortran_order': False, 'shape': (%d, %d), }" % (len(ids), dim)
+    header += " " * (63 - (10 + len(header)) % 64) + "\n"
+    with open(folder / f"{name}.npy", "wb") as f:
+        f.write(b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header.encode("latin1"))
+        for i in ids:
+            if len(vectors[i]) != dim:
+                raise ValueError(f"{name}: {i} has {len(vectors[i])} dimensions, not {dim}")
+            f.write(struct.pack(f"<{dim}f", *vectors[i]))
+    (folder / f"{name}.ids").write_text("".join(f"{i}\n" for i in ids))
+    return {"model": model, "clips": len(ids), "dim": dim}
 
 
 # --- inputs -----------------------------------------------------------------

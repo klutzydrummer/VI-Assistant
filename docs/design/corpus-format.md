@@ -108,6 +108,7 @@ Written by `jobs/discover.py`.
 - `captions.jsonl`: the audio LLM's description of each clip from its sound alone (clips over 30 s are skipped). `tags` come from a fixed delivery list (`laughing`, `sighing`, `crying`, `whispering`, `shouting`, `breathy`, `strained`, `effort`, `pain`, `slurred`, `sarcastic`, `music`). `scores` are its per-axis guesses without the words, which label uses as the `audio_llm` signal. A sample also has `with_text`, the same prompt with the words shown, to measure how much the words sway it.
 - `clusters.jsonl`: clusters by sound (emotion2vec embedding plus prosody); `cluster` -1 is unclustered, `x`/`y` a 2D map. `text_cluster` clusters the words, for lines that have them.
 - `prosody.jsonl`: pitch, loudness and pace, for matching negatives to positives later.
+- `embeddings/emotion.npy` and `embeddings/text.npy`: the emotion2vec vector of each clip's sound and the text-embedding vector of its words (lines with words only), the vectors the clusters were built from. Each is a float32 matrix with one row per clip; the matching `.ids` file lists the clip ids in row order. `discover.json` names the models under `embeddings`. Kept so later steps can train small per-axis probes on reviewed clips and find a clip's nearest neighbours without another GPU pass.
 
 Plus `clusters.md` (what each cluster seems to be, examples, and the audio LLM's emotion vocabulary grouped by meaning) and `discover.json` (counts and the with/without-words comparison). Advisory only; nothing downstream depends on it automatically, except label reading `captions.jsonl` when discover is one of its inputs.
 
@@ -130,6 +131,8 @@ Plus `clusters.md` (what each cluster seems to be, examples, and the audio LLM's
 How `jobs/label.py` treats special lines: barks have no subtitle, so they get no `text` signal unless clean transcribed words for them. Nonverbal lines (`{Sighs}`) go to the judge described as a sound rather than words. Both still get the acoustic and audio LLM signals.
 
 Beside them, `fusion.json` reports per axis how many clips each signal scored, how well each pair of signals agrees (Spearman), and how many clips came out low-confidence, for tuning the fusion weights.
+
+`embeddings/emotion.npy` + `.ids` hold the emotion2vec+ vector each clip's `audio_classes` came from, in the same layout as discover's; `fusion.json` names the model under `embeddings`. A small per-axis classifier trained on these and the reviewed clips can give every axis an audio signal, including axes no emotion2vec+ class maps to.
 
 `axes.json` lists the axes in the pack's order with their descriptions, so readers don't need the pack:
 ```json
