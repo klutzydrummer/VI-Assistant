@@ -112,6 +112,29 @@ mod tests {
     }
 
     #[test]
+    fn calibration_sample_comes_first_in_hash_order() {
+        let (_dir, corpus) = demo(50);
+        let q = queue::build_with(&corpus, 10);
+        let labelled = corpus
+            .lines
+            .iter()
+            .filter(|l| corpus.labels.contains_key(&l.id))
+            .map(|l| l.id.as_str());
+        let expected = queue::calibration(labelled, 10);
+        let first: Vec<&str> = q[..10].iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(first, expected);
+        assert!(q[..10].iter().all(|i| i.reason.starts_with("calibration")));
+        assert!(q[10..].iter().all(|i| !i.reason.starts_with("calibration")));
+        assert!(q.windows(2).all(|w| w[0].priority >= w[1].priority));
+    }
+
+    #[test]
+    fn calibration_is_sha256_order() {
+        // sha256("b") = 3e23..., sha256("a") = ca97..., sha256("c") = 2e7d...
+        assert_eq!(queue::calibration(["a", "b", "c"], 2), ["c", "b"]);
+    }
+
+    #[test]
     fn reviews_persist_and_latest_wins() {
         let (dir, mut corpus) = demo(10);
         let id = corpus.lines[0].id.clone();

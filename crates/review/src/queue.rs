@@ -1,16 +1,43 @@
 //! Which clips to review first.
 //!
 //! An hour covers a few hundred clips out of a few thousand, so the order
-//! matters more than anything else on the page. A clip ranks high when the
-//! label stage is unsure of an axis *and* the clip is likely to land in that
-//! axis's contrast set, because a wrong positive moves the vector most.
+//! matters more than anything else on the page. First comes a calibration
+//! sample: `CALIBRATION` clips picked at random, so the accuracy the
+//! calibrate stage measures on them isn't biased toward hard cases. Then a
+//! clip ranks high when the label stage is unsure of an axis *and* the clip
+//! is likely to land in that axis's contrast set, because a wrong positive
+//! moves the vector most.
+
+use std::collections::HashMap;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::corpus::{Corpus, Label, Verdict};
 
 /// Contrast sets take positives from lines scoring about this high.
 pub const POSITIVE_FROM: f32 = 0.6;
+
+/// Size of the calibration sample reviewed first.
+pub const CALIBRATION: usize = 150;
+
+/// The calibration sample: of the given ids, the `n` whose lowercase hex
+/// SHA-256 sorts first, in that order. A uniform random sample that any tool
+/// can recompute from the ids alone (the calibrate stage does).
+pub fn calibration<'a>(ids: impl IntoIterator<Item = &'a str>, n: usize) -> Vec<&'a str> {
+    let mut keyed: Vec<(String, &str)> = ids
+        .into_iter()
+        .map(|id| {
+            let hex: String = Sha256::digest(id.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            (hex, id)
+        })
+        .collect();
+    keyed.sort();
+    keyed.into_iter().take(n).map(|(_, id)| id).collect()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Item {
@@ -67,15 +94,35 @@ pub fn rank(label: &Label) -> Option<Item> {
         })
 }
 
-/// Clips still to review, most useful first. Skipped clips go to the back.
+/// Clips still to review, most useful first: the calibration sample, then
+/// by uncertainty. Skipped clips go to the back.
 pub fn build(corpus: &Corpus) -> Vec<Item> {
+    build_with(corpus, CALIBRATION)
+}
+
+pub fn build_with(corpus: &Corpus, calibration_size: usize) -> Vec<Item> {
+    let labelled = corpus
+        .lines
+        .iter()
+        .filter(|l| corpus.labels.contains_key(&l.id))
+        .map(|l| l.id.as_str());
+    let sample: HashMap<&str, usize> = calibration(labelled, calibration_size)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, i))
+        .collect();
     let latest = corpus.latest();
     let mut fresh = Vec::new();
     let mut skipped = Vec::new();
     for line in &corpus.lines {
-        let Some(item) = corpus.labels.get(&line.id).and_then(rank) else {
+        let Some(mut item) = corpus.labels.get(&line.id).and_then(rank) else {
             continue;
         };
+        if let Some(&i) = sample.get(line.id.as_str()) {
+            // Above every uncertainty priority (at most 1), in sample order.
+            item.priority = 2.0 - i as f32 / sample.len() as f32;
+            item.reason = format!("calibration sample (random), {}", item.reason);
+        }
         match latest.get(line.id.as_str()).map(|r| r.verdict) {
             None => fresh.push(item),
             Some(Verdict::Skip) => skipped.push(item),
