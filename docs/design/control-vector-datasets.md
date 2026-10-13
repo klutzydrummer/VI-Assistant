@@ -4,6 +4,8 @@ Status: plan approved 2026-10-12. Built: the stage runner, the GPU worker wrappe
 
 Decided: clips move only by direct rsync to the rented GPU, never through a third-party host (copyrighted material). Brandon will do about an hour of label review.
 
+What others tried, and what it changes here: [prior-work.md](prior-work.md).
+
 Goal: from a character's own recorded lines, produce one control vector per mixing-table row (`tts`/`sad`, `llm`/`drunk`, ...) for the chosen models, with a tested maximum strength for each. Same pipeline for every character; Tali first.
 
 ## The axes come from the pack
