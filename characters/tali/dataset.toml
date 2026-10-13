@@ -5,12 +5,12 @@
 corpus = "../../corpus/tali"
 
 # For now harvest imports the LE2/LE3 extraction already in the corpus
-# (corpus/tali/harvest-context, made by `vi extract` with conversation
+# (corpus/tali/harvest, made by `vi extract` with conversation
 # context). Once that extractor is merged this becomes
 # ["vi", "extract", "--character", ".", "<LE install>"].
 [stage.harvest]
-command = ["sh", "-c", "cp -a \"$VI_CORPUS/harvest-context/.\" \"$VI_OUT/\""]
-files = ["corpus:harvest-context"]
+command = ["sh", "-c", "cp -a \"$VI_CORPUS/harvest/.\" \"$VI_OUT/\""]
+files = ["corpus:harvest"]
 
 # GPU. Embeds and clusters every clip and captions it from its sound alone.
 [stage.discover]
