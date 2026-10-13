@@ -1,0 +1,9 @@
+# What steer.py needs on the worker. It runs in its own virtualenv
+# (vi_job.ensure_venv) on top of the image's PyTorch, because qwen-tts pins
+# transformers 4.57, older than the other jobs' requirements-gpu.txt.
+qwen-tts==0.1.1      # Qwen3-TTS Base and VoiceDesign
+huggingface_hub      # Empathic-Insight-Voice heads
+funasr>=1.2          # emotion2vec+
+speechbrain>=1.0     # ECAPA voice similarity
+librosa
+soundfile

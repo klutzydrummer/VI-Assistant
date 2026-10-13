@@ -63,7 +63,7 @@ def device():
 
 
 class Emotion2Vec:
-    """emotion2vec+ (or plain emotion2vec for embeddings) through FunASR.
+    """emotion2vec+ (or plain emotion2vec) through FunASR.
     Returns class probabilities and the utterance embedding."""
 
     def __init__(self, model_id):

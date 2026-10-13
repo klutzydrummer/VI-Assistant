@@ -195,7 +195,13 @@ impl Runner {
 
     /// Every stage's status, without running anything.
     pub fn status(&mut self) -> Result<Vec<(String, Status)>, Error> {
-        let order = self.order(None)?;
+        let order = self
+            .pipeline
+            .order_all()
+            .map_err(|message| Error::Invalid {
+                path: self.pipeline.dir.clone(),
+                message,
+            })?;
         let mut outputs = BTreeMap::new();
         let mut out = Vec::new();
         for name in order {

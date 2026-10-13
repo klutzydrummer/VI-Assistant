@@ -56,7 +56,7 @@ Built as `jobs/clean.py` (decided 2026-10-13): it runs on the worker (Whisper la
 
 ### 3. Discover (GPU)
 Before scoring anything, let the data say what's there, so we find axes the pack is missing:
-- Embed every clip three ways: an emotion representation (plain emotion2vec, which gives a rich embedding rather than four classes), prosody (pitch, energy, speaking rate), and the text with its context.
+- Embed every clip three ways: an emotion representation (emotion2vec+'s utterance embedding, not just its class scores; plain emotion2vec was the first choice, but on the smoke test its embedding mostly encoded clip length, R² 0.81 against 0.35 for emotion2vec+), prosody (pitch, energy, speaking rate), and the text with its context.
 - Cluster (UMAP, then HDBSCAN) and, for each cluster, pull exemplar clips and have the LLM summarize what its lines have in common.
 - In parallel, the audio LLM captions every line with free-form emotion words, and we cluster that vocabulary too. These captions are for discovery only: they name clusters and suggest axes, and their per-axis guesses are not a label signal (stage 4).
 - Compare against the pack's variables. Clusters no axis covers become candidate axes (flustered, awed, determined, tender...), and you decide which to add to `states.toml`.
@@ -131,6 +131,9 @@ Run the LLM sweep on open-ended chat prompts, not single sentences: steering wor
 
 ### TTS bake-off
 Harvest, clean and label first. The labeled clips feed the TTS bake-off, which narrows the field to one or two engines whose backbone we can hook. Only then extract and evaluate vectors, so we pay for extraction once per engine we'd actually use.
+
+
+**Steering test first** (decided 2026-10-13). Before labelling grows, the manual `steer` stage (`jobs/steer.py`) checks the riskiest assumption on the leading candidate, Qwen3-TTS 1.7B: does a vector added to its backbone move her cloned voice along an axis, keep her voice and the words, and beat simply cloning from an emotional clip of hers? It builds anger and intoxication vectors two ways, from her own top-labelled clips and from VoiceDesign pairs (the same sentence spoken with and without the emotion), and scores the results with Empathic-Insight-Voice, emotion2vec+, ECAPA and Whisper. If no axis steers, the voice side falls back to choosing reference clips by mood, which needs far fewer labels.
 
 ## Moving data
 Clips go from home to the worker by rsync over the same SSH tunnel as everything else, roughly a few hundred MB as FLAC for Tali. Results (labels, vectors, reports) come back home. Nothing stays on the worker. Game audio never goes through a third-party host.

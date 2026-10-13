@@ -39,7 +39,7 @@ files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py
          "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
 
 [stage.discover.settings]
-emotion = "emotion2vec/emotion2vec_base"
+emotion = "emotion2vec/emotion2vec_plus_large"  # base mostly encoded clip length
 text_embed = "sentence-transformers/all-MiniLM-L6-v2"
 audio_llm = "google/gemma-4-12B-it"
 compare = 200       # clips also captioned with their words shown
@@ -76,3 +76,31 @@ files = ["../../jobs/calibrate.py", "../../jobs/fusion.py", "../../jobs/vi_job.p
 [stage.calibrate.settings]
 calibration = 150   # the review page's random sample, reviewed first
 min_reviews = 30    # per axis, below this the defaults are kept
+
+# GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml steer`.
+# Tests whether a steering vector on Qwen3-TTS's backbone moves her cloned
+# voice along an axis, against swapping in an emotional reference clip. About
+# an hour on an A40. Read report.md, then listen with listen.md.
+[stage.steer]
+command = ["../../jobs/on-worker.sh", "python3", "jobs/steer.py"]
+inputs = ["harvest", "clean", "label"]
+files = ["../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py",
+         "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt"]
+manual = true
+
+[stage.steer.settings]
+model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+designer = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+axis_ids = ["anger", "intoxication"]
+sources = ["tali", "designed"]   # vectors from her clips, and from designed pairs
+refs_per_side = 12
+design_pairs = 6
+strengths = [0.5, 1, 2, 4]       # times the mean difference, added at each steered layer
+# layers = [9, 10, ..., 18]      # default: the middle third of the 28 talker layers
+max_similarity_drop = 0.05       # voice: ECAPA cosine to her may fall this much
+max_wer = 0.15                   # words: Whisper's word error rate at most this
+
+# Hand-picked clip ids win over label's top clips, e.g. drunk lines from the
+# Citadel party while scene tags are still missing:
+[stage.steer.settings.refs]
+# intoxication = ["le3.s...", ...]
