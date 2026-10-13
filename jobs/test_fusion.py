@@ -1,9 +1,13 @@
 """python3 -m unittest discover -s jobs"""
 
+import struct
+import tempfile
 import unittest
+from pathlib import Path
 
 import fusion
 import models
+import vi_job
 
 
 class Fuse(unittest.TestCase):
@@ -57,6 +61,24 @@ class Replies(unittest.TestCase):
     def test_final_answer(self):
         self.assertEqual(models.final_answer('<|channel>thought\nhmm<channel|>{"a": 1}<turn|>'), '{"a": 1}')
         self.assertEqual(models.final_answer('{"a": 1}<eos>'), '{"a": 1}')
+
+
+class Embeddings(unittest.TestCase):
+    def test_npy(self):
+        with tempfile.TemporaryDirectory() as d:
+            info = vi_job.write_embeddings(Path(d), "e", "m", {"a": [1.0, 2.0, 3.0], "b": [0.5, -1.0, 0.0]})
+            self.assertEqual(info, {"model": "m", "clips": 2, "dim": 3})
+            self.assertEqual((Path(d) / "e.ids").read_text(), "a\nb\n")
+            raw = (Path(d) / "e.npy").read_bytes()
+            n = struct.unpack("<H", raw[8:10])[0]
+            self.assertEqual((10 + n) % 64, 0)
+            self.assertIn("'shape': (2, 3)", raw[10 : 10 + n].decode())
+            self.assertEqual(struct.unpack("<6f", raw[10 + n :]), (1.0, 2.0, 3.0, 0.5, -1.0, 0.0))
+            try:
+                import numpy as np
+            except ImportError:
+                return
+            self.assertEqual(np.load(Path(d) / "e.npy").tolist(), [[1.0, 2.0, 3.0], [0.5, -1.0, 0.0]])
 
 
 if __name__ == "__main__":

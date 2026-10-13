@@ -13,8 +13,10 @@ they're tagged combat_bark so contrast sets can leave them out. Nonverbal
 lines ({Sighs}) go to the judge as a sound, not words, and are tagged
 nonverbal.
 
-Outputs: labels.jsonl, axes.json, and fusion.json (how often each signal
-scored each axis and how well the signals agree, to tune weights).
+Outputs: labels.jsonl, axes.json, fusion.json (how often each signal
+scored each axis and how well the signals agree, to tune weights), and
+embeddings/emotion.npy + .ids (emotion2vec+ per clip, for finding clips
+like a reviewed one and training small heads on reviews).
 
 Settings: backend ("fake" for tests), audio, dimensions, judge, batch,
 quant, weights, audio_map, scene_priors, audio_llm_axes, limit.
@@ -36,6 +38,7 @@ from vi_job import (
     read_jsonl,
     settings,
     write_axes,
+    write_embeddings,
     write_jsonl,
 )
 
@@ -62,20 +65,20 @@ def main():
     log(f"label: {len(clips)} clips, axes {', '.join(a.id for a in axes)}")
 
     # Acoustic models.
-    e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(
-        s.get("audio", "emotion2vec/emotion2vec_plus_large")
-    )
+    audio_model = s.get("audio", "emotion2vec/emotion2vec_plus_large")
+    e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(audio_model)
     dims = (models.FakeDimensions if fake else models.Dimensions)(
         s.get("dimensions", "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim")
     )
-    probs, adv = {}, {}
+    probs, adv, emb = {}, {}, {}
     for i, clip in enumerate(clips):
-        probs[clip.id] = e2v(clip)[0]
+        probs[clip.id], emb[clip.id] = e2v(clip)
         adv[clip.id] = dims(clip)
         if i % 250 == 0:
             log(f"acoustic: {i}/{len(clips)}")
     del e2v, dims
     free()
+    embeddings = {"emotion": write_embeddings(out / "embeddings", "emotion", audio_model, emb)}
 
     # Text judge.
     judge = models.Judge(
@@ -136,7 +139,8 @@ def main():
 
     write_jsonl(out / "labels.jsonl", labels)
     write_axes(out, axes)
-    (out / "fusion.json").write_text(json.dumps(report(labels, axes, unparsed), indent=1, sort_keys=True) + "\n")
+    summary = report(labels, axes, unparsed) | {"embeddings": embeddings}
+    (out / "fusion.json").write_text(json.dumps(summary, indent=1, sort_keys=True) + "\n")
     log(f"label: wrote {len(labels)} labels, {unparsed} unparsed judge replies")
 
 

@@ -12,6 +12,8 @@ cluster. Plan: docs/design/control-vector-datasets.md, step 3. Outputs
   prosody.jsonl    {id, duration_s, f0_median_hz, ..., words_per_s}
   clusters.md      what each cluster seems to be, and the emotion vocabulary
   discover.json    counts and the with/without-words comparison
+  embeddings/      emotion.npy (emotion2vec per clip) and text.npy (lines
+                   with words), each with a .ids file giving the row order
 
 Settings: backend ("fake" for tests), emotion (embedding model), text_embed,
 audio_llm, batch, quant, compare (how many clips to also caption with their
@@ -37,6 +39,7 @@ from vi_job import (
     settings,
     spread,
     unit_hash,
+    write_embeddings,
     write_jsonl,
 )
 
@@ -61,9 +64,8 @@ def main():
     log(f"discover: {len(clips)} clips, axes {', '.join(a.id for a in axes)}")
 
     # 1. Acoustic emotion embeddings.
-    e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(
-        s.get("emotion", "emotion2vec/emotion2vec_base")
-    )
+    emotion_model = s.get("emotion", "emotion2vec/emotion2vec_base")
+    e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(emotion_model)
     emotion = {}
     for i, clip in enumerate(clips):
         emotion[clip.id] = e2v(clip)[1]
@@ -71,6 +73,7 @@ def main():
             log(f"emotion embeddings: {i}/{len(clips)}")
     del e2v
     free()
+    embeddings = {"emotion": write_embeddings(out / "embeddings", "emotion", emotion_model, emotion)}
 
     # 2. Prosody.
     pros = {c.id: (models.fake_prosody if fake else models.prosody)(c) for c in clips}
@@ -78,10 +81,10 @@ def main():
 
     # 3. Text embeddings, for lines with words.
     worded = [c for c in clips if c.text.strip() and not c.nonverbal]
-    embedder = (models.FakeTextEmbedder if fake else models.TextEmbedder)(
-        s.get("text_embed", "sentence-transformers/all-MiniLM-L6-v2")
-    )
+    text_model = s.get("text_embed", "sentence-transformers/all-MiniLM-L6-v2")
+    embedder = (models.FakeTextEmbedder if fake else models.TextEmbedder)(text_model)
     text_emb = dict(zip([c.id for c in worded], embedder([c.text for c in worded])))
+    embeddings["text"] = write_embeddings(out / "embeddings", "text", text_model, text_emb)
 
     # 4. Captions from the audio alone, and a sample with the words shown.
     gemma = models.Judge(
@@ -169,6 +172,7 @@ def main():
                 "caption_failures": failed,
                 "too_long_for_audio_llm": len(clips) - len(hearable),
                 "clusters": len(order),
+                "embeddings": embeddings,
                 "noise": len(groups.get(-1, [])),
                 "with_text_compared": sum(1 for c in captions.values() if "with_text" in c),
                 "words_change_scores": comparison,

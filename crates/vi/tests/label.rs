@@ -93,9 +93,19 @@ settings = {{ backend = "fake" }}
     }
     let clusters = fs::read_to_string(discover.join("clusters.jsonl")).unwrap();
     assert_eq!(clusters.lines().count(), 24);
+    let ids = |stage: &Path, name: &str| {
+        assert!(stage.join(format!("embeddings/{name}.npy")).is_file());
+        fs::read_to_string(stage.join(format!("embeddings/{name}.ids")))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    assert_eq!(ids(&discover, "emotion"), 24);
+    assert!(ids(&discover, "text") > 0);
 
     let label = dataset::runner::current_out(&corpus, "label").unwrap();
     assert!(label.join("fusion.json").is_file());
+    assert_eq!(ids(&label, "emotion"), 24);
 
     // The review page reads the result.
     let loaded = review::corpus::Corpus::load(&corpus).unwrap();
