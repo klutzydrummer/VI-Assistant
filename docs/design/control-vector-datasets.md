@@ -70,7 +70,7 @@ A cascade, after ParaSpeechCaps (prior-work.md, section 1): cheap specialist sig
 1. **Audio emotion**: emotion2vec+ large (angry, happy, neutral, sad), plus audeering's arousal, valence and dominance model. These hear the delivery.
 2. **Text and context judge**: an open-weight LLM on the worker reads the line with its context and the LE3 voice director's note, and scores each pack variable from 0 to 1, with a confidence. It catches what audio models can't, like playfulness, worry and intoxication.
 3. **Priors**: scene tags (a Citadel party suggests intoxication) and stage-direction words.
-4. **Audio LLM verification**: per axis, the clips the first three rank highest, plus a matched sample of low ones, go to the audio LLM with one narrow question: how well does this delivery fit *sad*, from 1 to 5. Only its rating is used, only on the shortlist, and only on axes where calibration (5b) shows it agrees with the reviews.
+4. **Audio LLM verification** (built 2026-10-13, `verify_top`/`verify_low` in label's settings; `fusion.json`'s `verification` shows per axis whether the top rates above the control): per axis, the clips the first three rank highest, plus a matched sample of low ones, go to the audio LLM with one narrow question: how well does this delivery fit *sad*, from 1 to 5. Only its rating is used, only on the shortlist, and only on axes where calibration (5b) shows it agrees with the reviews.
 
 Fusion: a weighted average per axis. Lines where the signals disagree get a low confidence and go to review first. The weights start as defaults and are refit in 5b.
 

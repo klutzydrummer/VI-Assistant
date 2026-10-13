@@ -247,6 +247,8 @@ class FakeGemma:
                 })  # fmt: skip
             elif kind == "judge":
                 out.append({a: {"value": h(a), "confidence": h(a, "c")} for a in axes})
+            elif kind == "verify":
+                out.append({"rating": 1 + int(h("r") * 5)})
             else:
                 out.append({"name": f"fake {int(h('n') * 100)}", "summary": "fake summary", "axis": "none"})
         return out
@@ -289,6 +291,22 @@ def caption_prompt(clip, axes, with_text=False, audio=None):
     return [
         {"role": "user", "content": [{"type": "audio", "audio": str(audio or clip.audio)}, {"type": "text", "text": text}]},
         {"kind": "caption", "axes": [a.id for a in axes]},
+    ]
+
+
+def verify_prompt(clip, axis, audio=None):
+    """One narrow question for the audio LLM: how well this clip's delivery
+    fits one axis, 1 to 5. Audio first, words not shown."""
+    text = (
+        f"You heard one line spoken by {CHARACTER}.\n"
+        "Judge only how it is said: tone, pace, loudness and voice quality, not what the words mean.\n"
+        f"How strongly does the delivery express this: {axis.id} ({axis.description})?\n"
+        "1 not at all, 2 a hint, 3 clearly, 4 strongly, 5 overwhelmingly.\n"
+        'Reply with JSON only: {"rating": <1 to 5>}'
+    )
+    return [
+        {"role": "user", "content": [{"type": "audio", "audio": str(audio or clip.audio)}, {"type": "text", "text": text}]},
+        {"kind": "verify", "axes": [axis.id]},
     ]
 
 

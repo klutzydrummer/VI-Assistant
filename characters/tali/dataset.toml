@@ -57,4 +57,6 @@ files = ["../../jobs/label.py", "../../jobs/models.py", "../../jobs/vi_job.py",
 audio = "emotion2vec/emotion2vec_plus_large"
 dimensions = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
 judge = "google/gemma-4-12B-it"
+verify_top = 150   # clips per axis the audio LLM rates: the top by the other signals
+verify_low = 50    # ... plus this many from the lower half, as a control
 batch = 8
