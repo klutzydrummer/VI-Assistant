@@ -15,6 +15,7 @@ corpus/tali/                      the corpus, gitignored, home machine only
     log.txt                       the job's stdout and stderr
     out/                          the stage's output files (hard links into objects/)
   stages/<stage>/current          one line: the key of the latest successful run
+  stages/<stage>/.checkpoint-<key>/  a run's saved progress (VI_CHECKPOINT), kept while it hasn't succeeded
   reviews.jsonl                   Brandon's review decisions (written by the review page)
 ```
 
@@ -89,12 +90,26 @@ Everything else the harvester produces goes beside `lines.jsonl` in the same `ou
 
 Harvest writes WAV because it's the simplest thing to check and decode. Clean writes FLAC, which is what travels to the worker, so rsync size isn't a reason to change harvest.
 
-### clean: `clips.jsonl` + `audio/`
+### clean: `clips.jsonl` + `audio/` + `embeddings/speaker.npy` + `clean.json`
+Written by `jobs/clean.py`.
 ```json
-{"id": "...", "keep": true, "audio": {"path": "audio/<id>.flac", "sha256": "...", "sample_rate": 24000, "channels": 1, "duration_s": 1.31},
- "transcript": "Keelah se'lai.", "asr_text": "keelah selai", "subtitle_wer": 0.0, "flags": []}
+{"id": "...", "keep": true,
+ "audio": {"path": "audio/<id>.flac", "sample_rate": 24000, "channels": 1, "duration_s": 1.31, "rms_dbfs": -24.3},
+ "asr_text": "Keelah selai.", "subtitle_wer": 1.0, "speaker_similarity": 0.83,
+ "quality": {"p808": 3.6, "sig": 3.9, "bak": 4.1, "ovr": 3.4}, "flags": ["subtitle_mismatch"]}
 ```
-`keep: false` records stay in the file with a reason in `flags` (`too_short`, `too_long`, `subtitle_mismatch`, `music`, `effects`, `other_voice`), so the review page can show what was dropped. `transcript` is what later stages should treat as the words spoken.
+- `audio`: leading and trailing silence trimmed, FLAC at the source rate. Loudness is not normalized, since how loud she is carries emotion; `rms_dbfs` records it.
+- `asr_text`, `subtitle_wer`: Whisper's words and their word error rate against the subtitle (punctuation and `{stage notes}` ignored). Nonverbal lines aren't transcribed.
+- `transcript`: only present when it differs from the harvest `text`, which is when the line had no subtitle (barks) and Whisper heard words (`asr_only`). Lines with a subtitle keep it, since Whisper misspells names. Later stages use `transcript` if present, else `text`.
+- `speaker_similarity`: cosine similarity of the clip's ECAPA speaker embedding to her median voice (clips of 1.5 s or more set the median). The embeddings are in `embeddings/speaker.npy`.
+- `quality`: DNSMOS estimates, roughly 1 to 5; `ovr` is overall quality.
+- `flags`:
+  - `silent`: trimmed to nothing; the only reason for `keep: false` so far.
+  - `subtitle_mismatch`: WER above `mismatch_wer`, for subtitles of three or more words.
+  - `far_voice`: similarity more than `far_voice_mads` median absolute deviations below her median. Only spoken clips of 1.5 s or more are judged; shorter clips and sighs give speaker embeddings too noisy to mean anything.
+  - `asr_only`: the transcript came from Whisper.
+
+Mismatches and far voices are flagged, not dropped, until their thresholds are set from what the flagged clips turn out to be. `clean.json` holds counts, the distributions of WER, similarity and quality, and the 20 clips least like her, for that.
 
 ### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
 Written by `jobs/discover.py`.
@@ -214,6 +229,7 @@ Environment variables:
 | `VI_CHECKPOINT` | a folder for work to resume from: it keeps whatever earlier failed runs of the same key left there, and is deleted when the run succeeds |
 | `VI_CORPUS` | the corpus folder |
 | `VI_BIN` | the running `vi` binary |
+| `VI_CHECKPOINT` | a folder for saving progress; see below |
 
 A job exits 0 on success. Anything else marks the run failed: nothing becomes current, and the partial output stays in `stages/<stage>/.tmp-<key>/` for inspection until the next attempt or `gc`. A job that saves per-item results in `VI_CHECKPOINT` (the GPU jobs use `vi_job.Checkpoint`) picks up where it stopped when rerun; changing the stage's settings, inputs or files gives a new key and starts over. `gc` deletes checkpoints too.
 
