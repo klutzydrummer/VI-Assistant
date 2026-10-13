@@ -643,12 +643,16 @@ pub fn read_pcm(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
                 }
                 let samples: Vec<f32> = match (format, bits) {
                     (1, 16) => body
-                        .chunks_exact(2)
-                        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
                         .collect(),
                     (3, 32) => body
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b))
                         .collect(),
                     _ => return Err(format!("unsupported WAV format {format}/{bits} bits")),
                 };
