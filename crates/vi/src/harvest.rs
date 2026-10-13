@@ -221,8 +221,8 @@ pub fn extract(character: &Path, root: &Path, out: Option<&str>) -> ExitCode {
     let mut errors = 0;
     for (game, r) in &reports {
         println!(
-            "{game}: {} lines from {} streams in {} packages ({} duplicates merged, {} without subtitle, {} missing .afc, {} placeholders skipped, {} errors)",
-            r.lines, r.streams, r.packages, r.merged_duplicates, r.no_subtitle, r.missing_afc, r.placeholders.len(), r.errors.len()
+            "{game}: {} lines from {} streams in {} packages ({} duplicates merged, {} without subtitle, {} missing .afc, {} placeholders skipped, {} conversations, {} lines without a node, {} errors)",
+            r.lines, r.streams, r.packages, r.merged_duplicates, r.no_subtitle, r.missing_afc, r.placeholders.len(), r.conversations, r.without_node, r.errors.len()
         );
         for e in r.errors.iter().take(10) {
             println!("  error: {e}");

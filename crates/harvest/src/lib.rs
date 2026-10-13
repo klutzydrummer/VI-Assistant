@@ -6,6 +6,7 @@
 //! - [`tlk`]: subtitle tables, both the standalone `.tlk` files of LE2/LE3
 //!   and the `BioTlkFile` exports inside LE1 packages.
 //! - [`install`]: an inventory of an install folder.
+//! - [`conversation`]: the dialogue graph in `BioConversation` exports.
 //! - [`wwise`]: LE2/LE3 dialogue streams and where their audio is.
 //! - [`extract`]: `vi extract`, one character's lines as a harvest corpus.
 //!
@@ -14,6 +15,7 @@
 //! real install (results in `docs/design/harvester-plan.md`). Tests use
 //! synthetic files built by [`fixture`], never game bytes.
 
+pub mod conversation;
 pub mod extract;
 pub mod fixture;
 pub mod install;
