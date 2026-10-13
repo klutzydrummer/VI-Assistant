@@ -105,7 +105,7 @@ Written by `jobs/discover.py`.
 {"id": "...", "cluster": 7, "x": 1.23, "y": -0.4, "text_cluster": 3}
 {"id": "...", "duration_s": 1.42, "f0_median_hz": 231.0, "f0_range_st": 6.2, "loudness_db": -24.1, "loudness_range_db": 5.3, "voiced_fraction": 0.71, "words_per_s": 2.8}
 ```
-- `captions.jsonl`: the audio LLM's description of each clip from its sound alone (clips over 30 s are skipped). `tags` come from a fixed delivery list (`laughing`, `sighing`, `crying`, `whispering`, `shouting`, `breathy`, `strained`, `effort`, `pain`, `slurred`, `sarcastic`, `music`, `effects`, `other_voice`). `scores` are its per-axis guesses without the words, which label uses as the `audio_llm` signal. A sample also has `with_text`, the same prompt with the words shown, to measure how much the words sway it.
+- `captions.jsonl`: the audio LLM's description of each clip from its sound alone (clips over 30 s are skipped). `tags` come from a fixed delivery list (`laughing`, `sighing`, `crying`, `whispering`, `shouting`, `breathy`, `strained`, `effort`, `pain`, `slurred`, `sarcastic`, `music`). `scores` are its per-axis guesses without the words, which label uses as the `audio_llm` signal. A sample also has `with_text`, the same prompt with the words shown, to measure how much the words sway it.
 - `clusters.jsonl`: clusters by sound (emotion2vec embedding plus prosody); `cluster` -1 is unclustered, `x`/`y` a 2D map. `text_cluster` clusters the words, for lines that have them.
 - `prosody.jsonl`: pitch, loudness and pace, for matching negatives to positives later.
 

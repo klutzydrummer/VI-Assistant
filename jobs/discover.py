@@ -21,7 +21,9 @@ words shown), min_cluster, limit.
 import gc
 import json
 import math
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 import fusion
 import models
@@ -91,7 +93,10 @@ def main():
     )
     hearable = [c for c in clips if c.duration_s <= models.AUDIO_LLM_MAX_S]
     log(f"captioning {len(hearable)} clips from audio alone")
-    replies = gemma.json([models.caption_prompt(c, axes) for c in hearable], max_new_tokens=200)
+    # Short clips padded with silence, outside VI_OUT so they aren't outputs.
+    pad_dir = tempfile.TemporaryDirectory()
+    audio = {c.id: c.audio if fake else models.padded(c, Path(pad_dir.name)) for c in hearable}
+    replies = gemma.json([models.caption_prompt(c, axes, audio=audio[c.id]) for c in hearable], max_new_tokens=200)
     captions = {}
     failed = 0
     for clip, r in zip(hearable, replies):
@@ -102,7 +107,9 @@ def main():
 
     sample = spread([c for c in hearable if c.id in captions and c.id in text_emb], int(s.get("compare", 200)))
     log(f"captioning {len(sample)} clips again with their words shown")
-    replies = gemma.json([models.caption_prompt(c, axes, with_text=True) for c in sample], max_new_tokens=200)
+    replies = gemma.json(
+        [models.caption_prompt(c, axes, with_text=True, audio=audio[c.id]) for c in sample], max_new_tokens=200
+    )
     for clip, r in zip(sample, replies):
         if r is not None:
             captions[clip.id]["with_text"] = clean_caption(r, axes)
