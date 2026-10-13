@@ -39,6 +39,7 @@ files = ["../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py",
          "../../jobs/requirements-gpu.txt"]
 
 [stage.clean.settings]
+checks = "fail"   # fail the stage if an acceptance check fails (checks.json)
 asr = "openai/whisper-large-v3"
 speaker = "speechbrain/spkrec-ecapa-voxceleb"
 batch = 16
@@ -52,6 +53,7 @@ files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py
          "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
 
 [stage.discover.settings]
+checks = "fail"   # fail the stage if an acceptance check fails (checks.json)
 emotion = "emotion2vec/emotion2vec_plus_large"  # base mostly encoded clip length
 text_embed = "sentence-transformers/all-MiniLM-L6-v2"
 audio_llm = "google/gemma-4-12B-it"
@@ -67,6 +69,7 @@ files = ["../../jobs/label.py", "../../jobs/models.py", "../../jobs/vi_job.py",
          "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
 
 [stage.label.settings]
+checks = "fail"   # fail the stage if an acceptance check fails (checks.json)
 audio = "emotion2vec/emotion2vec_plus_large"
 dimensions = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
 judge = "google/gemma-4-12B-it"
@@ -82,7 +85,7 @@ batch_audio_s = 200  # cap on audio seconds per batch (memory grows ~0.07 GB/s o
 [stage.calibrate]
 command = ["nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scikit-learn])",
            "--run", "python3 ../../jobs/calibrate.py"]
-inputs = ["label"]
+inputs = ["harvest", "label"]   # harvest for conversation-grouped folds
 files = ["../../jobs/calibrate.py", "../../jobs/fusion.py", "../../jobs/vi_job.py", "corpus:reviews.jsonl"]
 
 [stage.calibrate.settings]

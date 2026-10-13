@@ -32,6 +32,7 @@ import shutil
 import statistics
 from concurrent.futures import ThreadPoolExecutor
 
+import checks
 import models
 from vi_job import (
     Checkpoint,
@@ -160,6 +161,17 @@ def main():
     report = summary(records, embeddings, asr_model, baselines)
     (out / "clean.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
     log(f"clean: {report['kept']} kept, flags {report['flags']}")
+
+    flags = report["flags"]
+    wers = [r["subtitle_wer"] for r in records if "subtitle_wer" in r]
+    results = [
+        checks.Check("far_voice share of judged clips", round(flags.get("far_voice", 0) / max(1, len(judged)), 3), 0.1,
+                     note="the speaker check flagging her own voice, as with sighs on the smoke test"),
+        checks.Check("median subtitle WER", sorted(wers)[len(wers) // 2] if wers else None, 0.2,
+                     note="clips mapped to the wrong lines"),
+        checks.Check("silent share", round(flags.get("silent", 0) / max(1, len(clips)), 3), 0.05),
+    ]  # fmt: skip
+    checks.finish(out, results, s.get("checks", "warn"))
 
 
 def baseline(voice, judged, members, mads):

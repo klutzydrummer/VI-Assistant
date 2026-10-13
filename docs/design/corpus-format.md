@@ -233,6 +233,16 @@ settings = { judge = "gemma-4-12b", audio = "emotion2vec_plus_large" }
 - `version`: an integer to bump when code not listed in `files` (like `vi extract` itself) changes behavior.
 - `manual`: `true` for a stage that runs only when named (`vi dataset run <pipeline> <stage>`), never in a whole-pipeline run: experiments that cost GPU time, like `steer`. A stage that isn't manual can't take a manual one as an input.
 
+### Acceptance checks and confound reports (clean, discover, label)
+Each of these stages writes `checks.json`: named checks with the measured value, the limit and whether it passed (`jobs/checks.py`). Examples:
+- clean: share of `far_voice`, median subtitle WER
+- discover: share of unparsed captions, share of captions carrying the most common tag, how well the emotion embedding predicts clip length
+- label: the judge's unparsed share, its share of all-zero answers, verification parse rates, and the fused score's confounds
+
+With the stage setting `checks = "fail"` (the smoke pipeline) a failed check fails the stage; with `"warn"` (the default) it's only logged. Replayed on the saved smoke-test outputs, the checks fail every run that had a known problem and pass the fixed ones.
+
+Label's `fusion.json` also has `confounds`, per axis and signal: Spearman with log clip length, and the share of variance explained by game and by bark vs conversation. It also has `data`, per axis: how many non-bark clips the fused score puts at 0.6+ and 0.4+, overall and by game, so an axis without enough candidates shows up before contrast sets.
+
 ## What a job sees
 Environment variables:
 
