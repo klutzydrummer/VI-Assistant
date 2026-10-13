@@ -42,9 +42,20 @@ pub fn read(package: &Package, index: usize) -> Result<(Vec<Tag>, usize)> {
             index + 1
         )));
     }
-    let data = package.export_data(index);
-    let mut r = Reader::new(data);
-    r.skip(4)?; // net index
+    read_at(package, package.export_data(index), 4).map_err(|e| match e {
+        Error::Format { offset, message } => Error::Format {
+            offset,
+            message: format!("export {}: {message}", index + 1),
+        },
+        other => other,
+    })
+}
+
+/// Walk tags in `data` from `start` (past an export's net index, or the
+/// start of a struct value) to the `None` that ends them; returns the tags
+/// and the position after `None`. Value offsets are relative to `data`.
+pub fn read_at(package: &Package, data: &[u8], start: usize) -> Result<(Vec<Tag>, usize)> {
+    let mut r = Reader::at(data, start);
     let name = |r: &mut Reader| -> Result<(FName, String)> {
         let start = r.pos;
         let n = FName {
@@ -54,7 +65,7 @@ pub fn read(package: &Package, index: usize) -> Result<(Vec<Tag>, usize)> {
         if usize::try_from(n.index).map_or(true, |i| i >= package.names.len()) {
             return Err(Error::Format {
                 offset: start,
-                message: format!("export {}: name index {} out of range", index + 1, n.index),
+                message: format!("name index {} out of range", n.index),
             });
         }
         Ok((n, package.name(n)))

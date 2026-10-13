@@ -1,9 +1,9 @@
 # Extracting Tali's voice lines from Legendary Edition
 
-Status: LE2/LE3 extraction works on the real install (`vi extract`); LE1 audio not yet.
+Status: extraction works on the real install for all three games (`vi extract`).
 
 ## Where the audio lives
-- LE2 and LE3 store dialogue as Wwise audio inside `.afc` files, referenced by `WwiseStream` exports in the game's `.pcc` packages. LE1 has no Wwise: its dialogue is ISACT banks (usually Ogg Vorbis samples) inside `BioSoundNodeWaveStreamingData` exports in packages.
+- LE2 and LE3 store dialogue as Wwise audio inside `.afc` files, referenced by `WwiseStream` exports in the game's `.pcc` packages. LE1 has no Wwise: its dialogue is ISACT banks of 48 kHz Ogg Vorbis, one per conversation, in `BioGame/Content/Packages/ISACT/*.isb`.
 - Dialogue is 44.1 kHz mono Wwise Vorbis; the corpus stores it resampled to 24 kHz.
 - Packages are Oodle-compressed in the Legendary Edition. The pure-Rust `oozextract` crate decompresses Oodle Leviathan, the codec LE uses, so a native Linux extractor is possible.
 - Subtitle text lives in string tables keyed by string ID (standalone `.tlk` files in LE2/LE3, `BioTlkFile` exports inside packages in LE1), which lets each clip be paired with its exact transcript.
@@ -12,7 +12,7 @@ Status: LE2/LE3 extraction works on the real install (`vi extract`); LE1 audio n
 Legendary Explorer (ME3Tweaks) is the community's modding toolkit. Its Dialogue Editor can dump all audio for one speaker. It is a Windows .NET app; people report ME3Tweaks tools running under Proton Experimental with .NET installed in the prefix, but Legendary Explorer on Linux is unconfirmed.
 
 ## Route B: native Rust extractor (`vi extract`)
-The chosen route; the full plan is [design/harvester-plan.md](design/harvester-plan.md). The package and subtitle readers are in `crates/harvest`, and `vi harvest scan|package|tlk` exercises them on an install. For LE2/LE3, with `vgmstream-cli` on `PATH`:
+The chosen route; the full plan is [design/harvester-plan.md](design/harvester-plan.md). The package and subtitle readers are in `crates/harvest`, and `vi harvest scan|package|tlk` exercises them on an install. With `vgmstream-cli` on `PATH`:
 
 ```
 vi extract --character characters/tali "<LE root>" --out corpus/tali/harvest

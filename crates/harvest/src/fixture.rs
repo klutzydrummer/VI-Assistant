@@ -208,6 +208,10 @@ pub enum Prop<'a> {
     Array(&'a str, Vec<u8>),
     /// A name value.
     Name(&'a str, &'a str),
+    /// A TLK string id.
+    StrRef(&'a str, i32),
+    /// A string, stored as UTF-16.
+    Str(&'a str, &'a str),
 }
 
 struct FixtureExport {
@@ -301,6 +305,13 @@ impl PackageBuilder {
                     let mut value = Vec::new();
                     self.put_name(&mut value, v);
                     (n, "NameProperty", vec![], value)
+                }
+                Prop::StrRef(n, v) => (n, "StringRefProperty", vec![], v.to_le_bytes().to_vec()),
+                Prop::Str(n, v) => {
+                    let units: Vec<u16> = v.encode_utf16().chain([0]).collect();
+                    let mut value = (-(units.len() as i32)).to_le_bytes().to_vec();
+                    value.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+                    (n, "StrProperty", vec![], value)
                 }
             };
             self.put_name(&mut out, name);

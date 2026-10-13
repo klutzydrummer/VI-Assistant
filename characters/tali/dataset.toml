@@ -4,10 +4,13 @@
 
 corpus = "../../corpus/tali"
 
-# For now harvest imports the LE2/LE3 extraction already in the corpus
-# (corpus/tali/harvest, made by `vi extract` with conversation
-# context). Once that extractor is merged this becomes
-# ["vi", "extract", "--character", ".", "<LE install>"].
+# For now harvest imports the extraction already in the corpus
+# (corpus/tali/harvest: LE1, LE2 and LE3, made by `vi extract` with
+# conversation context). To extract from the game instead (needs
+# `vgmstream-cli` on PATH; the first run hashes the whole 118 GB game folder,
+# so start it at low priority):
+#   command = ["vi", "extract", "--character", ".", "/mnt/data/Media/Games/steam/steamapps/common/Mass Effect Legendary Edition"]
+#   files = ["sources.toml", "/mnt/data/Media/Games/steam/steamapps/common/Mass Effect Legendary Edition/Game"]
 [stage.harvest]
 command = ["sh", "-c", "cp -a \"$VI_CORPUS/harvest/.\" \"$VI_OUT/\""]
 files = ["corpus:harvest"]

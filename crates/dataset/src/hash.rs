@@ -82,6 +82,11 @@ struct Stamp {
     sha256: String,
 }
 
+/// How many bytes of newly hashed files may pile up before the cache is
+/// saved, so an interrupted first pass over the game folder keeps most of
+/// its progress.
+const CHECKPOINT_BYTES: u64 = 1 << 30;
+
 /// Remembers file hashes by path, size and modification time, so large
 /// inputs such as the game folder are read in full only once.
 #[derive(Debug, Default)]
@@ -89,6 +94,8 @@ pub struct HashCache {
     path: Option<PathBuf>,
     entries: BTreeMap<String, Stamp>,
     dirty: bool,
+    /// Bytes hashed since the last save.
+    unsaved_bytes: u64,
 }
 
 impl HashCache {
@@ -104,6 +111,7 @@ impl HashCache {
             path: Some(path),
             entries,
             dirty: false,
+            unsaved_bytes: 0,
         }
     }
 
@@ -122,6 +130,7 @@ impl HashCache {
         fs::write(&tmp, json).at(&tmp)?;
         fs::rename(&tmp, path).at(path)?;
         self.dirty = false;
+        self.unsaved_bytes = 0;
         Ok(())
     }
 
@@ -151,6 +160,10 @@ impl HashCache {
             },
         );
         self.dirty = true;
+        self.unsaved_bytes += meta.len();
+        if self.unsaved_bytes >= CHECKPOINT_BYTES {
+            self.save()?;
+        }
         Ok(sha256)
     }
 
@@ -176,6 +189,24 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_large_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cache.json");
+        let mut cache = HashCache::load(&store);
+        let small = dir.path().join("small");
+        fs::write(&small, b"x").unwrap();
+        cache.file(&small).unwrap();
+        assert!(!store.exists(), "small files wait for an explicit save");
+        // Pretend a gigabyte was already hashed: the next file saves.
+        cache.unsaved_bytes = CHECKPOINT_BYTES;
+        let other = dir.path().join("other");
+        fs::write(&other, b"y").unwrap();
+        cache.file(&other).unwrap();
+        assert!(store.exists());
+        assert_eq!(HashCache::load(&store).entries.len(), 2);
+    }
 
     #[test]
     fn matches_sha256sum() {
