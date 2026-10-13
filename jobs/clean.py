@@ -47,6 +47,11 @@ from vi_job import (
 # judged against it: on the smoke test every clip under 1.6 s and every sigh
 # scored far from her, without being anyone else.
 SPEAKER_REFERENCE_MIN_S = 1.5
+# Each game gets its own median voice and threshold once it has this many
+# reference clips: the speaker embedding hears each game's recording and mix
+# (on the smoke test it told the games apart 72% of the time, 45% by chance).
+# Smaller groups use the all-games baseline.
+SPEAKER_GROUP_MIN = 20
 
 
 def free():
@@ -105,13 +110,14 @@ def main():
     del spk
     free()
     judged = {c.id for c in live if c.duration_s >= SPEAKER_REFERENCE_MIN_S and not c.nonverbal}
-    reference = [voice[cid] for cid in judged] or list(voice.values())
-    centre = unit([statistics.median(col) for col in zip(*reference)]) if reference else []
-    similarity = {cid: round(dot(unit(v), centre), 4) for cid, v in voice.items()}
-    ref_sims = [similarity[cid] for cid in judged] or list(similarity.values())
-    med = statistics.median(ref_sims) if ref_sims else 0.0
-    mad = statistics.median(abs(x - med) for x in ref_sims) if ref_sims else 0.0
-    far_below = med - float(s.get("far_voice_mads", 4)) * max(mad, 1e-3)
+    mads = float(s.get("far_voice_mads", 4))
+    baselines = {"all": baseline(voice, judged, list(voice), mads)}
+    for game in sorted({c.game for c in live}):
+        members = [c.id for c in live if c.game == game]
+        if sum(cid in judged for cid in members) >= SPEAKER_GROUP_MIN:
+            baselines[game] = baseline(voice, judged, members, mads)
+    group = {c.id: c.game if c.game in baselines else "all" for c in live}
+    similarity = {cid: round(dot(unit(v), baselines[group[cid]]["centre"]), 4) for cid, v in voice.items()}
 
     # 4. Quality.
     measure = models.fake_quality if fake else models.quality
@@ -137,19 +143,31 @@ def main():
                 r["transcript"] = heard[c.id]
                 r["flags"].append("asr_only")
         r["speaker_similarity"] = similarity[c.id]
-        if c.id in judged and similarity[c.id] < far_below:
+        if c.id in judged and similarity[c.id] < baselines[group[c.id]]["far_below"]:
             r["flags"].append("far_voice")
         r["quality"] = mos[c.id]
         records.append(r)
 
     write_jsonl(out / "clips.jsonl", records)
     embeddings = {"speaker": write_embeddings(out / "embeddings", "speaker", speaker_model, voice)}
-    report = summary(records, embeddings, asr_model, med, mad, far_below)
+    report = summary(records, embeddings, asr_model, baselines)
     (out / "clean.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
     log(f"clean: {report['kept']} kept, flags {report['flags']}")
 
 
-def summary(records, embeddings, asr_model, med, mad, far_below):
+def baseline(voice, judged, members, mads):
+    """Her median voice among `members` (from the judged ones, or all of them
+    if none is judged), and how far below it counts as a far voice."""
+    reference = [voice[cid] for cid in members if cid in judged] or [voice[cid] for cid in members]
+    centre = unit([statistics.median(col) for col in zip(*reference)]) if reference else []
+    sims = [dot(unit(v), centre) for v in reference]
+    med = statistics.median(sims) if sims else 0.0
+    mad = statistics.median(abs(x - med) for x in sims) if sims else 0.0
+    return {"centre": centre, "references": len(reference), "median": round(med, 4),
+            "mad": round(mad, 4), "far_below": round(med - mads * max(mad, 1e-3), 4)}  # fmt: skip
+
+
+def summary(records, embeddings, asr_model, baselines):
     kept = [r for r in records if r["keep"]]
     flags = {}
     for r in records:
@@ -164,9 +182,8 @@ def summary(records, embeddings, asr_model, med, mad, far_below):
         "asr_model": asr_model,
         "embeddings": embeddings,
         "subtitle_wer": quantiles(wers),
-        "speaker_similarity": {**quantiles([r["speaker_similarity"] for r in kept]),
-                               "median_of_references": round(med, 4), "mad": round(mad, 4),
-                               "far_voice_below": round(far_below, 4)},  # fmt: skip
+        "speaker_similarity": quantiles([r["speaker_similarity"] for r in kept]),
+        "speaker_baselines": {g: {k: v for k, v in b.items() if k != "centre"} for g, b in baselines.items()},
         "least_like_her": [r["id"] for r in sims[:20]],
         "quality_ovr": quantiles([r["quality"]["ovr"] for r in kept]),
     }

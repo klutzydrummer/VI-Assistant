@@ -39,7 +39,7 @@ files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py
          "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
 
 [stage.discover.settings]
-emotion = "emotion2vec/emotion2vec_base"
+emotion = "emotion2vec/emotion2vec_plus_large"  # base mostly encoded clip length
 text_embed = "sentence-transformers/all-MiniLM-L6-v2"
 audio_llm = "google/gemma-4-12B-it"
 compare = 200       # clips also captioned with their words shown

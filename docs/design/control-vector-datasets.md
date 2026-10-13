@@ -56,7 +56,7 @@ Built as `jobs/clean.py` (decided 2026-10-13): it runs on the worker (Whisper la
 
 ### 3. Discover (GPU)
 Before scoring anything, let the data say what's there, so we find axes the pack is missing:
-- Embed every clip three ways: an emotion representation (plain emotion2vec, which gives a rich embedding rather than four classes), prosody (pitch, energy, speaking rate), and the text with its context.
+- Embed every clip three ways: an emotion representation (emotion2vec+'s utterance embedding, not just its class scores; plain emotion2vec was the first choice, but on the smoke test its embedding mostly encoded clip length, R² 0.81 against 0.35 for emotion2vec+), prosody (pitch, energy, speaking rate), and the text with its context.
 - Cluster (UMAP, then HDBSCAN) and, for each cluster, pull exemplar clips and have the LLM summarize what its lines have in common.
 - In parallel, the audio LLM captions every line with free-form emotion words, and we cluster that vocabulary too. These captions are for discovery only: they name clusters and suggest axes, and their per-axis guesses are not a label signal (stage 4).
 - Compare against the pack's variables. Clusters no axis covers become candidate axes (flustered, awed, determined, tender...), and you decide which to add to `states.toml`.

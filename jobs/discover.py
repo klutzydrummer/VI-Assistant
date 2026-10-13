@@ -12,7 +12,7 @@ cluster. Plan: docs/design/control-vector-datasets.md, step 3. Outputs
   prosody.jsonl    {id, duration_s, f0_median_hz, ..., words_per_s}
   clusters.md      what each cluster seems to be, and the emotion vocabulary
   discover.json    counts and the with/without-words comparison
-  embeddings/      emotion.npy (emotion2vec per clip) and text.npy (lines
+  embeddings/      emotion.npy (emotion2vec+ per clip) and text.npy (lines
                    with words), each with a .ids file giving the row order
 
 Settings: backend ("fake" for tests), emotion (embedding model), text_embed,
@@ -65,7 +65,7 @@ def main():
     log(f"discover: {len(clips)} clips, axes {', '.join(a.id for a in axes)}")
 
     # 1. Acoustic emotion embeddings.
-    emotion_model = s.get("emotion", "emotion2vec/emotion2vec_base")
+    emotion_model = s.get("emotion", "emotion2vec/emotion2vec_plus_large")
     embedded = Checkpoint("emotion")
     if embedded.todo(clips):
         e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(emotion_model)
