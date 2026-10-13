@@ -159,9 +159,9 @@ enum Node {
 }
 
 /// The strings in the binary part of an LE1 `BioTlkFile` export. Each
-/// export holds a single variant; the package names them (`tlk`, `tlk_M`,
-/// `GlobalTlk_tlk`, ...). **Verify** on real files which name is which
-/// gender.
+/// export holds a single variant and language; the package names them
+/// `<table>.tlk` (female Shepard), `<table>.tlk_M` (male), and
+/// `<table>.tlk_DE`, `<table>.tlk_M_DE` and so on for other languages.
 pub fn parse_le1(binary: &[u8]) -> Result<BTreeMap<i32, String>> {
     let mut r = Reader::new(binary);
     let entry_count = r.len("entry count")?;

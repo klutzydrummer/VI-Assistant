@@ -6,7 +6,11 @@ license.workspace = true
 description = "Reads Mass Effect Legendary Edition game files (packages, TLK subtitles) for the dataset harvester"
 
 [dependencies]
+dataset = { path = "../dataset" }
 oozextract = "0.5.5"
+rubato = "5"
+serde_json = "1"
+toml = "0.8"
 thiserror = "1"
 
 [dev-dependencies]

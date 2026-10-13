@@ -1,13 +1,14 @@
 # Harvester plan (dataset stage 1)
 
-Status: 2026-10-12. Readers for milestones 1 to 3 (inventory, packages with Oodle decompression, both TLK layouts) are in `crates/harvest`, tested only on synthetic files; try them with `vi harvest scan|package|tlk`. Nothing yet tested against real game files. Everything marked **verify** must be checked on Brandon's install before code depends on it.
+Status: 2026-10-12. Readers for milestones 1 to 3 (inventory, packages with Oodle decompression, both TLK layouts) are in `crates/harvest`; try them with `vi harvest scan|package|tlk`. `vi extract` covers milestone 5 for LE2/LE3 (clips plus subtitles found through stream names, without the conversation graph). LE1 audio, the conversation reader, context and scene tags are still to do.
 
-Assumptions the readers make that the first run on the real install must confirm (`vi harvest scan <LE root> --open` exercises all of them):
-- The header's compression type for Leviathan is `0x400`.
-- Export table entries have no component map (68 bytes plus 4 per net object).
-- Export data starts with a 4-byte net index; bool tags hold a 1-byte value; byte tags carry an enum name.
-- LE1 `BioTlkFile` data: `(id, flags, index)` entries, tagged tree nodes, then per string an unused i32, a byte length and the bits. Which export name (`tlk`, `tlk_M`) is which Shepard gender is unknown.
-- The synthetic tests can't produce real Leviathan streams (no open encoder), so the first real package is also the first real test of `oozextract` on game data.
+Checked on Brandon's install (Steam, all three games plus DLC):
+- All 19,430 package headers parse. The compression type is `0x400` (Leviathan); a few hundred packages are uncompressed. Every package decompresses with `oozextract`.
+- Export table entries have no component map, and export data starts with a 4-byte net index: property tags walk cleanly to the binary part on every `BioConversation` sampled in all three games. LE1 bool tags have a value size of 0 with the 1-byte value in the tag.
+- All 719 LE2/LE3 `.tlk` files and the `BioTlkFile` exports in all 490 LE1 `_LOC_INT` packages decode to the right text. LE2/LE3 female tables hold a single entry each; gendered lines mostly have their own string ids.
+- LE1 `_LOC_INT` packages carry every language, named `<table>.tlk`, `<table>.tlk_M`, `<table>.tlk_DE`, `<table>.tlk_M_DE` and so on. `_M` is male Shepard, no suffix is female (the Czech tables use "velitelko" in the plain one and "veliteli" in `_M`). The English pair is identical in all 490 `_LOC_INT` packages and in `Startup_INT.pcc`.
+- Dialogue `WwiseStream` names: LE2 `en_us_<speaker tag>_<conversation>_<8-digit string id>_<m|f>_wav` (the conversation is also the `BankName` property, which is how tag and conversation are split); LE3 `en-us,<speaker tag>,<conversation>,<8-digit string id>_<m|f>_wav`. Tali is `hench_tali` in both games.
+- `WwiseStream` binary ends with the 16-byte bulk header (flags 1, element count, size on disk, offset into the `.afc`); LE2 has 8 more bytes in front. The bytes at the offset are a complete RIFF `.wem`, Wwise Vorbis at **44.1 kHz** mono, not 24 kHz. vgmstream decodes them.
 
 Goal: on Brandon's NixOS machine, read the Mass Effect Legendary Edition install and write every Tali line as a clip plus a record: audio, subtitle (via TLK string id), speaker, surrounding lines, and scene tags. This is stage 1 of [control-vector-datasets.md](control-vector-datasets.md). Output follows [corpus-format.md](corpus-format.md) v1.
 
@@ -110,10 +111,10 @@ Everything stays local and gitignored (`extracted/`, `corpus/`, `characters/*/vo
 
 ## Open questions to settle on real files
 
-1. WwiseStream naming and speaker tags for Tali in LE2/LE3.
+1. ~~WwiseStream naming and speaker tags for Tali in LE2/LE3~~: settled, see the status section.
 2. The LE1 FaceFX to SoundCue to ISACT sample path, and Tali's LE1 speaker tag.
 3. What LE3 stage directions actually say.
-4. Source sample rate of dialogue (docs say 24 kHz; LEC reads it per stream).
+4. ~~Source sample rate of dialogue~~: 44.1 kHz on the clips checked; the harvester resamples to 24 kHz.
 5. Whether Legendary Explorer runs under Wine on NixOS (only matters for the cross-check).
 6. How many Tali lines exist per game (the dataset plan guesses a few thousand total).
 

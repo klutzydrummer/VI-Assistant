@@ -7,8 +7,9 @@
 //! value. This module only walks the tags; reading values needs a schema
 //! per class and comes with the conversation reader.
 //!
-//! **Verify** on real exports: the 4-byte prefix, 1-byte bools and enum
-//! names on byte properties (all expected for engine versions 684/685).
+//! Checked on a real install: the 4-byte prefix and 1-byte bools hold for
+//! `BioConversation`, `BioTlkFile` and `WwiseStream` exports in all three
+//! games. Enum names on byte properties are still unchecked.
 
 use crate::package::{FName, Package};
 use crate::reader::Reader;

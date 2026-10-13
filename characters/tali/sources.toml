@@ -1,0 +1,11 @@
+# Where Tali's lines are in the game files, for `vi extract`.
+# Speaker tags as they appear in dialogue stream names, per game. Found by
+# counting every stream's tag on the Legendary Edition install: in LE2 and
+# LE3 she is only ever `hench_tali` (the other tags containing "tali" are
+# NPCs in her scenes, like `citprs_taliplot_csec`).
+
+[le2]
+speaker_tags = ["hench_tali"]
+
+[le3]
+speaker_tags = ["hench_tali"]
