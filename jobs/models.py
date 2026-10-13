@@ -263,8 +263,10 @@ def caption_prompt(clip, axes, with_text=False):
         "Scores: 0 none, 0.3 a hint, 0.6 clear, 1 overwhelming. Most lines are close to neutral.\n"
         f"Axes:\n{axes_text(axes)}"
     )
+    # The audio goes before the instructions: after them, Gemma 4 answered
+    # 14 of 40 clips by asking for the audio file.
     return [
-        {"role": "user", "content": [{"type": "text", "text": text}, {"type": "audio", "audio": str(clip.audio)}]},
+        {"role": "user", "content": [{"type": "audio", "audio": str(clip.audio)}, {"type": "text", "text": text}]},
         {"kind": "caption", "axes": [a.id for a in axes]},
     ]
 
