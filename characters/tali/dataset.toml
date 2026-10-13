@@ -1,0 +1,15 @@
+# Tali's dataset pipeline. Run from the repo root with
+#   vi dataset run characters/tali/dataset.toml
+# with `vgmstream-cli` on PATH. Outputs go to corpus/tali/stages/, which
+# git ignores; see docs/design/corpus-format.md.
+#
+# The game path is Brandon's Steam install. Hashing it (the `files` entry)
+# reads the whole 111 GB folder once; after that the hash cache only checks
+# sizes and modification times.
+
+corpus = "../../corpus/tali"
+
+[stage.harvest]
+command = ["vi", "extract", "--character", ".", "/mnt/data/Media/Games/steam/steamapps/common/Mass Effect Legendary Edition"]
+version = 1
+files = ["sources.toml", "/mnt/data/Media/Games/steam/steamapps/common/Mass Effect Legendary Edition/Game"]
