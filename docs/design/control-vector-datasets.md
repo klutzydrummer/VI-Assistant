@@ -1,8 +1,15 @@
 # Control vector datasets
 
-Status: plan approved 2026-10-12. Built: the stage runner, the GPU worker wrapper, harvest for LE2/LE3, and the discover and label jobs (`jobs/discover.py`, `jobs/label.py`, pipeline `characters/tali/dataset.toml`; signal fusion in `jobs/fusion.py`). Discover and label have only run with fake models so far; their first real run is on the LE2/LE3 test set.
+Status: plan approved 2026-10-12, revised 2026-10-13 after the 40-clip smoke test and a review of others' work ([primer](https://claude.ai/code/artifact/b314b4d6-516e-4fd2-a2b4-c8cda4158380)). Built: the stage runner, the GPU worker wrapper, harvest for LE2/LE3, and the discover and label jobs (`jobs/discover.py`, `jobs/label.py`, pipeline `characters/tali/dataset.toml`; signal fusion in `jobs/fusion.py`), which now save their embeddings. Smoke-tested on 40 real clips; the full run waits until the corpus is complete.
 
 Decided: clips move only by direct rsync to the rented GPU, never through a third-party host (copyrighted material). Brandon will do about an hour of label review.
+
+Revised 2026-10-13:
+- **Reviews are the ground truth.** Agreement between our own signals is a health check, not accuracy. Each signal earns its weight per axis by matching Brandon's labels.
+- **Specialist models measure; the audio LLM only checks.** Gemma names discover's clusters and rates a per-axis shortlist on tone; it no longer captions and scores every clip.
+- **Channel is a first-class attribute.** Tali's helmet and radio filtering would otherwise dominate clustering and bias the acoustic models.
+- **Steering is gated per axis.** An axis ships as a vector only if its strength sweep passes on open-ended chat; otherwise it falls back to prompting plus retrieved example lines.
+- **Finish Tali end to end before a second character** (candidate: Carl from Aqua Teen Hunger Force, a different source, to test the method rather than the extractor).
 
 Goal: from a character's own recorded lines, produce one control vector per mixing-table row (`tts`/`sad`, `llm`/`drunk`, ...) for the chosen models, with a tested maximum strength for each. Same pipeline for every character; Tali first.
 
@@ -12,8 +19,8 @@ The pack's `[[mix]]` rows list every vector we need, and its variables (joy, sad
 ## Stages
 
 ```
-harvest -> clean -> discover -> label -> review -> contrast sets -> extract -> evaluate
- (home)    (home)    (GPU)      (GPU)    (home)       (home)         (GPU)     (GPU)
+harvest -> clean -> discover -> label -> review -> calibrate -> contrast sets -> extract -> evaluate
+ (home)    (home)    (GPU)      (GPU)    (home)   (home + GPU)     (home)         (GPU)     (GPU)
 ```
 
 Each stage writes content-addressed output and records the hashes of its inputs and settings, so rerunning only redoes stages whose inputs changed (a new label rule doesn't re-harvest). `vi dataset run` in Rust orchestrates (file formats and caching rules: [corpus-format.md](corpus-format.md)); GPU stages are Python jobs, since the models are PyTorch, sent to the same rented worker as batch work.
@@ -31,15 +38,20 @@ Output: `corpus/<character>/lines.jsonl` plus `audio/`. Local only, gitignored. 
 - Trim silence, normalize loudness, keep clips of 1 to 20 seconds.
 - Run speech recognition (Whisper) only to verify the game subtitle. Small differences (an ad-lib, a trimmed word) mean we keep the clip and use Whisper's words as the exact transcript; a large mismatch means extraction mapped the wrong clip, so drop or flag it.
 - Flag clips with music or effects mixed in (rare for game dialogue, but cutscenes happen).
+- Tag each clip's **channel** (clean, helmet, radio). Later stages standardize and calibrate per channel, and TTS references and steering contrasts stay within one channel.
+- **Speaker check**: a speaker-verification embedding per clip, and its distance from Tali's median voice per channel. Far-off clips are flagged as another voice. This replaces asking the audio LLM, which tagged another voice on every smoke-test clip.
+- A **quality score** (DNSMOS or similar) as an attribute for choosing TTS references, not a filter: quality models rate filtered speech low and would delete her combat lines.
+- Tag each line's **point in the story** (game, and act where known), for the persona.
+- Deduplicate on game file id, then on transcript plus audio hash.
 
 ### 3. Discover (GPU)
 Before scoring anything, let the data say what's there, so we find axes the pack is missing:
-- Embed every clip three ways: an emotion representation (plain emotion2vec, which gives a rich embedding rather than four classes), prosody (pitch, energy, speaking rate), and the text with its context.
-- Cluster (UMAP, then HDBSCAN) and, for each cluster, pull exemplar clips and have the LLM summarize what its lines have in common.
-- In parallel, the LLM tags every line with free-form emotion words, and we cluster that vocabulary too.
+- Embed every clip three ways: an emotion representation (plain emotion2vec, which gives a rich embedding rather than four classes), prosody (pitch, energy, speaking rate), and the text with its context. The embeddings are saved for calibration and "more like this" in review.
+- Standardize within each channel and factor out clip length, then cluster (UMAP, then HDBSCAN). Rerun with other seeds and keep only clusters that come back.
+- For each cluster, pull exemplar clips and have the audio LLM summarize what they have in common. Cluster names are hints; reviews and fused labels decide what a cluster is.
 - Compare against the pack's variables. Clusters no axis covers become candidate axes (flustered, awed, determined, tender...), and you decide which to add to `states.toml`.
 
-**Audio language model.** An open-weight audio LLM (default candidate: Gemma 4 12B, reportedly Apache 2.0 with native audio input at 16 kHz, which fits a 24 GB card at 8-bit; Qwen3-Omni as the alternative) listens to each clip and writes a short free-form description: delivery, laughter, whispering, slurring, shouting, background music or effects, other voices. It handles the open-ended jobs the fixed models can't: discovery captions, filtering bad clips, and spotting things like drunk delivery. It does not replace the acoustic emotion models. A 2025 benchmark (LISTEN) found current audio LLMs mostly judge emotion from the words rather than the sound, so delivery scores still come from emotion2vec and the arousal/valence model. Gemma 4 12B can also be the text and context judge in the labeling stage, so one model covers both jobs. We check this on Tali's own data: caption a sample with and without the transcript visible, and trust the audio LLM only on what it hears without the words.
+**Audio language model.** Gemma 4 12B (Apache 2.0, native audio) names clusters here and rates shortlists in calibrate. It does not label every clip: studies (LISTEN, EmoVoice) found audio LLMs judge emotion mostly from the words and track people poorly per clip (Spearman about 0.2 to 0.26, against 0.40 for emotion2vec), and on the smoke test its captions were near-identical and it refused clips under about 1.6 s. Gemma 4 12B is also the text and context judge in label, where reading words is what we want.
 
 Clusters will also pick up things that aren't emotion: combat barks vs conversation, ME1 vs ME3 recording differences, line length. Those get labeled as such, and the useful ones become filters (combat barks out of most contrast sets) rather than axes.
 
@@ -49,16 +61,20 @@ Independent signals per line, fused (plus the audio LLM's tags from discovery as
 2. **Text and context judge**: an open-weight LLM on the worker reads the line with its context and scores each pack variable from 0 to 1, with a confidence, under constrained JSON output. It catches what audio models can't, like playfulness, worry and intoxication.
 3. **Scene priors**: tags like "Citadel party" set a prior for intoxication, which no emotion model detects.
 
-Fusion: a weighted average per axis. Lines where the signals disagree get a low confidence and go to review first.
+Fusion: a weighted average per axis, with different weights per axis (acoustics count most for anger and worry; the text judge and director notes for sadness, playfulness and intoxication). Lines where the signals disagree get a low confidence. Disagreement between script and voice (an angry line delivered flat) is kept as information, not averaged away.
 
 Both audio models carry non-commercial licenses (audeering is CC BY-NC-SA). That's fine for personal use; swap them if that ever changes.
 
 ### 5. Review (home)
-A small local review page: plays a clip, shows its scores, and you accept or nudge them. Clips are queued by uncertainty and by how much they'd change a vector, so roughly an hour of review covers what matters. Your corrections also recalibrate the fusion weights. This stage is optional but makes the biggest quality difference.
+A small local review page: plays a clip, shows its scores, and you accept or nudge them. About 150 random clips come first, so calibration isn't biased toward hard cases; then the queue orders clips by uncertainty and by how much they'd change a vector, with "more like this" from the saved embeddings. Roughly an hour covers what matters. This stage makes the biggest quality difference.
+
+### 5b. Calibrate (home, plus a short GPU pass)
+- Fit the fusion weights per axis to the reviews, and train small per-axis probes on the saved embeddings (these also give an audio signal on axes no emotion2vec+ class maps to). Keep, per axis, only the signals that beat the others against the reviews, and publish a per-axis accuracy table.
+- **Shortlist rating** (the ParaSpeechCaps cascade): per axis, take the top candidates by fused score, and have Gemma rate how well the delivery fits on a 1 to 5 scale, focusing on tone. Only top-rated clips become positives in contrast sets and TTS references.
 
 ### 6. Contrast sets (home)
 For each axis, select:
-- **Positives**: lines high on that axis and low on the others, so "sad" doesn't secretly encode "drunk".
+- **Positives**: shortlisted lines high on that axis and low on the others, so "sad" doesn't secretly encode "drunk", from one channel so the vector doesn't learn "helmet".
 - **Negatives**: neutral lines matched on length and speaking rate.
 
 For the LLM, also build **minimal pairs**: the judge model rewrites each positive line into a neutral version with the same content, so a pair differs only on that axis. That's the cleanest steering signal, and it's text-only, so it's cheap.
@@ -78,8 +94,10 @@ For each vector, sweep strength from 0 upward and measure:
 
 The highest strength that passes all checks becomes the suggested `max` for that mixing-table row. Then check pairs (sad + drunk, playful + drunk) to confirm both still come through when blended. Output is a short report with audio samples to listen to.
 
+LLM sweeps run on open-ended chat, not single sentences: steering effects vary a lot per input and some axes don't steer at all. An axis that fails ships without a vector and falls back to prompting plus retrieved example lines for that mood. People judge per-clip TTS results; emotion2vec labelled the data, so it can't be the only judge of the output.
+
 ## Order with the bake-off
-Harvest, clean and label first. The labeled clips feed the TTS bake-off, which narrows the field to one or two engines whose backbone we can hook. Only then extract and evaluate vectors, so we pay for extraction once per engine we'd actually use.
+Harvest, clean and label first. The labeled clips feed the TTS bake-off, which narrows the field to one or two engines whose backbone we can hook. Before building TTS extraction, test on one axis (sadness) whether steering beats simply choosing an emotion-matched reference clip from the labelled corpus; build extraction only if it does. Test with both matching and mismatched text, since the words override the reference's emotion in current models.
 
 ## Moving data
 Clips go from home to the worker by rsync over the same SSH tunnel as everything else, roughly a few hundred MB as FLAC for Tali. Results (labels, vectors, reports) come back home. Nothing stays on the worker. Game audio never goes through a third-party host.
@@ -92,6 +110,9 @@ On a rented RTX 3090 at about $0.14/hour, my estimates:
 - evaluation sweeps: about an hour
 
 Total is a few dollars for Tali, well inside the $25.
+
+## Persona
+The harvest doubles as the persona's memory: index real lines by situation and mood for retrieval at chat time, which is what captured character voice best in others' work. Start with one "latest" Tali; story-point tags keep a selectable point in the story possible later. The mood director restates persona and current mood every turn, since personas drift within a few turns.
 
 ## Other characters
 Harvest is the only character-specific stage. For characters without game files, a later source adapter can take recordings (videos, audiobooks), isolate the character with speaker diarization (which the speech input work needs anyway), and feed the same pipeline.
