@@ -184,6 +184,19 @@ Stage names are fixed by convention: `harvest`, `clean`, `label`. For a corpus f
 
 Rust code can call `dataset::runner::current_out(corpus, stage)` for those folders.
 
+### calibrate: `labels.jsonl` + `axes.json` + `calibration.json`
+Written by `jobs/calibrate.py` at home (CPU; numpy and scikit-learn through nix-shell), from label's output and `corpus:reviews.jsonl`.
+- `labels.jsonl`: label's schema, refitted.
+  - Each axis gains a `probe` signal: a ridge regression from the clip's emotion2vec+ embedding to the reviewed scores, out-of-fold on reviewed clips.
+  - Each axis is refused with weights fitted to the reviews.
+  - Reviewed clips (`reviewed: true`) take the reviewed value with confidence 1 and a `review` signal.
+  - Flagged clips carry `flagged: <reason>`.
+
+  Later stages (contrast sets) read this instead of label's.
+- `calibration.json`: per axis, the fitted weights and each signal's and the fused score's Spearman and mean absolute error against the reviews on the calibration sample, before and after calibration. The sample is the random clips the review page shows first: the 150 ids whose lowercase hex SHA-256 sorts first. Weights are fit on reviewed clips outside the sample when there are at least `min_reviews` of them, so the sample stays an honest test.
+
+A signal's weight on an axis is its Spearman with the reviews, squared, scaled so the best signal is 1, and 0 below 0.1. An axis with fewer than `min_reviews` reviews keeps the defaults.
+
 ### contrast: `<target>/<axis>/positives.jsonl`, `negatives.jsonl`, `pairs.jsonl`
 Records are `{"id": ...}` plus, for pairs, `{"id": ..., "neutral_text": ...}`.
 

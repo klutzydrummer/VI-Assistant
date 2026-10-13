@@ -110,7 +110,10 @@ def fuse(signals, weights):
         total += w
         acc += w * v
         present.append((v, w))
-    out = {"signals": {n: (None if s is None else round(s[0], 4)) for n, s in signals.items()}}
+    out = {
+        "signals": {n: (None if s is None else round(s[0], 4)) for n, s in signals.items()},
+        "signal_confidence": {n: round(s[1], 4) for n, s in signals.items() if s is not None},
+    }
     if total == 0:
         out.update(value=0.0, confidence=0.0)
         return out

@@ -82,7 +82,7 @@ A small local review page: plays a clip, shows its scores, and you accept or nud
 2. **Uncertainty queue**: then clips ordered by low fused confidence and by how much they'd change a vector.
 
 ### 5b. Calibrate (home, CPU)
-Fit everything to the reviews:
+Built 2026-10-13 as `jobs/calibrate.py` (format: corpus-format.md, calibrate). Fit everything to the reviews:
 - **Per-axis probes**: a small classifier per axis on the saved embeddings, trained on reviewed clips. It gives every axis an audio signal, including playfulness and intoxication, which no emotion2vec+ class covers, and it learns her helmet-filtered voice instead of assuming the generic class mapping.
 - **Fusion weights** refit per axis against the reviews.
 - **Signal selection**: a signal that doesn't beat chance against the reviews on an axis gets weight 0 there.
