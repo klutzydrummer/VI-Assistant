@@ -88,9 +88,9 @@ def main():
     spoken = [c for c in live if not c.nonverbal]
     saved = Checkpoint("asr")
     asr = None
-    if len(saved.done) < len(spoken):
+    if saved.todo(spoken):
         asr = (models.FakeWhisper if fake else models.Whisper)(asr_model, batch=int(s.get("batch", 16)))
-    heard = saved.run(spoken, lambda part: asr(part), chunk=64, label="asr")
+    heard = saved.run(spoken, lambda part: asr(part), chunk=64)
     del asr
     free()
 
@@ -98,9 +98,9 @@ def main():
     speaker_model = s.get("speaker", "speechbrain/spkrec-ecapa-voxceleb")
     saved = Checkpoint("speaker")
     spk = None
-    if len(saved.done) < len(live):
+    if saved.todo(live):
         spk = (models.FakeSpeaker if fake else models.Speaker)(speaker_model)
-    voice = saved.run(live, lambda part: [spk(c) for c in part], label="speaker")
+    voice = saved.run(live, lambda part: [spk(c) for c in part])
     del spk
     free()
     reference = [voice[c.id] for c in live if c.duration_s >= SPEAKER_REFERENCE_MIN_S] or list(voice.values())
@@ -113,7 +113,7 @@ def main():
 
     # 4. Quality.
     measure = models.fake_quality if fake else models.quality
-    mos = Checkpoint("quality").run(live, lambda part: [measure(c) for c in part], label="quality")
+    mos = Checkpoint("quality").run(live, lambda part: [measure(c) for c in part])
 
     # 5. Records.
     mismatch_wer = float(s.get("mismatch_wer", 0.5))

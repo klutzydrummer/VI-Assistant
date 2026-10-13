@@ -67,47 +67,39 @@ def main():
 
     # Acoustic models.
     audio_model = s.get("audio", "emotion2vec/emotion2vec_plus_large")
-    saved = Checkpoint("acoustic")
-    e2v = dims = None
-    if len(saved.done) < len(clips):
+    acoustic = Checkpoint("acoustic")
+    if acoustic.todo(clips):
         e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(audio_model)
         dims = (models.FakeDimensions if fake else models.Dimensions)(
             s.get("dimensions", "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim")
         )
-    acoustic = saved.run(clips, lambda part: [[*e2v(c), dims(c)] for c in part], label="acoustic")
-    probs = {cid: v[0] for cid, v in acoustic.items()}
-    emb = {cid: v[1] for cid, v in acoustic.items()}
-    adv = {cid: v[2] for cid, v in acoustic.items()}
-    del e2v, dims
-    free()
+        acoustic.run(clips, lambda part: [[*e2v(c), dims(c)] for c in part])
+        del e2v, dims
+        free()
+    results = acoustic.run(clips, None)
+    probs = {i: r[0] for i, r in results.items()}
+    emb = {i: r[1] for i, r in results.items()}
+    adv = {i: r[2] for i, r in results.items()}
     embeddings = {"emotion": write_embeddings(out / "embeddings", "emotion", audio_model, emb)}
 
     # Text judge.
-    judge = models.Judge(
-        (models.FakeGemma if fake else models.Gemma)(
-            s.get("judge", "google/gemma-4-12B-it"),
-            batch=int(s.get("batch", 8)),
-            quant=s.get("quant", "auto"),
-        )
-    )
     readable = [c for c in clips if c.text.strip()]
     log(f"judging {len(readable)} lines with text")
-    replies = Checkpoint("judge").run(
-        readable,
-        lambda part: judge.json([models.judge_prompt(c, axes) for c in part]),
-        chunk=int(s.get("batch", 8)) * 4,
-        label="judge",
-    )
-    text = {}
-    unparsed = 0
-    for clip in readable:
-        r = replies[clip.id]
-        if not isinstance(r, dict):
-            unparsed += 1
-            continue
-        text[clip.id] = r
-    del judge
-    free()
+    judged = Checkpoint("judge")
+    if judged.todo(readable):
+        judge = models.Judge(
+            (models.FakeGemma if fake else models.Gemma)(
+                s.get("judge", "google/gemma-4-12B-it"),
+                batch=int(s.get("batch", 8)),
+                quant=s.get("quant", "auto"),
+            )
+        )
+        judged.run(readable, lambda part: judge.json([models.judge_prompt(c, axes) for c in part]), chunk=64)
+        del judge
+        free()
+    replies = judged.run(readable, None)
+    text = {i: r for i, r in replies.items() if isinstance(r, dict)}
+    unparsed = len(replies) - len(text)
 
     # The audio LLM's scores from discover.
     heard = {}

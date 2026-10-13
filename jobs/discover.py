@@ -66,16 +66,18 @@ def main():
 
     # 1. Acoustic emotion embeddings.
     emotion_model = s.get("emotion", "emotion2vec/emotion2vec_base")
-    saved = Checkpoint("emotion")
-    e2v = None if len(saved.done) >= len(clips) else (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(emotion_model)
-    emotion = saved.run(clips, lambda part: [e2v(c)[1] for c in part], label="emotion embeddings")
-    del e2v
-    free()
+    embedded = Checkpoint("emotion")
+    if embedded.todo(clips):
+        e2v = (models.FakeEmotion2Vec if fake else models.Emotion2Vec)(emotion_model)
+        embedded.run(clips, lambda part: [e2v(c)[1] for c in part])
+        del e2v
+        free()
+    emotion = embedded.run(clips, None)
     embeddings = {"emotion": write_embeddings(out / "embeddings", "emotion", emotion_model, emotion)}
 
     # 2. Prosody.
     measure = models.fake_prosody if fake else models.prosody
-    pros = Checkpoint("prosody").run(clips, lambda part: [measure(c) for c in part], label="prosody")
+    pros = Checkpoint("prosody").run(clips, lambda part: [measure(c) for c in part])
     write_jsonl(out / "prosody.jsonl", [{"id": cid, **p} for cid, p in pros.items()])
 
     # 3. Text embeddings, for lines with words.
@@ -98,18 +100,16 @@ def main():
     # Short clips padded with silence, outside VI_OUT so they aren't outputs.
     pad_dir = tempfile.TemporaryDirectory()
     audio = {c.id: c.audio if fake else models.padded(c, Path(pad_dir.name)) for c in hearable}
-    batch = int(s.get("batch", 8))
     replies = Checkpoint("captions").run(
         hearable,
         lambda part: gemma.json([models.caption_prompt(c, axes, audio=audio[c.id]) for c in part], max_new_tokens=200),
-        chunk=batch * 4,
-        label="captions",
+        chunk=64,
     )
     captions = {}
     failed = 0
     for clip in hearable:
         r = replies[clip.id]
-        if r is None:
+        if not isinstance(r, dict):
             failed += 1
             continue
         captions[clip.id] = clean_caption(r, axes)
@@ -121,13 +121,11 @@ def main():
         lambda part: gemma.json(
             [models.caption_prompt(c, axes, with_text=True, audio=audio[c.id]) for c in part], max_new_tokens=200
         ),
-        chunk=batch * 4,
-        label="captions with words",
+        chunk=64,
     )
     for clip in sample:
-        r = replies[clip.id]
-        if r is not None:
-            captions[clip.id]["with_text"] = clean_caption(r, axes)
+        if isinstance(replies[clip.id], dict):
+            captions[clip.id]["with_text"] = clean_caption(replies[clip.id], axes)
 
     write_jsonl(
         out / "captions.jsonl",

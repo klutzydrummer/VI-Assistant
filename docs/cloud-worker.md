@@ -62,9 +62,6 @@ files = ["../../jobs/label.py", "states.toml"]
 
 It rsyncs `jobs/`, the settings, each input folder and the `--put` files into a fresh folder on the worker, runs the command there with the usual `VI_*` variables pointing at the copies (`--put` files land in `files/`), rsyncs `VI_OUT` back, and deletes the folder on the worker whether the job worked or not. Game audio only ever travels between home and the worker over ssh, and doesn't outlive the job there. Destroying the instance wipes its disk too.
 
-### If the credit runs out mid-job
-The stage's checkpoint folder (`VI_CHECKPOINT`, see `design/corpus-format.md`) travels with the job and comes back home every `VI_CHECKPOINT_EVERY` seconds (default 120) and when the job ends. The jobs save per-clip results there as they go. So if the worker is destroyed partway (credit gone, watchdog, a lost machine), the stage fails at home with its progress on disk. To resume: top up the credit, `vi cloud up`, and run `vi dataset run` again. The stage starts from the last copy that reached home, losing at most a couple of minutes of work. Model downloads and package installs aren't checkpointed; a fresh worker repeats them.
-
-The checkpoint belongs to the stage's key, so changing a setting or a job script before resuming starts that stage over.
+**If the worker dies part way.** Jobs save each clip's results in `VI_CHECKPOINT` as they go, and `on-worker.sh` copies that folder home every `VI_SYNC_SECONDS` (default 60) and once more when the job ends, however it ends. If the instance is lost, the watchdog or `max_hours` ends it, or the credit runs out, the stage fails with its checkpoint at home in `stages/<stage>/.checkpoint-<key>/`. Run `vi cloud up` and `vi dataset run` again: the checkpoint goes up to the new worker and the job skips clips already done. At most about a minute of work is lost. Editing the job's code or settings in between starts the stage over.
 
 For tests, `VI_WORKER_HOST=local` with `VI_WORKER_ROOT=<folder>` runs the "worker" in a local folder; `crates/vi/tests/on_worker.rs` does this, so CI needs no GPU or rented machine.

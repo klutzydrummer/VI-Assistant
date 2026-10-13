@@ -193,25 +193,34 @@ fn failure_keeps_the_previous_run_current() {
 }
 
 #[test]
-fn a_failed_run_leaves_its_checkpoint_for_the_rerun() {
+fn a_failed_run_resumes_from_its_checkpoint() {
     let f = Fixture::new();
-    // Saves a checkpoint, then fails unless the previous run already saved one.
-    let job = "test -s \"$VI_CHECKPOINT/done\" && wc -c < \"$VI_INPUT_HARVEST/audio/clip.txt\" > \"$VI_OUT/count.txt\" && exit 0\necho step1 > \"$VI_CHECKPOINT/done\"\nexit 3\n";
-    fs::write(f.root.join("count.sh"), job).unwrap();
-    assert!(f.runner().run(None, false, |_| {}).is_err());
-    let stage = f.runner().stage_dir("count");
-    let saved: Vec<_> = fs::read_dir(&stage)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with(".checkpoint-"))
-        .collect();
-    assert_eq!(saved.len(), 1, "{saved:?}");
-    assert_eq!(read(&stage.join(&saved[0]).join("done")), "step1\n");
-
-    // Same key, so the rerun sees the checkpoint, and it's gone once it works.
+    // Counts its attempts in VI_CHECKPOINT and fails while `fail` exists.
+    let step = r#"n=$(cat "$VI_CHECKPOINT/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$VI_CHECKPOINT/n"; [ ! -e fail ] && cp "$VI_CHECKPOINT/n" "$VI_OUT/attempts""#;
+    f.edit(
+        "[stage.count]",
+        &format!("[stage.step]\ncommand = [\"sh\", \"-c\", {step:?}]\n\n[stage.count]"),
+    );
+    fs::write(f.root.join("fail"), "").unwrap();
+    f.runner().run(None, false, |_| {}).unwrap_err();
+    f.runner().run(None, false, |_| {}).unwrap_err();
+    fs::remove_file(f.root.join("fail")).unwrap();
     f.run();
-    assert!(f.current_out("count").join("count.txt").is_file());
-    assert!(!stage.join(&saved[0]).exists());
+    assert_eq!(read(&f.current_out("step").join("attempts")), "3\n");
+    // Gone once the run succeeds.
+    let stage_dir = f
+        .current_out("step")
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let left: Vec<_> = fs::read_dir(&stage_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".checkpoint-"))
+        .collect();
+    assert!(left.is_empty());
 }
 
 #[test]

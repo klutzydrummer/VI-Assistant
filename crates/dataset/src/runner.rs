@@ -25,9 +25,9 @@ pub const LOG: &str = "log.txt";
 pub const OUT: &str = "out";
 pub const CURRENT: &str = "current";
 const TMP_PREFIX: &str = ".tmp-";
-/// A run's checkpoint folder (VI_CHECKPOINT), named by its key. Unlike the
-/// run's own folder it survives a failed run, so a rerun with the same key
-/// resumes from what the failed one saved; it's deleted once the run works.
+/// Where a run keeps work it can resume from if it fails part way (a lost
+/// GPU worker, say); `VI_CHECKPOINT`. Survives failed runs of the same key,
+/// deleted once the run succeeds.
 const CHECKPOINT_PREFIX: &str = ".checkpoint-";
 
 /// The current output folder of `stage` in a corpus, for readers outside
@@ -302,9 +302,9 @@ impl Runner {
             .current_dir(&self.pipeline.dir)
             .env("VI_STAGE", name)
             .env("VI_OUT", &out)
+            .env("VI_CHECKPOINT", &checkpoint)
             .env("VI_SETTINGS", &settings_path)
             .env("VI_CORPUS", &self.pipeline.corpus)
-            .env("VI_CHECKPOINT", &checkpoint)
             .env("VI_BIN", &self.vi_bin)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -337,8 +337,9 @@ impl Runner {
             return Err(Error::Stage {
                 stage: name.into(),
                 message: format!(
-                    "{status}; partial output kept in {}\n{}",
+                    "{status}; partial output kept in {}, and a rerun resumes from {}\n{}",
                     tmp.display(),
+                    checkpoint.display(),
                     tail(&log_path, 20)
                 ),
             });
@@ -411,8 +412,8 @@ impl Runner {
         fs::rename(&tmp, &path).at(&path)
     }
 
-    /// Deletes runs that aren't current, failed partial runs and their
-    /// checkpoints, and objects no current run uses.
+    /// Deletes runs that aren't current, failed partial runs, and objects
+    /// no current run uses.
     pub fn gc(&mut self) -> Result<GcReport, Error> {
         let _lock = Lock::take(&self.pipeline.corpus)?;
         let mut report = GcReport::default();

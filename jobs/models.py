@@ -81,7 +81,7 @@ class Emotion2Vec:
             name = label.split("/")[-1]
             if name in E2V_CLASSES:
                 probs[name] = round(float(score), 4)
-        return probs, [float(x) for x in res["feats"]]
+        return probs, [float(f"{x:.6g}") for x in res["feats"]]  # float32 precision, half the JSON
 
 
 class Dimensions:
