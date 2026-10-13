@@ -93,16 +93,20 @@ def main():
             s.get("audio_llm", "google/gemma-4-12B-it"),
             batch=int(s.get("batch", 8)),
             quant=s.get("quant", "auto"),
+            batch_audio_s=float(s.get("batch_audio_s", 200)),
         )
     )
-    hearable = [c for c in clips if c.duration_s <= models.AUDIO_LLM_MAX_S]
+    # Shortest first, so each batch holds clips of similar length (less padding).
+    hearable = sorted((c for c in clips if c.duration_s <= models.AUDIO_LLM_MAX_S), key=lambda c: c.duration_s)
     log(f"captioning {len(hearable)} clips from audio alone")
     # Short clips padded with silence, outside VI_OUT so they aren't outputs.
     pad_dir = tempfile.TemporaryDirectory()
     audio = {c.id: c.audio if fake else models.padded(c, Path(pad_dir.name)) for c in hearable}
     replies = Checkpoint("captions").run(
         hearable,
-        lambda part: gemma.json([models.caption_prompt(c, axes, audio=audio[c.id]) for c in part], max_new_tokens=200),
+        lambda part: gemma.json(
+            [models.caption_prompt(c, axes, audio=audio[c.id]) for c in part], 200, [heard_s(c) for c in part]
+        ),
         chunk=64,
     )
     captions = {}
@@ -115,11 +119,14 @@ def main():
         captions[clip.id] = clean_caption(r, axes)
 
     sample = spread([c for c in hearable if c.id in captions and c.id in text_emb], int(s.get("compare", 200)))
+    sample.sort(key=lambda c: c.duration_s)
     log(f"captioning {len(sample)} clips again with their words shown")
     replies = Checkpoint("captions_with_text").run(
         sample,
         lambda part: gemma.json(
-            [models.caption_prompt(c, axes, with_text=True, audio=audio[c.id]) for c in part], max_new_tokens=200
+            [models.caption_prompt(c, axes, with_text=True, audio=audio[c.id]) for c in part],
+            200,
+            [heard_s(c) for c in part],
         ),
         chunk=64,
     )
@@ -193,6 +200,11 @@ def main():
         + "\n"
     )
     log(f"discover: {len(order)} clusters, {len(captions)} captions, {failed} unparsed replies")
+
+
+def heard_s(clip):
+    """Seconds of audio the audio LLM gets for a clip, after padding."""
+    return max(clip.duration_s, models.AUDIO_LLM_MIN_S)
 
 
 def clean_caption(r, axes):

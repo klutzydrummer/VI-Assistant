@@ -26,9 +26,11 @@ far_voice_mads, limit.
 
 import gc
 import json
+import os
 import re
 import shutil
 import statistics
+from concurrent.futures import ThreadPoolExecutor
 
 import models
 from vi_job import (
@@ -114,8 +116,13 @@ def main():
     far_below = med - float(s.get("far_voice_mads", 4)) * max(mad, 1e-3)
 
     # 4. Quality.
+    # DNSMOS runs on the CPU at about 1 s a clip, so spread it over threads
+    # (onnxruntime releases the GIL).
     measure = models.fake_quality if fake else models.quality
-    mos = Checkpoint("quality").run(live, lambda part: [measure(c) for c in part])
+    if live:
+        measure(live[0])  # load the model once before the threads share it
+    with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
+        mos = Checkpoint("quality").run(live, lambda part: list(pool.map(measure, part)), chunk=128)
 
     # 5. Records.
     mismatch_wer = float(s.get("mismatch_wer", 0.5))

@@ -21,6 +21,16 @@ class ShortlistTest(unittest.TestCase):
         self.assertEqual(s["low"], ["c"])
 
 
+class BatchesTest(unittest.TestCase):
+    def test_batches_cap_count_and_audio(self):
+        import models
+
+        g = models.Gemma.__new__(models.Gemma)
+        g.batch, g.batch_audio_s = 3, 10
+        self.assertEqual(list(g.batches(7)), [(0, 3), (3, 6), (6, 7)])
+        self.assertEqual(list(g.batches(5, [2, 2, 2, 9, 30])), [(0, 3), (3, 4), (4, 5)])
+
+
 class RatingTest(unittest.TestCase):
     def test_ratings(self):
         self.assertEqual(label.rating({"rating": 4}), 4)

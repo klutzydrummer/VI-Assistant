@@ -172,14 +172,20 @@ class Gemma:
     """Gemma 4 (12B by default) through transformers: captions clips from
     their audio, judges lines from their text, summarizes clusters.
 
-    bf16 needs about 26 GB, so on a 24 GB card it loads in 8 bits."""
+    bf16 needs about 26 GB, so on a 24 GB card it loads in 8 bits.
 
-    def __init__(self, model_id, batch=8, quant="auto"):
+    Batches hold up to `batch` conversations and, when their audio lengths
+    are given, at most `batch_audio_s` seconds of audio: memory grows about
+    0.07 GB per second of audio in a batch (benchmarked on an A40, bf16), so
+    32 short clips fit in 48 GB but 32 thirty-second ones wouldn't."""
+
+    def __init__(self, model_id, batch=8, quant="auto", batch_audio_s=200):
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
         self.torch = torch
         self.batch = batch
+        self.batch_audio_s = batch_audio_s
         self.processor = AutoProcessor.from_pretrained(model_id, padding_side="left")
         kwargs = {"dtype": torch.bfloat16, "device_map": "auto"}
         if quant == "auto":
@@ -192,11 +198,28 @@ class Gemma:
         log(f"loading {model_id} (quantization: {quant})")
         self.model = AutoModelForMultimodalLM.from_pretrained(model_id, **kwargs).eval()
 
-    def generate(self, conversations, max_new_tokens):
-        """Replies, one per conversation, in batches."""
+    def batches(self, n, durations=None):
+        """Index ranges for batches of at most self.batch items and, with
+        durations, at most self.batch_audio_s seconds of audio."""
+        start = 0
+        while start < n:
+            end, total = start, 0.0
+            while end < n and end - start < self.batch:
+                d = durations[end] if durations else 0.0
+                if end > start and total + d > self.batch_audio_s:
+                    break
+                total += d
+                end += 1
+            yield start, end
+            start = end
+
+    def generate(self, conversations, max_new_tokens, durations=None):
+        """Replies, one per conversation, in batches. Pass each
+        conversation's audio length (seconds) in durations to cap the audio
+        per batch; sorting by length beforehand also cuts padding."""
         out = []
-        for i in range(0, len(conversations), self.batch):
-            chunk = conversations[i : i + self.batch]
+        for start, end in self.batches(len(conversations), durations):
+            chunk = conversations[start:end]
             inputs = self.processor.apply_chat_template(
                 chunk,
                 tokenize=True,
@@ -214,8 +237,8 @@ class Gemma:
                 out.append(final_answer(text))
         return out
 
-    def json(self, conversations, max_new_tokens=256):
-        return [parse_json(t) for t in self.generate(conversations, max_new_tokens)]
+    def json(self, conversations, max_new_tokens=256, durations=None):
+        return [parse_json(t) for t in self.generate(conversations, max_new_tokens, durations)]
 
 
 def final_answer(text):
@@ -228,10 +251,10 @@ def final_answer(text):
 class FakeGemma:
     """Answers in the real prompts' JSON shapes, from hashes."""
 
-    def __init__(self, model_id, batch=8, quant="auto"):
+    def __init__(self, model_id, batch=8, quant="auto", batch_audio_s=200):
         self.model_id = model_id
 
-    def json(self, conversations, max_new_tokens=256):
+    def json(self, conversations, max_new_tokens=256, durations=None):
         out = []
         for conv in conversations:
             prompt = json.dumps(conv, sort_keys=True, default=str)
@@ -241,14 +264,14 @@ class FakeGemma:
             if kind == "caption":
                 out.append({
                     "caption": "fake caption",
-                    "emotions": [["calm", "tense", "warm", "amused"][int(h("e") * 4)]],
-                    "delivery": [DELIVERY[int(h("d") * len(DELIVERY))]] if h("x") > 0.7 else [],
+                    "emotions": [["calm", "tense", "warm", "amused"][min(3, int(h("e") * 4))]],
+                    "delivery": [DELIVERY[min(len(DELIVERY) - 1, int(h("d") * len(DELIVERY)))]] if h("x") > 0.7 else [],
                     "scores": {a: h(a) for a in axes},
                 })  # fmt: skip
             elif kind == "judge":
                 out.append({a: {"value": h(a), "confidence": h(a, "c")} for a in axes})
             elif kind == "verify":
-                out.append({"rating": 1 + int(h("r") * 5)})
+                out.append({"rating": min(5, 1 + int(h("r") * 5))})
             else:
                 out.append({"name": f"fake {int(h('n') * 100)}", "summary": "fake summary", "axis": "none"})
         return out
@@ -366,10 +389,10 @@ class Judge:
     def __init__(self, model):
         self.model = model
 
-    def json(self, conversations, max_new_tokens=256):
+    def json(self, conversations, max_new_tokens=256, durations=None):
         if isinstance(self.model, FakeGemma):
             return self.model.json(conversations, max_new_tokens)
-        return self.model.json(strip_marker(conversations), max_new_tokens)
+        return self.model.json(strip_marker(conversations), max_new_tokens, durations)
 
 
 # --- discovery embeddings ---------------------------------------------------
@@ -487,7 +510,10 @@ def quality(clip):
     from torchmetrics.functional.audio.dnsmos import deep_noise_suppression_mean_opinion_score
 
     wav = torch.from_numpy(load_audio(clip.audio))
-    p808, sig, bak, ovr = deep_noise_suppression_mean_opinion_score(wav, 16_000, False, device="cpu").tolist()
+    # One onnxruntime thread per call; clean.py runs calls in parallel.
+    p808, sig, bak, ovr = deep_noise_suppression_mean_opinion_score(
+        wav, 16_000, False, device="cpu", num_threads=1
+    ).tolist()
     return {"p808": round(p808, 3), "sig": round(sig, 3), "bak": round(bak, 3), "ovr": round(ovr, 3)}
 
 

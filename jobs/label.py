@@ -101,11 +101,13 @@ def main():
                     s.get("judge", "google/gemma-4-12B-it"),
                     batch=int(s.get("batch", 8)),
                     quant=s.get("quant", "auto"),
+                    batch_audio_s=float(s.get("batch_audio_s", 200)),
                 )
             )
         return gemma
 
-    readable = [c for c in clips if c.text.strip()]
+    # Shortest prompt first, so batches pad less.
+    readable = sorted((c for c in clips if c.text.strip()), key=lambda c: len(models.judge_prompt(c, axes)[0]["content"][0]["text"]))
     log(f"judging {len(readable)} lines with text")
     judged = Checkpoint("judge")
     if judged.todo(readable):
@@ -148,14 +150,18 @@ def main():
     for a in verify_axes:
         prelim = {c.id: fusion.fuse(signals(c, a.id), weights)["value"] for c in hearable}
         shortlists[a.id] = shortlist(prelim, top, low)
-        picked = [c for c in hearable if c.id in shortlists[a.id]["all"]]
+        picked = sorted((c for c in hearable if c.id in shortlists[a.id]["all"]), key=lambda c: c.duration_s)
         saved = Checkpoint(f"verify_{a.id}")
         if saved.todo(picked):
             log(f"verifying {a.id}: {len(picked)} clips")
             audio = {c.id: c.audio if fake else models.padded(c, Path(pad_dir.name)) for c in picked}
             saved.run(
                 picked,
-                lambda part: llm().json([models.verify_prompt(c, a, audio[c.id]) for c in part], max_new_tokens=16),
+                lambda part: llm().json(
+                    [models.verify_prompt(c, a, audio[c.id]) for c in part],
+                    16,
+                    [max(c.duration_s, models.AUDIO_LLM_MIN_S) for c in part],
+                ),
                 chunk=64,
             )
         ratings[a.id] = {i: rating(r) for i, r in saved.run(picked, None).items()}

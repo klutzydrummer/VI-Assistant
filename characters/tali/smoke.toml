@@ -57,7 +57,8 @@ text_embed = "sentence-transformers/all-MiniLM-L6-v2"
 audio_llm = "google/gemma-4-12B-it"
 compare = 10
 min_cluster = 5
-batch = 8
+batch = 32         # benchmarked on an A40: 1.1 s/clip vs 1.8 at 8; peak 33 GB
+batch_audio_s = 200  # cap on audio seconds per batch (memory grows ~0.07 GB/s of audio)
 
 [stage.label]
 command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/label.py"]
@@ -71,7 +72,8 @@ dimensions = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
 judge = "google/gemma-4-12B-it"
 verify_top = 10   # clips per axis the audio LLM rates: the top by the other signals
 verify_low = 5    # ... plus this many from the lower half, as a control
-batch = 8
+batch = 32         # benchmarked on an A40: 1.1 s/clip vs 1.8 at 8; peak 33 GB
+batch_audio_s = 200  # cap on audio seconds per batch (memory grows ~0.07 GB/s of audio)
 
 # Home, CPU. Fits the labels to the reviews (reviews.jsonl): a per-axis probe
 # on the emotion2vec+ embeddings, fusion weights from each signal's agreement
