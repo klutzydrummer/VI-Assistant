@@ -1,0 +1,13 @@
+# What discover.py and label.py need on the worker, on top of the image's
+# PyTorch. vi_job.ensure_packages installs this once per instance.
+transformers>=5.19,<6
+accelerate
+bitsandbytes
+pillow
+torchvision
+librosa
+soundfile
+funasr>=1.2
+umap-learn
+scikit-learn>=1.3
+sentence-transformers

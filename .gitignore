@@ -8,3 +8,6 @@ extracted/
 
 # Dataset corpora hold extracted game audio.
 corpus/
+
+# Python bytecode from running the jobs.
+__pycache__/
