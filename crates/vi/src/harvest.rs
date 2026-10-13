@@ -190,3 +190,48 @@ pub fn tlk(path: &Path, id: Option<&str>) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+/// `vi extract`: the harvest stage. Writes into `out`, or `$VI_OUT` when
+/// run by the pipeline.
+pub fn extract(character: &Path, root: &Path, out: Option<&str>) -> ExitCode {
+    let Some(out) = out
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("VI_OUT").map(std::path::PathBuf::from))
+    else {
+        return fail("no output folder: pass --out or set VI_OUT");
+    };
+    let sources = character.join("sources.toml");
+    let text = match std::fs::read_to_string(&sources) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("{}: {e}", sources.display())),
+    };
+    let id = character
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .unwrap_or_default();
+    let who = match harvest::extract::Character::from_sources(&id, &text) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let reports = match harvest::extract::run(root, &who, &out, &|m| eprintln!("{m}")) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let mut errors = 0;
+    for (game, r) in &reports {
+        println!(
+            "{game}: {} lines from {} streams in {} packages ({} duplicates merged, {} without subtitle, {} missing .afc, {} placeholders skipped, {} errors)",
+            r.lines, r.streams, r.packages, r.merged_duplicates, r.no_subtitle, r.missing_afc, r.placeholders.len(), r.errors.len()
+        );
+        for e in r.errors.iter().take(10) {
+            println!("  error: {e}");
+        }
+        errors += r.errors.len();
+    }
+    if errors == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}

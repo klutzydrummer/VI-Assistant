@@ -6,19 +6,22 @@
 //! - [`tlk`]: subtitle tables, both the standalone `.tlk` files of LE2/LE3
 //!   and the `BioTlkFile` exports inside LE1 packages.
 //! - [`install`]: an inventory of an install folder.
+//! - [`wwise`]: LE2/LE3 dialogue streams and where their audio is.
+//! - [`extract`]: `vi extract`, one character's lines as a harvest corpus.
 //!
 //! The formats were learned from LegendaryExplorerCore's source, used as
-//! documentation only (it is GPL-3; no code is copied). Nothing here has been
-//! run against real game files yet: everything is tested on synthetic files
-//! built by [`fixture`], and the places that most need checking on a real
-//! install are marked "verify".
+//! documentation only (it is GPL-3; no code is copied), then checked on a
+//! real install (results in `docs/design/harvester-plan.md`). Tests use
+//! synthetic files built by [`fixture`], never game bytes.
 
+pub mod extract;
 pub mod fixture;
 pub mod install;
 pub mod package;
 pub mod props;
 mod reader;
 pub mod tlk;
+pub mod wwise;
 
 pub use package::Package;
 

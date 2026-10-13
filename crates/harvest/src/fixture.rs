@@ -206,6 +206,8 @@ pub enum Prop<'a> {
     Struct(&'a str, &'a str, Vec<u8>),
     /// An array with its raw serialized bytes (count included).
     Array(&'a str, Vec<u8>),
+    /// A name value.
+    Name(&'a str, &'a str),
 }
 
 struct FixtureExport {
@@ -295,6 +297,11 @@ impl PackageBuilder {
                     (n, "StructProperty", extra, raw.clone())
                 }
                 Prop::Array(n, raw) => (n, "ArrayProperty", vec![], raw.clone()),
+                Prop::Name(n, v) => {
+                    let mut value = Vec::new();
+                    self.put_name(&mut value, v);
+                    (n, "NameProperty", vec![], value)
+                }
             };
             self.put_name(&mut out, name);
             self.put_name(&mut out, ty);

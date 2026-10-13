@@ -19,7 +19,8 @@ pub const TAG: u32 = 0x9E2A_83C1;
 pub const COOKED_FLAG: u32 = 0x0000_0008;
 /// `EPackageFlags::Compressed`.
 pub const COMPRESSED_FLAG: u32 = 0x0200_0000;
-/// The compression type LE writes. **Verify** the value on real headers.
+/// The compression type LE writes (confirmed on every compressed package
+/// of a real install).
 pub const OODLE_LEVIATHAN: u32 = 0x400;
 
 /// Which game an `(engine, licensee)` version pair belongs to.

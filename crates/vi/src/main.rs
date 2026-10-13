@@ -19,6 +19,7 @@ pub(crate) const USAGE: &str = "usage:
   vi harvest scan <LE-install-folder> [--open]
   vi harvest package <file.pcc>
   vi harvest tlk <file.tlk | LE1-file.pcc> [--id N]
+  vi extract --character <character-folder> <LE-install-folder> [--out <folder>]
   vi review <corpus-folder> [--port N]
   vi review --demo <empty-folder> [--port N]
   vi cloud offers
@@ -41,6 +42,8 @@ fn main() -> ExitCode {
     };
     let open = take_flag(&mut args, "--open");
     let id = take_option(&mut args, "--id");
+    let character = take_option(&mut args, "--character");
+    let out = take_option(&mut args, "--out");
     match args
         .iter()
         .map(String::as_str)
@@ -59,6 +62,13 @@ fn main() -> ExitCode {
         ["harvest", "scan", dir] => harvest::scan(Path::new(dir), open),
         ["harvest", "package", file] => harvest::package(Path::new(file)),
         ["harvest", "tlk", file] => harvest::tlk(Path::new(file), id.as_deref()),
+        ["extract", root] => match &character {
+            Some(c) => harvest::extract(Path::new(c), Path::new(root), out.as_deref()),
+            None => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         ["review", rest @ ..] => review(rest),
         ["cloud", rest @ ..] => cloud::run(rest),
         _ => {
