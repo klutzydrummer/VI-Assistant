@@ -1,6 +1,7 @@
 # What discover.py and label.py need on the worker, on top of the image's
 # PyTorch. vi_job.ensure_packages installs this once per instance.
 transformers>=5.19,<6
+torch>=2.6           # transformers 5 needs it; the default worker image has 2.8
 accelerate
 bitsandbytes
 pillow

@@ -30,7 +30,7 @@ The worker-side watchdog hasn't run on a real instance yet. The first `vi cloud 
 `~/.config/vi/cloud.toml` (or `$VI_CLOUD_CONFIG`). Every field is optional; these are the defaults:
 
 ```toml
-image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
+image = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"
 disk_gb = 60
 idle_minutes = 20
 max_hours = 4          # 0 = no limit
@@ -43,7 +43,7 @@ min_gpu_ram_gb = 24
 max_dph = 0.40         # dollars per hour
 min_reliability = 0.98
 min_inet_down_mbps = 200
-min_cuda = 12.4
+min_cuda = 12.8
 min_compute_cap = 800  # Ampere or newer, for bf16 and flash attention
 verified = true
 ```

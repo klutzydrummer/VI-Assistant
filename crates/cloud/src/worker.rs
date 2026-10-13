@@ -135,8 +135,9 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         }
 
         let candidates = match offer {
+            // Vast's search ignores `id`; an offer's id is its ask_contract_id.
             Some(id) => self.vast.offers(&json!({
-                "id": {"eq": id}, "rentable": {"eq": true}, "limit": 1
+                "ask_contract_id": {"eq": id}, "rentable": {"eq": true}, "limit": 1
             }))?,
             None => self.offers(10)?,
         };
@@ -392,7 +393,7 @@ mod tests {
 
     impl Vast for &FakeVast {
         fn offers(&self, q: &Value) -> Result<Vec<Offer>> {
-            Ok(match q["id"]["eq"].as_u64() {
+            Ok(match q["ask_contract_id"]["eq"].as_u64() {
                 Some(id) => self.offers.iter().filter(|o| o.id == id).cloned().collect(),
                 None => self.offers.clone(),
             })

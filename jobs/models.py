@@ -12,13 +12,17 @@ import re
 from vi_job import log, unit_hash
 
 E2V_CLASSES = ["angry", "disgusted", "fearful", "happy", "neutral", "other", "sad", "surprised"]
+# No "other_voice" or "effects": on the smoke test Gemma put other_voice on
+# every clip, hearing her helmet filter as a second voice.
 DELIVERY = [
     "laughing", "sighing", "crying", "whispering", "shouting", "breathy", "strained",
-    "effort", "pain", "slurred", "sarcastic", "music", "effects", "other_voice",
+    "effort", "pain", "slurred", "sarcastic", "music",
 ]  # fmt: skip
 
-# The audio LLM accepts at most 30 s of audio.
+# The audio LLM accepts at most 30 s of audio. Under about 1.6 s it often
+# answered by asking for the audio, so shorter clips get padded with silence.
 AUDIO_LLM_MAX_S = 30.0
+AUDIO_LLM_MIN_S = 2.0
 
 
 def load_audio(path, rate=16_000):
@@ -31,6 +35,22 @@ def load_audio(path, rate=16_000):
     if sr != rate:
         data = librosa.resample(data, orig_sr=sr, target_sr=rate)
     return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def padded(clip, folder):
+    """The clip's audio path, or a copy padded with trailing silence to
+    AUDIO_LLM_MIN_S in `folder` when it's shorter than that."""
+    if clip.duration_s >= AUDIO_LLM_MIN_S:
+        return clip.audio
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(str(clip.audio), dtype="float32", always_2d=True)
+    data = data.mean(axis=1)
+    pad = np.zeros(max(0, int(AUDIO_LLM_MIN_S * sr) - len(data)), dtype=np.float32)
+    path = folder / f"{clip.id}.wav"
+    sf.write(str(path), np.concatenate([data, pad]), sr)
+    return path
 
 
 def device():
@@ -247,7 +267,7 @@ def axes_text(axes):
     return "\n".join(f"- {a.id}: {a.description}" for a in axes)
 
 
-def caption_prompt(clip, axes, with_text=False):
+def caption_prompt(clip, axes, with_text=False, audio=None):
     words = ""
     if with_text:
         words = f'\nThe words are: "{clip.text}"\n'
@@ -260,13 +280,14 @@ def caption_prompt(clip, axes, with_text=False):
         ' "emotions": ["up to four single words for the emotions you hear"],\n'
         f' "delivery": [any of: {", ".join(DELIVERY)}],\n'
         ' "scores": {"<axis id>": 0.0 to 1.0 for each axis below}}\n'
-        "Scores: 0 none, 0.3 a hint, 0.6 clear, 1 overwhelming. Most lines are close to neutral.\n"
+        "Scores: 0 none, 0.2 barely there, 0.4 noticeable, 0.6 clear, 1 overwhelming. Any feeling "
+        "you can hear at all is at least 0.2.\n"
         f"Axes:\n{axes_text(axes)}"
     )
     # The audio goes before the instructions: after them, Gemma 4 answered
     # 14 of 40 clips by asking for the audio file.
     return [
-        {"role": "user", "content": [{"type": "audio", "audio": str(clip.audio)}, {"type": "text", "text": text}]},
+        {"role": "user", "content": [{"type": "audio", "audio": str(audio or clip.audio)}, {"type": "text", "text": text}]},
         {"kind": "caption", "axes": [a.id for a in axes]},
     ]
 
@@ -278,11 +299,15 @@ def judge_prompt(clip, axes):
     else:
         lines.append(f"Tali: {clip.text}")
     scene = f"Scene tags: {', '.join(clip.scene_tags)}\n" if clip.scene_tags else ""
+    if clip.stage_direction:
+        scene += f"The voice director's note for Tali's last line: {clip.stage_direction}\n"
     text = (
         "You label lines Tali'Zorah speaks in Mass Effect by the feelings she expresses "
         "as she says them. Read the conversation and score Tali's last line on each axis "
-        "below, from 0 (none) through 0.3 (a hint) and 0.6 (clear) to 1 (overwhelming), "
-        "with your confidence from 0 to 1. Most lines are close to neutral.\n\n"
+        "below, from 0 (none) through 0.2 (barely there), 0.4 (noticeable) and 0.6 (clear) to 1 "
+        "(overwhelming), with your confidence from 0 to 1. Score what she expresses, however "
+        "lightly: a line with any trace of a feeling scores at least 0.2 on it, and 0 means "
+        "none at all.\n\n"
         f"Axes:\n{axes_text(axes)}\n\n{scene}Conversation:\n" + "\n".join(lines) + "\n\n"
         'Reply with JSON only: {"<axis id>": {"value": 0.0, "confidence": 0.0}, ...} with every axis.'
     )

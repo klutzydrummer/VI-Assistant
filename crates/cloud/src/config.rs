@@ -57,7 +57,7 @@ pub struct Search {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            image: "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime".into(),
+            image: "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime".into(),
             disk_gb: 60.0,
             idle_minutes: 20,
             max_hours: 4.0,
@@ -76,7 +76,7 @@ impl Default for Search {
             max_dph: 0.40,
             min_reliability: 0.98,
             min_inet_down_mbps: 200.0,
-            min_cuda: 12.4,
+            min_cuda: 12.8,
             min_compute_cap: 800,
             verified: true,
         }
