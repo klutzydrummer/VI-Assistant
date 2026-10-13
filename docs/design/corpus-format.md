@@ -101,7 +101,7 @@ Written by `jobs/clean.py`.
 - `audio`: leading and trailing silence trimmed, FLAC at the source rate. Loudness is not normalized, since how loud she is carries emotion; `rms_dbfs` records it.
 - `asr_text`, `subtitle_wer`: Whisper's words and their word error rate against the subtitle (punctuation and `{stage notes}` ignored). Nonverbal lines aren't transcribed.
 - `transcript`: only present when it differs from the harvest `text`, which is when the line had no subtitle (barks) and Whisper heard words (`asr_only`). Lines with a subtitle keep it, since Whisper misspells names. Later stages use `transcript` if present, else `text`.
-- `speaker_similarity`: cosine similarity of the clip's ECAPA speaker embedding to her median voice (clips of 1.5 s or more set the median). The embeddings are in `embeddings/speaker.npy`.
+- `speaker_similarity`: cosine similarity of the clip's ECAPA speaker embedding to her median voice (spoken clips of 1.5 s or more set the median). Each game with at least 20 such clips gets its own median and threshold, since the embedding hears each game's recording and mix; smaller groups use the all-games one. `clean.json`'s `speaker_baselines` lists them. The embeddings are in `embeddings/speaker.npy`.
 - `quality`: DNSMOS estimates, roughly 1 to 5; `ovr` is overall quality.
 - `flags`:
   - `silent`: trimmed to nothing; the only reason for `keep: false` so far.
