@@ -1,0 +1,59 @@
+# 40-clip smoke test of the GPU stages. `vi dataset run characters/tali/smoke.toml`.
+# Same as dataset.toml except harvest copies a fixed 40-line subset of the
+# real harvest (mixed games, barks, nonverbal, stage directions, one long clip)
+# into its own corpus folder, and discovery's thresholds are scaled down.
+
+corpus = "/home/brandon/Projects/VI-Assistant/corpus/tali-smoke"
+
+[stage.harvest]
+command = ["python3", "-c", """
+import json, os, random, shutil
+src = '/home/brandon/Projects/VI-Assistant/corpus/tali/harvest'
+out = os.environ['VI_OUT']
+rows = [json.loads(l) for l in open(f'{src}/lines.jsonl')]
+rnd = random.Random(7)
+def pick(pred, n):
+    pool = [r for r in rows if pred(r) and r not in chosen]
+    chosen.extend(rnd.sample(pool, n))
+chosen = []
+flags = lambda r: r.get('flags') or []
+pick(lambda r: 'bark' in flags(r), 4)
+pick(lambda r: 'nonverbal' in flags(r), 3)
+pick(lambda r: r.get('stage_direction'), 5)
+pick(lambda r: r['audio']['duration_s'] > 10, 2)
+for game in ('le1', 'le2', 'le3'):
+    pick(lambda r: r['source']['game'] == game and not flags(r), 26 // 3 + (game == 'le3') * 2)
+assert len(chosen) == 40, len(chosen)
+os.makedirs(f'{out}/audio')
+with open(f'{out}/lines.jsonl', 'w') as f:
+    for r in chosen:
+        f.write(json.dumps(r) + '\\n')
+        shutil.copy2(f"{src}/{r['audio']['path']}", f"{out}/{r['audio']['path']}")
+"""]
+files = ["/home/brandon/Projects/VI-Assistant/corpus/tali/harvest"]
+
+[stage.discover]
+command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/discover.py"]
+inputs = ["harvest"]
+files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
+
+[stage.discover.settings]
+emotion = "emotion2vec/emotion2vec_base"
+text_embed = "sentence-transformers/all-MiniLM-L6-v2"
+audio_llm = "google/gemma-4-12B-it"
+compare = 10
+min_cluster = 5
+batch = 8
+
+[stage.label]
+command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/label.py"]
+inputs = ["harvest", "discover"]
+files = ["../../jobs/label.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
+
+[stage.label.settings]
+audio = "emotion2vec/emotion2vec_plus_large"
+dimensions = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
+judge = "google/gemma-4-12B-it"
+batch = 8
