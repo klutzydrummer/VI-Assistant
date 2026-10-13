@@ -141,3 +141,26 @@ echo clip-1 >> "$VI_CHECKPOINT/step.jsonl"; exit 3"#,
     );
     assert_eq!(leftovers(dir.path()), Vec::<String>::new());
 }
+
+#[test]
+fn check_worker_round_trips_a_token() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../jobs/check-worker.sh");
+    let out = Command::new(script)
+        .env("VI_WORKER_HOST", "local")
+        .env("VI_WORKER_ROOT", dir.path().join("worker"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("check-worker: OK"), "{stdout}");
+    assert!(stdout.contains("gpu: "), "{stdout}");
+    assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+}
