@@ -274,6 +274,34 @@ def ensure_packages(requirements="requirements-gpu.txt"):
     stamp.touch()
 
 
+def ensure_venv(requirements):
+    """On the worker, run this job in its own virtualenv, for jobs whose
+    packages clash with requirements-gpu.txt (qwen-tts pins an older
+    transformers). The venv sees the image's packages, so torch isn't
+    installed twice. Built once per instance, then the job re-runs itself
+    inside it."""
+    if fake_models() or os.environ.get("VI_WORKER") != "1":
+        return
+    req = JOBS / requirements
+    venv = Path.home() / ".cache" / "vi" / (
+        "venv-" + hashlib.sha256(req.read_bytes()).hexdigest()[:16]
+    )
+    if Path(sys.prefix).resolve() == venv.resolve():
+        return
+    python = venv / "bin" / "python"
+    if not (venv / ".ready").exists():
+        log(f"building a virtualenv for {req.name}")
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", "--clear", str(venv)],
+            check=True,
+        )
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "-q", "-r", str(req)], check=True
+        )
+        (venv / ".ready").touch()
+    os.execv(str(python), [str(python), *sys.argv])
+
+
 def unit_hash(*parts):
     """A float in [0, 1) from strings, for the fake models."""
     h = hashlib.sha256("\0".join(parts).encode()).digest()

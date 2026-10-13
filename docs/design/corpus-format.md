@@ -216,6 +216,7 @@ settings = { judge = "gemma-4-12b", audio = "emotion2vec_plus_large" }
 - `files`: files or folders whose content counts as input: job scripts, the pack's `states.toml`, `reviews.jsonl`, the game folder. Relative to the pipeline file. A leading `corpus:` makes a path relative to the corpus instead, like `corpus:reviews.jsonl`; such a file may be missing (it counts as `missing` until it appears). Any other missing file is an error.
 - `settings`: any TOML table. Passed to the job and part of the key.
 - `version`: an integer to bump when code not listed in `files` (like `vi extract` itself) changes behavior.
+- `manual`: `true` for a stage that runs only when named (`vi dataset run <pipeline> <stage>`), never in a whole-pipeline run: experiments that cost GPU time, like `steer`. A stage that isn't manual can't take a manual one as an input.
 
 ## What a job sees
 Environment variables:

@@ -31,6 +31,10 @@ pub struct Stage {
     pub settings: toml::Table,
     #[serde(default = "one")]
     pub version: u32,
+    /// Runs only when named (`vi dataset run <pipeline> <stage>`), never as
+    /// part of a whole-pipeline run: for experiments that cost GPU time.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 fn one() -> u32 {
@@ -88,8 +92,12 @@ impl Pipeline {
                 out.push(format!("stage {name} has an empty command"));
             }
             for input in &stage.inputs {
-                if !self.stages.contains_key(input) {
-                    out.push(format!("stage {name} needs unknown stage {input}"));
+                match self.stages.get(input) {
+                    None => out.push(format!("stage {name} needs unknown stage {input}")),
+                    Some(i) if i.manual && !stage.manual => out.push(format!(
+                        "stage {name} needs manual stage {input}, so it must be manual too"
+                    )),
+                    Some(_) => {}
                 }
             }
         }
@@ -102,13 +110,27 @@ impl Pipeline {
     }
 
     /// Stages in run order, dependencies first. With a target, only that
-    /// stage and what it needs.
+    /// stage and what it needs; without one, every stage but manual ones.
     pub fn order(&self, target: Option<&str>) -> Result<Vec<String>, String> {
         let roots: Vec<&str> = match target {
             Some(t) if !self.stages.contains_key(t) => return Err(format!("no stage named {t}")),
             Some(t) => vec![t],
-            None => self.stages.keys().map(String::as_str).collect(),
+            None => self
+                .stages
+                .iter()
+                .filter(|(_, s)| !s.manual)
+                .map(|(n, _)| n.as_str())
+                .collect(),
         };
+        self.order_from(roots)
+    }
+
+    /// Every stage in run order, manual ones included (for status).
+    pub fn order_all(&self) -> Result<Vec<String>, String> {
+        self.order_from(self.stages.keys().map(String::as_str).collect())
+    }
+
+    fn order_from(&self, roots: Vec<&str>) -> Result<Vec<String>, String> {
         let mut done = BTreeSet::new();
         let mut order = Vec::new();
         for root in roots {
@@ -195,6 +217,32 @@ mod tests {
         let all = p.order(None).unwrap();
         assert_eq!(all.len(), 4);
         assert!(all.iter().position(|s| s == "clean") < all.iter().position(|s| s == "label"));
+    }
+
+    #[test]
+    fn manual_stages_run_only_when_named() {
+        let p = load(
+            r#"
+            corpus = "c"
+            [stage.harvest]
+            command = ["x"]
+            [stage.steer]
+            command = ["x"]
+            inputs = ["harvest"]
+            manual = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.order(None).unwrap(), ["harvest"]);
+        assert_eq!(p.order(Some("steer")).unwrap(), ["harvest", "steer"]);
+        assert_eq!(p.order_all().unwrap(), ["harvest", "steer"]);
+        let needs_manual = load(
+            "corpus = \"c\"\n[stage.a]\ncommand = [\"x\"]\nmanual = true\n[stage.b]\ncommand = [\"x\"]\ninputs = [\"a\"]\n",
+        );
+        assert!(needs_manual
+            .unwrap_err()
+            .to_string()
+            .contains("must be manual too"));
     }
 
     #[test]
