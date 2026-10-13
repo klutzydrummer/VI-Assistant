@@ -1,5 +1,6 @@
 """python3 -m unittest discover -s jobs"""
 
+import os
 import struct
 import tempfile
 import unittest
@@ -79,6 +80,32 @@ class Embeddings(unittest.TestCase):
             except ImportError:
                 return
             self.assertEqual(np.load(Path(d) / "e.npy").tolist(), [[1.0, 2.0, 3.0], [0.5, -1.0, 0.0]])
+
+
+class Checkpoints(unittest.TestCase):
+    def test_resumes_and_drops_a_torn_line(self):
+        clips = [vi_job.Clip(id=f"c{i}", text="", audio="", duration_s=1.0) for i in range(5)]
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["VI_CHECKPOINT"] = d
+            try:
+                seen = []
+
+                def compute(part):
+                    seen.extend(c.id for c in part)
+                    if "c3" in seen:
+                        raise RuntimeError("worker lost")
+                    return [[c.id, 1] for c in part]
+
+                with self.assertRaises(RuntimeError):
+                    vi_job.Checkpoint("x").run(clips, compute, chunk=2)
+                path = Path(d) / "x.jsonl"
+                path.write_text(path.read_text() + '{"id": "c2", "v"')  # copied mid-write
+                done = vi_job.Checkpoint("x").run(clips, lambda part: [[c.id, 2] for c in part])
+                self.assertEqual(done, {"c0": ["c0", 1], "c1": ["c1", 1], "c2": ["c2", 2],
+                                        "c3": ["c3", 2], "c4": ["c4", 2]})  # fmt: skip
+                self.assertEqual(len(path.read_text().splitlines()), 5)
+            finally:
+                del os.environ["VI_CHECKPOINT"]
 
 
 if __name__ == "__main__":

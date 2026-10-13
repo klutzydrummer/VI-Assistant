@@ -76,6 +76,63 @@ def write_embeddings(folder, name, model, vectors):
     return {"model": model, "clips": len(ids), "dim": dim}
 
 
+
+class Checkpoint:
+    """Per-clip results kept in VI_CHECKPOINT/<name>.jsonl as they're made, so
+    a run that dies part way (worker lost, credit gone) skips them when it's
+    rerun. on-worker.sh copies the folder home during the run. Values must be
+    JSON; tuples come back as lists. Without VI_CHECKPOINT nothing is kept."""
+
+    def __init__(self, name):
+        self.name = name
+        self.done = {}
+        folder = env_path("VI_CHECKPOINT")
+        self.path = folder / f"{name}.jsonl" if folder else None
+        if self.path is None or not self.path.exists():
+            return
+        data = self.path.read_bytes()
+        if data and not data.endswith(b"\n"):
+            # A copy taken mid-write: drop the torn last line.
+            data = data[: data.rfind(b"\n") + 1]
+            self.path.write_bytes(data)
+        for line in data.decode("utf-8").splitlines():
+            try:
+                r = json.loads(line)
+                self.done[r["id"]] = r["v"]
+            except (ValueError, KeyError, TypeError):
+                continue
+        if self.done:
+            log(f"{name}: resuming, {len(self.done)} already done")
+
+    def todo(self, clips):
+        return [c for c in clips if c.id not in self.done]
+
+    def run(self, clips, compute, chunk=50):
+        """compute(list of clips) -> one result per clip, for the clips not
+        done yet, saved after every chunk. Returns {id: result} for all."""
+        todo = self.todo(clips)
+        f = None
+        if self.path is not None and todo:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            f = open(self.path, "a", encoding="utf-8", newline="\n")
+        try:
+            for start in range(0, len(todo), chunk):
+                part = todo[start : start + chunk]
+                results = compute(part)
+                for clip, r in zip(part, results, strict=True):
+                    self.done[clip.id] = r
+                    if f:
+                        f.write(json.dumps({"id": clip.id, "v": r}, ensure_ascii=False) + "\n")
+                if f:
+                    f.flush()
+                    os.fsync(f.fileno())
+                log(f"{self.name}: {len(clips) - len(todo) + start + len(part)}/{len(clips)}")
+        finally:
+            if f:
+                f.close()
+        return {c.id: self.done[c.id] for c in clips}
+
+
 # --- inputs -----------------------------------------------------------------
 
 

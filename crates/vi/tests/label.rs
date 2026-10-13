@@ -132,3 +132,47 @@ settings = {{ backend = "fake" }}
         assert_eq!(label.scores["intoxication"].signals["audio"], None);
     }
 }
+
+#[test]
+fn the_worker_sends_the_checkpoint_home_even_when_the_job_fails() {
+    if !have_tools() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let on_worker = repo("jobs/on-worker.sh");
+    let pipeline = dir.path().join("dataset.toml");
+    let step = r#"echo done >> "$VI_CHECKPOINT/step.jsonl"; exit 1"#;
+    fs::write(
+        &pipeline,
+        format!(
+            "corpus = \"corpus\"\n\n[stage.step]\ncommand = [{on_worker:?}, \"sh\", \"-c\", {step:?}]\n"
+        ),
+    )
+    .unwrap();
+    let run = || {
+        Command::new(VI)
+            .args(["dataset", "run", pipeline.to_str().unwrap()])
+            .env("VI_WORKER_HOST", "local")
+            .env("VI_WORKER_ROOT", dir.path().join("worker"))
+            .output()
+            .unwrap()
+    };
+    assert!(!run().status.success());
+    // The second attempt starts from what the first sent home.
+    assert!(!run().status.success());
+    let stage = dir.path().join("corpus/stages/step");
+    let checkpoint = fs::read_dir(&stage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".checkpoint-")
+        })
+        .expect("a checkpoint folder");
+    assert_eq!(
+        fs::read_to_string(checkpoint.join("step.jsonl")).unwrap(),
+        "done\ndone\n"
+    );
+}

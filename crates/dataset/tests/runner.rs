@@ -193,6 +193,37 @@ fn failure_keeps_the_previous_run_current() {
 }
 
 #[test]
+fn a_failed_run_resumes_from_its_checkpoint() {
+    let f = Fixture::new();
+    // Counts its attempts in VI_CHECKPOINT and fails while `fail` exists.
+    let step = r#"n=$(cat "$VI_CHECKPOINT/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$VI_CHECKPOINT/n"; [ ! -e fail ] && cp "$VI_CHECKPOINT/n" "$VI_OUT/attempts""#;
+    f.edit(
+        "[stage.count]",
+        &format!("[stage.step]\ncommand = [\"sh\", \"-c\", {step:?}]\n\n[stage.count]"),
+    );
+    fs::write(f.root.join("fail"), "").unwrap();
+    f.runner().run(None, false, |_| {}).unwrap_err();
+    f.runner().run(None, false, |_| {}).unwrap_err();
+    fs::remove_file(f.root.join("fail")).unwrap();
+    f.run();
+    assert_eq!(read(&f.current_out("step").join("attempts")), "3\n");
+    // Gone once the run succeeds.
+    let stage_dir = f
+        .current_out("step")
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let left: Vec<_> = fs::read_dir(&stage_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".checkpoint-"))
+        .collect();
+    assert!(left.is_empty());
+}
+
+#[test]
 fn identical_outputs_share_one_object_and_gc_frees_old_runs() {
     let f = Fixture::new();
     f.run();

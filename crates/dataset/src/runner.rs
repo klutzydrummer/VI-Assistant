@@ -25,6 +25,10 @@ pub const LOG: &str = "log.txt";
 pub const OUT: &str = "out";
 pub const CURRENT: &str = "current";
 const TMP_PREFIX: &str = ".tmp-";
+/// Where a run keeps work it can resume from if it fails part way (a lost
+/// GPU worker, say); `VI_CHECKPOINT`. Survives failed runs of the same key,
+/// deleted once the run succeeds.
+const CHECKPOINT_PREFIX: &str = ".checkpoint-";
 
 /// The current output folder of `stage` in a corpus, for readers outside
 /// the runner such as the review page.
@@ -279,6 +283,8 @@ impl Runner {
         }
         let out = tmp.join(OUT);
         fs::create_dir_all(&out).at(&out)?;
+        let checkpoint = stage_dir.join(format!("{CHECKPOINT_PREFIX}{}", planned.key));
+        fs::create_dir_all(&checkpoint).at(&checkpoint)?;
         let settings_path = tmp.join("settings.json");
         fs::write(
             &settings_path,
@@ -296,6 +302,7 @@ impl Runner {
             .current_dir(&self.pipeline.dir)
             .env("VI_STAGE", name)
             .env("VI_OUT", &out)
+            .env("VI_CHECKPOINT", &checkpoint)
             .env("VI_SETTINGS", &settings_path)
             .env("VI_CORPUS", &self.pipeline.corpus)
             .env("VI_BIN", &self.vi_bin)
@@ -330,8 +337,9 @@ impl Runner {
             return Err(Error::Stage {
                 stage: name.into(),
                 message: format!(
-                    "{status}; partial output kept in {}\n{}",
+                    "{status}; partial output kept in {}, and a rerun resumes from {}\n{}",
                     tmp.display(),
+                    checkpoint.display(),
                     tail(&log_path, 20)
                 ),
             });
@@ -370,6 +378,7 @@ impl Runner {
             fs::remove_dir_all(&dest).at(&dest)?;
         }
         fs::rename(&tmp, &dest).at(&dest)?;
+        fs::remove_dir_all(&checkpoint).at(&checkpoint)?;
         Ok(manifest)
     }
 
