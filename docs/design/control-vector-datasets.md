@@ -46,13 +46,13 @@ Extract every line the character speaks, plus the lines around it, from the game
 Output: `corpus/<character>/lines.jsonl` plus `audio/`. Local only, gitignored. Expect a few thousand Tali lines across the trilogy.
 
 ### 2. Clean
-- Trim silence, normalize loudness. Flag rather than drop by length: 472 of Tali's 3,387 clips are under 1 s and 1,158 under 2 s, mostly barks, and every model here is weak on them.
+- Trim silence; measure loudness. Flag rather than drop by length: 472 of Tali's 3,387 clips are under 1 s and 1,158 under 2 s, mostly barks, and every model here is weak on them.
 - Run speech recognition (Whisper) only to verify the game subtitle. Small differences (an ad-lib, a trimmed word) mean we keep the clip and use Whisper's words as the exact transcript; a large mismatch means extraction mapped the wrong clip, so drop or flag it.
 - **Speaker check**: a speaker embedding per clip, and its distance from her median voice. Far clips are another voice, heavy effects or a wrong mapping. This replaces the audio LLM's `other_voice` tag, which heard her helmet filter as a second voice. For characters whose voice changes by condition (helmet, radio), compute the median per condition.
 - **Quality score** per clip (a DNSMOS-style estimate), used later to pick TTS references.
 - Flag clips with music or effects mixed in (rare for game dialogue, but cutscenes happen).
 
-Where it runs (home CPU or the worker) and which speaker and quality models it uses are still to choose; see the stage's own design when it's built.
+Built as `jobs/clean.py` (decided 2026-10-13): it runs on the worker (Whisper large-v3, ECAPA-TDNN from SpeechBrain, DNSMOS). It flags and doesn't drop, until the thresholds are set from the flagged clips. One change from the list above: loudness is measured, not normalized, since how loud she is carries emotion. TTS references can be normalized when they're picked.
 
 ### 3. Discover (GPU)
 Before scoring anything, let the data say what's there, so we find axes the pack is missing:

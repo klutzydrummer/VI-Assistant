@@ -15,10 +15,26 @@ corpus = "../../corpus/tali"
 command = ["sh", "-c", "cp -a \"$VI_CORPUS/harvest/.\" \"$VI_OUT/\""]
 files = ["corpus:harvest"]
 
+# GPU. Trims each clip, checks its subtitle with Whisper, measures how much
+# it sounds like her (speaker embedding) and its quality (DNSMOS). Flags,
+# doesn't drop; see clean.json for the distributions.
+[stage.clean]
+command = ["../../jobs/on-worker.sh", "python3", "jobs/clean.py"]
+inputs = ["harvest"]
+files = ["../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/requirements-gpu.txt"]
+
+[stage.clean.settings]
+asr = "openai/whisper-large-v3"
+speaker = "speechbrain/spkrec-ecapa-voxceleb"
+batch = 16
+mismatch_wer = 0.5   # subtitle_mismatch above this (lines of 3+ words)
+far_voice_mads = 4   # far_voice this many MADs below her median similarity
+
 # GPU. Embeds and clusters every clip and captions it from its sound alone.
 [stage.discover]
 command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/discover.py"]
-inputs = ["harvest"]
+inputs = ["harvest", "clean"]
 files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py",
          "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
 
@@ -33,7 +49,7 @@ batch = 8
 # GPU. Scores every clip on the variables in states.toml.
 [stage.label]
 command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/label.py"]
-inputs = ["harvest", "discover"]
+inputs = ["harvest", "clean", "discover"]
 files = ["../../jobs/label.py", "../../jobs/models.py", "../../jobs/vi_job.py",
          "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
 

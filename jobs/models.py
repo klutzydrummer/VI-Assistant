@@ -410,3 +410,105 @@ def fake_prosody(clip):
         "voiced_fraction": round(unit_hash("v", clip.id), 3),
         "words_per_s": None if clip.nonverbal or not clip.text else round(1 + 3 * unit_hash("w", clip.id), 2),
     }
+
+
+# --- clean: speech recognition, speaker, quality ------------------------------
+
+
+class Whisper:
+    """Speech recognition, only to check the game's subtitle against the audio
+    (and to give subtitle-less barks words)."""
+
+    def __init__(self, model_id, batch=16):
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, dtype=dtype, low_cpu_mem_usage=True)
+        processor = AutoProcessor.from_pretrained(model_id)
+        self.batch = batch
+        self.pipe = pipeline(
+            "automatic-speech-recognition",
+            model=model.to(device()),
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            device=device(),
+        )
+
+    def __call__(self, clips):
+        inputs = [{"raw": load_audio(c.audio), "sampling_rate": 16_000} for c in clips]
+        out = self.pipe(inputs, batch_size=self.batch, generate_kwargs={"language": "en", "task": "transcribe"})
+        return [r["text"].strip() for r in out]
+
+
+class Speaker:
+    """ECAPA-TDNN speaker embeddings (SpeechBrain), for checking each clip is
+    her voice."""
+
+    def __init__(self, model_id):
+        from pathlib import Path
+
+        import torch
+        from speechbrain.inference.speaker import EncoderClassifier
+
+        self.torch = torch
+        save = Path.home() / ".cache" / "vi" / "speechbrain" / model_id.replace("/", "--")
+        self.model = EncoderClassifier.from_hparams(source=model_id, savedir=str(save), run_opts={"device": device()})
+
+    def __call__(self, clip):
+        wav = self.torch.from_numpy(load_audio(clip.audio)).unsqueeze(0)
+        with self.torch.no_grad():
+            emb = self.model.encode_batch(wav)
+        return [float(x) for x in emb.squeeze().cpu()]
+
+
+def quality(clip):
+    """DNSMOS (Microsoft's speech quality estimate) as {p808, sig, bak, ovr},
+    each about 1 to 5. Clips under its 9 s window are looped to fill it."""
+    import torch
+    from torchmetrics.functional.audio.dnsmos import deep_noise_suppression_mean_opinion_score
+
+    wav = torch.from_numpy(load_audio(clip.audio))
+    p808, sig, bak, ovr = deep_noise_suppression_mean_opinion_score(wav, 16_000, False, device="cpu").tolist()
+    return {"p808": round(p808, 3), "sig": round(sig, 3), "bak": round(bak, 3), "ovr": round(ovr, 3)}
+
+
+def trim(clip, dest, top_db=40, pad_s=0.05):
+    """Writes the clip with leading and trailing silence cut (keeping pad_s)
+    as FLAC at its own rate, unchanged otherwise: loudness is left alone,
+    since how loud she is says something about how she feels. Returns
+    (duration_s, sample_rate, rms_dbfs)."""
+    import librosa
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(str(clip.audio), dtype="float32", always_2d=True)
+    data = data.mean(axis=1)
+    _, (start, end) = librosa.effects.trim(data, top_db=top_db)
+    pad = int(pad_s * sr)
+    data = data[max(0, start - pad) : min(len(data), end + pad)]
+    sf.write(str(dest), data, sr, format="FLAC")
+    rms = float(np.sqrt(np.mean(data**2))) if len(data) else 0.0
+    return len(data) / sr, sr, round(20 * np.log10(rms + 1e-9), 2)
+
+
+class FakeWhisper:
+    """The subtitle back, lowercased; a fixed phrase for barks."""
+
+    def __init__(self, model_id, batch=16):
+        pass
+
+    def __call__(self, clips):
+        return [c.text.lower() if c.text.strip() else "fake words" for c in clips]
+
+
+class FakeSpeaker:
+    def __init__(self, model_id):
+        self.model_id = model_id
+
+    def __call__(self, clip):
+        return [1.0 + 0.1 * (unit_hash(self.model_id, clip.id, str(i)) - 0.5) for i in range(16)]
+
+
+def fake_quality(clip):
+    return {k: round(2.5 + 2 * unit_hash("dnsmos", clip.id, k), 3) for k in ("p808", "sig", "bak", "ovr")}

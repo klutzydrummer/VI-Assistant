@@ -53,15 +53,20 @@ corpus = "corpus"
 [stage.harvest]
 command = ["vi", "corpus", "synth", "--lines", "24"]
 
+[stage.clean]
+command = [{on_worker:?}, "python3", "jobs/clean.py"]
+inputs = ["harvest"]
+settings = {{ backend = "fake" }}
+
 [stage.discover]
 command = [{on_worker:?}, "--put", "states.toml", "python3", "jobs/discover.py"]
-inputs = ["harvest"]
+inputs = ["harvest", "clean"]
 files = ["states.toml"]
 settings = {{ backend = "fake", compare = 6 }}
 
 [stage.label]
 command = [{on_worker:?}, "--put", "states.toml", "python3", "jobs/label.py"]
-inputs = ["harvest", "discover"]
+inputs = ["harvest", "clean", "discover"]
 files = ["states.toml"]
 settings = {{ backend = "fake" }}
 "#
@@ -81,6 +86,16 @@ settings = {{ backend = "fake" }}
     );
 
     let corpus = dir.path().join("corpus");
+    let clean = dataset::runner::current_out(&corpus, "clean").unwrap();
+    assert_eq!(
+        fs::read_to_string(clean.join("clips.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        24
+    );
+    assert!(clean.join("clean.json").is_file());
+    assert!(clean.join("embeddings/speaker.npy").is_file());
     let discover = dataset::runner::current_out(&corpus, "discover").unwrap();
     for f in [
         "captions.jsonl",
