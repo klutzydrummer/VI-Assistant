@@ -1,6 +1,6 @@
 # Control vector datasets
 
-Status: plan approved 2026-10-12. Nothing here is built yet.
+Status: plan approved 2026-10-12. Built: the stage runner, the GPU worker wrapper, harvest for LE2/LE3, and the discover and label jobs (`jobs/discover.py`, `jobs/label.py`, pipeline `characters/tali/dataset.toml`; signal fusion in `jobs/fusion.py`). Discover and label have only run with fake models so far; their first real run is on the LE2/LE3 test set.
 
 Decided: clips move only by direct rsync to the rented GPU, never through a third-party host (copyrighted material). Brandon will do about an hour of label review.
 
