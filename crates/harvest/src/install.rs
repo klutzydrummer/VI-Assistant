@@ -20,6 +20,8 @@ pub struct GameFiles {
     pub packages: Vec<FileInfo>,
     pub tlks: Vec<FileInfo>,
     pub afcs: Vec<FileInfo>,
+    /// LE1's ISACT sound banks.
+    pub isbs: Vec<FileInfo>,
 }
 
 #[derive(Debug)]
@@ -85,6 +87,7 @@ fn collect(dir: &Path) -> std::io::Result<GameFiles> {
                 Some("pcc") => &mut files.packages,
                 Some("tlk") => &mut files.tlks,
                 Some("afc") => &mut files.afcs,
+                Some("isb") => &mut files.isbs,
                 _ => continue,
             };
             list.push(FileInfo {
@@ -93,7 +96,12 @@ fn collect(dir: &Path) -> std::io::Result<GameFiles> {
             });
         }
     }
-    for list in [&mut files.packages, &mut files.tlks, &mut files.afcs] {
+    for list in [
+        &mut files.packages,
+        &mut files.tlks,
+        &mut files.afcs,
+        &mut files.isbs,
+    ] {
         list.sort_by(|a, b| a.path.cmp(&b.path));
     }
     Ok(files)

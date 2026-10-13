@@ -43,20 +43,26 @@ pub const MIN_SECONDS: f64 = 0.05;
 pub struct Character {
     /// Pack id, used as `speaker` in records (`tali`).
     pub id: String,
-    /// Speaker tags per game, as they appear in stream names.
+    /// Speaker tags per game, as they appear in stream names (LE2/LE3)
+    /// and conversation speaker lists.
     pub tags: BTreeMap<Game, Vec<String>>,
+    /// Conversations the character owns, whose owner lines (speaker index
+    /// -1) are theirs. LE1 needs these: its audio doesn't name speakers.
+    pub owns: BTreeMap<Game, Vec<String>>,
 }
 
 impl Character {
     /// Read `sources.toml` from a character pack:
     ///
     /// ```toml
-    /// [le2]
-    /// speaker_tags = ["hench_tali"]
+    /// [le1]
+    /// speaker_tags = ["hench_quarian"]
+    /// owner_of = ["cha00_quarian_tali"]
     /// ```
     pub fn from_sources(id: &str, text: &str) -> Result<Character, String> {
         let table: toml::Table = text.parse().map_err(|e| format!("sources.toml: {e}"))?;
         let mut tags = BTreeMap::new();
+        let mut owns = BTreeMap::new();
         for game in [Game::Le1, Game::Le2, Game::Le3] {
             let Some(section) = table.get(game.id()) else {
                 continue;
@@ -75,10 +81,25 @@ impl Character {
                     format!("sources.toml: [{}] speaker_tags must be strings", game.id())
                 })?,
             );
+            if let Some(list) = section.get("owner_of") {
+                let list: Option<Vec<String>> = list
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().map(str::to_ascii_lowercase))
+                    .collect();
+                owns.insert(
+                    game,
+                    list.ok_or_else(|| {
+                        format!("sources.toml: [{}] owner_of must be strings", game.id())
+                    })?,
+                );
+            }
         }
         Ok(Character {
             id: id.to_string(),
             tags,
+            owns,
         })
     }
 }
@@ -161,17 +182,29 @@ struct Found {
     export: String,
     conversation: String,
     speaker_tag: String,
-    afc: PathBuf,
+    /// The `.afc` (LE2/LE3) or `.isb` bank (LE1).
+    container: PathBuf,
+    /// Byte offset in an `.afc`; subsong index in an `.isb`.
     offset: usize,
+    /// Bytes in an `.afc`; 0 for an `.isb`.
     size: usize,
+}
+
+/// Where a recording's audio comes from.
+enum Raw {
+    /// A complete `.wem`, sliced from an `.afc`.
+    Wem(Vec<u8>),
+    /// A subsong of an ISACT bank (1-based, as vgmstream counts).
+    Subsong(PathBuf, usize),
 }
 
 /// A distinct recording: one string id, gender and set of audio bytes.
 struct Recording {
     string_id: i32,
     gender: Gender,
-    raw: Vec<u8>,
-    raw_sha: String,
+    raw: Raw,
+    /// Hash of the source bytes, when we have them (`.wem` only).
+    raw_sha: Option<String>,
     found: Vec<Found>,
 }
 
@@ -212,18 +245,20 @@ pub fn run(
         let Some(tags) = character.tags.get(&game.game) else {
             continue;
         };
-        if game.game == Game::Le1 {
-            progress("le1: skipped (LE1 audio isn't supported yet)");
-            continue;
-        }
         let mut report = GameReport::default();
-        let subs = Subtitles::load(game)?;
-        progress(&format!(
-            "{}: {} subtitles, scanning packages",
-            game.game,
-            subs.male.len()
-        ));
-        let (recordings, graphs) = find(game, tags, &mut report, progress);
+        let (recordings, graphs, subs) = if game.game == Game::Le1 {
+            progress("le1: scanning packages");
+            find_le1(game, character, &mut report, progress)?
+        } else {
+            let subs = Subtitles::load(game)?;
+            progress(&format!(
+                "{}: {} subtitles, scanning packages",
+                game.game,
+                subs.male.len()
+            ));
+            let (r, g) = find(game, tags, &mut report, progress);
+            (r, g, subs)
+        };
         progress(&format!(
             "{}: {} streams, {} recordings, decoding",
             game.game,
@@ -288,7 +323,7 @@ pub fn run(
         "version": VERSION,
         "character": character.id,
         "games": per_game,
-        "not_covered": ["le1 audio", "scene tags", "barks without a stream name"],
+        "not_covered": ["scene tags", "barks without a stream name or conversation node"],
     });
     let path = out.join("harvest.json");
     fs::write(
@@ -415,21 +450,24 @@ fn find(
                 export: pkg.full_path(i as i32 + 1),
                 conversation: name.conversation,
                 speaker_tag: name.speaker_tag,
-                afc: afc.clone(),
+                container: afc.clone(),
                 offset: stream.offset,
                 size: stream.size,
             };
             let raw_sha = dataset::hash::sha256_bytes(&raw);
             let list = by_key.entry((name.string_id, name.gender)).or_default();
-            if let Some(r) = list.iter_mut().find(|r| r.raw_sha == raw_sha) {
+            if let Some(r) = list
+                .iter_mut()
+                .find(|r| r.raw_sha.as_ref() == Some(&raw_sha))
+            {
                 r.found.push(found);
                 report.merged_duplicates += 1;
             } else {
                 list.push(Recording {
                     string_id: name.string_id,
                     gender: name.gender,
-                    raw,
-                    raw_sha,
+                    raw: Raw::Wem(raw),
+                    raw_sha: Some(raw_sha),
                     found: vec![found],
                 });
             }
@@ -457,6 +495,223 @@ fn find(
         }
     }
     (by_key.into_values().flatten().collect(), graphs)
+}
+
+/// LE1: the character's lines from conversation nodes (their speaker
+/// tags, or owner lines of the conversations they own), with audio from
+/// each conversation's ISACT bank (`Content/Packages/ISACT/<name>.isb`,
+/// streams named `EN_<name>_<8-digit string id>_<M|F>.wav`). Subtitles
+/// come from the `BioTlkFile` exports: `Startup_INT.pcc` and each
+/// `_LOC_INT` package, English tables only (`.tlk` female, `.tlk_M` male).
+fn find_le1(
+    game: &GameDir,
+    character: &Character,
+    report: &mut GameReport,
+    progress: &dyn Fn(&str),
+) -> Result<(Vec<Recording>, Graphs, Subtitles), String> {
+    let tags = character.tags.get(&game.game).cloned().unwrap_or_default();
+    let owns = character.owns.get(&game.game).cloned().unwrap_or_default();
+    let mut subs = Subtitles {
+        male: BTreeMap::new(),
+        female: BTreeMap::new(),
+    };
+    let mut add_tables = |pkg: &Package, file: &str| {
+        let Ok(tables) = crate::tlk::le1_tables(pkg) else {
+            return;
+        };
+        for (name, strings) in tables {
+            let map = if name.ends_with("tlk_M") {
+                &mut subs.male
+            } else if name.ends_with("tlk") {
+                &mut subs.female
+            } else {
+                continue; // another language
+            };
+            for (id, text) in strings {
+                map.entry(id).or_insert_with(|| (text, file.to_string()));
+            }
+        }
+    };
+    let mut packages: Vec<_> = game
+        .files
+        .packages
+        .iter()
+        .filter(|f| {
+            let n = file_name(&f.path).to_ascii_lowercase();
+            n.ends_with("_loc_int.pcc") || n == "startup_int.pcc"
+        })
+        .collect();
+    // Startup (the global tables) first, then base game before DLC.
+    packages.sort_by_key(|f| {
+        (
+            !file_name(&f.path).eq_ignore_ascii_case("startup_int.pcc"),
+            is_dlc(&f.path),
+            f.path.clone(),
+        )
+    });
+
+    let mut graphs = Graphs::default();
+    // Conversation -> (string id -> speaker tag) for the character's lines.
+    let mut wanted: BTreeMap<String, BTreeMap<i32, String>> = BTreeMap::new();
+    for (n, info) in packages.iter().enumerate() {
+        if n % 100 == 0 {
+            progress(&format!("{}: package {n}/{}", game.game, packages.len()));
+        }
+        report.packages += 1;
+        let pkg = match Package::read(&info.path) {
+            Ok(p) => p,
+            Err(e) => {
+                report.errors.push(e);
+                continue;
+            }
+        };
+        add_tables(&pkg, file_name(&info.path));
+        for (path, conversation) in conversation::all(&pkg) {
+            let c = match conversation {
+                Ok(c) => c,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("{} {path}: {e}", info.path.display()));
+                    continue;
+                }
+            };
+            let key = c.name.to_ascii_lowercase();
+            let key = key.strip_suffix("_dlg").unwrap_or(&key).to_string();
+            if graphs.conversations.contains_key(&key) {
+                continue;
+            }
+            let owned = owns.contains(&key);
+            let mut lines = BTreeMap::new();
+            for e in &c.entries {
+                if e.string_id < 0 {
+                    continue;
+                }
+                let tag = match e.speaker_index {
+                    OWNER if owned => tags.first().cloned(),
+                    i => c
+                        .speaker_tag(i)
+                        .map(str::to_ascii_lowercase)
+                        .filter(|t| tags.contains(t)),
+                };
+                if let Some(tag) = tag {
+                    if e.speaker_index == OWNER {
+                        graphs.tags.insert((key.clone(), e.string_id), tag.clone());
+                    }
+                    lines.insert(e.string_id, tag);
+                }
+            }
+            if !lines.is_empty() {
+                wanted.insert(key.clone(), lines);
+            }
+            graphs.conversations.insert(key, (c, info.path.clone()));
+        }
+    }
+    // Keep only the conversations the character is in.
+    graphs.conversations.retain(|k, _| wanted.contains_key(k));
+
+    let banks: BTreeMap<String, PathBuf> = game
+        .files
+        .isbs
+        .iter()
+        .map(|f| {
+            let stem = f
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            (stem, f.path.clone())
+        })
+        .collect();
+    let mut recordings = Vec::new();
+    progress(&format!(
+        "{}: {} conversations, listing banks",
+        game.game,
+        wanted.len()
+    ));
+    for (key, lines) in &wanted {
+        let Some(bank) = banks.get(key) else {
+            report.missing_afc += lines.len();
+            continue;
+        };
+        let streams = match list_subsongs(bank) {
+            Ok(s) => s,
+            Err(e) => {
+                report.errors.push(format!("{}: {e}", bank.display()));
+                continue;
+            }
+        };
+        let package = graphs.conversations[key].1.clone();
+        for (index, name) in streams {
+            let Some((string_id, gender)) = parse_isact_name(&name) else {
+                continue;
+            };
+            let Some(tag) = lines.get(&string_id) else {
+                continue;
+            };
+            report.streams += 1;
+            recordings.push(Recording {
+                string_id,
+                gender,
+                raw: Raw::Subsong(bank.clone(), index),
+                raw_sha: None,
+                found: vec![Found {
+                    package: package.clone(),
+                    export: name,
+                    conversation: key.clone(),
+                    speaker_tag: tag.clone(),
+                    container: bank.clone(),
+                    offset: index,
+                    size: 0,
+                }],
+            });
+        }
+    }
+    Ok((recordings, graphs, subs))
+}
+
+/// `EN_cha00_quarian_tali_00127848_M.wav` -> (127848, male). English only.
+fn parse_isact_name(name: &str) -> Option<(i32, Gender)> {
+    let rest = name.strip_prefix("EN_")?.strip_suffix(".wav")?;
+    let (rest, g) = rest.rsplit_once('_')?;
+    let gender = match g {
+        "M" | "m" => Gender::Male,
+        "F" | "f" => Gender::Female,
+        _ => return None,
+    };
+    let (_, id) = rest.rsplit_once('_')?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((id.parse().ok()?, gender))
+}
+
+/// The subsongs of a bank as `(1-based index, stream name)`, from
+/// `vgmstream-cli -I -m -S 0` (one JSON object per line).
+fn list_subsongs(bank: &Path) -> Result<Vec<(usize, String)>, String> {
+    let output = Command::new("vgmstream-cli")
+        .args(["-I", "-m", "-S", "0"])
+        .arg(bank)
+        .output()
+        .map_err(|e| format!("running vgmstream-cli: {e} (is vgmstream installed?)"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "vgmstream-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let info = &v["streamInfo"];
+        if let (Some(i), Some(n)) = (info["index"].as_u64(), info["name"].as_str()) {
+            out.push((i as usize, n.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 fn read_slice(path: &Path, offset: usize, size: usize) -> Result<Vec<u8>, String> {
@@ -515,9 +770,12 @@ fn decode_all(
                 };
                 let wem = tmp.join(format!("{w}.wem"));
                 let wav = tmp.join(format!("{w}.wav"));
-                let decoded = fs::write(&wem, &r.raw)
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| decode(&wem, &wav));
+                let decoded = match &r.raw {
+                    Raw::Wem(bytes) => fs::write(&wem, bytes)
+                        .map_err(|e| e.to_string())
+                        .and_then(|_| decode(&wem, None, &wav)),
+                    Raw::Subsong(bank, n) => decode(bank, Some(*n), &wav),
+                };
                 let (rate, samples) = match decoded {
                     Ok(d) => d,
                     Err(e) => {
@@ -562,15 +820,24 @@ fn decode_all(
                 let mut audio_extra = Map::new();
                 audio_extra.insert(
                     "source".into(),
-                    json!({
-                        "container": rel(&first.afc),
-                        "offset": first.offset,
-                        "size": first.size,
-                        "export": first.export,
-                        "codec": "wwise_vorbis",
-                        "sample_rate": rate,
-                        "sha256": r.raw_sha,
-                    }),
+                    match &r.raw {
+                        Raw::Wem(_) => json!({
+                            "container": rel(&first.container),
+                            "offset": first.offset,
+                            "size": first.size,
+                            "export": first.export,
+                            "codec": "wwise_vorbis",
+                            "sample_rate": rate,
+                            "sha256": r.raw_sha,
+                        }),
+                        Raw::Subsong(_, n) => json!({
+                            "container": rel(&first.container),
+                            "subsong": n,
+                            "stream": first.export,
+                            "codec": "isact_vorbis",
+                            "sample_rate": rate,
+                        }),
+                    },
                 );
                 let mut source = Map::new();
                 source.insert("package".into(), json!(rel(&first.package)));
@@ -920,13 +1187,17 @@ fn package_prefix(p: &Path) -> String {
     stem.splitn(3, '_').take(2).collect::<Vec<_>>().join("_")
 }
 
-/// Decode a `.wem` with `vgmstream-cli`; mono samples in [-1, 1] and the
-/// rate.
-fn decode(wem: &Path, wav: &Path) -> Result<(u32, Vec<f32>), String> {
-    let output = Command::new("vgmstream-cli")
+/// Decode a `.wem`, or one subsong of a bank, with `vgmstream-cli`; mono
+/// samples in [-1, 1] and the rate.
+fn decode(input: &Path, subsong: Option<usize>, wav: &Path) -> Result<(u32, Vec<f32>), String> {
+    let mut cmd = Command::new("vgmstream-cli");
+    if let Some(n) = subsong {
+        cmd.arg("-s").arg(n.to_string());
+    }
+    let output = cmd
         .arg("-o")
         .arg(wav)
-        .arg(wem)
+        .arg(input)
         .output()
         .map_err(|e| format!("running vgmstream-cli: {e} (is vgmstream installed?)"))?;
     if !output.status.success() {
@@ -1023,6 +1294,12 @@ mod tests {
         assert_eq!(c.tags[&Game::Le2], ["hench_tali"]);
         assert_eq!(c.tags[&Game::Le3], ["hench_tali", "x"]);
         assert!(!c.tags.contains_key(&Game::Le1));
+        let c = Character::from_sources(
+            "tali",
+            "[le1]\nspeaker_tags = [\"hench_quarian\"]\nowner_of = [\"Cha00_Quarian_Tali\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.owns[&Game::Le1], ["cha00_quarian_tali"]);
         assert!(Character::from_sources("t", "[le2]\n").is_err());
     }
 
@@ -1101,11 +1378,26 @@ mod tests {
         let tali = Character {
             id: "tali".into(),
             tags: BTreeMap::from([(Game::Le3, vec!["hench_tali".into()])]),
+            owns: BTreeMap::new(),
         };
         let label = |n: &Node| speaker_label(&tali, Game::Le3, &c, "t_d", &graphs, n);
         assert_eq!(label(&c.entries[0]), "cit_diplomat");
         assert_eq!(label(&c.entries[1]), "tali");
         assert_eq!(label(&c.replies[1]), "shepard");
+    }
+
+    #[test]
+    fn isact_names() {
+        assert_eq!(
+            parse_isact_name("EN_cha00_quarian_tali_00127848_M.wav"),
+            Some((127848, Gender::Male))
+        );
+        assert_eq!(
+            parse_isact_name("EN_x_00000007_F.wav"),
+            Some((7, Gender::Female))
+        );
+        assert_eq!(parse_isact_name("FR_x_00000007_F.wav"), None);
+        assert_eq!(parse_isact_name("EN_x_y_M.wav"), None);
     }
 
     #[test]

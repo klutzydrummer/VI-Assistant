@@ -1,8 +1,16 @@
 # Where Tali's lines are in the game files, for `vi extract`.
-# Speaker tags as they appear in dialogue stream names, per game. Found by
-# counting every stream's tag on the Legendary Edition install: in LE2 and
-# LE3 she is only ever `hench_tali` (the other tags containing "tali" are
-# NPCs in her scenes, like `citprs_taliplot_csec`).
+# Speaker tags per game, found by counting every speaker tag on the
+# Legendary Edition install.
+# - LE2/LE3: she is only ever `hench_tali` in stream names (other tags
+#   containing "tali" are NPCs in her scenes, like `citprs_taliplot_csec`).
+# - LE1: `hench_quarian` (squad lines) and `sta20_quarian` (recruitment).
+#   LE1 audio doesn't name speakers, so the conversations she owns are
+#   listed too: their owner lines are hers.
+
+[le1]
+speaker_tags = ["hench_quarian", "sta20_quarian"]
+# Normandy talks, the Fist ambush rescue, Virmire ambient lines.
+owner_of = ["cha00_quarian_tali", "sta60_quarian", "jug20_amb_tali"]
 
 [le2]
 speaker_tags = ["hench_tali"]
