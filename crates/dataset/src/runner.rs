@@ -25,6 +25,10 @@ pub const LOG: &str = "log.txt";
 pub const OUT: &str = "out";
 pub const CURRENT: &str = "current";
 const TMP_PREFIX: &str = ".tmp-";
+/// A run's checkpoint folder (VI_CHECKPOINT), named by its key. Unlike the
+/// run's own folder it survives a failed run, so a rerun with the same key
+/// resumes from what the failed one saved; it's deleted once the run works.
+const CHECKPOINT_PREFIX: &str = ".checkpoint-";
 
 /// The current output folder of `stage` in a corpus, for readers outside
 /// the runner such as the review page.
@@ -279,6 +283,8 @@ impl Runner {
         }
         let out = tmp.join(OUT);
         fs::create_dir_all(&out).at(&out)?;
+        let checkpoint = stage_dir.join(format!("{CHECKPOINT_PREFIX}{}", planned.key));
+        fs::create_dir_all(&checkpoint).at(&checkpoint)?;
         let settings_path = tmp.join("settings.json");
         fs::write(
             &settings_path,
@@ -298,6 +304,7 @@ impl Runner {
             .env("VI_OUT", &out)
             .env("VI_SETTINGS", &settings_path)
             .env("VI_CORPUS", &self.pipeline.corpus)
+            .env("VI_CHECKPOINT", &checkpoint)
             .env("VI_BIN", &self.vi_bin)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -370,6 +377,7 @@ impl Runner {
             fs::remove_dir_all(&dest).at(&dest)?;
         }
         fs::rename(&tmp, &dest).at(&dest)?;
+        fs::remove_dir_all(&checkpoint).at(&checkpoint)?;
         Ok(manifest)
     }
 
@@ -403,8 +411,8 @@ impl Runner {
         fs::rename(&tmp, &path).at(&path)
     }
 
-    /// Deletes runs that aren't current, failed partial runs, and objects
-    /// no current run uses.
+    /// Deletes runs that aren't current, failed partial runs and their
+    /// checkpoints, and objects no current run uses.
     pub fn gc(&mut self) -> Result<GcReport, Error> {
         let _lock = Lock::take(&self.pipeline.corpus)?;
         let mut report = GcReport::default();

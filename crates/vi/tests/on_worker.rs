@@ -109,3 +109,35 @@ fn a_failing_job_fails_the_stage_and_still_cleans_up() {
     assert!(dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").is_none());
     assert_eq!(leftovers(dir.path()), Vec::<String>::new());
 }
+
+#[test]
+fn a_failing_job_still_brings_its_checkpoint_home() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(
+        dir.path(),
+        r#"case "$VI_CHECKPOINT" in "$PWD"/*) ;; *) exit 9 ;; esac
+echo clip-1 >> "$VI_CHECKPOINT/step.jsonl"; exit 3"#,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("exited with 3"));
+    let stage = dir.path().join("corpus/stages/on-gpu");
+    let saved: Vec<_> = fs::read_dir(&stage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".checkpoint-")
+        })
+        .collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(
+        fs::read_to_string(saved[0].join("step.jsonl")).unwrap(),
+        "clip-1\n"
+    );
+    assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+}

@@ -193,6 +193,28 @@ fn failure_keeps_the_previous_run_current() {
 }
 
 #[test]
+fn a_failed_run_leaves_its_checkpoint_for_the_rerun() {
+    let f = Fixture::new();
+    // Saves a checkpoint, then fails unless the previous run already saved one.
+    let job = "test -s \"$VI_CHECKPOINT/done\" && wc -c < \"$VI_INPUT_HARVEST/audio/clip.txt\" > \"$VI_OUT/count.txt\" && exit 0\necho step1 > \"$VI_CHECKPOINT/done\"\nexit 3\n";
+    fs::write(f.root.join("count.sh"), job).unwrap();
+    assert!(f.runner().run(None, false, |_| {}).is_err());
+    let stage = f.runner().stage_dir("count");
+    let saved: Vec<_> = fs::read_dir(&stage)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".checkpoint-"))
+        .collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(read(&stage.join(&saved[0]).join("done")), "step1\n");
+
+    // Same key, so the rerun sees the checkpoint, and it's gone once it works.
+    f.run();
+    assert!(f.current_out("count").join("count.txt").is_file());
+    assert!(!stage.join(&saved[0]).exists());
+}
+
+#[test]
 fn identical_outputs_share_one_object_and_gc_frees_old_runs() {
     let f = Fixture::new();
     f.run();

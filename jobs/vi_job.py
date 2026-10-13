@@ -76,6 +76,63 @@ def write_embeddings(folder, name, model, vectors):
     return {"model": model, "clips": len(ids), "dim": dim}
 
 
+class Checkpoint:
+    """One step's per-clip results, saved as they're made, so a run that dies
+    (credit ran out, the worker was lost) resumes where it stopped.
+
+    It lives in VI_CHECKPOINT, which the runner keeps for a stage's key across
+    failed runs and on-worker.sh copies home every few minutes. Without
+    VI_CHECKPOINT nothing is saved. A copy taken mid-write can end in a cut-off
+    line; that line is ignored and its clip done again.
+    """
+
+    def __init__(self, step):
+        folder = env_path("VI_CHECKPOINT")
+        self.path = folder / f"{step}.jsonl" if folder else None
+        self.done = {}
+        if self.path and self.path.exists():
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    self.done[r["id"]] = r["value"]
+            if self.done:
+                log(f"{step}: resuming, {len(self.done)} clips already done")
+        self._file = None
+
+    def add(self, results):
+        """Save {id: value} (values must be JSON) and flush."""
+        self.done.update(results)
+        if self.path is None:
+            return
+        if self._file is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = open(self.path, "a", encoding="utf-8", newline="\n")
+            # Start on a fresh line if a cut-off copy ended mid-record.
+            if self._file.tell():
+                with open(self.path, "rb") as f:
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        self._file.write("\n")
+        for cid, value in results.items():
+            self._file.write(json.dumps({"id": cid, "value": value}, ensure_ascii=False) + "\n")
+        self._file.flush()
+
+    def run(self, items, compute, chunk=1, every=250, label=None):
+        """{id: value} for every item (anything with .id), computing only the
+        ones not already saved. compute gets a list of up to `chunk` items and
+        returns their values in order; each chunk is saved as it finishes."""
+        todo = [c for c in items if c.id not in self.done]
+        for i in range(0, len(todo), chunk):
+            part = todo[i : i + chunk]
+            self.add({c.id: v for c, v in zip(part, compute(part))})
+            if label and (i // chunk) % max(1, every // chunk) == 0:
+                log(f"{label}: {len(self.done)}/{len(items)}")
+        return {c.id: self.done[c.id] for c in items}
+
+
 # --- inputs -----------------------------------------------------------------
 
 

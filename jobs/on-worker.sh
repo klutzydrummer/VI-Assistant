@@ -10,8 +10,14 @@
 # the worker's folder whether the job worked or not. The job sees:
 #   jobs/            this folder
 #   files/<name>     each --put file, by its base name
-#   VI_STAGE, VI_OUT, VI_SETTINGS, VI_INPUT_<NAME>, and VI_WORKER=1
+#   VI_STAGE, VI_OUT, VI_SETTINGS, VI_INPUT_<NAME>, VI_CHECKPOINT, and VI_WORKER=1
 # VI_CORPUS isn't sent: a GPU job gets only what its inputs and --put name.
+#
+# Checkpoints: the runner's VI_CHECKPOINT folder goes up with the job and comes
+# back home every VI_CHECKPOINT_EVERY seconds (default 120) while it runs, and
+# once more when it ends, worked or not. If the worker dies mid-job (credit runs
+# out, the machine is lost), the next run of the stage starts from the last copy
+# that reached home; the jobs skip what their checkpoint already has.
 #
 # The worker comes from `vi cloud env` (run `vi cloud up` first) unless
 # VI_WORKER_HOST is already set. VI_WORKER_HOST=local runs the "worker" in a
@@ -52,12 +58,20 @@ else
   push() { rsync -a -e "ssh ${ssh_opts[*]}" "$1" "$target:$2"; }
   pull() { rsync -a -e "ssh ${ssh_opts[*]}" "$target:$1" "$2"; }
   # Keep home's idle clock running while the job does.
-  (while sleep 60; do "$vi" cloud touch >/dev/null 2>&1 || true; done) &
+  # Background loops get no stdout/stderr: a leftover `sleep` holding the
+  # runner's pipes open would keep the stage from finishing.
+  (while sleep 60; do "$vi" cloud touch || true; done) >/dev/null 2>&1 &
   heartbeat=$!
 fi
 
 cleanup() {
   [ -n "${heartbeat-}" ] && kill "$heartbeat" 2>/dev/null
+  if [ -n "${saver-}" ]; then
+    kill "$saver" 2>/dev/null || true
+    wait "$saver" 2>/dev/null || true
+    save_checkpoint ||
+      echo "on-worker.sh: could not copy the checkpoint home; the last periodic copy stands" >&2
+  fi
   remote "rm -rf $(q "$work")" ||
     echo "on-worker.sh: could not delete $work on the worker; \`vi cloud down\` removes it with the instance" >&2
 }
@@ -70,6 +84,14 @@ for f in "${puts[@]}"; do
   push "$f" "$work/files/"
 done
 exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$work/settings.json") VI_WORKER=1"
+if [ -n "${VI_CHECKPOINT-}" ]; then
+  mkdir -p "$VI_CHECKPOINT"
+  push "$VI_CHECKPOINT/" "$work/checkpoint/"
+  exports+=" VI_CHECKPOINT=$(q "$work/checkpoint")"
+  save_checkpoint() { pull "$work/checkpoint/" "$VI_CHECKPOINT/"; }
+  (while sleep "${VI_CHECKPOINT_EVERY:-120}"; do save_checkpoint || true; done) >/dev/null 2>&1 &
+  saver=$!
+fi
 for var in $(compgen -e | grep '^VI_INPUT_' || true); do
   name=${var#VI_INPUT_}
   push "${!var}/" "$work/inputs/$name/"
