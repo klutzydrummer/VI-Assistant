@@ -34,6 +34,14 @@ class Fuse(unittest.TestCase):
         self.assertIsNone(fusion.audio_signal(probs, "intoxication", fusion.DEFAULT_AUDIO_MAP, 2.0))
         self.assertEqual(fusion.audio_signal(probs, "anger", fusion.DEFAULT_AUDIO_MAP, 0.5)[1], 0.4)
 
+    def test_direction_priors_skip_others_and_negations(self):
+        p = lambda d: fusion.priors([], d, {}, fusion.DEFAULT_DIRECTION_PRIORS)  # noqa: E731
+        self.assertEqual(p("Shepard grins, seeing that she gets it."), {})
+        self.assertEqual(p("Leaves, not hurt or offended. Not flippant here."), {})
+        self.assertIn("playfulness", p("Flirt line, slight banter tone."))
+        self.assertIn("joy", p("Tali arrives. Friendly greeting."))
+        self.assertEqual(p("Drinking alone at a table.")["intoxication"][0], 0.5)
+
     def test_priors(self):
         p = fusion.priors(["citadel_party"], "Quiet sad delivery. Not flippant here.",
                           fusion.DEFAULT_SCENE_PRIORS, fusion.DEFAULT_DIRECTION_PRIORS)  # fmt: skip

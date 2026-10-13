@@ -38,10 +38,18 @@ DEFAULT_DIRECTION_PRIORS = [
     (r"\b(sad|sadly|grief|griev|mourn|tearful|crying|upset|somber)", {"sadness": 0.75}),
     (r"\b(angry|angrily|furious|annoyed|irritat|frustrat|snap)", {"anger": 0.75}),
     (r"\b(worr|concern|nervous|anxious|afraid|scared|fear|urgent|panic)", {"worry": 0.75}),
-    (r"\b(laugh|amused|teas|joking|playful|wry|sarcas|flirt)", {"playfulness": 0.7, "joy": 0.5}),
+    (r"\b(laugh|chuckl|amused|teas|joking|playful|wry|sarcas|flirt|banter|good.humou?r|grin|smirk)",
+     {"playfulness": 0.7, "joy": 0.5}),
     (r"\b(happy|happily|excited|pleased|delighted|cheer|warm)", {"joy": 0.7}),
+    (r"\b(friendly|glad|smil|relie[fv]|hug)", {"joy": 0.5}),
     (r"\b(drunk|tipsy|slurr|intoxicated)", {"intoxication": 0.85}),
-]
+    (r"\b(drink|brandy|booze)", {"intoxication": 0.5}),
+]  # fmt: skip
+
+# A direction sentence about someone else ("Shepard grins") says nothing
+# about her, and a negated word ("Not flippant here") says the opposite.
+OTHER_SUBJECT = re.compile(r"^\s*(shepard|the\s+player|radio\b)")
+NEGATED = re.compile(r"\b(not|no|never|without)\b|n't\b")
 
 SCENE_PRIOR_CONFIDENCE = 0.5
 DIRECTION_PRIOR_CONFIDENCE = 0.6
@@ -66,11 +74,17 @@ def priors(scene_tags, stage_direction, scene_priors, direction_priors):
         for axis, value in scene_priors.get(tag, {}).items():
             out[axis] = (value, SCENE_PRIOR_CONFIDENCE)
     if stage_direction:
-        text = stage_direction.lower()
-        for pattern, axes in direction_priors:
-            if re.search(pattern, text):
-                for axis, value in axes.items():
-                    out[axis] = (value, DIRECTION_PRIOR_CONFIDENCE)
+        for sentence in re.split(r"[.!?\n]+", stage_direction.lower()):
+            if OTHER_SUBJECT.match(sentence):
+                continue
+            for pattern, axes in direction_priors:
+                for m in re.finditer(pattern, sentence):
+                    clause = re.split(r"[,;:]", sentence[: m.start()])[-1]
+                    if NEGATED.search(clause):
+                        continue
+                    for axis, value in axes.items():
+                        out[axis] = (value, DIRECTION_PRIOR_CONFIDENCE)
+                    break
     return out
 
 
@@ -96,7 +110,10 @@ def fuse(signals, weights):
         total += w
         acc += w * v
         present.append((v, w))
-    out = {"signals": {n: (None if s is None else round(s[0], 4)) for n, s in signals.items()}}
+    out = {
+        "signals": {n: (None if s is None else round(s[0], 4)) for n, s in signals.items()},
+        "signal_confidence": {n: round(s[1], 4) for n, s in signals.items() if s is not None},
+    }
     if total == 0:
         out.update(value=0.0, confidence=0.0)
         return out

@@ -43,6 +43,7 @@ fn discover_and_label_run_on_the_worker_with_fake_models() {
     )
     .unwrap();
     let on_worker = repo("jobs/on-worker.sh");
+    let calibrate = repo("jobs/calibrate.py");
     let pipeline = dir.path().join("dataset.toml");
     fs::write(
         &pipeline,
@@ -68,6 +69,12 @@ settings = {{ backend = "fake", compare = 6 }}
 command = [{on_worker:?}, "--put", "states.toml", "python3", "jobs/label.py"]
 inputs = ["harvest", "clean", "discover"]
 files = ["states.toml"]
+settings = {{ backend = "fake" }}
+
+[stage.calibrate]
+command = ["python3", {calibrate:?}]
+inputs = ["label"]
+files = ["corpus:reviews.jsonl"]
 settings = {{ backend = "fake" }}
 "#
         ),
@@ -120,6 +127,15 @@ settings = {{ backend = "fake" }}
 
     let label = dataset::runner::current_out(&corpus, "label").unwrap();
     assert!(label.join("fusion.json").is_file());
+    let calibrated = dataset::runner::current_out(&corpus, "calibrate").unwrap();
+    assert!(calibrated.join("calibration.json").is_file());
+    assert_eq!(
+        fs::read_to_string(calibrated.join("labels.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        24
+    );
     assert_eq!(ids(&label, "emotion"), 24);
 
     // The review page reads the result.

@@ -6,7 +6,10 @@ docs/design/corpus-format.md, label. Signals per axis:
   audio      emotion2vec+ class probabilities, mapped to axes (fusion.py)
   text       Gemma 4 reading the line and its context, with a confidence
   prior      scene tags and LE3 stage directions
-  audio_llm  discover's no-words scores, when discover is an input
+  audio_llm  the audio LLM's 1-5 rating of how well the delivery fits the
+             axis, asked only for a shortlist per axis: the clips the other
+             signals rank highest, plus a sample of low ones to show whether
+             it can hear the axis at all (fusion.json's `verification`)
 
 Barks have no subtitle, so they get no text signal unless clean found words;
 they're tagged combat_bark so contrast sets can leave them out. Nonverbal
@@ -19,11 +22,15 @@ embeddings/emotion.npy + .ids (emotion2vec+ per clip, for finding clips
 like a reviewed one and training small heads on reviews).
 
 Settings: backend ("fake" for tests), audio, dimensions, judge, batch,
-quant, weights, audio_map, scene_priors, audio_llm_axes, limit.
+quant, weights, audio_map, scene_priors, audio_llm_axes (axes to verify),
+verify_top, verify_low, limit.
 """
 
 import gc
+import hashlib
 import json
+import tempfile
+from pathlib import Path
 
 import fusion
 import models
@@ -82,52 +89,94 @@ def main():
     adv = {i: r[2] for i, r in results.items()}
     embeddings = {"emotion": write_embeddings(out / "embeddings", "emotion", audio_model, emb)}
 
-    # Text judge.
-    readable = [c for c in clips if c.text.strip()]
+    # Gemma: the text judge, then the audio verification. Loaded once, only
+    # if a checkpoint is missing something.
+    gemma = None
+
+    def llm():
+        nonlocal gemma
+        if gemma is None:
+            gemma = models.Judge(
+                (models.FakeGemma if fake else models.Gemma)(
+                    s.get("judge", "google/gemma-4-12B-it"),
+                    batch=int(s.get("batch", 8)),
+                    quant=s.get("quant", "auto"),
+                    batch_audio_s=float(s.get("batch_audio_s", 200)),
+                )
+            )
+        return gemma
+
+    # Shortest prompt first, so batches pad less.
+    readable = sorted((c for c in clips if c.text.strip()), key=lambda c: len(models.judge_prompt(c, axes)[0]["content"][0]["text"]))
     log(f"judging {len(readable)} lines with text")
     judged = Checkpoint("judge")
     if judged.todo(readable):
-        judge = models.Judge(
-            (models.FakeGemma if fake else models.Gemma)(
-                s.get("judge", "google/gemma-4-12B-it"),
-                batch=int(s.get("batch", 8)),
-                quant=s.get("quant", "auto"),
-            )
-        )
-        judged.run(readable, lambda part: judge.json([models.judge_prompt(c, axes) for c in part]), chunk=64)
-        del judge
-        free()
+        judged.run(readable, lambda part: llm().json([models.judge_prompt(c, axes) for c in part]), chunk=64)
     replies = judged.run(readable, None)
     text = {i: r for i, r in replies.items() if isinstance(r, dict)}
     unparsed = len(replies) - len(text)
 
-    # The audio LLM's scores from discover.
+    # Delivery tags from discover's captions (laughing, whispering, ...).
+    # Its per-axis guesses aren't used: open-ended captions mostly echo the
+    # words (prior-work.md, section 2), so the audio LLM gets a narrow
+    # question below instead.
     heard = {}
     discover = env_path("VI_INPUT_DISCOVER")
     if discover is not None and (discover / "captions.jsonl").exists():
         for c in read_jsonl(discover / "captions.jsonl"):
             heard[c["id"]] = c
-    audio_llm_axes = set(s.get("audio_llm_axes", [a.id for a in axes]))
 
     weights = {**fusion.DEFAULT_WEIGHTS, **s.get("weights", {})}
     audio_map = s.get("audio_map", fusion.DEFAULT_AUDIO_MAP)
     scene_priors = s.get("scene_priors", fusion.DEFAULT_SCENE_PRIORS)
+    priors = {
+        c.id: fusion.priors(c.scene_tags, c.stage_direction, scene_priors, fusion.DEFAULT_DIRECTION_PRIORS)
+        for c in clips
+    }
+
+    def signals(clip, axis):
+        return {
+            "audio": fusion.audio_signal(probs.get(clip.id), axis, audio_map, clip.duration_s),
+            "text": text_signal(text.get(clip.id), axis),
+            "prior": priors[clip.id].get(axis),
+        }
+
+    # Audio LLM verification of a shortlist per axis.
+    verify_axes = [a for a in axes if a.id in set(s.get("audio_llm_axes", [a.id for a in axes]))]
+    top, low = int(s.get("verify_top", 150)), int(s.get("verify_low", 50))
+    hearable = [c for c in clips if c.duration_s <= models.AUDIO_LLM_MAX_S]
+    ratings, shortlists = {}, {}
+    pad_dir = tempfile.TemporaryDirectory()
+    for a in verify_axes:
+        prelim = {c.id: fusion.fuse(signals(c, a.id), weights)["value"] for c in hearable}
+        shortlists[a.id] = shortlist(prelim, top, low)
+        picked = sorted((c for c in hearable if c.id in shortlists[a.id]["all"]), key=lambda c: c.duration_s)
+        saved = Checkpoint(f"verify_{a.id}")
+        if saved.todo(picked):
+            log(f"verifying {a.id}: {len(picked)} clips")
+            audio = {c.id: c.audio if fake else models.padded(c, Path(pad_dir.name)) for c in picked}
+            saved.run(
+                picked,
+                lambda part: llm().json(
+                    [models.verify_prompt(c, a, audio[c.id]) for c in part],
+                    16,
+                    [max(c.duration_s, models.AUDIO_LLM_MIN_S) for c in part],
+                ),
+                chunk=64,
+            )
+        ratings[a.id] = {i: rating(r) for i, r in saved.run(picked, None).items()}
+    gemma = None
+    free()
 
     labels = []
     for clip in clips:
-        prior = fusion.priors(clip.scene_tags, clip.stage_direction, scene_priors, fusion.DEFAULT_DIRECTION_PRIORS)
         caption = heard.get(clip.id, {})
         scores = {}
         for a in axes:
-            signals = {
-                "audio": fusion.audio_signal(probs.get(clip.id), a.id, audio_map, clip.duration_s),
-                "text": text_signal(text.get(clip.id), a.id),
-                "prior": prior.get(a.id),
-            }
-            if heard:
-                v = caption.get("scores", {}).get(a.id) if a.id in audio_llm_axes else None
-                signals["audio_llm"] = None if v is None else (v, AUDIO_LLM_CONFIDENCE)
-            scores[a.id] = fusion.fuse(signals, weights)
+            sig = signals(clip, a.id)
+            r = ratings.get(a.id, {}).get(clip.id)
+            sig["audio_llm"] = None if r is None else ((r - 1) / 4, AUDIO_LLM_CONFIDENCE)
+            scores[a.id] = fusion.fuse(sig, weights)
         labels.append(
             {
                 "id": clip.id,
@@ -140,9 +189,53 @@ def main():
 
     write_jsonl(out / "labels.jsonl", labels)
     write_axes(out, axes)
-    summary = report(labels, axes, unparsed) | {"embeddings": embeddings}
+    summary = report(labels, axes, unparsed) | {
+        "embeddings": embeddings,
+        "verification": verification_report(ratings, shortlists),
+    }
     (out / "fusion.json").write_text(json.dumps(summary, indent=1, sort_keys=True) + "\n")
     log(f"label: wrote {len(labels)} labels, {unparsed} unparsed judge replies")
+
+
+def shortlist(prelim, top, low):
+    """The `top` clips with the highest preliminary score, and `low` clips
+    picked by id hash from the lower half, as a control."""
+    ranked = sorted(prelim, key=lambda i: (-prelim[i], i))
+    high = ranked[:top]
+    rest = ranked[max(top, len(ranked) // 2) :]
+    control = sorted(rest, key=lambda i: hashlib.sha256(i.encode()).hexdigest())[:low]
+    return {"top": high, "low": control, "all": set(high) | set(control)}
+
+
+def rating(reply):
+    """A 1-5 rating from the audio LLM's reply, or None."""
+    if not isinstance(reply, dict):
+        return None
+    try:
+        r = round(float(reply.get("rating")))
+    except (TypeError, ValueError):
+        return None
+    return r if 1 <= r <= 5 else None
+
+
+def verification_report(ratings, shortlists):
+    """Per axis: mean rating on the top of the shortlist vs the low control.
+    If the audio LLM can hear the axis, the top should rate clearly higher;
+    if they rate the same, its ratings there are noise."""
+    out = {}
+    for axis, r in ratings.items():
+        tops = [r[i] for i in shortlists[axis]["top"] if r.get(i) is not None]
+        lows = [r[i] for i in shortlists[axis]["low"] if r.get(i) is not None]
+        mean = lambda xs: round(sum(xs) / len(xs), 2) if xs else None  # noqa: E731
+        out[axis] = {
+            "top": len(shortlists[axis]["top"]),
+            "low": len(shortlists[axis]["low"]),
+            "unparsed": sum(v is None for v in r.values()),
+            "mean_rating_top": mean(tops),
+            "mean_rating_low": mean(lows),
+            "separation": None if not tops or not lows else round(mean(tops) - mean(lows), 2),
+        }
+    return out
 
 
 def text_signal(reply, axis):

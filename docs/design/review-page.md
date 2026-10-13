@@ -30,7 +30,9 @@ Each axis shows the model's score as a tick, its confidence, and each signal's o
 
 ## Queue order
 
-A clip's priority is its highest, over axes, of **uncertainty × stake**:
+First comes the **calibration sample**: 150 labelled clips picked at random, so the accuracy the calibrate stage measures on them isn't biased toward hard cases. "Random" is reproducible: the clips whose lowercase hex SHA-256 of their id sorts first, in that order (`queue::calibration`), so the calibrate stage can recompute the sample from ids alone. These clips say "calibration sample" in their reason.
+
+After that, a clip's priority is its highest, over axes, of **uncertainty × stake**:
 - **uncertainty**: the larger of (1 − confidence) and the spread between its signals, so a confident fusion of disagreeing signals still counts as unsure.
 - **stake**: 0.4 + 0.6 × max(score, closeness to the positive threshold 0.6). Likely positives move a vector most, so they rank higher; neutral lines still count because they become the negatives.
 
