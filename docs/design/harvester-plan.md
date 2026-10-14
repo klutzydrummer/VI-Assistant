@@ -1,6 +1,6 @@
 # Harvester plan (dataset stage 1)
 
-Status: 2026-10-12. Readers for milestones 1 to 3 (inventory, packages with Oodle decompression, both TLK layouts) are in `crates/harvest`; try them with `vi harvest scan|package|tlk`. `vi extract` covers milestones 4 to 6 for all three games. In LE2/LE3, clips and subtitles are found through stream names; in LE1, through conversation nodes and ISACT banks. The conversation reader (`harvest::conversation`) gives each line's node, listener, `prev`/`next`, context and LE3 stage direction, and each conversation's graph is written to `conversations/`. Scene tags are still to do.
+Status: 2026-10-12. Readers for milestones 1 to 3 (inventory, packages with Oodle decompression, both TLK layouts) are in `crates/harvest`; try them with `vi harvest scan|package|tlk`. `vi extract` covers milestones 4 to 6 for all three games. In LE2/LE3, clips and subtitles are found through stream names; in LE1, through conversation nodes and ISACT banks. The conversation reader (`harvest::conversation`) gives each line's node, listener, `prev`/`next`, context and LE3 stage direction, and each conversation's graph is written to `conversations/`. Scene tags come from `harvest::scenes` (see below); `vi corpus tag` recomputes them in an existing harvest folder without touching audio.
 
 Checked on Brandon's install (Steam, all three games plus DLC):
 - All 19,430 package headers parse. The compression type is `0x400` (Leviathan); a few hundred packages are uncompressed. Every package but one decompresses with `oozextract`. The exception is LE3 `SFXImages_Codex_4.pcc`, where the last block of chunk 13 (306 bytes packed, 462 unpacked) fails inside `oozextract` while the four full blocks before it decode. Likely an `oozextract` bug on tiny blocks; it's a codex image package, so the harvester doesn't need it.
@@ -84,7 +84,11 @@ Out of scope for the first pass: combat barks and squad ambient lines that live 
 ## Context and scene tags
 
 - **Context:** a conversation is a graph, so "the previous lines" depends on the path. The harvester records each line's immediate predecessors and successors (ids), plus one canonical preceding path: the shortest path from a starting node, up to 4 lines, with speaker and text. The full graph per conversation is also written, so later stages can choose differently without re-harvesting.
-- **Scene tags:** derived from package names (`BioD_Nor_*` Normandy, `BioD_CitHub_*` Citadel, `DLC_EXP_Pack003*` Citadel DLC, loyalty mission packages), conversation export names, and DLC folder. A small hand-written mapping table in the source file turns prefixes into tags like `normandy`, `citadel_party`, `loyalty`. Plot conditionals are recorded raw (ids only); interpreting them is out of scope.
+- **Scene tags:** derived from the level code (`scene.prefix`), the DLC folder (`scene.dlc`) and the conversation name, by the reviewed table in `crates/harvest/src/scenes.toml`. Its sources are cited at the top of the file: the Mass Effect Wiki's level lists for places, the DLC folders' contents for DLC, and Tali's lines for conversation keywords. Each line gets:
+  - a place (`normandy`, `migrant_fleet`, `rannoch`, `despoina`, ...) and the kind of mission (`hub`, `main_mission`, `side_mission`, `recruitment`, `loyalty`, `n7_assignment`, `endgame`, a DLC like `citadel_dlc`);
+  - situation tags from the conversation name (`squad_banter`, `ambient`, `romance`, `mission_reaction`, `debrief`, `citadel_party`, `combat`, `squad_comment`, `radio`, `dream`, `shuttle`);
+  - the character's own tags from `sources.toml` `[<game>.scene_tags]`; for Tali, `personal_arc` (her storyline) and `personal_talk` (one-on-one time with Shepard).
+  Barks that play anywhere (`ss_*`, LE1's `combat_banter_*`) get only their situation tags, because the package storing them isn't where they're heard. Level codes the table doesn't know are listed in `harvest.json` (`unknown_levels`). Plot conditionals are recorded raw (ids only); interpreting them is out of scope.
 
 ## Output (per corpus-format.md v1)
 

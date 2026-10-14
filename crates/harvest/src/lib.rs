@@ -7,6 +7,7 @@
 //!   and the `BioTlkFile` exports inside LE1 packages.
 //! - [`install`]: an inventory of an install folder.
 //! - [`conversation`]: the dialogue graph in `BioConversation` exports.
+//! - [`scenes`]: scene tags from level codes, DLC folders and conversation names.
 //! - [`wwise`]: LE2/LE3 dialogue streams and where their audio is.
 //! - [`extract`]: `vi extract`, one character's lines as a harvest corpus.
 //!
@@ -22,6 +23,7 @@ pub mod install;
 pub mod package;
 pub mod props;
 mod reader;
+pub mod scenes;
 pub mod tlk;
 pub mod wwise;
 
@@ -56,6 +58,13 @@ impl Game {
             Game::Le2 => "le2",
             Game::Le3 => "le3",
         }
+    }
+
+    /// The game for an id from [`Game::id`].
+    pub fn from_id(id: &str) -> Option<Game> {
+        [Game::Le1, Game::Le2, Game::Le3]
+            .into_iter()
+            .find(|g| g.id() == id)
     }
 }
 
