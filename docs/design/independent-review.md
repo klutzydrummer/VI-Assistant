@@ -1,5 +1,7 @@
 # Independent review: Tali dataset pipeline (labelling for mood control vectors)
 
+> **Superseded (2026-10-14).** The corpus pipeline is now [corpus-pipeline.md](corpus-pipeline.md): classes are discovered by clustering Tali's own clip embeddings, not scored on fixed axes. This document is kept for history only. Don't build from it.
+
 Written 2026-10-13 by a fresh reviewer (a subagent with no prior context, read-only access, told to form its own view before reading earlier reviews). Saved unedited. It had no access to `methodology-review.md`, which was then only on an unmerged branch.
 
 ## Verdict
