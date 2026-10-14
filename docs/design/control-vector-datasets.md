@@ -1,5 +1,7 @@
 # Control vector datasets
 
+> **Superseded (2026-10-14).** The corpus pipeline is now [corpus-pipeline.md](corpus-pipeline.md): classes are discovered by clustering Tali's own clip embeddings, not scored on fixed axes. This document is kept for history only. Don't build from it.
+
 Status: plan approved 2026-10-12, revised 2026-10-13 after the 40-clip smoke test and the research in [prior-work.md](prior-work.md). Built: the stage runner, the GPU worker wrapper, harvest for LE1/LE2/LE3, and the discover and label jobs (`jobs/discover.py`, `jobs/label.py`, pipeline `characters/tali/dataset.toml`; signal fusion in `jobs/fusion.py`). Discover and label ran end to end on 40 real clips (`characters/tali/smoke.toml`).
 
 Review after the smoke tests, with proposed changes: [methodology-review.md](methodology-review.md).

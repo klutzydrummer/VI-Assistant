@@ -203,6 +203,16 @@ Records are `{"id": ...}` plus, for pairs, `{"id": ..., "neutral_text": ...}`.
 ### extract, evaluate
 Vectors go to `vectors/<axis>.{gguf,safetensors}` and the report to `report.md` plus `samples/`. The runner already keys these by the model through the stage settings; copying the chosen vectors into the pack's vector store is a separate step.
 
+### Corpus pipeline stages (proposed, see corpus-pipeline.md)
+These replace discover, label and calibrate in Tali's pipeline. The shapes are proposals for the implementation PRs, all additive. Outputs stay in stage folders, never in `lines.jsonl`.
+- **prep:** `audio16k/<id>.wav` (an embedding-only copy; the 24 kHz originals are untouched) and `prep.jsonl` `{id, gain_db, trimmed_s, noise_floor: {level_db, spectrum: [...]}}`.
+- **clean:** as now. DNSMOS is kept as a reported covariate, never a gate.
+- **embed:** `embeddings/<model>[_L<layer>].npy` + `.ids` (float16), `eiv.jsonl` `{id, heads: {...}, quality: {...}}`, `embed.json` (pinned revisions).
+- **confounds:** `confounds.json` (before and after probe tables, chosen candidate, acceptance results), `cleaned.npy` + `.ids`.
+- **cluster:** `clusters.jsonl` `{id, responsibilities: {...}, scores: {...}, cluster}`, `cluster.json` (k, BIC/ICL, merges, Jaccard per cluster, flags, enrichment).
+- **review (purity mode):** adds `purity` records to `reviews.jsonl` `{id, cluster, fits, foil, repeat, seconds, at}`.
+- **classes:** `classes.json`, `memberships.jsonl`, `eiv_labels.jsonl` (backup), `report.md`.
+
 ## Pipeline file
 
 ```toml

@@ -1,5 +1,7 @@
 # Methodology review after the smoke tests
 
+> **Superseded (2026-10-14).** The corpus pipeline is now [corpus-pipeline.md](corpus-pipeline.md): classes are discovered by clustering Tali's own clip embeddings, not scored on fixed axes. This document is kept for history only. Don't build from it.
+
 Status: review and proposals, 2026-10-13. Nothing here is decided until Brandon approves it; the approved parts move into [control-vector-datasets.md](control-vector-datasets.md).
 
 Inputs:
