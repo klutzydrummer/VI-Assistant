@@ -536,6 +536,19 @@ def trim(clip, dest, top_db=40, pad_s=0.05):
     return len(data) / sr, sr, round(20 * np.log10(rms + 1e-9), 2)
 
 
+def cut(clip, dest, start_s, end_s):
+    """Writes the clip between prep's trim bounds as FLAC at its own rate,
+    unchanged otherwise. Returns (duration_s, sample_rate, rms_dbfs)."""
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(str(clip.audio), dtype="float32", always_2d=True)
+    data = data.mean(axis=1)[int(round(start_s * sr)) : int(round(end_s * sr))]
+    sf.write(str(dest), data, sr, format="FLAC")
+    rms = float(np.sqrt(np.mean(data**2))) if len(data) else 0.0
+    return len(data) / sr, sr, round(20 * np.log10(rms + 1e-9), 2)
+
+
 class FakeWhisper:
     """The subtitle back, lowercased; a fixed phrase for barks."""
 

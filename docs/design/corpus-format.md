@@ -90,8 +90,26 @@ Everything else the harvester produces goes beside `lines.jsonl` in the same `ou
 
 Harvest writes WAV because it's the simplest thing to check and decode. Clean writes FLAC, which is what travels to the worker, so rsync size isn't a reason to change harvest.
 
+### prep: `prep.jsonl` + `audio16k/` + `prep.json`
+Written by `jobs/prep.py`, at home on the CPU (numpy, scipy, soundfile). One trim and one level for every clip, so every later stage hears the same clip ([corpus-pipeline.md](corpus-pipeline.md), step 1).
+```json
+{"id": "le2.s348112_f", "trim": {"start_s": 0.212, "end_s": 1.632}, "duration_s": 1.42, "trimmed_s": 0.31,
+ "level": {"method": "bs1770", "db": -27.4, "peak_dbfs": -6.1}, "gain_db": 4.4, "gain_capped": false,
+ "noise_floor": {"level_db": -71.2, "seconds": 0.26, "spectrum": [-88.1, -90.4]},
+ "audio16k": {"path": "audio16k/le2.s348112_f.flac", "sample_rate": 16000}, "flags": []}
+```
+- `trim`: where the kept clip starts and ends in harvest's WAV, in seconds. Frames more than `top_db` below the loudest frame count as silence (the same rule clean used before); `pad_s` of it is kept at each end. Clean cuts its FLAC at these bounds.
+- `noise_floor`: the level (dBFS) and the per-band power spectrum (dB, bands in `prep.json`'s `band_edges_hz`, 50 Hz to 7.6 kHz) of the silence the trim cut away, measured before trimming. It is recording chain with no voice in it: a nuisance covariate for `confounds`. `null` (flag `no_noise_floor`) when under 50 ms was cut.
+- `level`: the kept clip's loudness before the gain: ITU-R BS.1770 integrated loudness (`bs1770`, LUFS), or RMS dBFS (`rms`) for clips under `rms_below_s`, where the 400 ms gating is unreliable. A covariate, since how loud she is carries vocal effort.
+- `gain_db`: the one linear gain to `target_lufs`, capped so the peak stays under `max_peak_dbfs` (`gain_capped`). Never dynamic compression.
+- `audio16k`: the trimmed, levelled clip at 16 kHz as 16-bit FLAC, for the models only. Harvest's 24 kHz WAVs are untouched. Absent for `silent` clips (trimmed under 0.2 s), which later stages skip.
+
+`prep.json` holds the settings, band edges, package versions, flag counts and the distributions of gain, noise floor and trimmed silence.
+
+Jobs with prep as an input get each clip's 16 kHz copy and prep record from `vi_job.load_clips()` (`clip.audio16k`, `clip.prep`).
+
 ### clean: `clips.jsonl` + `audio/` + `embeddings/speaker.npy` + `clean.json`
-Written by `jobs/clean.py`.
+Written by `jobs/clean.py`. With prep as an input, it cuts at prep's bounds and its models hear prep's 16 kHz copy; without it, it trims as described below.
 ```json
 {"id": "...", "keep": true,
  "audio": {"path": "audio/<id>.flac", "sample_rate": 24000, "channels": 1, "duration_s": 1.31, "rms_dbfs": -24.3},
@@ -99,15 +117,17 @@ Written by `jobs/clean.py`.
  "quality": {"p808": 3.6, "sig": 3.9, "bak": 4.1, "ovr": 3.4}, "flags": ["subtitle_mismatch"]}
 ```
 - `audio`: leading and trailing silence trimmed, FLAC at the source rate. Loudness is not normalized, since how loud she is carries emotion; `rms_dbfs` records it.
-- `asr_text`, `subtitle_wer`: Whisper's words and their word error rate against the subtitle (punctuation and `{stage notes}` ignored). Nonverbal lines aren't transcribed.
-- `transcript`: only present when it differs from the harvest `text`, which is when the line had no subtitle (barks) and Whisper heard words (`asr_only`). Lines with a subtitle keep it, since Whisper misspells names. Later stages use `transcript` if present, else `text`.
+- `asr_text`, `subtitle_wer`: Whisper's words and their word error rate against the subtitle (punctuation and `{stage notes}` ignored). Nonverbal lines and lines without a subtitle (`no_subtitle`, the LE1 barks) aren't transcribed.
+- `transcript`: only present when it differs from the harvest `text`, which is when the line had an empty subtitle without the `no_subtitle` flag and Whisper heard words (`asr_only`). Lines with a subtitle keep it, since Whisper misspells names. Later stages use `transcript` if present, else `text`.
 - `speaker_similarity`: cosine similarity of the clip's ECAPA speaker embedding to her median voice (spoken clips of 1.5 s or more set the median). Each game with at least 20 such clips gets its own median and threshold, since the embedding hears each game's recording and mix; smaller groups use the all-games one. `clean.json`'s `speaker_baselines` lists them. The embeddings are in `embeddings/speaker.npy`.
-- `quality`: DNSMOS estimates, roughly 1 to 5; `ovr` is overall quality.
+- `quality`: DNSMOS estimates, roughly 1 to 5; `ovr` is overall quality. A reported covariate, never a gate.
 - `flags`:
   - `silent`: trimmed to nothing; the only reason for `keep: false` so far.
   - `subtitle_mismatch`: WER above `mismatch_wer`, for subtitles of three or more words.
   - `far_voice`: similarity more than `far_voice_mads` median absolute deviations below her median. Only spoken clips of 1.5 s or more are judged; shorter clips and sighs give speaker embeddings too noisy to mean anything.
   - `asr_only`: the transcript came from Whisper.
+
+`clean.json`'s `speaker_by_length` gives the similarity distribution and `far_voice` share per length band of the judged clips (1.5–3 s, 3–6 s, 6 s and up), to check the threshold treats short and long clips alike.
 
 Mismatches and far voices are flagged, not dropped, until their thresholds are set from what the flagged clips turn out to be. `clean.json` holds counts, the distributions of WER, similarity and quality, and the 20 clips least like her, for that.
 
@@ -204,9 +224,8 @@ Records are `{"id": ...}` plus, for pairs, `{"id": ..., "neutral_text": ...}`.
 Vectors go to `vectors/<axis>.{gguf,safetensors}` and the report to `report.md` plus `samples/`. The runner already keys these by the model through the stage settings; copying the chosen vectors into the pack's vector store is a separate step.
 
 ### Corpus pipeline stages (proposed, see corpus-pipeline.md)
-These replace discover, label and calibrate in Tali's pipeline. The shapes are proposals for the implementation PRs, all additive. Outputs stay in stage folders, never in `lines.jsonl`.
-- **prep:** `audio16k/<id>.wav` (an embedding-only copy; the 24 kHz originals are untouched) and `prep.jsonl` `{id, gain_db, trimmed_s, noise_floor: {level_db, spectrum: [...]}}`.
-- **clean:** as now. DNSMOS is kept as a reported covariate, never a gate.
+These replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). The shapes below are proposals for the implementation PRs, all additive; each moves into its own section above once built. Outputs stay in stage folders, never in `lines.jsonl`.
+- **prep, clean:** built, see above.
 - **embed:** `embeddings/<model>[_L<layer>].npy` + `.ids` (float16), `eiv.jsonl` `{id, heads: {...}, quality: {...}}`, `embed.json` (pinned revisions).
 - **confounds:** `confounds.json` (before and after probe tables, chosen candidate, acceptance results), `cleaned.npy` + `.ids`.
 - **cluster:** `clusters.jsonl` `{id, responsibilities: {...}, scores: {...}, cluster}`, `cluster.json` (k, BIC/ICL, merges, Jaccard per cluster, flags, enrichment).
