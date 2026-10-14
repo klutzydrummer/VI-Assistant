@@ -32,6 +32,7 @@ import json
 import tempfile
 from pathlib import Path
 
+import checks
 import fusion
 import models
 from vi_job import (
@@ -193,8 +194,28 @@ def main():
         "embeddings": embeddings,
         "verification": verification_report(ratings, shortlists),
     }
+    summary["confounds"] = {
+        a.id: {n: checks.confounds([l["scores"][a.id]["signals"].get(n) if n != "fused" else l["scores"][a.id]["value"]
+                                    for l in labels], clips)
+               for n in ("fused", *fusion.SIGNALS)}
+        for a in axes
+    }  # fmt: skip
+    summary["data"] = data_counts(labels, clips, axes)
     (out / "fusion.json").write_text(json.dumps(summary, indent=1, sort_keys=True) + "\n")
     log(f"label: wrote {len(labels)} labels, {unparsed} unparsed judge replies")
+
+    all_zero = sum(1 for r in text.values() if all((text_signal(r, a.id) or (0.0,))[0] == 0 for a in axes))
+    results = [
+        checks.Check("judge: unparsed share", round(unparsed / max(1, len(readable)), 3), 0.1),
+        checks.Check("judge: share of lines scored 0 on every axis", round(all_zero / max(1, len(text)), 3), 0.8,
+                     note="the judge defaulting to neutral, as on the first smoke test"),  # fmt: skip
+    ]
+    for axis, v in summary["verification"].items():
+        rated = v["top"] + v["low"]
+        results.append(checks.Check(f"verify {axis}: unparsed share", round(v["unparsed"] / max(1, rated), 3), 0.25))
+    for a in axes:
+        results += checks.confound_checks(f"{a.id} fused", summary["confounds"][a.id]["fused"])
+    checks.finish(out, results, s.get("checks", "warn"))
 
 
 def shortlist(prelim, top, low):
@@ -250,6 +271,24 @@ def text_signal(reply, axis):
     if value is None:
         return None
     return value, 0.5 if confidence is None else confidence
+
+
+def data_counts(labels, clips, axes):
+    """Per axis, how many clips the fused score puts at 0.6+ and 0.4+, overall
+    and by game, outside barks: whether the axis has enough candidates for a
+    contrast set before anything is extracted."""
+    game = {c.id: c.game for c in clips}
+    bark = {c.id for c in clips if c.bark}
+    out = {}
+    for a in axes:
+        rows = [(l["scores"][a.id]["value"], game[l["id"]]) for l in labels if l["id"] not in bark]
+        by_game = {}
+        for v, g in rows:
+            if v >= 0.6:
+                by_game[g] = by_game.get(g, 0) + 1
+        out[a.id] = {"at_0.6": sum(v >= 0.6 for v, _ in rows), "at_0.4": sum(v >= 0.4 for v, _ in rows),
+                     "at_0.6_by_game": by_game, "of": len(rows)}  # fmt: skip
+    return out
 
 
 def report(labels, axes, unparsed):

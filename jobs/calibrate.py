@@ -47,6 +47,7 @@ def main():
     s = settings()
     fake = fake_models()
     out = out_dir()
+    groups = conversations()
     label = env_path("VI_INPUT_LABEL")
     if label is None:
         raise SystemExit("calibrate needs the label stage as an input")
@@ -79,7 +80,7 @@ def main():
             weights[a] = dict(fusion.DEFAULT_WEIGHTS)
             report["axes"][a] = {"reviewed": len(truth), "note": f"fewer than {min_reviews} reviews; defaults kept"}
             continue
-        probe[a] = fit_probe(ids, truth, vectors, fake)
+        probe[a] = fit_probe(ids, truth, vectors, fake, groups)
         cols = signal_columns(by_id, a, probe[a])
         weights[a] = {**fusion.DEFAULT_WEIGHTS, **fit_weights(cols, truth, [i for i in fit_ids if i in truth])}
         fused_before = {i: by_id[i]["scores"][a]["value"] for i in ids}
@@ -185,15 +186,27 @@ def accuracy(col, truth, ids):
     }
 
 
-def fit_probe(ids, truth, vectors, fake):
+def conversations():
+    """id -> conversation, from harvest when it's an input, for grouping
+    cross-validation folds: clips from one conversation share context,
+    scene and recording, so a random split would leak between them and
+    overstate the probe (methodology-review.md, 2e). Lines without a
+    conversation (barks) are their own group."""
+    harvest = env_path("VI_INPUT_HARVEST")
+    if harvest is None:
+        return {}
+    return {l["id"]: (l.get("source") or {}).get("conversation") or l["id"] for l in read_jsonl(harvest / "lines.jsonl")}
+
+
+def fit_probe(ids, truth, vectors, fake, groups=None):
     """{id: predicted value} for every clip with an embedding; reviewed clips
-    get out-of-fold predictions."""
+    get out-of-fold predictions, with folds grouped by conversation."""
     if fake:
         mean = sum(truth.values()) / len(truth)
         return {i: round(mean, 4) for i in ids}
     import numpy as np
     from sklearn.linear_model import RidgeCV
-    from sklearn.model_selection import KFold, cross_val_predict
+    from sklearn.model_selection import GroupKFold, cross_val_predict
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -202,8 +215,9 @@ def fit_probe(ids, truth, vectors, fake):
     train = [k for k, i in enumerate(have) if i in truth]
     y = np.array([truth[have[k]] for k in train], dtype=np.float32)
     model = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-1, 5, 25)))
-    folds = KFold(n_splits=min(5, len(train)), shuffle=True, random_state=0)
-    oof = cross_val_predict(model, x_all[train], y, cv=folds)
+    group = [(groups or {}).get(have[k], have[k]) for k in train]
+    folds = GroupKFold(n_splits=min(5, len(set(group))))
+    oof = cross_val_predict(model, x_all[train], y, cv=folds, groups=group)
     pred = model.fit(x_all[train], y).predict(x_all)
     pred[train] = oof
     return {i: round(float(min(1.0, max(0.0, p))), 4) for i, p in zip(have, pred)}

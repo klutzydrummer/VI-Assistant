@@ -27,6 +27,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
+import checks
 import fusion
 import models
 from vi_job import (
@@ -200,6 +201,38 @@ def main():
         + "\n"
     )
     log(f"discover: {len(order)} clusters, {len(captions)} captions, {failed} unparsed replies")
+
+    tags = Counter(t for c in captions.values() for t in c["tags"])
+    top_tag, top_n = tags.most_common(1)[0] if tags else ("", 0)
+    results = [
+        checks.Check("captions: unparsed share", round(failed / max(1, len(hearable)), 3), 0.25,
+                     note="the audio LLM refusing or answering off-format"),
+        checks.Check(f"captions: share with the most common tag ({top_tag or 'none'})",
+                     round(top_n / max(1, len(captions)), 3), 0.8,
+                     note="one tag on nearly every clip, like other_voice on the first smoke test"),
+    ]  # fmt: skip
+    if not fake:
+        r2 = length_r2([emotion[c.id] for c in clips], [c.duration_s for c in clips])
+        results.append(checks.Check("emotion embedding: log-duration R2", r2, 0.6,
+                                    note="clusters would group by line length, not feeling"))  # fmt: skip
+    checks.finish(out, results, s.get("checks", "warn"))
+
+
+def length_r2(vectors, durations):
+    """How well a ridge fit recovers log clip length from the embeddings,
+    out of fold (R2). Plain emotion2vec scored 0.81 on the smoke test."""
+    import numpy as np
+    from sklearn.linear_model import RidgeCV
+    from sklearn.model_selection import cross_val_predict
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    if len(vectors) < 10:
+        return None
+    x = np.asarray(vectors, dtype=np.float32)
+    y = np.log(np.maximum(np.asarray(durations), 0.05))
+    pred = cross_val_predict(make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-1, 4, 12))), x, y, cv=5)
+    return round(float(1 - ((y - pred) ** 2).sum() / ((y - y.mean()) ** 2).sum()), 3)
 
 
 def heard_s(clip):
