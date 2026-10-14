@@ -1,8 +1,26 @@
 """Tests for clean.py's pure helpers. Run with `python3 -m unittest discover -s jobs`."""
 
 import unittest
+from types import SimpleNamespace
 
 import clean
+
+
+class TranscribeTest(unittest.TestCase):
+    def test_clips_too_long_for_a_batch_go_one_at_a_time(self):
+        clips = [SimpleNamespace(id=i) for i in "abc"]
+        durations = {"a": 2.0, "b": 49.6, "c": 29.5}
+        batches = []
+
+        def whole(part):
+            batches.append([c.id for c in part])
+            return [f"whole {c.id}" for c in part]
+
+        got = clean.transcribe(clips, durations, whole, lambda c: f"long {c.id}")
+        self.assertEqual(got, ["whole a", "long b", "whole c"])
+        self.assertEqual(batches, [["a", "c"]])
+        self.assertEqual(clean.transcribe(clips[1:2], durations, whole, lambda c: "x"), ["x"])
+        self.assertEqual(len(batches), 1, "no empty batch")
 
 
 class BaselineTest(unittest.TestCase):

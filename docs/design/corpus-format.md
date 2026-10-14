@@ -118,7 +118,7 @@ Written by `jobs/clean.py`. With prep as an input, it cuts at prep's bounds and 
  "quality": {"p808": 3.6, "sig": 3.9, "bak": 4.1, "ovr": 3.4}, "flags": ["subtitle_mismatch"]}
 ```
 - `audio`: leading and trailing silence trimmed, FLAC at the source rate. Loudness is not normalized, since how loud she is carries emotion; `rms_dbfs` records it.
-- `asr_text`, `subtitle_wer`: Whisper's words and their word error rate against the subtitle (punctuation and `{stage notes}` ignored). Nonverbal lines and lines without a subtitle (`no_subtitle`, the LE1 barks) aren't transcribed.
+- `asr_text`, `subtitle_wer`: Whisper's words and their word error rate against the subtitle (punctuation and `{stage notes}` ignored). Nonverbal lines and lines without a subtitle (`no_subtitle`, the LE1 barks) aren't transcribed. Whisper is greedy and capped at `asr_max_tokens`; clips over 29.5 s, too long for a batch, are transcribed one at a time in 30 s pieces.
 - `transcript`: only present when it differs from the harvest `text`, which is when the line had an empty subtitle without the `no_subtitle` flag and Whisper heard words (`asr_only`). Lines with a subtitle keep it, since Whisper misspells names. Later stages use `transcript` if present, else `text`.
 - `speaker_similarity`: cosine similarity of the clip's ECAPA speaker embedding to her median voice (spoken clips of 1.5 s or more set the median). Each game with at least 20 such clips gets its own median and threshold, since the embedding hears each game's recording and mix; smaller groups use the all-games one. `clean.json`'s `speaker_baselines` lists them. The embeddings are in `embeddings/speaker.npy`.
 - `quality`: DNSMOS estimates, roughly 1 to 5; `ovr` is overall quality. A reported covariate, never a gate.
