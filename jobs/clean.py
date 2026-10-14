@@ -62,6 +62,10 @@ SPEAKER_REFERENCE_MIN_S = 1.5
 SPEAKER_GROUP_MIN = 20
 # Length bands the speaker check is reported in, to see whether its threshold
 # treats short and long clips alike.
+# Whisper hears 30 s at a time and a batch can't hold anything longer (one
+# 49.6 s LE3 line stopped the full run). Longer clips are transcribed one at a
+# time in 30 s pieces. Under 30 s, with room for prep's resampling.
+WHISPER_WHOLE_S = 29.5
 LENGTH_BANDS = [(SPEAKER_REFERENCE_MIN_S, 3.0), (3.0, 6.0), (6.0, None)]
 
 
@@ -121,7 +125,9 @@ def main():
             cfg = asr.pipe.model.generation_config
             cfg.num_beams = 1
             cfg.max_new_tokens = int(s.get("asr_max_tokens", 160))
-    heard = saved.run(spoken, lambda part: asr(part), chunk=64)
+    durations = {c.id: audio[c.id]["duration_s"] for c in live}
+    long = (lambda c: asr([c])[0]) if fake else (lambda c: long_form(asr, c))
+    heard = saved.run(spoken, lambda part: transcribe(part, durations, asr, long), chunk=64)
     del asr
     free()
 
@@ -197,6 +203,24 @@ def main():
         checks.Check("silent share", round(flags.get("silent", 0) / max(1, len(clips)), 3), 0.05),
     ]  # fmt: skip
     checks.finish(out, results, s.get("checks", "warn"))
+
+
+def transcribe(clips, durations, whole, long):
+    """Whisper's words per clip: batched for clips it hears whole, one at a
+    time through `long` for the rest."""
+    short = [c for c in clips if durations[c.id] <= WHISPER_WHOLE_S]
+    got = dict(zip([c.id for c in short], whole(short) if short else []))
+    for c in clips:
+        if c.id not in got:
+            log(f"{c.id}: {durations[c.id]:.1f} s, transcribing in 30 s pieces")
+            got[c.id] = long(c)
+    return [got[c.id] for c in clips]
+
+
+def long_form(asr, clip):
+    out = asr.pipe({"raw": models.load_audio(clip.audio), "sampling_rate": 16_000}, chunk_length_s=30,
+                   batch_size=1, generate_kwargs={"language": "en", "task": "transcribe"})  # fmt: skip
+    return out["text"].strip()
 
 
 def baseline(voice, judged, members, mads):
