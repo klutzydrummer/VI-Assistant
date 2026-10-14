@@ -158,7 +158,7 @@ def avd_check(raw, cx, d, s):
     rows, y, g, z, resid = rows[ok], y[ok], g[ok], z[ok], resid[ok]
     before, after = cf.ridge_r2(raw[rows], y, g, k), cf.ridge_r2(cx[rows], y, g, k)
     rb, ra = cf.ridge_r2(raw[rows], resid, g, k), cf.ridge_r2(cx[rows], resid, g, k)
-    return {"clips": int(len(rows)),
+    return {"clips": len(rows),
             "avd_from_nuisance_alone_r2": cf.ridge_r2(z, y, g, k),
             "avd_r2": {"before": before, "after": after, "drop": round(before - after, 4)},
             "avd_minus_nuisance_r2": {"before": rb, "after": ra, "drop": round(rb - ra, 4)},
@@ -178,7 +178,7 @@ def main():
         pos = {cid: i for i, cid in enumerate(xids)}
         x = x[[pos[i] for i in d["ids"]]]
         with_duration = bool(run.get("candidates", {}).get(name, {}).get("transform", {}).get("duration_erased", True))
-        cx, raw, info, _ = cf.clean(x, d["meta"], d["comparable"], dims, with_duration)
+        cx, raw, _, _ = cf.clean(x, d["meta"], d["comparable"], dims, with_duration)
         game = cf.game_probe(cx, d["meta"], d["rep_comp"], s)
         r = {"duration_erased": with_duration,
              "game_probe_as_run": {m: game[m]["balanced_accuracy"] for m in ("knn", "svm") if game.get(m)},
