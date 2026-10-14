@@ -54,6 +54,19 @@ A review records the verdict, your scores for every axis, the model scores you w
 
 Contrast sets and fusion recalibration list `corpus:reviews.jsonl` as an input, so a new review reruns them and nothing upstream. The page shows the running bias per axis ("playfulness: +0.12 on average"), a first look at what recalibration will find; the recalibration itself belongs to the label stage.
 
+## Purity mode
+
+```
+vi review --purity <corpus-folder>          # needs the cluster stage's output
+vi review --purity --demo <empty-folder>    # synthetic corpus with four clusters by pitch
+```
+
+The corpus pipeline's listening step ([corpus-pipeline.md](corpus-pipeline.md) step 6). One cluster at a time, it plays a clip and asks whether it fits: <kbd>Y</kbd> or <kbd>N</kbd>, <kbd>Space</kbd> to replay. Only after you answer does it show the line, its context and following lines, scene tags, stage direction, prosody and the top three EIV heads (as z-scores against the corpus), then <kbd>Enter</kbd> plays the next.
+
+About one clip in five is a foil from another cluster and one in eight a hidden repeat; the page doesn't say which, before or after, so your answers stay honest measures of purity and consistency. When the SPRT reaches a verdict (or the members run out), the cluster's purity and its audits from `cluster.json` appear (size, Jaccard, games, enriched tags, and flags for low purity, a session flag, "topic, not tone?", below the minimum size, nuisance), and you name, merge, split or reject it. "Decide this cluster now" ends listening early.
+
+Answers and decisions go to `purity.jsonl` at the corpus root as you go (format in `corpus-format.md`). The Gemma text name suggestion from the spec isn't built yet.
+
 ## Not done
 - Audio is served whole without range requests, which is fine for clips under 20 seconds.
 - `current_out` is a few lines in `corpus.rs`; once `crates/dataset` merges, it can call `dataset::runner::current_out` instead.

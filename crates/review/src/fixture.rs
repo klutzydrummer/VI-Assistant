@@ -212,3 +212,69 @@ impl Rng {
         (self.next() % n as u64) as usize
     }
 }
+
+/// Add cluster and embed outputs for the purity page to a corpus `write`
+/// made: `classes` clusters by tone pitch, so the demo's clusters can be
+/// heard, with every tenth clip left unformed (barks, singing).
+pub fn write_clusters(dir: &Path, classes: usize) -> std::io::Result<()> {
+    let harvest = dir.join("stages/harvest/synthetic/out");
+    let ids: Vec<String> = fs::read_to_string(harvest.join(LINES))?
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| Some(v["id"].as_str()?.to_string()))
+        .collect();
+    let cluster = stage(dir, "cluster")?;
+    let embed = stage(dir, "embed")?;
+    let mut rng = Rng(0xc1a55);
+    let mut rows = Vec::new();
+    let mut scores = Vec::new();
+    let mut prosody = Vec::new();
+    let mut sizes = vec![0usize; classes];
+    for id in &ids {
+        // Ids end in the clip's index, which sets its pitch.
+        let i: usize = id[id.len() - 5..].parse().unwrap_or(0);
+        let c = (i % 7) % classes;
+        let sure = 0.7 + 0.3 * rng.unit() as f64;
+        let responsibilities: BTreeMap<String, f64> = (0..classes)
+            .map(|k| {
+                let r = if k == c {
+                    sure
+                } else {
+                    (1.0 - sure) / (classes - 1).max(1) as f64
+                };
+                (format!("c{k}"), (r * 1000.0).round() / 1000.0)
+            })
+            .collect();
+        let formed = i % 10 != 9;
+        if formed {
+            sizes[c] += 1;
+        }
+        rows.push(serde_json::json!({
+            "id": id, "cluster": format!("c{c}"), "responsibilities": responsibilities,
+            "formed": formed,
+        }));
+        scores.push(serde_json::json!({
+            "id": id,
+            "eiv": {"Amusement": rng.unit() + (c == 0) as u8 as f32, "Sadness": rng.unit(),
+                    "Anger": rng.unit() + (c == 1) as u8 as f32, "Teasing": rng.unit()},
+        }));
+        prosody.push(serde_json::json!({
+            "id": id, "f0_median_hz": 180.0 + 40.0 * (i % 7) as f32, "words_per_s": 2.5 + rng.unit(),
+        }));
+    }
+    write_jsonl(&cluster.join("clusters.jsonl"), &rows)?;
+    let report = serde_json::json!({
+        "status": "ok",
+        "classes": (0..classes).map(|k| serde_json::json!({
+            "class": format!("c{k}"), "size": sizes[k], "stability": "class",
+            "jaccard": 0.8, "session_flag": false, "topic_not_tone": false,
+            "below_min_size": false, "rejected_for_nuisance": false,
+        })).collect::<Vec<_>>(),
+    });
+    fs::write(
+        cluster.join("cluster.json"),
+        serde_json::to_string_pretty(&report).expect("report serializes"),
+    )?;
+    write_jsonl(&embed.join("scores.jsonl"), &scores)?;
+    write_jsonl(&embed.join("prosody.jsonl"), &prosody)
+}

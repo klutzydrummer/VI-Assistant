@@ -23,7 +23,7 @@ pub const BUDGET_SECONDS: f32 = 3600.0;
 /// routes can be tested directly.
 #[derive(Debug)]
 pub enum Reply {
-    Page,
+    Page(&'static str),
     Json(Value),
     Audio(PathBuf),
     NotFound,
@@ -31,6 +31,14 @@ pub enum Reply {
 }
 
 pub fn serve(mut corpus: Corpus, addr: &str) -> Result<(), String> {
+    serve_with(addr, |post, url, body| handle(&mut corpus, post, url, body))
+}
+
+/// Serve any page's routes on `addr`.
+pub fn serve_with(
+    addr: &str,
+    mut handle: impl FnMut(bool, &str, &str) -> Reply,
+) -> Result<(), String> {
     let server = Server::http(addr).map_err(|e| format!("could not listen on {addr}: {e}"))?;
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
@@ -42,10 +50,10 @@ pub fn serve(mut corpus: Corpus, addr: &str) -> Result<(), String> {
                 continue;
             }
         }
-        let reply = handle(&mut corpus, method == Method::Post, &url, &body);
+        let reply = handle(method == Method::Post, &url, &body);
         let sent = match reply {
-            Reply::Page => request.respond(
-                Response::from_string(PAGE).with_header(header("text/html; charset=utf-8")),
+            Reply::Page(page) => request.respond(
+                Response::from_string(page).with_header(header("text/html; charset=utf-8")),
             ),
             Reply::Json(v) => request.respond(
                 Response::from_string(v.to_string()).with_header(header("application/json")),
@@ -75,7 +83,7 @@ pub fn serve(mut corpus: Corpus, addr: &str) -> Result<(), String> {
 pub fn handle(corpus: &mut Corpus, post: bool, url: &str, body: &str) -> Reply {
     let path = url.split('?').next().unwrap_or(url);
     match (post, path) {
-        (false, "/") => Reply::Page,
+        (false, "/") => Reply::Page(PAGE),
         (false, "/api/session") => Reply::Json(session(corpus)),
         (false, p) if p.starts_with("/api/clip/") => {
             clip(corpus, &decode(&p["/api/clip/".len()..]))
@@ -222,7 +230,7 @@ fn audio_type(path: &std::path::Path) -> &'static str {
 }
 
 /// Percent-decoding for ids in paths.
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

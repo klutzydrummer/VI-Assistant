@@ -1,9 +1,13 @@
 //! The review stage of the dataset pipeline: a local page that plays each
 //! clip with its label scores, most uncertain first, and records the
 //! reviewer's corrections. See `docs/design/review-page.md`.
+//!
+//! `purity` is the corpus pipeline's listening step: does each clip fit its
+//! cluster, then name, merge, split or reject it.
 
 pub mod corpus;
 pub mod fixture;
+pub mod purity;
 pub mod queue;
 pub mod server;
 
@@ -178,7 +182,10 @@ mod tests {
     fn routes() {
         let (_dir, mut corpus) = demo(3);
         let id = corpus.lines[0].id.clone();
-        assert!(matches!(handle(&mut corpus, false, "/", ""), Reply::Page));
+        assert!(matches!(
+            handle(&mut corpus, false, "/", ""),
+            Reply::Page(_)
+        ));
         let clip = json(handle(&mut corpus, false, &format!("/api/clip/{id}"), ""));
         assert_eq!(clip["line"]["id"], id.as_str());
         assert!(clip["why"]["reason"].is_string());

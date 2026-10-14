@@ -23,6 +23,8 @@ pub(crate) const USAGE: &str = "usage:
   vi extract --character <character-folder> <LE-install-folder> [--out <folder>]
   vi review <corpus-folder> [--port N]
   vi review --demo <empty-folder> [--port N]
+  vi review --purity <corpus-folder> [--port N]
+  vi review --purity --demo <empty-folder> [--port N]
   vi cloud offers
   vi cloud up [--offer ID] [--yes]
   vi cloud down
@@ -162,15 +164,18 @@ fn pack_check(dir: PathBuf) -> ExitCode {
     }
 }
 
-/// Serve the label review page for a corpus on localhost.
+/// Serve the label review page, or with `--purity` the cluster purity
+/// review, for a corpus on localhost.
 fn review(args: &[&str]) -> ExitCode {
     let mut port = 8737u16;
     let mut demo = false;
+    let mut purity = false;
     let mut dir = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match *arg {
             "--demo" => demo = true,
+            "--purity" => purity = true,
             "--port" => match args.next().and_then(|p| p.parse().ok()) {
                 Some(p) => port = p,
                 None => {
@@ -199,10 +204,47 @@ fn review(args: &[&str]) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-        if let Err(e) = review::fixture::write(&dir, 120) {
+        let written = review::fixture::write(&dir, 120).and_then(|()| {
+            if purity {
+                review::fixture::write_clusters(&dir, 4)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = written {
             eprintln!("error: could not write demo corpus: {e}");
             return ExitCode::FAILURE;
         }
+    }
+    let addr = format!("127.0.0.1:{port}");
+
+    if purity {
+        let mut p = match review::purity::Purity::load(&dir) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "{} clusters, {} decided, {} answers so far",
+            p.classes.len(),
+            p.decided(),
+            p.records.len()
+        );
+        println!(
+            "purity review at http://{addr}/  (Ctrl+C to stop; every answer is saved to {} as you go)",
+            dir.join(review::purity::PURITY).display()
+        );
+        return match review::server::serve_with(&addr, |post, url, body| {
+            review::purity::handle(&mut p, post, url, body)
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let corpus = match review::Corpus::load(&dir) {
@@ -212,7 +254,6 @@ fn review(args: &[&str]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let addr = format!("127.0.0.1:{port}");
     println!(
         "{} clips, {} labelled, {} reviewed so far",
         corpus.lines.len(),

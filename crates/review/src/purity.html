@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Purity review</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --yes: #2e7d4f; --no: #b3392f; --warn: #b8701a; --warn-soft: #f7e7d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --yes: #6fc492; --no: #e57b70; --warn: #e0a253; --warn-soft: #3d2f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 17px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+  button, select, input[type=text] {
+    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 8px; padding: 7px 12px;
+  }
+  button { cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.yes { border-color: var(--yes); color: var(--yes); }
+  button.no { border-color: var(--no); color: var(--no); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+  button.primary kbd { color: inherit; border-color: currentColor; opacity: .8; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; color: var(--muted); }
+  .say { font-size: 18px; margin: 4px 0 10px; }
+  .context p { margin: 2px 0; color: var(--muted); }
+  .tag { display: inline-block; background: var(--accent-soft); border-radius: 999px; padding: 1px 9px; font-size: 12px; margin: 2px 4px 2px 0; }
+  .flag { display: inline-block; background: var(--warn-soft); color: var(--warn); border-radius: 999px; padding: 1px 9px; font-size: 12px; margin: 2px 4px 2px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .err { color: var(--no); }
+  .hidden { display: none; }
+  .grid { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; font-size: 13px; }
+  .grid div:nth-child(odd) { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Purity review</h1>
+    <span class="muted small" id="progress"></span>
+  </header>
+
+  <section class="panel hidden" id="listen">
+    <h2 id="listen-title"></h2>
+    <p class="muted small">Does this clip fit the cluster? Nothing about it shows until you answer.</p>
+    <audio id="audio" controls preload="auto" style="width:100%"></audio>
+    <div class="actions">
+      <button class="yes" id="yes">Fits <kbd>Y</kbd></button>
+      <button class="no" id="no">Doesn't fit <kbd>N</kbd></button>
+      <button id="replay">Replay <kbd>Space</kbd></button>
+      <span style="flex:1"></span>
+      <button id="early" class="small">Decide this cluster now</button>
+    </div>
+  </section>
+
+  <section class="panel hidden" id="reveal">
+    <h2>The clip you just answered <span class="muted small" id="reveal-answer"></span></h2>
+    <div id="reveal-body"></div>
+    <div class="actions">
+      <button id="reveal-replay">Play it again</button>
+      <span style="flex:1"></span>
+      <button class="primary" id="next">Next clip <kbd>Enter</kbd></button>
+    </div>
+  </section>
+
+  <section class="panel hidden" id="decide">
+    <h2 id="decide-title"></h2>
+    <div id="decide-body"></div>
+    <div class="actions">
+      <input type="text" id="name" placeholder="Name, e.g. teasing" style="flex:1; min-width:180px">
+      <button class="primary" id="do-name">Name it</button>
+    </div>
+    <div class="actions">
+      <select id="into"></select>
+      <button id="do-merge">Merge into it</button>
+      <button id="do-split">Split it</button>
+      <button class="no" id="do-reject">Reject it</button>
+    </div>
+    <div class="actions">
+      <input type="text" id="note" placeholder="Note (optional)" style="flex:1">
+    </div>
+    <div class="actions hidden" id="back-row">
+      <button id="back">Keep listening</button>
+    </div>
+  </section>
+
+  <section class="panel hidden" id="done">
+    <h2>Every cluster is decided</h2>
+    <p class="muted small">Your answers are in purity.jsonl next to the corpus; the classes stage reads them.</p>
+  </section>
+
+  <p class="err" id="error"></p>
+
+  <section class="panel">
+    <h2>Clusters</h2>
+    <table>
+      <thead><tr><th>Cluster</th><th>Size</th><th>Answered</th><th>Verdict</th><th>Purity</th><th>Decision</th></tr></thead>
+      <tbody id="clusters"></tbody>
+    </table>
+    <p class="muted small" id="totals"></p>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let session = null;
+let lastId = null;
+let started = null;
+let early = false;
+let busy = false;
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+}
+
+function pct(v) { return v == null ? '–' : Math.round(v * 100) + '%'; }
+
+function show(id, on) { $(id).classList.toggle('hidden', !on); }
+
+function render() {
+  const s = session;
+  const decided = s.clusters.filter((c) => c.state.decision).length;
+  const mins = Math.round(s.seconds / 60);
+  $('progress').textContent = `${decided} of ${s.clusters.length} clusters decided · ${mins} min listening`;
+  $('totals').textContent =
+    `False yes on foils: ${pct(s.false_yes)} · consistency (kappa): ` +
+    `${s.kappa == null ? '–' : s.kappa.toFixed(2)} on ${s.repeat_pairs} of ${s.repeat_target} repeats`;
+  $('clusters').innerHTML = s.clusters.map((c) => {
+    const st = c.state;
+    const d = st.decision;
+    const what = d ? (d.action === 'name' ? `named “${esc(d.name)}”` : d.action === 'merge' ? `merged into ${esc(d.into)}` : d.action + 'ed') : '';
+    const live = s.current && s.current.cluster === c.cluster;
+    // Purity shows only once a cluster's listening is over.
+    const over = st.sprt || d;
+    return `<tr><td>${esc(c.cluster)}${live ? ' ◂' : ''}</td><td class="num">${c.size ?? ''}</td>` +
+      `<td class="num">${st.answers}</td><td>${over ? esc(st.sprt ?? '') : ''}</td>` +
+      `<td class="num">${over ? pct(st.purity) : ''}</td><td>${what}</td></tr>`;
+  }).join('');
+
+  const cur = s.current;
+  show('done', !cur);
+  const listening = cur && cur.waiting && !early;
+  show('listen', listening && !lastId);
+  show('decide', cur && (!cur.waiting || early));
+  show('back-row', cur && cur.waiting && early);
+  if (!cur) { show('listen', false); return; }
+  if (listening && !lastId) loadClip(cur);
+  if (!cur.waiting || early) renderDecide(cur);
+}
+
+function loadClip(cur) {
+  $('listen-title').textContent = `Cluster ${cur.cluster} · clip ${cur.state.answers + 1}`;
+  const audio = $('audio');
+  audio.src = `/audio/next?n=${session.n}`;
+  started = null;
+  audio.onplay = () => { if (started == null) started = Date.now(); };
+  audio.play().catch(() => {}); // autoplay may need one click first
+}
+
+function renderDecide(cur) {
+  const st = cur.state;
+  const info = cur.info || {};
+  $('decide-title').textContent = `Decide cluster ${cur.cluster}`;
+  const flags = [];
+  if (st.purity != null && st.purity < 0.6) flags.push('purity below 0.6: merge or reject');
+  if (info.session_flag) flags.push('mostly from one or two conversations');
+  if (info.topic_not_tone) flags.push('topic, not tone? text predicts it better than audio');
+  if (info.below_min_size) flags.push('below the minimum class size');
+  if (info.rejected_for_nuisance) flags.push('predictable from game, length or noise floor');
+  if (info.stability && info.stability !== 'class') flags.push(`stability: ${info.stability}`);
+  const top = (info.enrichment || []).slice(0, 5)
+    .map((e) => `<span class="tag">${esc(e.tag)} ×${e.ratio} (${e.count})</span>`).join('');
+  const games = info.games ? Object.entries(info.games).map(([g, n]) => `${esc(g)} ${n}`).join(', ') : '–';
+  $('decide-body').innerHTML =
+    (early && cur.waiting ? '<p class="muted small">Listening isn\'t finished; deciding now ends it for this cluster.</p>' : '') +
+    `<div class="grid">` +
+    `<div>Verdict</div><div>${esc(st.sprt ?? 'still listening')}</div>` +
+    `<div>Members you heard</div><div>${st.members_yes} fit, ${st.members_no} didn't</div>` +
+    `<div>Purity</div><div>${pct(st.purity)} corrected (${pct(st.observed)} as heard)</div>` +
+    `<div>Size</div><div>${info.size ?? '–'}</div>` +
+    `<div>Stability</div><div>${info.jaccard != null ? 'Jaccard ' + Number(info.jaccard).toFixed(2) : '–'}</div>` +
+    `<div>Games</div><div>${games}</div>` +
+    (top ? `<div>Enriched tags</div><div>${top}</div>` : '') +
+    `</div>` +
+    (flags.length ? `<p>${flags.map((f) => `<span class="flag">${esc(f)}</span>`).join('')}</p>` : '');
+  const others = session.clusters.filter((c) => c.cluster !== cur.cluster);
+  $('into').innerHTML = others.map((c) => {
+    const d = c.state.decision;
+    const label = d && d.name ? `${c.cluster} (${d.name})` : c.cluster;
+    return `<option value="${esc(c.cluster)}">${esc(label)}</option>`;
+  }).join('');
+  $('do-merge').disabled = others.length === 0;
+}
+
+function renderReveal(r, fits) {
+  $('reveal-answer').textContent = fits ? '· you said it fits' : "· you said it doesn't fit";
+  const ctx = (r.context || []).map((c) => `<p><b>${esc(c.speaker)}:</b> ${esc(c.text)}</p>`).join('');
+  const fol = (r.following || []).map((c) => `<p><b>${esc(c.speaker)}:</b> ${esc(c.text)}</p>`).join('');
+  const tags = (r.scene_tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('');
+  const pro = r.prosody ? Object.entries(r.prosody).filter(([k]) => k !== 'id')
+    .map(([k, v]) => `${esc(k)} ${typeof v === 'number' ? Math.round(v * 100) / 100 : esc(v)}`).join(' · ') : '';
+  const eiv = (r.eiv_top || []).map((h) => `${esc(h.head)} ${h.z > 0 ? '+' : ''}${h.z}σ`).join(' · ');
+  $('reveal-body').innerHTML =
+    `<div class="context">${ctx}</div>` +
+    `<p class="say"><b>Tali:</b> ${esc(r.text) || '<span class="muted">(no words)</span>'}</p>` +
+    (r.stage_direction ? `<p class="muted small"><i>${esc(r.stage_direction)}</i></p>` : '') +
+    (fol ? `<div class="context">${fol}</div>` : '') +
+    `<p>${tags}</p>` +
+    `<div class="grid">` +
+    `<div>Game</div><div>${esc(r.game)} · ${esc(r.conversation)}</div>` +
+    (pro ? `<div>Prosody</div><div>${pro}</div>` : '') +
+    (eiv ? `<div>Top EIV heads</div><div>${eiv}</div>` : '') +
+    `</div>`;
+}
+
+async function answer(fits) {
+  if (busy || !session.current || !session.current.waiting || lastId) return;
+  busy = true;
+  const seconds = started == null ? 0 : (Date.now() - started) / 1000;
+  try {
+    const r = await api('/api/answer', {n: session.n, fits, seconds});
+    $('audio').pause();
+    lastId = r.reveal.id;
+    session = r.session;
+    renderReveal(r.reveal, fits);
+    show('reveal', true);
+    $('error').textContent = '';
+    render();
+  } catch (e) {
+    $('error').textContent = e.message;
+  } finally {
+    busy = false;
+  }
+}
+
+function next() {
+  if (!lastId) return;
+  lastId = null;
+  show('reveal', false);
+  render();
+}
+
+async function decide(action) {
+  const cur = session.current;
+  if (!cur || busy) return;
+  const body = {cluster: cur.cluster, action, note: $('note').value || null};
+  if (action === 'name') body.name = $('name').value;
+  if (action === 'merge') body.into = $('into').value;
+  busy = true;
+  try {
+    session = await api('/api/decide', body);
+    $('name').value = '';
+    $('note').value = '';
+    early = false;
+    lastId = null;
+    show('reveal', false);
+    $('error').textContent = '';
+    render();
+  } catch (e) {
+    $('error').textContent = e.message;
+  } finally {
+    busy = false;
+  }
+}
+
+$('yes').onclick = () => answer(true);
+$('no').onclick = () => answer(false);
+$('replay').onclick = () => { const a = $('audio'); a.currentTime = 0; a.play(); };
+$('reveal-replay').onclick = () => { if (lastId) new Audio('/audio/' + encodeURIComponent(lastId)).play(); };
+$('next').onclick = next;
+$('early').onclick = () => { early = true; $('audio').pause(); render(); };
+$('back').onclick = () => { early = false; render(); };
+$('do-name').onclick = () => decide('name');
+$('do-merge').onclick = () => decide('merge');
+$('do-split').onclick = () => decide('split');
+$('do-reject').onclick = () => decide('reject');
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'y') answer(true);
+  else if (k === 'n') answer(false);
+  else if (k === ' ') { e.preventDefault(); $('replay').click(); }
+  else if (k === 'enter') next();
+});
+
+api('/api/session').then((s) => { session = s; render(); })
+  .catch((e) => { $('error').textContent = e.message; });
+</script>
+</body>
+</html>
