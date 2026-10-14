@@ -80,7 +80,7 @@ Written by the extractor (see `harvester-plan.md`). One record per distinct line
 | `source.*` | no | `package` (relative to the install), `conversation`, `node` (`kind` entry/reply, `index`), `string_id`, `gender` (`m`, `f`, `none`), `tlk`, `speaker_tag`, `speaker_name`, `speaker_index` (-1 owner, -2 Shepard), `listener`, `occurrences` |
 | `context` | no | the canonical preceding path, oldest first, up to 4 lines, each `{id?, speaker, text, string_id?}` |
 | `prev`, `next` | no | ids of immediate predecessor and successor lines in the conversation graph (any speaker) |
-| `scene_tags` | no | lowercase tags, like `citadel_party`, `normandy`, `loyalty`, `combat` |
+| `scene_tags` | no | lowercase tags for where and in what situation the line is spoken, like `citadel_party`, `normandy`, `loyalty`, `combat`; vocabulary and sources in `crates/harvest/src/scenes.toml` |
 | `scene` | no | `dlc`, `prefix` and anything else the tags were derived from |
 | `stage_direction` | no | LE3 voice director's note for this line, verbatim. The label stage treats it as a prior. |
 

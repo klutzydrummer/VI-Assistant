@@ -15,6 +15,7 @@ pub(crate) const USAGE: &str = "usage:
   vi dataset status <pipeline.toml>
   vi dataset gc <pipeline.toml>
   vi corpus check <harvest-output-folder>
+  vi corpus tag <harvest-output-folder> --character <character-folder>
   vi corpus synth [folder] [--lines N]
   vi harvest scan <LE-install-folder> [--open]
   vi harvest package <file.pcc>
@@ -57,6 +58,13 @@ fn main() -> ExitCode {
         ["dataset", "status", p] => dataset::status(Path::new(p)),
         ["dataset", "gc", p] => dataset::gc(Path::new(p)),
         ["corpus", "check", dir] => dataset::check(Path::new(dir)),
+        ["corpus", "tag", dir] => match &character {
+            Some(c) => harvest::retag(Path::new(c), Path::new(dir)),
+            None => {
+                eprintln!("{USAGE}");
+                ExitCode::from(2)
+            }
+        },
         ["corpus", "synth"] => dataset::synth(None, lines.as_deref()),
         ["corpus", "synth", dir] => dataset::synth(Some(dir), lines.as_deref()),
         ["harvest", "scan", dir] => harvest::scan(Path::new(dir), open),

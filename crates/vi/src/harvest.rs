@@ -200,17 +200,7 @@ pub fn extract(character: &Path, root: &Path, out: Option<&str>) -> ExitCode {
     else {
         return fail("no output folder: pass --out or set VI_OUT");
     };
-    let sources = character.join("sources.toml");
-    let text = match std::fs::read_to_string(&sources) {
-        Ok(t) => t,
-        Err(e) => return fail(format!("{}: {e}", sources.display())),
-    };
-    let id = character
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
-        .unwrap_or_default();
-    let who = match harvest::extract::Character::from_sources(&id, &text) {
+    let who = match load_character(character) {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
@@ -224,6 +214,9 @@ pub fn extract(character: &Path, root: &Path, out: Option<&str>) -> ExitCode {
             "{game}: {} lines from {} streams in {} packages ({} duplicates merged, {} without subtitle, {} missing .afc, {} placeholders skipped, {} conversations, {} lines without a node, {} errors)",
             r.lines, r.streams, r.packages, r.merged_duplicates, r.no_subtitle, r.missing_afc, r.placeholders.len(), r.conversations, r.without_node, r.errors.len()
         );
+        for (code, n) in &r.unknown_levels {
+            println!("  no scene entry for level {code} ({n} lines)");
+        }
         for e in r.errors.iter().take(10) {
             println!("  error: {e}");
         }
@@ -233,5 +226,36 @@ pub fn extract(character: &Path, root: &Path, out: Option<&str>) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+fn load_character(character: &Path) -> Result<harvest::extract::Character, String> {
+    let sources = character.join("sources.toml");
+    let text =
+        std::fs::read_to_string(&sources).map_err(|e| format!("{}: {e}", sources.display()))?;
+    let id = character
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .unwrap_or_default();
+    harvest::extract::Character::from_sources(&id, &text)
+}
+
+/// `vi corpus tag`: recompute `scene_tags` in an existing harvest folder
+/// from the records' level, DLC and conversation, without touching audio.
+pub fn retag(character: &Path, dir: &Path) -> ExitCode {
+    let who = match load_character(character) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    match harvest::extract::retag(dir, &who) {
+        Ok((changed, unknown)) => {
+            println!("{changed} lines got new scene tags");
+            for (code, n) in &unknown {
+                println!("  no scene entry for level {code} ({n} lines)");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
     }
 }

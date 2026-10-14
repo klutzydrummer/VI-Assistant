@@ -1,0 +1,242 @@
+# Scene tags: where a line is spoken and in what situation.
+#
+# Read by `harvest::scenes` for every harvested line, from three things a
+# record already carries: the level code (`scene.prefix`, the package name
+# up to its second underscore), the DLC folder (`scene.dlc`) and the
+# conversation name. Tags are lowercase with underscores
+# (docs/design/corpus-format.md, "harvest"). Character-specific tags (whose
+# own story a scene is) live in each pack's sources.toml instead.
+#
+# Sources:
+# - Level codes and their places: the Mass Effect Wiki's console level
+#   lists, "PC Tweaks" (LE1), "PC Tweaks (Mass Effect 2)" and
+#   "PC Tweaks (Mass Effect 3)" at masseffect.fandom.com.
+# - DLC folders: matched to their DLC by the levels and conversations inside
+#   them on the install (e.g. DLC_UNC_Hammer01 holds BioD_N7Ruins and
+#   BioD_N7Shipwreck, which the wiki lists as Project Firewalker missions).
+# - Conversation keywords: BioWare's naming, checked by reading the lines
+#   each keyword selects in Tali's corpus.
+#
+# Level codes match case-insensitively on the part after the package type
+# (`BioD_`, `BioA_`, `BioSnd_`, `BIOA_`), so `BioA_Gth001` and `BioD_Gth001`
+# share an entry. LE1 codes are an area plus a number (`NOR10`); the area
+# entry applies unless the full code has its own.
+
+# --- LE1 -------------------------------------------------------------------
+[le1.levels]
+NOR = ["normandy"]
+STA = ["citadel", "hub"]
+PRO = ["eden_prime", "main_mission", "prologue"]
+WAR = ["feros", "main_mission"]
+ICE = ["noveria", "main_mission"]
+LAV = ["therum", "main_mission"]
+JUG = ["virmire", "main_mission"]
+LOS = ["ilos", "main_mission"]
+END = ["citadel", "main_mission", "endgame"]
+# Uncharted worlds (side missions on planets named in the wiki's list).
+UNC = ["uncharted_world", "side_mission"]
+UNC17 = ["antibaar", "uncharted_world", "side_mission"]
+UNC20 = ["trebin", "uncharted_world", "side_mission"]
+UNC24 = ["altahe", "uncharted_world", "side_mission"]
+UNC25 = ["edolus", "uncharted_world", "side_mission"]
+UNC53 = ["agebinium", "uncharted_world", "side_mission"]
+UNC54 = ["presrop", "uncharted_world", "side_mission"]
+UNC73 = ["nepmos", "uncharted_world", "side_mission"]
+UNC81 = ["chasca", "uncharted_world", "side_mission"]
+UNC84 = ["eletania", "uncharted_world", "side_mission"]
+UNC92 = ["binthu", "uncharted_world", "side_mission"]
+# Freighter side missions.
+FRE = ["freighter", "side_mission"]
+
+# --- LE2 -------------------------------------------------------------------
+[le2.levels]
+Nor = ["normandy"]
+CitHub = ["citadel", "hub"]
+KroHub = ["tuchanka", "hub"]
+OmgHub = ["omega", "hub"]
+TwrHub = ["illium", "hub"]
+ProNor = ["normandy", "main_mission", "prologue"]
+ProCer = ["lazarus_station", "main_mission", "prologue"]
+ProFre = ["freedoms_progress", "main_mission"]
+HorCr1 = ["horizon", "main_mission"]
+ShpCr2 = ["collector_ship", "main_mission"]
+RprGtA = ["derelict_reaper", "main_mission"]
+EndGm1 = ["tartarus_debris_field", "main_mission", "endgame", "suicide_mission"]
+EndGm2 = ["collector_base", "main_mission", "endgame", "suicide_mission"]
+EndGm3 = ["main_mission", "endgame"]
+# Dossiers: the codes ending in A are recruitment missions.
+JnkKgA = ["korlus", "recruitment"]
+OmgGrA = ["omega", "recruitment"]
+OmgPrA = ["omega", "recruitment"]
+SunTlA = ["haestrom", "recruitment"]
+TwrAsA = ["illium", "recruitment"]
+TwrMwA = ["illium", "recruitment"]
+PrsCvA = ["purgatory", "recruitment"]
+# Loyalty missions: the codes ending in L.
+BchLmL = ["aeia", "loyalty"]
+BlbGtl = ["heretic_station", "loyalty"]
+CitAsL = ["citadel", "loyalty"]
+CitGrL = ["citadel", "loyalty"]
+JunCvL = ["pragia", "loyalty"]
+KroKgL = ["tuchanka", "loyalty"]
+KroPrL = ["tuchanka", "loyalty"]
+PtyMtL = ["bekenstein", "loyalty"]
+QuaTlL = ["migrant_fleet", "loyalty"]
+TwrVxL = ["illium", "loyalty"]
+ZyaVtL = ["zorya", "loyalty"]
+# DLC missions.
+Unc1Explore = ["aite", "overlord_dlc"]
+Unc1Base1 = ["aite", "overlord_dlc"]
+Unc1Base2 = ["aite", "overlord_dlc"]
+Unc1Base3 = ["aite", "overlord_dlc"]
+Unc1Base4 = ["aite", "overlord_dlc"]
+# N7 assignments, with the planet or ship from the wiki's list.
+N7BldInv1 = ["tarith", "n7_assignment"]
+N7BldInv2 = ["zada_ban", "n7_assignment"]
+N7Crsh = ["zanethu", "n7_assignment"]
+N7Geth2 = ["canalus", "n7_assignment"]
+N7Ruins = ["kopis", "n7_assignment"]
+N7ShipWreck = ["zeona", "n7_assignment"]
+N7Spdr1 = ["joab", "n7_assignment"]
+N7Spdr2 = ["msv_strontium_mule", "n7_assignment"]
+N7Spdr3 = ["sanctum", "n7_assignment"]
+N7VIQ1 = ["neith", "n7_assignment"]
+N7VIQ2 = ["jarrahe_station", "n7_assignment"]
+N7VIQ3 = ["capek", "n7_assignment"]
+N7Mine = ["helyme", "n7_assignment"]
+N7Mmnt1 = ["daratar", "n7_assignment"]
+N7Mmnt2 = ["gei_hinnom", "n7_assignment"]
+N7Mmnt3 = ["taitus", "n7_assignment"]
+N7Mmnt4 = ["msv_broken_arrow", "n7_assignment"]
+N7Mmnt5 = ["lorek", "n7_assignment"]
+N7Mmnt6 = ["sinmara", "n7_assignment"]
+N7Mmnt7 = ["franklin", "n7_assignment"]
+N7Mmnt10 = ["aequitas", "n7_assignment"]
+N7NorCrash = ["alchera", "n7_assignment"]
+
+# --- LE3 -------------------------------------------------------------------
+[le3.levels]
+Nor = ["normandy"]
+CitHub = ["citadel", "hub"]
+ProEar = ["earth", "main_mission", "prologue"]
+ProMar = ["mars", "main_mission"]
+Kro001 = ["sur_kesh", "main_mission"]
+Kro002 = ["tuchanka", "main_mission"]
+KroGar = ["palaven", "main_mission"]
+KroGru = ["attican_traverse", "side_mission"]
+KroN7a = ["tuchanka", "n7_assignment"]
+KroN7b = ["tuchanka", "n7_assignment"]
+CerMir = ["horizon", "main_mission"]
+CerJcb = ["arrae", "side_mission"]
+CitSam = ["ardat_yakshi_monastery", "side_mission"]
+OmgJck = ["grissom_academy", "side_mission"]
+Gth001 = ["geth_dreadnought", "main_mission"]
+Gth002 = ["rannoch", "main_mission"]
+GthLeg = ["rannoch", "side_mission"]
+GthN7a = ["rannoch", "side_mission"]
+# Cat001 is From Ashes on Eden Prime (its conversations are dlcpro_ext_*).
+Cat001 = ["eden_prime", "from_ashes_dlc"]
+Cat002 = ["thessia", "main_mission"]
+Cat003 = ["citadel", "main_mission"]
+Cat004 = ["cerberus_hq", "main_mission"]
+End001 = ["earth", "main_mission", "endgame"]
+End002 = ["citadel", "main_mission", "endgame"]
+# Single-player N7 missions are played on the multiplayer maps; the place is
+# the map's firebase name from the wiki's list.
+MPCer = ["firebase_glacier", "n7_assignment"]
+MPDish = ["firebase_dagger", "n7_assignment"]
+MPNov = ["firebase_white", "n7_assignment"]
+MPRctr = ["firebase_reactor", "n7_assignment"]
+MPSlum = ["firebase_ghost", "n7_assignment"]
+MPTowr = ["firebase_giant", "n7_assignment"]
+SPCer = ["n7_assignment"]
+SPDish = ["n7_assignment"]
+SPNov = ["n7_assignment"]
+SPRctr = ["n7_assignment"]
+SPSlum = ["n7_assignment"]
+SPTowr = ["n7_assignment"]
+# Citadel DLC: the mission (Cit001 to Cit004), the apartment, the casino.
+Cit001 = ["citadel", "citadel_dlc"]
+Cit002 = ["citadel", "citadel_dlc"]
+Cit003 = ["citadel", "citadel_dlc"]
+Cit004 = ["citadel", "citadel_dlc"]
+CitApt = ["citadel", "citadel_dlc", "apartment"]
+CitCas = ["citadel", "citadel_dlc", "casino"]
+# Leviathan DLC. The wiki's level list doesn't name these, so they're
+# matched by content to the DLC's missions (Wikipedia, "Mass Effect 3:
+# Leviathan"; Mass Effect Wiki, "Namakli", "Mahavid", "2181 Despoina"):
+# Lev002 holds the mining site with enthralled workers (Mahavid), Lev003
+# the meeting with Ann Bryson (Namakli), Lev004 the descent in a diving suit
+# (2181 Despoina). Lev001 is Dr. Bryson's lab on the Citadel.
+Lev001 = ["citadel", "leviathan_dlc"]
+Lev002 = ["mahavid", "leviathan_dlc"]
+Lev003 = ["namakli", "leviathan_dlc"]
+Lev004 = ["despoina", "leviathan_dlc"]
+
+# DLC folders, for lines in a DLC whose level isn't listed above.
+[le2.dlc]
+DLC_UNC_Hammer01 = ["firewalker_dlc"]
+DLC_UNC_Pack01 = ["overlord_dlc"]
+
+[le3.dlc]
+DLC_EXP_Pack001 = ["leviathan_dlc"]
+DLC_EXP_Pack003 = ["citadel_dlc"]
+DLC_EXP_Pack003_Base = ["citadel_dlc"]
+DLC_HEN_PR = ["from_ashes_dlc"]
+DLC_CON_END = ["extended_cut"]
+
+# --- Situation, from conversation names (all games) -------------------------
+# A keyword matches a whole part of the conversation name between
+# underscores or digits: `sta20_banter_00` has the parts sta, banter.
+[conversation_keywords]
+banter = ["squad_banter"]
+amb = ["ambient"]
+ambs = ["ambient"]
+ambient = ["ambient"]
+ambientmaster = ["ambient"]
+# Romance scenes: nortl_culmination_h is the LE2 romance culmination; the
+# Citadel DLC uses loveint / lovei / love interest.
+rom = ["romance"]
+romance = ["romance"]
+culmination = ["romance"]
+loveint = ["romance"]
+lovei = ["romance"]
+love = ["romance"]
+# LE3 norhen_<who>_mr_<mission>: a squadmate's reaction after a mission.
+mr = ["mission_reaction"]
+debrief = ["debrief"]
+# LE3 citpar_*: the Citadel DLC party.
+citpar = ["citadel_party"]
+radio = ["radio"]
+dream = ["dream"]
+combat = ["combat"]
+fight = ["combat"]
+firefight = ["combat"]
+ambush = ["combat"]
+# Squad sound sets (ss_global_hench_tali, ss_tali_minimal): combat barks.
+ss = ["combat"]
+# LE1 trigger and interjection conversations: the squad commenting on the
+# place or on someone else's conversation.
+trig = ["squad_comment"]
+trigger = ["squad_comment"]
+triggers = ["squad_comment"]
+interject = ["squad_comment"]
+
+# Whole-name patterns, where a single keyword would catch other scenes.
+# `*` matches any run of characters.
+[conversation_patterns]
+# LE1 nor20_<mission>_done: the Normandy debrief after a mission (unlike
+# los30_security_system_done, a door opening on Ilos).
+"nor20_*_done" = ["debrief"]
+# LE3 shuttle rides to a mission (cat002_shuttle_ride_m, cermir_shuttle_down_m).
+"*_shuttle_ride_*" = ["shuttle"]
+"*_shuttle_down_*" = ["shuttle"]
+"*_shuttledown_*" = ["shuttle"]
+"*_shuttle_m" = ["shuttle"]
+
+# Conversations that play anywhere, so the package they happen to be stored
+# in says nothing about where they're heard: only their keyword and pattern
+# tags apply: the squad sound sets (ss_*) and LE1's generic combat banter
+# (combat_banter_00, stored in the otherwise unlisted BIOA_CRD00).
+[global_conversations]
+patterns = ["ss_*", "combat_banter_*"]

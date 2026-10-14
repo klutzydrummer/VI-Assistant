@@ -11,8 +11,10 @@
 //! LE3 the stage direction; each conversation's full graph goes to
 //! `conversations/<name>.json`.
 //!
-//! Not yet here: LE1 (its audio is ISACT, reached through FaceFX) and scene
-//! tags.
+//! LE1 lines come from conversation nodes and each conversation's ISACT
+//! bank (see `find_le1`). Scene tags come from [`crate::scenes`]: the
+//! level code, DLC folder and conversation name, plus the character's own
+//! rules from `sources.toml`.
 //!
 //! Reads the install only; everything is written under `out`.
 
@@ -27,6 +29,7 @@ use serde_json::{json, Map, Value};
 
 use crate::conversation::{self, Conversation, Kind, Node, OWNER, SHEPARD};
 use crate::install::GameDir;
+use crate::scenes;
 use crate::tlk::{Gender, TalkFile};
 use crate::{wwise, Game, Package};
 
@@ -49,6 +52,8 @@ pub struct Character {
     /// Conversations the character owns, whose owner lines (speaker index
     /// -1) are theirs. LE1 needs these: its audio doesn't name speakers.
     pub owns: BTreeMap<Game, Vec<String>>,
+    /// The character's own scene tags (`[<game>.scene_tags]`).
+    pub scene_rules: BTreeMap<Game, Vec<scenes::Rule>>,
 }
 
 impl Character {
@@ -63,6 +68,7 @@ impl Character {
         let table: toml::Table = text.parse().map_err(|e| format!("sources.toml: {e}"))?;
         let mut tags = BTreeMap::new();
         let mut owns = BTreeMap::new();
+        let mut scene_rules = BTreeMap::new();
         for game in [Game::Le1, Game::Le2, Game::Le3] {
             let Some(section) = table.get(game.id()) else {
                 continue;
@@ -95,11 +101,19 @@ impl Character {
                     })?,
                 );
             }
+            if let Some(rules) = section.get("scene_tags") {
+                let what = format!("sources.toml: [{}.scene_tags]", game.id());
+                let rules = rules
+                    .as_table()
+                    .ok_or_else(|| format!("{what} must be a table"))?;
+                scene_rules.insert(game, scenes::parse_rules(rules, &what)?);
+            }
         }
         Ok(Character {
             id: id.to_string(),
             tags,
             owns,
+            scene_rules,
         })
     }
 }
@@ -222,6 +236,8 @@ pub struct GameReport {
     pub without_node: usize,
     /// Ids of streams skipped as placeholders (see [`MIN_SECONDS`]).
     pub placeholders: Vec<String>,
+    /// Level codes `scenes.toml` doesn't know, with how many lines each.
+    pub unknown_levels: BTreeMap<String, usize>,
     pub errors: Vec<String>,
 }
 
@@ -285,6 +301,7 @@ pub fn run(
             out,
             root,
         )?;
+        report.unknown_levels = tag_lines(character, &mut game_lines);
         report.lines = game_lines.len();
         report.no_subtitle = game_lines
             .iter()
@@ -313,6 +330,7 @@ pub fn run(
                     "conversations": r.conversations,
                     "lines_without_node": r.without_node,
                     "placeholders_skipped": r.placeholders,
+                    "unknown_levels": r.unknown_levels,
                     "errors": r.errors,
                 }),
             )
@@ -323,7 +341,7 @@ pub fn run(
         "version": VERSION,
         "character": character.id,
         "games": per_game,
-        "not_covered": ["scene tags", "barks without a stream name or conversation node"],
+        "not_covered": ["barks without a stream name or conversation node"],
     });
     let path = out.join("harvest.json");
     fs::write(
@@ -1163,6 +1181,73 @@ fn attach_context(
     Ok(missing)
 }
 
+/// Set every line's `scene_tags` from its game, `scene.prefix`,
+/// `scene.dlc` and conversation. Returns the level codes the table
+/// doesn't know, with their line counts.
+pub fn tag_lines(
+    character: &Character,
+    lines: &mut [dataset::corpus::Line],
+) -> BTreeMap<String, usize> {
+    let table = scenes::Table::builtin();
+    let mut unknown = BTreeMap::new();
+    for line in lines.iter_mut() {
+        let Some(game) = Game::from_id(&line.source.game) else {
+            continue;
+        };
+        let scene = line.extra.get("scene");
+        let prefix = scene
+            .and_then(|s| s.get("prefix"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let dlc = scene.and_then(|s| s.get("dlc")).and_then(Value::as_str);
+        let conversation = line
+            .source
+            .extra
+            .get("conversation")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let rules = character
+            .scene_rules
+            .get(&game)
+            .map_or(&[][..], Vec::as_slice);
+        let (tags, known) = table.tags(
+            scenes::Scene {
+                game,
+                prefix,
+                dlc,
+                conversation,
+            },
+            rules,
+        );
+        if !known {
+            *unknown
+                .entry(format!("{}:{prefix}", game.id()))
+                .or_default() += 1;
+        }
+        line.scene_tags = tags;
+    }
+    unknown
+}
+
+/// Re-tag an existing harvest folder in place (`vi corpus tag`): only
+/// `scene_tags` in `lines.jsonl` change; audio and everything else stay.
+/// Returns how many lines changed and the unknown level codes.
+pub fn retag(
+    dir: &Path,
+    character: &Character,
+) -> Result<(usize, BTreeMap<String, usize>), String> {
+    let mut lines = dataset::corpus::read_lines(dir).map_err(|e| e.to_string())?;
+    let before: Vec<Vec<String>> = lines.iter().map(|l| l.scene_tags.clone()).collect();
+    let unknown = tag_lines(character, &mut lines);
+    let changed = lines
+        .iter()
+        .zip(&before)
+        .filter(|(l, b)| &l.scene_tags != *b)
+        .count();
+    dataset::corpus::write_lines(dir, &lines).map_err(|e| e.to_string())?;
+    Ok((changed, unknown))
+}
+
 /// Corpus flags for a line: `no_subtitle` for empty text, `nonverbal` for
 /// subtitles that only describe a sound (`{Sighs}`), `bark` for the squad
 /// sound sets (`ss_global_hench_tali`, `ss_tali_minimal`), which have no
@@ -1379,6 +1464,7 @@ mod tests {
             id: "tali".into(),
             tags: BTreeMap::from([(Game::Le3, vec!["hench_tali".into()])]),
             owns: BTreeMap::new(),
+            scene_rules: BTreeMap::new(),
         };
         let label = |n: &Node| speaker_label(&tali, Game::Le3, &c, "t_d", &graphs, n);
         assert_eq!(label(&c.entries[0]), "cit_diplomat");

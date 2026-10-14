@@ -6,14 +6,42 @@
 # - LE1: `hench_quarian` (squad lines) and `sta20_quarian` (recruitment).
 #   LE1 audio doesn't name speakers, so the conversations she owns are
 #   listed too: their owner lines are hers.
+#
+# scene_tags add Tali's own tags on top of the game-wide ones in
+# crates/harvest/src/scenes.toml. Each entry is `level:<code>` or
+# `conversation:<glob>` (`*` matches anything).
+# - personal_arc: her own storyline (recruitment, her trial, Rannoch).
+# - personal_talk: one-on-one time with Shepard (Normandy talks, the
+#   Citadel apartment).
 
 [le1]
 speaker_tags = ["hench_quarian", "sta20_quarian"]
 # Normandy talks, the Fist ambush rescue, Virmire ambient lines.
 owner_of = ["cha00_quarian_tali", "sta60_quarian", "jug20_amb_tali"]
 
+[le1.scene_tags]
+# Fist's ambush on the Citadel is where she is recruited; she then presents
+# the geth data to the ambassador.
+personal_arc = ["conversation:sta60_quarian", "conversation:sta20_human_ambassador_enter"]
+recruitment = ["conversation:sta60_quarian"]
+personal_talk = ["conversation:cha00_quarian_tali"]
+
 [le2]
 speaker_tags = ["hench_tali"]
 
+[le2.scene_tags]
+# Freedom's Progress (Veetor), her dossier on Haestrom, her trial on the
+# Migrant Fleet, the debrief after she joins, and her clash with Legion.
+personal_arc = ["level:ProFre", "level:SunTlA", "level:QuaTlL", "conversation:nortla_*",
+                "conversation:nortlc_*"]
+personal_talk = ["conversation:nortl_*"]
+
 [le3]
 speaker_tags = ["hench_tali"]
+
+[le3.scene_tags]
+# The geth dreadnought and Rannoch, the Normandy scenes about the
+# geth-quarian war, and her Citadel scenes as admiral.
+personal_arc = ["level:Gth001", "level:Gth002", "level:GthLeg", "level:GthN7a",
+                "conversation:norgth_*", "conversation:citprs_tali_*"]
+personal_talk = ["conversation:norhen_tali_*", "conversation:citapt_*tali*"]
