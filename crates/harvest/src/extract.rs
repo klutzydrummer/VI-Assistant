@@ -1224,6 +1224,36 @@ fn path_back(
     out
 }
 
+/// What kind of conversation this is, from its graph alone:
+/// - `one_liner`: a single node with a line;
+/// - `dialogue_choices`: Shepard picks a reply somewhere (an entry leads to
+///   two or more replies that aren't autocontinues);
+/// - `exchange`: several lines, no choice for the player.
+fn conversation_kind(c: &Conversation, subs: &Subtitles, gender: Gender) -> &'static str {
+    let lines = c
+        .entries
+        .iter()
+        .chain(&c.replies)
+        .filter(|n| node_text(subs, n, gender).is_some())
+        .count();
+    if lines <= 1 {
+        return "one_liner";
+    }
+    let choice = c.entries.iter().any(|e| {
+        e.links
+            .iter()
+            .filter_map(|&i| c.replies.get(i))
+            .filter(|r| r.reply_type.as_deref() != Some("REPLY_AUTOCONTINUE"))
+            .count()
+            >= 2
+    });
+    if choice {
+        "dialogue_choices"
+    } else {
+        "exchange"
+    }
+}
+
 fn line_id(game: Game, string_id: i32, gender: Gender) -> String {
     format!("{}.s{}_{}", game.id(), string_id, gender.suffix())
 }
@@ -1286,6 +1316,10 @@ fn attach_context(
             "listener".into(),
             json!(listener_label(c, node.listener_index)),
         );
+        s.insert(
+            "conversation_kind".into(),
+            json!(conversation_kind(c, subs, gender)),
+        );
         let ids = |nodes: Vec<(Kind, usize)>| -> Value {
             Value::Array(
                 nodes
@@ -1295,11 +1329,35 @@ fn attach_context(
                     .collect(),
             )
         };
-        line.extra
-            .insert("prev".into(), ids(nearest_lines(c, subs, gender, at, true)));
+        let prev = nearest_lines(c, subs, gender, at, true);
+        let next = nearest_lines(c, subs, gender, at, false);
+        // The line's own kind: alone (nothing before or after it), or part
+        // of its conversation's exchange.
+        let kind = if prev.is_empty() && next.is_empty() {
+            "one_liner"
+        } else {
+            conversation_kind(c, subs, gender)
+        };
+        line.source.extra.insert("line_kind".into(), json!(kind));
+        line.extra.insert("prev".into(), ids(prev));
+        line.extra.insert("next".into(), ids(next.clone()));
+        // Every line directly after hers, all branches, one step: how the
+        // scene answers her.
         line.extra.insert(
-            "next".into(),
-            ids(nearest_lines(c, subs, gender, at, false)),
+            "following".into(),
+            Value::Array(
+                next.into_iter()
+                    .filter_map(|(k, i)| c.node(k, i))
+                    .map(|n| {
+                        json!({
+                            "id": line_id(game, n.string_id, gender),
+                            "speaker": speaker_label(character, game, c, &key, graphs, n),
+                            "text": node_text(subs, n, gender).unwrap_or(""),
+                            "string_id": n.string_id,
+                        })
+                    })
+                    .collect(),
+            ),
         );
         let mut path: Vec<&Node> = path_to(c, at)
             .into_iter()
@@ -1410,6 +1468,10 @@ pub fn tag_lines(
                 .entry(format!("{}:{prefix}", game.id()))
                 .or_default() += 1;
         }
+        let mut tags = tags;
+        tags.extend(structure_tags(&line.source.extra));
+        tags.sort();
+        tags.dedup();
         line.scene_tags = tags;
     }
     unknown
@@ -1424,6 +1486,28 @@ pub fn apply_line_flags(character: &Character, lines: &mut [dataset::corpus::Lin
             }
         }
     }
+}
+
+/// Tags from the conversation graph's facts on a record: the line's kind
+/// (`source.line_kind`: `one_liner` if nothing comes before or after it,
+/// else its conversation's `exchange` or `dialogue_choices`) and who she's
+/// speaking to
+/// (`to_shepard`; `to_squad` for squadmates, whose tags start `hench_`;
+/// `to_npc` for anyone else named). An unnamed listener (the conversation's
+/// owner) gets no listener tag.
+fn structure_tags(source: &Map<String, Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(kind) = source.get("line_kind").and_then(Value::as_str) {
+        out.push(kind.to_string());
+    }
+    match source.get("listener").and_then(Value::as_str) {
+        Some("shepard") => out.push("to_shepard".into()),
+        Some("owner") | None => {}
+        Some(l) if l.starts_with("speaker_") => {}
+        Some(l) if l.starts_with("hench_") => out.push("to_squad".into()),
+        Some(_) => out.push("to_npc".into()),
+    }
+    out
 }
 
 /// Re-tag an existing harvest folder in place (`vi corpus tag`): only
@@ -1675,6 +1759,19 @@ mod tests {
             path_back(&cut, &subs, g, (Kind::Entry, 2)),
             [(Kind::Entry, 0), (Kind::Entry, 1), (Kind::Reply, 1)]
         );
+        assert_eq!(conversation_kind(&c, &subs, g), "exchange");
+        let mut choices = c.clone();
+        choices.entries[1].links = vec![0, 1];
+        assert_eq!(conversation_kind(&choices, &subs, g), "dialogue_choices");
+        let mut auto = choices.clone();
+        auto.replies[1].reply_type = Some("REPLY_AUTOCONTINUE".into());
+        assert_eq!(conversation_kind(&auto, &subs, g), "exchange");
+        let one = Conversation {
+            entries: vec![node(Kind::Entry, 0, 11, 0, &[])],
+            replies: vec![],
+            ..c.clone()
+        };
+        assert_eq!(conversation_kind(&one, &subs, g), "one_liner");
         let mut graphs = Graphs::default();
         graphs
             .tags
@@ -1691,6 +1788,22 @@ mod tests {
         assert_eq!(label(&c.entries[0]), "cit_diplomat");
         assert_eq!(label(&c.entries[1]), "tali");
         assert_eq!(label(&c.replies[1]), "shepard");
+    }
+
+    #[test]
+    fn structure() {
+        let tags = |listener: &str| {
+            let mut m = Map::new();
+            m.insert("listener".into(), json!(listener));
+            m.insert("line_kind".into(), json!("exchange"));
+            structure_tags(&m)
+        };
+        assert_eq!(tags("shepard"), ["exchange", "to_shepard"]);
+        assert_eq!(tags("hench_garrus"), ["exchange", "to_squad"]);
+        assert_eq!(tags("citprs_taliplot_csec"), ["exchange", "to_npc"]);
+        assert_eq!(tags("owner"), ["exchange"]);
+        assert_eq!(tags("speaker_3"), ["exchange"]);
+        assert!(structure_tags(&Map::new()).is_empty());
     }
 
     #[test]
