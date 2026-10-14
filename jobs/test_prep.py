@@ -65,6 +65,22 @@ class PrepareTest(unittest.TestCase):
     def test_no_floor_without_trimmed_silence(self):
         self.assertIsNone(prep.prepare(tone(1.5), RATE)["noise_floor"])
 
+    def test_floor_from_tight_edges_without_speech_in_it(self):
+        # 40 ms of hiss at each end: the trim's centred 85 ms frames see
+        # speech there, the floor's 20 ms frames don't.
+        noise = 1e-3
+        clip = np.concatenate([hiss(0.04, noise, 1), tone(1.5), hiss(0.04, noise, 2)])
+        start, end = prep.trim_bounds(clip, 40)
+        self.assertEqual((start, end), (0, len(clip)))
+        r = prep.prepare(clip, RATE)
+        self.assertIsNotNone(r["noise_floor"])
+        self.assertAlmostEqual(r["noise_floor"]["level_db"], 20 * np.log10(noise), delta=1.0)
+        self.assertAlmostEqual(r["noise_floor"]["seconds"], 0.08, delta=0.021)
+
+    def test_pauses_mid_line_never_give_a_floor(self):
+        clip = np.concatenate([tone(0.8), hiss(0.3, 1e-3, 1), tone(0.8)])
+        self.assertIsNone(prep.prepare(clip, RATE)["noise_floor"])
+
     def test_one_linear_gain_to_the_target(self):
         for amp in (0.01, 0.1):
             r = prep.prepare(tone(3, amp=amp), RATE, target_lufs=-23)
