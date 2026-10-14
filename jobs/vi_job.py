@@ -133,6 +133,68 @@ class Checkpoint:
         return {c.id: self.done[c.id] for c in clips}
 
 
+class ArrayCheckpoint:
+    """Checkpoint for per-clip vectors (embed): each finished chunk is one
+    immutable VI_CHECKPOINT/<name>/<n>.npz holding `ids` and one float16
+    array per output, so the minute-by-minute copy home only sends new
+    chunks and never rewrites a big file on the home disk. Needs numpy.
+    Without VI_CHECKPOINT nothing is kept."""
+
+    def __init__(self, name):
+        import numpy as np
+
+        self.np = np
+        self.name = name
+        self.done = {}
+        folder = env_path("VI_CHECKPOINT")
+        self.folder = folder / name if folder else None
+        self.chunks = 0
+        if self.folder is None or not self.folder.is_dir():
+            return
+        for path in sorted(self.folder.glob("*.npz")):
+            try:
+                with np.load(path) as z:
+                    arrays = {k: z[k] for k in z.files if k != "ids"}
+                    for row, cid in enumerate(z["ids"]):
+                        self.done[str(cid)] = {k: v[row] for k, v in arrays.items()}
+            except (OSError, ValueError, KeyError):
+                log(f"{name}: skipping unreadable {path.name}")
+                continue
+            self.chunks = max(self.chunks, int(path.stem) + 1)
+        if self.done:
+            log(f"{name}: resuming, {len(self.done)} already done")
+
+    def todo(self, clips):
+        return [c for c in clips if c.id not in self.done]
+
+    def run(self, clips, compute, chunk=32):
+        """compute(list of clips) -> one {output name: vector} per clip, for
+        the clips not done yet, saved after every chunk. Returns {id: dict}."""
+        np = self.np
+        todo = self.todo(clips)
+        if self.folder is not None and todo:
+            self.folder.mkdir(parents=True, exist_ok=True)
+        for start in range(0, len(todo), chunk):
+            part = todo[start : start + chunk]
+            results = compute(part)
+            stacked = {}
+            for clip, r in zip(part, results, strict=True):
+                r = {k: np.asarray(v, dtype=np.float16) for k, v in r.items()}
+                self.done[clip.id] = r
+                for k, v in r.items():
+                    stacked.setdefault(k, []).append(v)
+            if self.folder is not None:
+                tmp = self.folder / f".{self.chunks:05d}.tmp"
+                with open(tmp, "wb") as f:
+                    np.savez(f, ids=np.array([c.id for c in part]), **{k: np.stack(v) for k, v in stacked.items()})
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.folder / f"{self.chunks:05d}.npz")
+                self.chunks += 1
+            log(f"{self.name}: {len(clips) - len(todo) + start + len(part)}/{len(clips)}")
+        return {c.id: self.done[c.id] for c in clips}
+
+
 # --- inputs -----------------------------------------------------------------
 
 
@@ -149,6 +211,13 @@ class Clip:
     scene_tags: list = field(default_factory=list)
     stage_direction: str | None = None
     game: str = ""
+    # From prep, when it ran: the trimmed, levelled 16 kHz copy for models,
+    # and prep's record (trim bounds, level, noise floor).
+    audio16k: Path | None = None
+    prep: dict | None = None
+    # The harvest record as read, for stages that need more of it
+    # (conversation, following, structural tags).
+    line: dict = field(default_factory=dict, repr=False)
 
     @property
     def bark(self):
@@ -165,9 +234,11 @@ class Clip:
 
 
 def load_clips():
-    """Harvest's lines, with clean's audio and transcript when clean has run.
+    """Harvest's lines, with prep's trim and 16 kHz copy when prep has run
+    and clean's audio and transcript when clean has run.
 
-    Clips clean dropped (`keep: false`) are left out.
+    Clips prep found silent or clean dropped (`keep: false`) are left out.
+    Without clean, a clip's duration is prep's trimmed one.
     """
     harvest = env_path("VI_INPUT_HARVEST")
     if harvest is None:
@@ -176,6 +247,10 @@ def load_clips():
     cleaned = {}
     if clean is not None:
         cleaned = {c["id"]: c for c in read_jsonl(clean / "clips.jsonl")}
+    prep = env_path("VI_INPUT_PREP")
+    prepped = {}
+    if prep is not None:
+        prepped = {p["id"]: p for p in read_jsonl(prep / "prep.jsonl")}
 
     clips = []
     for line in read_jsonl(harvest / "lines.jsonl"):
@@ -183,6 +258,12 @@ def load_clips():
         duration = line["audio"]["duration_s"]
         text = line.get("text", "")
         flags = list(line.get("flags", []))
+        p = None
+        if prep is not None:
+            p = prepped.get(line["id"])
+            if p is None or "audio16k" not in p:
+                continue
+            duration = p["duration_s"]
         if clean is not None:
             c = cleaned.get(line["id"])
             if c is None or not c.get("keep", True):
@@ -202,6 +283,9 @@ def load_clips():
                 scene_tags=line.get("scene_tags", []),
                 stage_direction=line.get("stage_direction"),
                 game=line.get("source", {}).get("game", ""),
+                audio16k=prep / p["audio16k"]["path"] if p else None,
+                prep=p,
+                line=line,
             )
         )
     limit = settings().get("limit")

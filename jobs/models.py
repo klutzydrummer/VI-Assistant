@@ -7,6 +7,7 @@ lists what the worker installs.
 """
 
 import json
+import math
 import re
 
 from vi_job import log, unit_hash
@@ -87,7 +88,7 @@ class Emotion2Vec:
 class Dimensions:
     """audeering's wav2vec2 arousal / dominance / valence model."""
 
-    def __init__(self, model_id):
+    def __init__(self, model_id, revision=None):
         import torch
         from torch import nn
         from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model, Wav2Vec2PreTrainedModel
@@ -114,8 +115,8 @@ class Dimensions:
                 return self.classifier(hidden)
 
         self.torch = torch
-        self.extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_id)
-        self.model = EmotionModel.from_pretrained(model_id).to(device()).eval()
+        self.extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_id, revision=revision)
+        self.model = EmotionModel.from_pretrained(model_id, revision=revision).to(device()).eval()
 
     def __call__(self, clip):
         wav = load_audio(clip.audio)
@@ -536,6 +537,19 @@ def trim(clip, dest, top_db=40, pad_s=0.05):
     return len(data) / sr, sr, round(20 * np.log10(rms + 1e-9), 2)
 
 
+def cut(clip, dest, start_s, end_s):
+    """Writes the clip between prep's trim bounds as FLAC at its own rate,
+    unchanged otherwise. Returns (duration_s, sample_rate, rms_dbfs)."""
+    import numpy as np
+    import soundfile as sf
+
+    data, sr = sf.read(str(clip.audio), dtype="float32", always_2d=True)
+    data = data.mean(axis=1)[int(round(start_s * sr)) : int(round(end_s * sr))]
+    sf.write(str(dest), data, sr, format="FLAC")
+    rms = float(np.sqrt(np.mean(data**2))) if len(data) else 0.0
+    return len(data) / sr, sr, round(20 * np.log10(rms + 1e-9), 2)
+
+
 class FakeWhisper:
     """The subtitle back, lowercased; a fixed phrase for barks."""
 
@@ -556,3 +570,219 @@ class FakeSpeaker:
 
 def fake_quality(clip):
     return {k: round(2.5 + 2 * unit_hash("dnsmos", clip.id, k), 3) for k in ("p808", "sig", "bak", "ovr")}
+
+
+# --- embed: the candidate embeddings and the backup scores --------------------
+#
+# Each takes 16 kHz mono float32 samples (prep's copy) and returns
+# {name: vector}. Revisions are pinned: every model is fetched at the commit
+# the stage settings name, and embed.json records it.
+
+WHISPER_FRAMES = 1500  # Whisper's encoder always sees 30 s: 1,500 frames
+WHISPER_FRAME_RATE = 50  # frames per second
+
+
+def real_frames(n_samples, rate=16_000):
+    """How many of Whisper's 1,500 encoder frames hold the clip, the rest
+    being padding: ceil(duration x 50), at least 1."""
+    return max(1, min(WHISPER_FRAMES, math.ceil(n_samples / rate * WHISPER_FRAME_RATE)))
+
+
+def pool_real(hidden, n_samples):
+    """Mean of the encoder frames that hold audio. `hidden` is (frames, dim)
+    for one clip, padded to any length; padding frames are ignored, so the
+    same clip padded differently pools to the same vector."""
+    return hidden[: real_frames(n_samples)].mean(axis=0)
+
+
+def snapshot(repo, revision, patterns=None):
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(repo, revision=revision, allow_patterns=patterns)
+
+
+class WavLMLayers:
+    """WavLM hidden states, mean-pooled over frames, one vector per layer.
+    hidden_states[0] is the input to the first transformer layer, so layer k
+    is hidden_states[k]."""
+
+    def __init__(self, model_id, revision, layers):
+        import torch
+        from transformers import AutoFeatureExtractor, WavLMModel
+
+        self.torch = torch
+        self.layers = list(layers)
+        self.extractor = AutoFeatureExtractor.from_pretrained(model_id, revision=revision)
+        self.model = WavLMModel.from_pretrained(model_id, revision=revision).to(device()).eval()
+
+    def __call__(self, wav):
+        x = self.extractor(wav, sampling_rate=16_000, return_tensors="pt").input_values.to(self.model.device)
+        with self.torch.no_grad():
+            hidden = self.model(x, output_hidden_states=True).hidden_states
+        return {f"wavlm_L{k:02d}": hidden[k][0].float().mean(dim=0).cpu().numpy() for k in self.layers}
+
+
+class Emotion2VecEmbed:
+    """emotion2vec (+ large or base) through FunASR, from a pinned snapshot.
+    Returns the utterance embedding, and for emotion2vec+ its class scores."""
+
+    def __init__(self, model_id, revision, name):
+        from funasr import AutoModel
+
+        self.name = name
+        self.model = AutoModel(model=snapshot(model_id, revision), disable_update=True, device=device())
+        self.labels = None
+
+    def __call__(self, wav):
+        import numpy as np
+
+        res = self.model.generate(wav, fs=16_000, granularity="utterance", extract_embedding=True,
+                                  disable_pbar=True)[0]  # fmt: skip
+        out = {self.name: np.asarray(res["feats"], dtype=np.float32)}
+        if res.get("labels"):
+            self.labels = [label.split("/")[-1] for label in res["labels"]]
+            out[f"{self.name}_classes"] = np.asarray(res["scores"], dtype=np.float32)
+        return out
+
+
+class EIVHead:
+    """One Empathic-Insight-Voice MLP head (LAION): a projection of the
+    flattened (full) or pooled encoder output to 64, then 64-32-16-1."""
+
+    @staticmethod
+    def build(input_dim):
+        from torch import nn
+
+        layers = [nn.Linear(input_dim, 64), nn.ReLU()]
+        for a, b in [(64, 64), (64, 32), (32, 16)]:
+            layers += [nn.Linear(a, b), nn.ReLU()]
+        return nn.Sequential(*layers, nn.Linear(16, 1))
+
+    @staticmethod
+    def load(path, input_dim):
+        import torch
+
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+        # LAION's modules name the projection `proj` and the rest `mlp.<i>`
+        # with ReLU and Dropout between; map them onto the plain Sequential.
+        linears = [state["proj.weight"], state["proj.bias"]]
+        for i in sorted({int(k.split(".")[1]) for k in state if k.startswith("mlp.")}):
+            linears += [state[f"mlp.{i}.weight"], state[f"mlp.{i}.bias"]]
+        head = EIVHead.build(input_dim)
+        params = [p for m in head if hasattr(m, "weight") for p in (m.weight, m.bias)]
+        with torch.no_grad():
+            for p, v in zip(params, linears, strict=True):
+                p.copy_(v)
+        return head.eval()
+
+
+class BudEWhisper:
+    """The BUD-E-Whisper encoder (the EIV backbone), and the EIV heads on it.
+
+    Returns per clip:
+      bude_whisper   the encoder output averaged over the frames that hold
+                     audio only (pool_real); Whisper pads every clip to 30 s
+      eiv            every Empathic-Insight-Voice-Small head, on the full
+                     padded encoder output as the heads were trained
+      eiv_quality    the Plus quality heads (mean+min+max+std pooled, as
+                     trained), without content enjoyment
+    """
+
+    def __init__(self, model_id, revision, small, small_revision, plus, plus_revision, skip=()):
+        from pathlib import Path
+
+        import torch
+        from transformers import WhisperFeatureExtractor, WhisperModel
+
+        self.torch = torch
+        self.extractor = WhisperFeatureExtractor.from_pretrained(model_id, revision=revision)
+        dtype = torch.float16 if device() == "cuda" else torch.float32
+        whisper = WhisperModel.from_pretrained(model_id, revision=revision, dtype=dtype)
+        self.encoder = whisper.get_encoder().to(device()).eval()
+        self.dtype = dtype
+        dim = whisper.config.d_model
+        del whisper
+        small_dir = Path(snapshot(small, small_revision, ["*.pth"]))
+        plus_dir = Path(snapshot(plus, plus_revision, ["model_score_*.pth"]))
+        name = lambda p: p.name.removeprefix("model_").removesuffix("_best.pth")  # noqa: E731
+        self.heads = {name(p): EIVHead.load(p, WHISPER_FRAMES * dim).to(device(), dtype)
+                      for p in sorted(small_dir.glob("model_*_best.pth"))}  # fmt: skip
+        self.quality = {name(p): EIVHead.load(p, 4 * dim).to(device(), dtype)
+                        for p in sorted(plus_dir.glob("model_score_*_best.pth")) if name(p) not in skip}  # fmt: skip
+        self.head_names = list(self.heads)
+        self.quality_names = list(self.quality)
+
+    def __call__(self, wavs):
+        torch = self.torch
+        feats = self.extractor(wavs, sampling_rate=16_000, return_tensors="pt").input_features
+        with torch.no_grad():
+            hidden = self.encoder(feats.to(device(), self.dtype)).last_hidden_state  # (B, 1500, d)
+            flat = hidden.flatten(1)
+            h = hidden.float()
+            pooled = torch.cat([h.mean(1), h.amin(1), h.amax(1), h.std(1)], dim=1).to(self.dtype)
+            eiv = torch.cat([head(flat) for head in self.heads.values()], dim=1).float().cpu().numpy()
+            quality = torch.cat([head(pooled) for head in self.quality.values()], dim=1).float().cpu().numpy()
+        h = h.cpu().numpy()
+        return [{"bude_whisper": pool_real(h[i], len(w)), "eiv": eiv[i], "eiv_quality": quality[i]}
+                for i, w in enumerate(wavs)]  # fmt: skip
+
+
+class AVD:
+    """audeering's arousal / dominance / valence model, as a guard."""
+
+    def __init__(self, model_id, revision):
+        self.inner = Dimensions(model_id, revision=revision)
+
+    def __call__(self, wav):
+        import numpy as np
+
+        x = self.inner.extractor(wav, sampling_rate=16_000, return_tensors="pt").input_values
+        with self.inner.torch.no_grad():
+            a, d, v = self.inner.model(x.to(self.inner.model.device))[0].tolist()
+        return {"avd": np.asarray([a, d, v], dtype=np.float32)}
+
+
+class FakeEmbedder:
+    """Deterministic stand-ins for every embed model, from the samples
+    themselves, so CI exercises the shapes and the real-frame pooling."""
+
+    DIM = 16
+    HEADS = ["Anger", "Amusement", "Sadness", "Teasing"]
+    QUALITY = ["score_background_quality", "score_overall_quality", "score_speech_quality"]
+
+    def __init__(self, layers):
+        import numpy as np
+
+        self.layers = list(layers)
+        rng = np.random.default_rng(0)
+        self.proj = rng.standard_normal((3, self.DIM)).astype(np.float32)
+        self.pad = rng.standard_normal(self.DIM).astype(np.float32)  # what Whisper makes of padding
+
+    def frames(self, wav, total=WHISPER_FRAMES):
+        """Fake encoder output: one row per 20 ms of audio from its level,
+        then padding rows up to `total`, as Whisper pads to 30 s."""
+        import numpy as np
+
+        n = real_frames(len(wav))
+        rows = []
+        for t in range(n):
+            w = wav[t * 320 : (t + 1) * 320]
+            w = w if len(w) else np.zeros(1, dtype=np.float32)
+            rows.append(np.array([np.abs(w).mean(), w.std(), np.abs(np.diff(w)).mean() if len(w) > 1 else 0])
+                        @ self.proj)  # fmt: skip
+        return np.vstack(rows + [self.pad] * (total - n)).astype(np.float32)
+
+    def __call__(self, wav):
+        import numpy as np
+
+        base = self.frames(wav).mean(axis=0)
+        out = {f"wavlm_L{k:02d}": base * (1 + k / 10) for k in self.layers}
+        out["emotion2vec_plus_large"] = base[::-1].copy()
+        out["emotion2vec_plus_large_classes"] = np.full(9, 1 / 9, dtype=np.float32)
+        out["emotion2vec_base"] = base + 1
+        out["bude_whisper"] = pool_real(self.frames(wav), len(wav))
+        out["eiv"] = np.tanh(base[: len(self.HEADS)])
+        out["eiv_quality"] = 2.5 + np.tanh(base[: len(self.QUALITY)])
+        out["avd"] = 0.5 + 0.5 * np.tanh(base[:3])
+        return out

@@ -1633,6 +1633,7 @@ dependencies = [
  "harvest",
  "llm",
  "review",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

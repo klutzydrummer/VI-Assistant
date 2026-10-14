@@ -1,18 +1,22 @@
 """clean stage: check every clip before anything is scored.
 
-Plan: docs/design/control-vector-datasets.md, step 2. Format:
-docs/design/corpus-format.md, clean. Per clip:
+Plan: docs/design/corpus-pipeline.md, step 2. Format:
+docs/design/corpus-format.md, clean. Flags only. Per clip:
 
-  audio      leading and trailing silence trimmed, written as FLAC. Loudness
-             is left alone: how loud she is carries emotion.
+  audio      cut at prep's trim bounds (or trimmed here when the pipeline has
+             no prep stage), written as FLAC at the source rate. Loudness is
+             left alone: how loud she is carries emotion.
   asr_text   Whisper's words, to check the subtitle (subtitle_wer). The
              subtitle stays the transcript, since Whisper misspells names
-             like Keelah se'lai; a line with no subtitle (barks) gets
-             Whisper's words as its transcript, flagged asr_only.
+             like Keelah se'lai. Lines without a subtitle (`no_subtitle`,
+             the LE1 barks) are skipped: there is nothing to check.
   speaker    ECAPA embedding and its cosine similarity to her median voice.
              Clips far below the rest are flagged far_voice: another voice,
              heavy effects, or a clip mapped to the wrong line.
-  quality    DNSMOS scores, for picking TTS references later.
+  quality    DNSMOS scores: a reported covariate and for picking TTS
+             references later, never a gate.
+
+With prep as an input, the models hear prep's trimmed, levelled 16 kHz copy.
 
 Nothing is dropped for a mismatch or a far voice yet; they're flagged so the
 review page can show them and we can set thresholds from what they turn out
@@ -31,6 +35,7 @@ import re
 import shutil
 import statistics
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import checks
 import models
@@ -55,6 +60,9 @@ SPEAKER_REFERENCE_MIN_S = 1.5
 # (on the smoke test it told the games apart 72% of the time, 45% by chance).
 # Smaller groups use the all-games baseline.
 SPEAKER_GROUP_MIN = 20
+# Length bands the speaker check is reported in, to see whether its threshold
+# treats short and long clips alike.
+LENGTH_BANDS = [(SPEAKER_REFERENCE_MIN_S, 3.0), (3.0, 6.0), (6.0, None)]
 
 
 def free():
@@ -85,16 +93,22 @@ def main():
             audio[c.id] = {"path": f"audio/{dest.name}", "duration_s": c.duration_s, "rms_dbfs": -20.0}
         else:
             dest = out / "audio" / f"{c.id}.flac"
-            duration, rate, rms = models.trim(c, dest)
+            if c.prep:
+                t = c.prep["trim"]
+                duration, rate, rms = models.cut(c, dest, t["start_s"], t["end_s"])
+            else:
+                duration, rate, rms = models.trim(c, dest)
             audio[c.id] = {"path": f"audio/{dest.name}", "sample_rate": rate, "channels": 1,
                            "duration_s": round(duration, 4), "rms_dbfs": rms}  # fmt: skip
     silent = {c.id for c in clips if audio[c.id]["duration_s"] < 0.2}
     live = [c for c in clips if c.id not in silent]
+    # What the models hear: prep's levelled 16 kHz copy when there is one.
+    heard_as = {c.id: replace(c, audio=c.audio16k) if c.audio16k else c for c in live}
 
     # 2. Speech recognition, on what's left after trimming. Nonverbal lines
     # ({Sighs}) have no words to check.
     asr_model = s.get("asr", "openai/whisper-large-v3")
-    spoken = [c for c in live if not c.nonverbal]
+    spoken = [heard_as[c.id] for c in live if not c.nonverbal and "no_subtitle" not in c.flags]
     saved = Checkpoint("asr")
     asr = None
     if saved.todo(spoken):
@@ -109,7 +123,7 @@ def main():
     spk = None
     if saved.todo(live):
         spk = (models.FakeSpeaker if fake else models.Speaker)(speaker_model)
-    voice = saved.run(live, lambda part: [spk(c) for c in part])
+    voice = saved.run(live, lambda part: [spk(heard_as[c.id]) for c in part])
     del spk
     free()
     judged = {c.id for c in live if c.duration_s >= SPEAKER_REFERENCE_MIN_S and not c.nonverbal}
@@ -127,9 +141,11 @@ def main():
     # (onnxruntime releases the GIL).
     measure = models.fake_quality if fake else models.quality
     if live:
-        measure(live[0])  # load the model once before the threads share it
+        measure(heard_as[live[0].id])  # load the model once before the threads share it
     with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
-        mos = Checkpoint("quality").run(live, lambda part: list(pool.map(measure, part)), chunk=128)
+        mos = Checkpoint("quality").run(
+            live, lambda part: list(pool.map(measure, [heard_as[c.id] for c in part])), chunk=128
+        )
 
     # 5. Records.
     mismatch_wer = float(s.get("mismatch_wer", 0.5))
@@ -159,6 +175,7 @@ def main():
     write_jsonl(out / "clips.jsonl", records)
     embeddings = {"speaker": write_embeddings(out / "embeddings", "speaker", speaker_model, voice)}
     report = summary(records, embeddings, asr_model, baselines)
+    report["speaker_by_length"] = by_length(records, {c.id: c.duration_s for c in live}, judged)
     (out / "clean.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
     log(f"clean: {report['kept']} kept, flags {report['flags']}")
 
@@ -184,6 +201,20 @@ def baseline(voice, judged, members, mads):
     mad = statistics.median(abs(x - med) for x in sims) if sims else 0.0
     return {"centre": centre, "references": len(reference), "median": round(med, 4),
             "mad": round(mad, 4), "far_below": round(med - mads * max(mad, 1e-3), 4)}  # fmt: skip
+
+
+def by_length(records, durations, judged):
+    """Speaker similarity and far_voice share per length band of the judged
+    clips, so a threshold that only fails short clips shows up."""
+    bands = {}
+    for lo, hi in LENGTH_BANDS:
+        rs = [r for r in records if r["id"] in judged and durations[r["id"]] >= lo
+              and (hi is None or durations[r["id"]] < hi)]  # fmt: skip
+        name = f"{lo:g}-{hi:g}s" if hi else f"{lo:g}s+"
+        far = sum("far_voice" in r["flags"] for r in rs)
+        bands[name] = {"clips": len(rs), "far_voice_share": round(far / len(rs), 3) if rs else None,
+                       "similarity": quantiles([r["speaker_similarity"] for r in rs])}  # fmt: skip
+    return bands
 
 
 def summary(records, embeddings, asr_model, baselines):

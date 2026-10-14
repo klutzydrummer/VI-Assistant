@@ -17,6 +17,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Python packages for the home stages
+        run: python3 -m pip install --user --break-system-packages -r jobs/requirements-home.txt
       - name: Format
         run: cargo fmt --all --check
       - name: Lint

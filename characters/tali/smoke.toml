@@ -1,7 +1,8 @@
-# 40-clip smoke test of the GPU stages. `vi dataset run characters/tali/smoke.toml`.
+# 40-clip smoke test of the corpus pipeline. `vi dataset run characters/tali/smoke.toml`.
 # Same as dataset.toml except harvest copies a fixed 40-line subset of the
 # real harvest (mixed games, barks, nonverbal, stage directions, one long clip)
-# into its own corpus folder, and discovery's thresholds are scaled down.
+# into its own corpus folder. It ends at confounds: 40 clips are too few
+# to pass its tests or to cluster, so it checks the stages run, not results.
 
 corpus = "/home/brandon/Projects/VI-Assistant/corpus/tali-smoke"
 
@@ -32,9 +33,30 @@ with open(f'{out}/lines.jsonl', 'w') as f:
 """]
 files = ["/home/brandon/Projects/VI-Assistant/corpus/tali/harvest"]
 
+# Home, CPU. One trim and level for every clip: measures the noise floor in
+# the silence it trims, trims, applies one linear gain, and writes a 16 kHz
+# copy for embedding (the 24 kHz originals stay as they are). Low priority:
+# it reads the corpus on the busy system disk. numpy, scipy and soundfile
+# come from nix-shell.
+[stage.prep]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scipy p.soundfile])",
+           "--run", "python3 ../../jobs/prep.py"]
+inputs = ["harvest"]
+files = ["../../jobs/prep.py", "../../jobs/checks.py", "../../jobs/vi_job.py"]
+
+[stage.prep.settings]
+checks = "fail"
+top_db = 40          # trim where frames fall this far below the loudest
+pad_s = 0.05         # silence kept at each end
+target_lufs = -23    # one linear gain to this (BS.1770; RMS under rms_below_s)
+rms_below_s = 1.0
+max_peak_dbfs = -1   # the gain is capped so peaks stay under this
+bands = 16           # noise-floor spectrum bands, 50 Hz to 7.6 kHz
+
 [stage.clean]
 command = ["../../jobs/on-worker.sh", "python3", "jobs/clean.py"]
-inputs = ["harvest"]
+inputs = ["harvest", "prep"]
 files = ["../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py",
          "../../jobs/requirements-gpu.txt"]
 
@@ -46,48 +68,52 @@ batch = 16
 mismatch_wer = 0.5
 far_voice_mads = 4
 
-[stage.discover]
-command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/discover.py"]
-inputs = ["harvest", "clean"]
-files = ["../../jobs/discover.py", "../../jobs/models.py", "../../jobs/vi_job.py",
-         "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
+# GPU, the one paid job of the corpus pipeline: every candidate embedding
+# and the Empathic-Insight-Voice backup scores in one pass over prep's 16 kHz
+# copies (docs/design/corpus-pipeline.md, step 3). Runs only on Brandon's ok
+# for that run. Checkpointed; models fetched at the pinned revisions.
+[stage.embed]
+command = ["../../jobs/on-worker.sh", "python3", "jobs/embed.py"]
+inputs = ["harvest", "prep"]
+files = ["../../jobs/embed.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/checks.py", "../../jobs/requirements-gpu.txt"]
 
-[stage.discover.settings]
-checks = "fail"   # fail the stage if an acceptance check fails (checks.json)
-emotion = "emotion2vec/emotion2vec_plus_large"  # base mostly encoded clip length
-text_embed = "sentence-transformers/all-MiniLM-L6-v2"
-audio_llm = "google/gemma-4-12B-it"
-compare = 10
-min_cluster = 5
-batch = 32         # benchmarked on an A40: 1.1 s/clip vs 1.8 at 8; peak 33 GB
-batch_audio_s = 200  # cap on audio seconds per batch (memory grows ~0.07 GB/s of audio)
+[stage.embed.settings]
+checks = "fail"
+wavlm_layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+eiv_skip = ["score_content_enjoyment"]
+batch = 16
 
-[stage.label]
-command = ["../../jobs/on-worker.sh", "--put", "states.toml", "python3", "jobs/label.py"]
-inputs = ["harvest", "clean", "discover"]
-files = ["../../jobs/label.py", "../../jobs/models.py", "../../jobs/vi_job.py",
-         "../../jobs/fusion.py", "../../jobs/requirements-gpu.txt", "states.toml"]
+[stage.embed.settings.revisions]   # pinned 2026-10-14
+"microsoft/wavlm-large" = "c1423ed94bb01d80a3f5ce5bc39f6026a0f4828c"
+"emotion2vec/emotion2vec_plus_large" = "6c303ba987b86b93193de93e34bb2b077a6bedc4"
+"emotion2vec/emotion2vec_base" = "0c9a3152734f9d7a7a05b4ee6bfb3c109d288664"
+"laion/BUD-E-Whisper" = "9400e6740ea103bf619a4ce66374576fab8a4e23"
+"laion/Empathic-Insight-Voice-Small" = "66775f02233af401b323bcd3aac13b32f5dd1407"
+"laion/Empathic-Insight-Voice-Plus" = "9ceb45912f4d555fc0210e92ec8459234b3992ec"
+"audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim" = "6eba34a2485ea31cb03600241787c3a5edab8626"
+"sentence-transformers/all-MiniLM-L6-v2" = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
-[stage.label.settings]
-checks = "fail"   # fail the stage if an acceptance check fails (checks.json)
-audio = "emotion2vec/emotion2vec_plus_large"
-dimensions = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
-judge = "google/gemma-4-12B-it"
-verify_top = 10   # clips per axis the audio LLM rates: the top by the other signals
-verify_low = 5    # ... plus this many from the lower half, as a control
-batch = 32         # benchmarked on an A40: 1.1 s/clip vs 1.8 at 8; peak 33 GB
-batch_audio_s = 200  # cap on audio seconds per batch (memory grows ~0.07 GB/s of audio)
+# Home, CPU. Takes the recording out of each candidate embedding (PCA,
+# per-game CORAL re-colouring, LEACE for text length and noise floor), checks
+# it's gone, and picks the candidate to cluster on a 30% selection split,
+# reporting on the other 70%. Thresholds are fixed here, before results;
+# never loosen one to pass. If nothing passes it stops and says why.
+[stage.confounds]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scikit-learn])",
+           "--run", "python3 ../../jobs/confounds.py"]
+inputs = ["harvest", "prep", "clean", "embed"]
+files = ["../../jobs/confounds.py", "../../jobs/checks.py", "../../jobs/vi_job.py", "../../jobs/fusion.py"]
 
-# Home, CPU. Fits the labels to the reviews (reviews.jsonl): a per-axis probe
-# on the emotion2vec+ embeddings, fusion weights from each signal's agreement
-# with the reviews, and an accuracy table on the random calibration sample.
-# Needs numpy and scikit-learn, which NixOS's python lacks, hence nix-shell.
-[stage.calibrate]
-command = ["nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scikit-learn])",
-           "--run", "python3 ../../jobs/calibrate.py"]
-inputs = ["harvest", "label"]   # harvest for conversation-grouped folds
-files = ["../../jobs/calibrate.py", "../../jobs/fusion.py", "../../jobs/vi_job.py", "corpus:reviews.jsonl"]
-
-[stage.calibrate.settings]
-calibration = 10
-min_reviews = 10
+[stage.confounds.settings]
+checks = "warn"   # 40 clips are too few to pass the game bound; this checks it runs
+pca_dims = 96          # 64-128; capped below the comparable subset's size
+selection_share = 0.3  # conversations used to choose; the rest report
+game_margin = 0.05     # game probe's upper 95% bound within this of chance
+max_length_r2 = 0.05   # text-length and duration probes' R^2 at most this
+avd_max_drop = 0.10    # A/V/D probe R^2 may fall at most this
+knn_k = 15
+folds = 5
+permutations = 200     # game shuffled across conversations, shortlist only
+bootstrap = 200        # conversation-level bound, shortlist only
