@@ -234,6 +234,15 @@ mod tests {
     }
 
     #[test]
+    fn durations_survive_a_round_trip_exactly() {
+        // Without serde_json's float_roundtrip feature this reads back as
+        // ...337, so rewriting lines.jsonl would change every such clip.
+        let raw = r#"{"id":"le1.x","speaker":"tali","text":"hi","audio":{"path":"a.wav","sha256":"00","sample_rate":24000,"channels":1,"duration_s":1.8145833333333334},"source":{"game":"le1"}}"#;
+        let line: Line = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&line).unwrap(), raw);
+    }
+
+    #[test]
     fn unknown_fields_survive_a_round_trip() {
         let raw = r#"{"id":"le1.x","speaker":"tali","text":"hi","audio":{"path":"audio/le1.x.wav","sha256":"00","sample_rate":24000,"channels":1,"duration_s":1.0,"codec":"pcm"},"source":{"game":"le1","string_id":5},"future":true}"#;
         let line: Line = serde_json::from_str(raw).unwrap();
