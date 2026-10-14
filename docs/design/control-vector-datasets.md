@@ -2,6 +2,8 @@
 
 Status: plan approved 2026-10-12, revised 2026-10-13 after the 40-clip smoke test and the research in [prior-work.md](prior-work.md). Built: the stage runner, the GPU worker wrapper, harvest for LE1/LE2/LE3, and the discover and label jobs (`jobs/discover.py`, `jobs/label.py`, pipeline `characters/tali/dataset.toml`; signal fusion in `jobs/fusion.py`). Discover and label ran end to end on 40 real clips (`characters/tali/smoke.toml`).
 
+Review after the smoke tests, with proposed changes: [methodology-review.md](methodology-review.md).
+
 Decided:
 - Clips move only by direct rsync to the rented GPU, never through a third-party host (copyrighted material).
 - Brandon will do about an hour of label review.
