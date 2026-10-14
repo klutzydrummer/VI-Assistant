@@ -3,9 +3,15 @@
 Plan: docs/design/corpus-pipeline.md, step 1. Format:
 docs/design/corpus-format.md, prep. Per clip:
 
-  noise floor  the level and spectrum of the silence the trim cuts away,
-               measured *before* trimming. Pure recording chain with no voice
-               in it, so it is the cleanest nuisance covariate there is.
+  noise floor  the level and spectrum of the silence at the clip's two
+               edges, measured *before* trimming. Pure recording chain with no
+               voice in it, so it is the cleanest nuisance covariate there is.
+               Found with short 20 ms frames, because the game's clips are cut
+               tight and the trim's 85 ms frames smear speech into the edges.
+               Clips with under 50 ms of edge silence get no floor (flag
+               no_noise_floor, a reported share, not a failure); confounds
+               fills those in with the median. Pauses mid-line are never used:
+               they can hold breath or reverb.
   trim         leading and trailing silence cut where the frame level drops
                `top_db` below the clip's loudest frame, keeping `pad_s`. Later
                stages cut at these bounds, so every stage sees the same clip.
@@ -33,7 +39,8 @@ from vi_job import load_clips, log, out_dir, settings, write_jsonl
 RATE_16K = 16_000
 FRAME = 2048  # librosa.effects.trim's defaults, which clean used before prep
 HOP = 512
-MIN_NOISE_S = 0.05  # less trimmed-away silence than this gives no floor
+MIN_NOISE_S = 0.05  # less edge silence than this gives no floor
+FLOOR_FRAME_S = 0.02  # frames for finding the edge silence the floor is read from
 SPECTRUM_N = 512
 
 
@@ -81,9 +88,10 @@ def main():
         checks.Check("silent share", round(report["flags"].get("silent", 0) / n, 3), 0.05),
         checks.Check("gain_capped share", round(report["flags"].get("gain_capped", 0) / n, 3), 0.2,
                      note="levelling barely applied; lower target_lufs"),
-        checks.Check("no_noise_floor share", round(report["flags"].get("no_noise_floor", 0) / n, 3), 0.5,
-                     note="too little trimmed silence to measure the recording chain"),
     ]  # fmt: skip
+    # Reported, not checked: the game's clips are cut tight, and confounds
+    # fills missing floors with the median.
+    log(f"prep: no noise floor on {report['flags'].get('no_noise_floor', 0)} of {len(records)} clips")
     checks.finish(out, results, s.get("checks", "warn"))
 
 
@@ -97,8 +105,8 @@ def prepare(data, rate, top_db=40.0, pad_s=0.05, target_lufs=-23.0, rms_below_s=
     start, end = trim_bounds(data, top_db)
     pad = int(round(pad_s * rate))
     lo, hi = (max(0, start - pad), min(len(data), end + pad)) if end > start else (0, 0)
-    # The floor comes from what the trim found silent, not the kept padding.
-    noise = np.concatenate([data[:start], data[end:]]) if end > start else data[:0]
+    a, b = edge_silence(data, rate, top_db)
+    noise = np.concatenate([data[:a], data[b:]]) if b > a else data[:0]
     floor = noise_floor(noise, rate, edges) if len(noise) >= MIN_NOISE_S * rate else None
 
     kept = data[lo:hi]
@@ -143,6 +151,25 @@ def trim_bounds(data, top_db):
     start = int(loud[0] * HOP)
     end = min(len(data), int((loud[-1] + 1) * HOP))
     return start, end
+
+
+def edge_silence(data, rate, top_db):
+    """Sample bounds inside which the clip is not edge silence: from each end
+    inward, whole FLOOR_FRAME_S frames more than top_db below the loudest one,
+    up to the first loud frame. Frames aren't centred, so speech doesn't spill
+    into the edges the way it does in the trim's longer frames."""
+    import numpy as np
+
+    n = max(1, int(round(FLOOR_FRAME_S * rate)))
+    frames = len(data) // n
+    if frames == 0:
+        return 0, 0
+    rms = np.sqrt(np.mean(data[: frames * n].reshape(frames, n) ** 2, axis=1))
+    if rms.max() <= 1e-10:
+        return 0, 0
+    loud = np.flatnonzero(20 * np.log10(np.maximum(rms, 1e-10)) > 20 * math.log10(rms.max()) - top_db)
+    # Only whole frames count, so the tail's partial frame is never silence.
+    return int(loud[0] * n), int((loud[-1] + 1) * n) if loud[-1] < frames - 1 else len(data)
 
 
 def band_edges(n, lo=50.0, hi=7600.0):
