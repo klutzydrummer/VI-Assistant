@@ -51,7 +51,8 @@ files = ["../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py",
 checks = "warn"   # log failed acceptance checks (checks.json); the smoke pipeline fails on them
 asr = "openai/whisper-large-v3"
 speaker = "speechbrain/spkrec-ecapa-voxceleb"
-batch = 16
+batch = 8
+asr_max_tokens = 160  # about 30 s of fast speech; a runaway transcript stops here
 mismatch_wer = 0.5   # subtitle_mismatch above this (lines of 3+ words)
 far_voice_mads = 4   # far_voice this many MADs below her median similarity
 

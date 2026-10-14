@@ -24,7 +24,7 @@ to be. Only clips that trim to nothing are dropped (`silent`).
 
 Outputs: clips.jsonl, audio/<id>.flac, embeddings/speaker.npy, clean.json.
 
-Settings: backend ("fake" for tests), asr, speaker, batch, mismatch_wer,
+Settings: backend ("fake" for tests), asr, speaker, batch, asr_max_tokens, mismatch_wer,
 far_voice_mads, limit.
 """
 
@@ -113,6 +113,14 @@ def main():
     asr = None
     if saved.todo(spoken):
         asr = (models.FakeWhisper if fake else models.Whisper)(asr_model, batch=int(s.get("batch", 16)))
+        if not fake:
+            # Greedy and capped: beam search on a batch with a runaway
+            # transcript ran a 24 GB card out of memory on the full corpus.
+            # The words only check the subtitle. Set here, not in models.py,
+            # which embed shares: changing it would make embed run again.
+            cfg = asr.pipe.model.generation_config
+            cfg.num_beams = 1
+            cfg.max_new_tokens = int(s.get("asr_max_tokens", 160))
     heard = saved.run(spoken, lambda part: asr(part), chunk=64)
     del asr
     free()
