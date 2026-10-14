@@ -77,10 +77,11 @@ Written by the extractor (see `harvester-plan.md`). One record per distinct line
 | `audio.sample_rate`, `channels`, `duration_s` | yes | as written |
 | `audio.source` | no | where the bytes came from: `container` (AFC file, or package for LE1), `offset`, `size`, `export`, `codec`, the original `sample_rate`, and `sha256` of the raw source bytes |
 | `source.game` | yes | `le1`, `le2`, `le3` |
-| `source.*` | no | `package` (relative to the install), `conversation`, `node` (`kind` entry/reply, `index`), `string_id`, `gender` (`m`, `f`, `none`), `tlk`, `speaker_tag`, `speaker_name`, `speaker_index` (-1 owner, -2 Shepard), `listener`, `occurrences` |
+| `source.*` | no | `package` (relative to the install), `conversation`, `node` (`kind` entry/reply, `index`), `string_id`, `gender` (`m`, `f`, `none`), `tlk`, `speaker_tag`, `speaker_name`, `speaker_index` (-1 owner, -2 Shepard), `listener`, `conversation_kind` (`one_liner`: one line; `dialogue_choices`: Shepard picks a reply somewhere; `exchange`: several lines, no choice), `line_kind` (`one_liner` if nothing comes before or after this line, else its conversation's kind), `bark_category` (LE1 barks: the raw category code from the stream name), `occurrences` |
 | `context` | no | the canonical preceding path, oldest first, up to 4 lines, each `{id?, speaker, text, string_id?}` |
 | `prev`, `next` | no | ids of immediate predecessor and successor lines in the conversation graph (any speaker) |
-| `scene_tags` | no | lowercase tags for where and in what situation the line is spoken, like `citadel_party`, `normandy`, `loyalty`, `combat`; vocabulary and sources in `crates/harvest/src/scenes.toml` |
+| `following` | no | every line directly after this one, all branches, one step: `{id, speaker, text, string_id}` each |
+| `scene_tags` | no | lowercase tags for where and in what situation the line is spoken, like `citadel_party`, `normandy`, `loyalty`, `combat`; vocabulary and sources in `crates/harvest/src/scenes.toml`. Also structural facts from the conversation graph: `one_liner` / `exchange` / `dialogue_choices` (from `source.line_kind`) and `to_shepard` / `to_squad` / `to_npc` (from `source.listener`) |
 | `scene` | no | `dlc`, `prefix` and anything else the tags were derived from |
 | `stage_direction` | no | LE3 voice director's note for this line, verbatim. The label stage treats it as a prior. |
 
