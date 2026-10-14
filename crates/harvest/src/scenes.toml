@@ -236,7 +236,8 @@ interject = ["squad_comment"]
 
 # Conversations that play anywhere, so the package they happen to be stored
 # in says nothing about where they're heard: only their keyword and pattern
-# tags apply: the squad sound sets (ss_*) and LE1's generic combat banter
+# tags apply: the squad sound sets (ss_* in LE2/LE3, <name>_ss in LE1) and
+# LE1's generic combat banter
 # (combat_banter_00, stored in the otherwise unlisted BIOA_CRD00).
 [global_conversations]
-patterns = ["ss_*", "combat_banter_*"]
+patterns = ["ss_*", "*_ss", "combat_banter_*"]
