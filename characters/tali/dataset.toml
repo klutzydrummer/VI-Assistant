@@ -55,6 +55,32 @@ batch = 16
 mismatch_wer = 0.5   # subtitle_mismatch above this (lines of 3+ words)
 far_voice_mads = 4   # far_voice this many MADs below her median similarity
 
+# GPU, the one paid job of the corpus pipeline: every candidate embedding
+# and the Empathic-Insight-Voice backup scores in one pass over prep's 16 kHz
+# copies (docs/design/corpus-pipeline.md, step 3). Runs only on Brandon's ok
+# for that run. Checkpointed; models fetched at the pinned revisions.
+[stage.embed]
+command = ["../../jobs/on-worker.sh", "python3", "jobs/embed.py"]
+inputs = ["harvest", "prep"]
+files = ["../../jobs/embed.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/checks.py", "../../jobs/requirements-gpu.txt"]
+
+[stage.embed.settings]
+checks = "warn"
+wavlm_layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+eiv_skip = ["score_content_enjoyment"]
+batch = 16
+
+[stage.embed.settings.revisions]   # pinned 2026-10-14
+"microsoft/wavlm-large" = "c1423ed94bb01d80a3f5ce5bc39f6026a0f4828c"
+"emotion2vec/emotion2vec_plus_large" = "6c303ba987b86b93193de93e34bb2b077a6bedc4"
+"emotion2vec/emotion2vec_base" = "0c9a3152734f9d7a7a05b4ee6bfb3c109d288664"
+"laion/BUD-E-Whisper" = "9400e6740ea103bf619a4ce66374576fab8a4e23"
+"laion/Empathic-Insight-Voice-Small" = "66775f02233af401b323bcd3aac13b32f5dd1407"
+"laion/Empathic-Insight-Voice-Plus" = "9ceb45912f4d555fc0210e92ec8459234b3992ec"
+"audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim" = "6eba34a2485ea31cb03600241787c3a5edab8626"
+"sentence-transformers/all-MiniLM-L6-v2" = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
 # The steer test (jobs/steer.py) read label's axes, which this pipeline no
 # longer has; it comes back built on the classes. Its old definition:
 # # GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml steer`.

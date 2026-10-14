@@ -131,6 +131,22 @@ Written by `jobs/clean.py`. With prep as an input, it cuts at prep's bounds and 
 
 Mismatches and far voices are flagged, not dropped, until their thresholds are set from what the flagged clips turn out to be. `clean.json` holds counts, the distributions of WER, similarity and quality, and the 20 clips least like her, for that.
 
+### embed: `embeddings/` + `scores.jsonl` + `prosody.jsonl` + `embed.json`
+Written by `jobs/embed.py` on the rented GPU from prep's 16 kHz copies ([corpus-pipeline.md](corpus-pipeline.md), step 3). The one paid job of the corpus pipeline; it runs only on Brandon's ok for that run.
+- `embeddings/<name>.npy` + `<name>.ids`: float16, one row per clip, ids in row order (`numpy.load`). Compute downstream in float32 or float64. Names:
+  - `wavlm_L06` … `wavlm_L18`: WavLM-large hidden states, mean over frames, one file per layer (`hidden_states[k]`, where 0 is the input to the first transformer layer)
+  - `emotion2vec_plus_large`, `emotion2vec_base`: FunASR utterance embeddings
+  - `bude_whisper`: the BUD-E-Whisper encoder output averaged over the frames that hold audio, the first ceil(duration × 50) of 1,500. Whisper pads every clip to 30 s; pooling the padding too would make the vector mostly encode length.
+  - `minilm`: text embeddings of lines with words (not `nonverbal` or `no_subtitle`), so fewer rows
+- `scores.jsonl`, by name:
+  ```json
+  {"id": "...", "eiv": {"Anger": 0.41, "Teasing": 1.2}, "eiv_quality": {"score_overall_quality": 2.6},
+   "avd": {"arousal": 0.52, "dominance": 0.48, "valence": 0.61}, "emotion2vec_plus_large_classes": {"angry": 0.02}}
+  ```
+  `eiv`: every Empathic-Insight-Voice-Small head (raw regression outputs, on LAION's scales), run on the full padded encoder output as the heads were trained. `eiv_quality`: the Plus quality heads except content enjoyment (mean+min+max+std pooled, as trained). Backup labelling and naming help only.
+- `prosody.jsonl`: `duration_s`, `f0_median_hz`, `f0_range_st`, `loudness_db`, `loudness_range_db`, `voiced_fraction`, `words_per_s`, as discover wrote them.
+- `embed.json`: per model the repo, the pinned revision and the commit it resolved to; the layers; the score names in order; how each embedding was pooled; package versions; run time.
+
 ### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
 Written by `jobs/discover.py`.
 ```json
@@ -226,7 +242,7 @@ Vectors go to `vectors/<axis>.{gguf,safetensors}` and the report to `report.md` 
 ### Corpus pipeline stages (proposed, see corpus-pipeline.md)
 These replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). The shapes below are proposals for the implementation PRs, all additive; each moves into its own section above once built. Outputs stay in stage folders, never in `lines.jsonl`.
 - **prep, clean:** built, see above.
-- **embed:** `embeddings/<model>[_L<layer>].npy` + `.ids` (float16), `eiv.jsonl` `{id, heads: {...}, quality: {...}}`, `embed.json` (pinned revisions).
+- **embed:** built, see above.
 - **confounds:** `confounds.json` (before and after probe tables, chosen candidate, acceptance results), `cleaned.npy` + `.ids`.
 - **cluster:** `clusters.jsonl` `{id, responsibilities: {...}, scores: {...}, cluster}`, `cluster.json` (k, BIC/ICL, merges, Jaccard per cluster, flags, enrichment).
 - **review (purity mode):** adds `purity` records to `reviews.jsonl` `{id, cluster, fits, foil, repeat, seconds, at}`.

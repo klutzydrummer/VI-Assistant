@@ -133,6 +133,68 @@ class Checkpoint:
         return {c.id: self.done[c.id] for c in clips}
 
 
+class ArrayCheckpoint:
+    """Checkpoint for per-clip vectors (embed): each finished chunk is one
+    immutable VI_CHECKPOINT/<name>/<n>.npz holding `ids` and one float16
+    array per output, so the minute-by-minute copy home only sends new
+    chunks and never rewrites a big file on the home disk. Needs numpy.
+    Without VI_CHECKPOINT nothing is kept."""
+
+    def __init__(self, name):
+        import numpy as np
+
+        self.np = np
+        self.name = name
+        self.done = {}
+        folder = env_path("VI_CHECKPOINT")
+        self.folder = folder / name if folder else None
+        self.chunks = 0
+        if self.folder is None or not self.folder.is_dir():
+            return
+        for path in sorted(self.folder.glob("*.npz")):
+            try:
+                with np.load(path) as z:
+                    arrays = {k: z[k] for k in z.files if k != "ids"}
+                    for row, cid in enumerate(z["ids"]):
+                        self.done[str(cid)] = {k: v[row] for k, v in arrays.items()}
+            except (OSError, ValueError, KeyError):
+                log(f"{name}: skipping unreadable {path.name}")
+                continue
+            self.chunks = max(self.chunks, int(path.stem) + 1)
+        if self.done:
+            log(f"{name}: resuming, {len(self.done)} already done")
+
+    def todo(self, clips):
+        return [c for c in clips if c.id not in self.done]
+
+    def run(self, clips, compute, chunk=32):
+        """compute(list of clips) -> one {output name: vector} per clip, for
+        the clips not done yet, saved after every chunk. Returns {id: dict}."""
+        np = self.np
+        todo = self.todo(clips)
+        if self.folder is not None and todo:
+            self.folder.mkdir(parents=True, exist_ok=True)
+        for start in range(0, len(todo), chunk):
+            part = todo[start : start + chunk]
+            results = compute(part)
+            stacked = {}
+            for clip, r in zip(part, results, strict=True):
+                r = {k: np.asarray(v, dtype=np.float16) for k, v in r.items()}
+                self.done[clip.id] = r
+                for k, v in r.items():
+                    stacked.setdefault(k, []).append(v)
+            if self.folder is not None:
+                tmp = self.folder / f".{self.chunks:05d}.tmp"
+                with open(tmp, "wb") as f:
+                    np.savez(f, ids=np.array([c.id for c in part]), **{k: np.stack(v) for k, v in stacked.items()})
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.folder / f"{self.chunks:05d}.npz")
+                self.chunks += 1
+            log(f"{self.name}: {len(clips) - len(todo) + start + len(part)}/{len(clips)}")
+        return {c.id: self.done[c.id] for c in clips}
+
+
 # --- inputs -----------------------------------------------------------------
 
 

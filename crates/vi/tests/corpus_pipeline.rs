@@ -1,7 +1,7 @@
 //! The corpus pipeline (docs/design/corpus-pipeline.md) end to end on
-//! synthetic clips: prep at home, then clean with fake models through
-//! `jobs/on-worker.sh` and a local "worker". The real models only run on a
-//! rented GPU.
+//! synthetic clips: prep at home, then clean and embed with fake models
+//! through `jobs/on-worker.sh` and a local "worker". The real models only run
+//! on a rented GPU.
 
 use std::fs;
 use std::path::Path;
@@ -41,7 +41,7 @@ fn lines(path: &Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn prep_then_clean_with_fake_models() {
+fn prep_clean_and_embed_with_fake_models() {
     if !have_tools() {
         return;
     }
@@ -66,6 +66,11 @@ inputs = ["harvest"]
 command = [{on_worker:?}, "python3", "jobs/clean.py"]
 inputs = ["harvest", "prep"]
 settings = {{ backend = "fake" }}
+
+[stage.embed]
+command = [{on_worker:?}, "python3", "jobs/embed.py"]
+inputs = ["harvest", "prep"]
+settings = {{ backend = "fake", checks = "fail", wavlm_layers = [6, 18] }}
 "#
         ),
     )
@@ -104,4 +109,20 @@ settings = {{ backend = "fake" }}
     let report: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(clean.join("clean.json")).unwrap()).unwrap();
     assert!(report["speaker_by_length"].is_object());
+
+    // Embed wrote every candidate for every clip, plus the scores.
+    let embed = dataset::runner::current_out(&corpus, "embed").unwrap();
+    for name in [
+        "wavlm_L06",
+        "wavlm_L18",
+        "emotion2vec_plus_large",
+        "emotion2vec_base",
+        "bude_whisper",
+    ] {
+        let ids = fs::read_to_string(embed.join(format!("embeddings/{name}.ids"))).unwrap();
+        assert_eq!(ids.lines().count(), 24, "{name}");
+        assert!(embed.join(format!("embeddings/{name}.npy")).is_file());
+    }
+    assert_eq!(lines(&embed.join("scores.jsonl")).len(), 24);
+    assert!(embed.join("embed.json").is_file());
 }
