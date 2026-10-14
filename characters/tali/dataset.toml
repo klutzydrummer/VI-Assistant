@@ -105,6 +105,37 @@ folds = 5
 permutations = 200     # game shuffled across conversations, shortlist only
 bootstrap = 200        # conversation-level bound, shortlist only
 
+# Home, CPU. Finds the classes in confounds' cleaned space: shortest usable
+# clip from the crops, PCA by parallel analysis, GMM chosen by held-out
+# likelihood, entropy merging, HDBSCAN second opinion, conversation-level
+# Jaccard stability, audits and memberships. Fewer than 2 stable classes or
+# over 60% HDBSCAN noise stops it for Brandon; no automatic fallback.
+[stage.cluster]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scipy p.scikit-learn])",
+           "--run", "python3 ../../jobs/cluster.py"]
+inputs = ["harvest", "prep", "clean", "embed", "confounds"]
+files = ["../../jobs/cluster.py", "../../jobs/confounds.py", "../../jobs/checks.py",
+         "../../jobs/vi_job.py", "../../jobs/fusion.py"]
+
+[stage.cluster.settings]
+checks = "warn"
+max_dims = 32           # cap on parallel analysis
+k_min = 2
+k_max = 30
+cov_types = ["full", "diag"]
+folds = 5
+merge_min_slope = 0.05  # nats saved per merged clip to keep merging
+hdbscan_min_size = 15
+resamples = 200         # ~80% of conversations each, no replacement
+subsample = 0.8
+keep_jaccard = 0.75     # a class
+trust_jaccard = 0.6     # below: not trusted; between: a pattern
+max_noise = 0.6         # HDBSCAN noise above this stops
+nuisance_max_auc = 0.7  # a class game/length/noise floor predict this well is rejected
+retrieval_share = 0.8   # shortest usable clip: 80% of the 2 s crop retrieval
+class_cosine = 0.9      # split-half class-vector cosine for the minimum class size
+
 # The steer test (jobs/steer.py) read label's axes, which this pipeline no
 # longer has; it comes back built on the classes. Its old definition:
 # # GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml steer`.

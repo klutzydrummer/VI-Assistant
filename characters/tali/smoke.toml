@@ -1,7 +1,8 @@
 # 40-clip smoke test of the corpus pipeline. `vi dataset run characters/tali/smoke.toml`.
 # Same as dataset.toml except harvest copies a fixed 40-line subset of the
 # real harvest (mixed games, barks, nonverbal, stage directions, one long clip)
-# into its own corpus folder.
+# into its own corpus folder. It ends at confounds: 40 clips are too few
+# to pass its tests or to cluster, so it checks the stages run, not results.
 
 corpus = "/home/brandon/Projects/VI-Assistant/corpus/tali-smoke"
 

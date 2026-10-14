@@ -162,6 +162,18 @@ Written by `jobs/confounds.py` at home (numpy, scikit-learn), following [corpus-
 
 The acceptance limits are the stage settings, fixed before results. Folds are grouped by conversation everywhere.
 
+### cluster: `clusters.jsonl` + `cluster.json`
+Written by `jobs/cluster.py` at home (numpy, scipy, scikit-learn) from confounds' cleaned space, following [corpus-pipeline.md](corpus-pipeline.md) step 5. Refuses to run when confounds stopped.
+```json
+{"id": "...", "cluster": "c2", "responsibilities": {"c0": 0.01, "c1": 0.02, "c2": 0.97},
+ "scores": {"c0": -8.1, "c1": -5.3, "c2": 4.2}, "formed": true, "hdbscan": 3}
+```
+- One record per clip, every clip. `formed: false` for clips that didn't form the clusters (flagged, duplicate takes, or shorter than the shortest usable length); they still get memberships. A duplicate take gets its twin's.
+- `responsibilities`: the GMM's, summed over each class's components (they saturate near 0 or 1). `scores`: the continuous per-class score, log p(x | class) − log p(x | rest), for intensity when mixing. `hdbscan`: the second opinion's label (−1 noise, null if not formed).
+- Class ids `c0`, `c1`, … go by size, largest first. Names come later, from the purity review.
+
+`cluster.json`: `status` (`ok` or `stopped` with `stop_reason`: fewer than 2 classes at Jaccard ≥ `keep_jaccard`, or HDBSCAN noise over `max_noise`), `shortest_usable` (retrieval per crop length, the minimum length, paired-take agreement for short and long clips), `pca` (dimensions by parallel analysis), `gmm` (held-out likelihood, BIC and ICL for every k and covariance type tried; the chosen one), `merge` (the entropy path), `hdbscan` (clusters, noise share, agreement with the classes), `min_class_size` (from split-half cosines), and per class: size, components, Jaccard and its band (`class`, `pattern`, `not trusted`), nuisance AUC and `rejected_for_nuisance`, audio and text AUC with `topic_not_tone`, counts by game, barks, tag enrichment, the session check (effective conversations against a same-size baseline, top-two share, Jaccard without the biggest conversation) with `session_flag` for Brandon's call, split-half cosines and `below_min_size`; plus the sensitivity run without LE1 barks.
+
 ### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
 Written by `jobs/discover.py`.
 ```json
@@ -259,7 +271,7 @@ These replace discover, label and calibrate in Tali's pipeline (their jobs stay 
 - **prep, clean:** built, see above.
 - **embed:** built, see above.
 - **confounds:** built, see above.
-- **cluster:** `clusters.jsonl` `{id, responsibilities: {...}, scores: {...}, cluster}`, `cluster.json` (k, BIC/ICL, merges, Jaccard per cluster, flags, enrichment).
+- **cluster:** built, see above.
 - **review (purity mode):** adds `purity` records to `reviews.jsonl` `{id, cluster, fits, foil, repeat, seconds, at}`.
 - **classes:** `classes.json`, `memberships.jsonl`, `eiv_labels.jsonl` (backup), `report.md`.
 
