@@ -30,7 +30,7 @@ If fewer than 2 classes reach Jaccard 0.75, or HDBSCAN calls more than 60%
 noise, it stops and reports to Brandon: no automatic fallback to continuous
 axes or EIV labels.
 
-Outputs: clusters.jsonl, cluster.json, checks.json.
+Outputs: clusters.jsonl, cluster.json, components.npy + .ids, checks.json.
 
 Settings: max_dims, k_min, k_max, cov_types, folds, resamples, subsample,
 merge_min_slope, hdbscan_min_size, keep_jaccard, trust_jaccard, max_noise, nuisance_max_auc,
@@ -492,6 +492,12 @@ def main():
                         "scores": {f"c{c}": round(float(s_all[j, c]), 3) for c in range(n_classes)},
                         "formed": i in formed, "hdbscan": hd_label.get(i)})  # fmt: skip
     write_jsonl(out / "clusters.jsonl", records)
+    # Per component log w_c + log N(x | c), so classes can rescore merges
+    # exactly without refitting.
+    logp = classes.model._estimate_weighted_log_prob(z_all)
+    twins = [twin[meta.sha[i]] for i in range(len(ids))]
+    np.save(out / "components.npy", logp[twins].astype(np.float32))
+    (out / "components.ids").write_text("".join(f"{i}\n" for i in ids))
 
     stable = sum(p["stability"] == "class" for p in per)
     stop_reasons = []
@@ -507,7 +513,7 @@ def main():
         "formed_by": int(len(rows)),
         "shortest_usable": shortest,
         "pca": {"dims": dims, "parallel_analysis": pa},
-        "gmm": {"k": k, "cov": cov, "table": table},
+        "gmm": {"k": k, "cov": cov, "table": table, "weights": [round(float(w), 6) for w in classes.model.weights_]},
         "merge": {"classes": n_classes, "entropy_path": [{"classes": len(g), "entropy": round(e, 2), "merged_clips": round(m, 1)}
                                                        for g, e, m in path]},
         "hdbscan": hdbscan,

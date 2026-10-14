@@ -136,6 +136,21 @@ nuisance_max_auc = 0.7  # a class game/length/noise floor predict this well is r
 retrieval_share = 0.8   # shortest usable clip: 80% of the 2 s crop retrieval
 class_cosine = 0.9      # split-half class-vector cosine for the minimum class size
 
+# Home, CPU. The final output: Brandon's purity-review decisions applied to
+# the clusters (merges and splits rescored from the GMM components), every
+# clip's memberships, the EIV backup labelling and report.md with every
+# acceptance number and failed check. Reruns when purity.jsonl changes.
+[stage.classes]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scipy])",
+           "--run", "python3 ../../jobs/classes.py"]
+inputs = ["cluster", "embed", "confounds"]
+files = ["../../jobs/classes.py", "../../jobs/checks.py", "../../jobs/vi_job.py", "corpus:purity.jsonl"]
+
+[stage.classes.settings]
+checks = "warn"
+min_purity = 0.6        # below: flagged, Brandon's call to merge or reject
+
 # The steer test (jobs/steer.py) read label's axes, which this pipeline no
 # longer has; it comes back built on the classes. Its old definition:
 # # GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml steer`.

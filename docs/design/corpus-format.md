@@ -175,6 +175,32 @@ Written by `jobs/cluster.py` at home (numpy, scipy, scikit-learn) from confounds
 
 `cluster.json`: `status` (`ok` or `stopped` with `stop_reason`: fewer than 2 classes at Jaccard ≥ `keep_jaccard`, or HDBSCAN noise over `max_noise`), `shortest_usable` (retrieval per crop length, the minimum length, paired-take agreement for short and long clips), `pca` (dimensions by parallel analysis), `gmm` (held-out likelihood, BIC and ICL for every k and covariance type tried; the chosen one), `merge` (the entropy path), `hdbscan` (clusters, noise share, agreement with the classes), `min_class_size` (from split-half cosines), and per class: size, components, Jaccard and its band (`class`, `pattern`, `not trusted`), nuisance AUC and `rejected_for_nuisance`, audio and text AUC with `topic_not_tone`, counts by game, barks, tag enrichment, the session check (effective conversations against a same-size baseline, top-two share, Jaccard without the biggest conversation) with `session_flag` for Brandon's call, split-half cosines and `below_min_size`; plus the sensitivity run without LE1 barks.
 
+### review, purity mode: `purity.jsonl` (human input, not a stage)
+`vi review --purity <corpus>` appends to `corpus/<character>/purity.jsonl`, following [corpus-pipeline.md](corpus-pipeline.md) step 6. It's its own file rather than records in `reviews.jsonl` (the earlier proposal), so the label review and the purity review never rerun each other's consumers. Two kinds of record:
+```json
+{"kind": "answer", "id": "le2.s4_f", "cluster": "c2", "fits": true, "foil": false, "repeat": false, "seconds": 3.1, "at": 1791979143}
+{"kind": "decision", "cluster": "c2", "action": "name", "name": "teasing", "into": null, "note": null, "at": 1791979150}
+```
+- `answer`: one per clip played. `foil` is a clip from another cluster (responsibility for this one ≤ 0.1) at a similar length, every fifth clip; `repeat` is a hidden replay of a member already answered in this cluster, every eighth clip until 50 exist. Members come stratified: round-robin over scenes (the first non-structural scene tag), then over conversations, each in SHA-256 order. Only `formed` clips with audio are played.
+- `decision`: `action` is `name` (with `name`), `merge` (with `into`, another cluster), `split` or `reject`; `note` is free text. Clusters are reviewed in `cluster.json` order (largest first), one at a time; a cluster is done once it has a decision.
+- The SPRT (p₀ 0.5 against p₁ 0.8, α = β = 0.05) counts member answers only; a cluster with no verdict after its members run out, or after 40, is `undecided`. Purity is the members' yes share, corrected for the false-yes rate on all foils so far: (y − f) / (1 − f). Consistency is Cohen's kappa of first answers against repeats. All of these are recomputed from the file, never stored, so nothing can drift.
+- The server picks every clip from this file alone, so a restart resumes exactly. The page never sees a clip's id, line or audits before the answer (the id names the game).
+
+The classes stage lists `corpus:purity.jsonl` in `files`.
+
+### classes: `classes.json` + `memberships.jsonl` + `eiv_labels.jsonl` + `report.md`
+Written by `jobs/classes.py` at home (numpy, scipy) from cluster, embed, confounds and `corpus:purity.jsonl`. The corpus pipeline's final output. Refuses to run when cluster stopped; runs without a review (every cluster `unreviewed`, status `incomplete`).
+```json
+{"id": "...", "class": "teasing", "responsibilities": {"calm": 0.02, "teasing": 0.97}, "scores": {"calm": -6.2, "teasing": 4.4}, "formed": true}
+```
+- `memberships.jsonl`: one record per clip, every clip. Keys are class keys: the slug of the name Brandon gave, or the cluster ids (`c4`, `c1+c4` for an unnamed merge, `c3.0` for a split part). `responsibilities` sum the GMM posteriors over the class's components; `scores` are log p(x | class) − log p(x | not class) for intensity when mixing. Both come from cluster's `components.npy`, so merges and splits are exact, not refitted. A rejected cluster's components stay in "not class" and nothing is renormalised.
+- `classes.json`: `status` (`ok` when every class is named and at least 2 are; else `incomplete`), and per class: `key`, `name`, `status` (`named`, `split_part`, `unreviewed`, `split_single_component`), `clusters`, `components`, `size` (formed clips whose top class it is) and `size_all_clips`, `stability` (the cluster's Jaccard and band; `not re-measured` for merges and splits, with each cluster's Jaccard), `purity` (members heard, observed, corrected, SPRT verdicts), `flags` carried from cluster. Also `rejected`, the purity summary (per cluster and overall: false-yes rate, kappa, repeat pairs) and `failed`, the list of checks that failed.
+- A split separates a cluster back into its GMM components; a single-component cluster can't be split this way and is kept whole and reported. Split parts are unnamed until another review.
+- `eiv_labels.jsonl`: the Empathic-Insight-Voice backup labelling, `{id, eiv, eiv_z, quality, top}` (z-scores over the corpus, top three heads). Kept apart; never an automatic fallback.
+- `report.md`: every acceptance number (confounds' probes before and after, the game bound, paired takes; cluster's shortest usable clip, GMM, HDBSCAN, per-cluster Jaccard and audits; purity, false-yes rate, kappa; the class table) with the failed checks first.
+
+cluster also writes `components.npy` (float32, clips × GMM components, log w_c + log N(x | c), a duplicate take carrying its twin's) with `components.ids`, and the component weights in `cluster.json` under `gmm.weights`.
+
 ### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
 Written by `jobs/discover.py`.
 ```json
@@ -267,14 +293,8 @@ Records are `{"id": ...}` plus, for pairs, `{"id": ..., "neutral_text": ...}`.
 ### extract, evaluate
 Vectors go to `vectors/<axis>.{gguf,safetensors}` and the report to `report.md` plus `samples/`. The runner already keys these by the model through the stage settings; copying the chosen vectors into the pack's vector store is a separate step.
 
-### Corpus pipeline stages (proposed, see corpus-pipeline.md)
-These replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). The shapes below are proposals for the implementation PRs, all additive; each moves into its own section above once built. Outputs stay in stage folders, never in `lines.jsonl`.
-- **prep, clean:** built, see above.
-- **embed:** built, see above.
-- **confounds:** built, see above.
-- **cluster:** built, see above.
-- **review (purity mode):** adds `purity` records to `reviews.jsonl` `{id, cluster, fits, foil, repeat, seconds, at}`.
-- **classes:** `classes.json`, `memberships.jsonl`, `eiv_labels.jsonl` (backup), `report.md`.
+### Corpus pipeline stages
+prep, clean, embed, confounds, cluster, the purity review and classes replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). Each has its section above. Outputs stay in stage folders, never in `lines.jsonl`.
 
 ## Pipeline file
 
