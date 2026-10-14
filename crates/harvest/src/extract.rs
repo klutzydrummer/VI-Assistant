@@ -54,6 +54,12 @@ pub struct Character {
     pub owns: BTreeMap<Game, Vec<String>>,
     /// The character's own scene tags (`[<game>.scene_tags]`).
     pub scene_rules: BTreeMap<Game, Vec<scenes::Rule>>,
+    /// LE1 squad sound-set banks (`bark_banks`): ISACT banks of combat barks
+    /// that belong to no conversation, like `tali` (`tali.isb`).
+    pub bark_banks: BTreeMap<Game, Vec<String>>,
+    /// Hand-checked flags on single lines (`[<game>.line_flags]`), for facts
+    /// the game data doesn't record, like a sung line: flag -> line ids.
+    pub line_flags: BTreeMap<String, Vec<String>>,
 }
 
 impl Character {
@@ -69,6 +75,8 @@ impl Character {
         let mut tags = BTreeMap::new();
         let mut owns = BTreeMap::new();
         let mut scene_rules = BTreeMap::new();
+        let mut bark_banks = BTreeMap::new();
+        let mut line_flags: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for game in [Game::Le1, Game::Le2, Game::Le3] {
             let Some(section) = table.get(game.id()) else {
                 continue;
@@ -108,12 +116,59 @@ impl Character {
                     .ok_or_else(|| format!("{what} must be a table"))?;
                 scene_rules.insert(game, scenes::parse_rules(rules, &what)?);
             }
+            if let Some(list) = section.get("bark_banks") {
+                let list: Option<Vec<String>> = list
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.as_str().map(str::to_ascii_lowercase))
+                    .collect();
+                bark_banks.insert(
+                    game,
+                    list.ok_or_else(|| {
+                        format!("sources.toml: [{}] bark_banks must be strings", game.id())
+                    })?,
+                );
+            }
+            if let Some(flags) = section.get("line_flags") {
+                let what = format!("sources.toml: [{}.line_flags]", game.id());
+                let flags = flags
+                    .as_table()
+                    .ok_or_else(|| format!("{what} must be a table"))?;
+                for (flag, ids) in flags {
+                    if !scenes::valid_tag(flag) {
+                        return Err(format!(
+                            "{what}: flag {flag:?} must be lowercase a-z, 0-9 and _"
+                        ));
+                    }
+                    let ids: Option<Vec<String>> = ids
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    let ids =
+                        ids.ok_or_else(|| format!("{what}.{flag} must be a list of line ids"))?;
+                    if let Some(bad) = ids
+                        .iter()
+                        .find(|i| !i.starts_with(&format!("{}.", game.id())))
+                    {
+                        return Err(format!(
+                            "{what}.{flag}: {bad} isn't a {} line id",
+                            game.id()
+                        ));
+                    }
+                    line_flags.entry(flag.clone()).or_default().extend(ids);
+                }
+            }
         }
         Ok(Character {
             id: id.to_string(),
             tags,
             owns,
             scene_rules,
+            bark_banks,
+            line_flags,
         })
     }
 }
@@ -216,6 +271,12 @@ enum Raw {
 struct Recording {
     string_id: i32,
     gender: Gender,
+    /// False for recordings with no gender variant (LE1 barks): their id has
+    /// no `_m`/`_f` and `source.gender` is `none`.
+    variant: bool,
+    /// LE1 bark category code from the stream name (`png`, `dth`, ...),
+    /// recorded as-is.
+    bark_category: Option<String>,
     raw: Raw,
     /// Hash of the source bytes, when we have them (`.wem` only).
     raw_sha: Option<String>,
@@ -302,6 +363,7 @@ pub fn run(
             root,
         )?;
         report.unknown_levels = tag_lines(character, &mut game_lines);
+        apply_line_flags(character, &mut game_lines);
         report.lines = game_lines.len();
         report.no_subtitle = game_lines
             .iter()
@@ -484,6 +546,8 @@ fn find(
                 list.push(Recording {
                     string_id: name.string_id,
                     gender: name.gender,
+                    variant: true,
+                    bark_category: None,
                     raw: Raw::Wem(raw),
                     raw_sha: Some(raw_sha),
                     found: vec![found],
@@ -672,6 +736,8 @@ fn find_le1(
             recordings.push(Recording {
                 string_id,
                 gender,
+                variant: true,
+                bark_category: None,
                 raw: Raw::Subsong(bank.clone(), index),
                 raw_sha: None,
                 found: vec![Found {
@@ -686,7 +752,77 @@ fn find_le1(
             });
         }
     }
+    // Squad sound sets: combat barks outside any conversation, one bank per
+    // character (`tali.isb`, streams `EN_tali_<string id>_<category><n>.wav`).
+    for name in character.bark_banks.get(&game.game).into_iter().flatten() {
+        let Some(bank) = banks.get(name) else {
+            report.missing_afc += 1;
+            report
+                .errors
+                .push(format!("bark bank {name}.isb not found"));
+            continue;
+        };
+        let streams = match list_subsongs(bank) {
+            Ok(s) => s,
+            Err(e) => {
+                report.errors.push(format!("{}: {e}", bank.display()));
+                continue;
+            }
+        };
+        let package = game
+            .files
+            .packages
+            .iter()
+            .find(|f| file_name(&f.path).eq_ignore_ascii_case(&format!("{name}_ss.pcc")))
+            .map_or_else(|| bank.clone(), |f| f.path.clone());
+        for (index, stream) in streams {
+            let Some((string_id, category)) = parse_isact_bark(name, &stream) else {
+                continue;
+            };
+            report.streams += 1;
+            recordings.push(Recording {
+                string_id,
+                gender: Gender::Male,
+                variant: false,
+                bark_category: Some(category),
+                raw: Raw::Subsong(bank.clone(), index),
+                raw_sha: None,
+                found: vec![Found {
+                    package: package.clone(),
+                    export: stream,
+                    conversation: format!("{name}_ss"),
+                    speaker_tag: tags.first().cloned().unwrap_or_default(),
+                    container: bank.clone(),
+                    offset: index,
+                    size: 0,
+                }],
+            });
+        }
+    }
     Ok((recordings, graphs, subs))
+}
+
+/// `EN_tali_00168422_png00.wav` in bank `tali` -> (168422, `png`): an LE1
+/// squad bark, whose name has a category code where dialogue has a gender.
+fn parse_isact_bark(bank: &str, name: &str) -> Option<(i32, String)> {
+    let rest = name.strip_prefix("EN_")?.strip_suffix(".wav")?;
+    let rest = rest
+        .get(..bank.len())
+        .filter(|b| b.eq_ignore_ascii_case(bank))
+        .map(|_| &rest[bank.len()..])?
+        .strip_prefix('_')?;
+    let (id, code) = rest.split_once('_')?;
+    if id.len() != 8 || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let category: String = code
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    if category.is_empty() || !code[category.len()..].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((id.parse().ok()?, category.to_ascii_lowercase()))
 }
 
 /// `EN_cha00_quarian_tali_00127848_M.wav` -> (127848, male). English only.
@@ -760,7 +896,11 @@ fn decode_all(
         r.found.sort_by(|a, b| a.package.cmp(&b.package));
         let n = seen.entry((r.string_id, r.gender)).or_default();
         *n += 1;
-        let mut id = format!("{}.s{}_{}", game.game.id(), r.string_id, r.gender.suffix());
+        let mut id = if r.variant {
+            format!("{}.s{}_{}", game.game.id(), r.string_id, r.gender.suffix())
+        } else {
+            format!("{}.s{}", game.game.id(), r.string_id)
+        };
         if *n > 1 {
             id.push_str(&format!(".{n}"));
         }
@@ -830,7 +970,12 @@ fn decode_all(
                     }
                 };
                 let first = &r.found[0];
-                let (text, tlk) = match subs.get(r.string_id, r.gender) {
+                let looked_up = if r.variant {
+                    subs.get(r.string_id, r.gender)
+                } else {
+                    subs.male.get(&r.string_id)
+                };
+                let (text, tlk) = match looked_up {
                     Some((t, f)) => (t.clone(), Some(f.clone())),
                     None => (String::new(), None),
                 };
@@ -861,7 +1006,13 @@ fn decode_all(
                 source.insert("package".into(), json!(rel(&first.package)));
                 source.insert("conversation".into(), json!(first.conversation));
                 source.insert("string_id".into(), json!(r.string_id));
-                source.insert("gender".into(), json!(r.gender.suffix()));
+                source.insert(
+                    "gender".into(),
+                    json!(if r.variant { r.gender.suffix() } else { "none" }),
+                );
+                if let Some(category) = &r.bark_category {
+                    source.insert("bark_category".into(), json!(category));
+                }
                 if let Some(tlk) = tlk {
                     source.insert("tlk".into(), json!(tlk));
                 }
@@ -1264,6 +1415,17 @@ pub fn tag_lines(
     unknown
 }
 
+/// Add the hand-checked `line_flags` from sources.toml to their lines.
+pub fn apply_line_flags(character: &Character, lines: &mut [dataset::corpus::Line]) {
+    for line in lines.iter_mut() {
+        for (flag, ids) in &character.line_flags {
+            if ids.contains(&line.id) && !line.flags.contains(flag) {
+                line.flags.push(flag.clone());
+            }
+        }
+    }
+}
+
 /// Re-tag an existing harvest folder in place (`vi corpus tag`): only
 /// `scene_tags` in `lines.jsonl` change; audio and everything else stay.
 /// Returns how many lines changed and the unknown level codes.
@@ -1274,6 +1436,7 @@ pub fn retag(
     let mut lines = dataset::corpus::read_lines(dir).map_err(|e| e.to_string())?;
     let before: Vec<Vec<String>> = lines.iter().map(|l| l.scene_tags.clone()).collect();
     let unknown = tag_lines(character, &mut lines);
+    apply_line_flags(character, &mut lines);
     let changed = lines
         .iter()
         .zip(&before)
@@ -1297,8 +1460,8 @@ pub fn retag(
 
 /// Corpus flags for a line: `no_subtitle` for empty text, `nonverbal` for
 /// subtitles that only describe a sound (`{Sighs}`), `bark` for the squad
-/// sound sets (`ss_global_hench_tali`, `ss_tali_minimal`), which have no
-/// conversation node and no subtitles.
+/// sound sets (`ss_global_hench_tali`, `ss_tali_minimal`, LE1's `tali_ss`),
+/// which have no conversation node and no subtitles.
 fn flags_for(text: &str, conversation: &str) -> Vec<String> {
     let text = text.trim();
     let mut flags = Vec::new();
@@ -1307,7 +1470,8 @@ fn flags_for(text: &str, conversation: &str) -> Vec<String> {
     } else if text.starts_with('{') && text.ends_with('}') {
         flags.push("nonverbal".to_string());
     }
-    if conversation.to_ascii_lowercase().starts_with("ss_") {
+    let conversation = conversation.to_ascii_lowercase();
+    if conversation.starts_with("ss_") || conversation.ends_with("_ss") {
         flags.push("bark".to_string());
     }
     flags
@@ -1520,11 +1684,45 @@ mod tests {
             tags: BTreeMap::from([(Game::Le3, vec!["hench_tali".into()])]),
             owns: BTreeMap::new(),
             scene_rules: BTreeMap::new(),
+            bark_banks: BTreeMap::new(),
+            line_flags: BTreeMap::new(),
         };
         let label = |n: &Node| speaker_label(&tali, Game::Le3, &c, "t_d", &graphs, n);
         assert_eq!(label(&c.entries[0]), "cit_diplomat");
         assert_eq!(label(&c.entries[1]), "tali");
         assert_eq!(label(&c.replies[1]), "shepard");
+    }
+
+    #[test]
+    fn isact_barks() {
+        assert_eq!(
+            parse_isact_bark("tali", "EN_tali_00168422_png00.wav"),
+            Some((168422, "png".to_string()))
+        );
+        assert_eq!(
+            parse_isact_bark("tali", "EN_tali_00172830_lwh00.wav"),
+            Some((172830, "lwh".to_string()))
+        );
+        // Another bank's streams, dialogue names, and malformed ones.
+        assert_eq!(
+            parse_isact_bark("tali", "EN_cha00_quarian_tali_00127848_M.wav"),
+            None
+        );
+        assert_eq!(parse_isact_bark("tali", "EN_tali_0016842_png00.wav"), None);
+        assert_eq!(parse_isact_bark("tali", "EN_tali_00168422_00.wav"), None);
+        assert_eq!(flags_for("", "tali_ss"), ["no_subtitle", "bark"]);
+    }
+
+    #[test]
+    fn line_flags_from_sources() {
+        let c = Character::from_sources(
+            "tali",
+            "[le3]\nspeaker_tags = [\"hench_tali\"]\n[le3.line_flags]\nsinging = [\"le3.s769911_m\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.line_flags["singing"], ["le3.s769911_m"]);
+        let bad = "[le3]\nspeaker_tags = []\n[le3.line_flags]\nsinging = [\"le2.s1_m\"]\n";
+        assert!(Character::from_sources("tali", bad).is_err());
     }
 
     #[test]

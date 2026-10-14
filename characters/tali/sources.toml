@@ -18,6 +18,9 @@
 speaker_tags = ["hench_quarian", "sta20_quarian"]
 # Normandy talks, the Fist ambush rescue, Virmire ambient lines.
 owner_of = ["cha00_quarian_tali", "sta60_quarian", "jug20_amb_tali"]
+# Her squad sound set: 129 combat barks in Content/Packages/ISACT/tali.isb
+# (cued by tali_ss.pcc), with no subtitles.
+bark_banks = ["tali"]
 
 [le1.scene_tags]
 # Fist's ambush on the Citadel is where she is recruited; she then presents
@@ -45,3 +48,10 @@ speaker_tags = ["hench_tali"]
 personal_arc = ["level:Gth001", "level:Gth002", "level:GthLeg", "level:GthN7a",
                 "conversation:norgth_*", "conversation:citprs_tali_*"]
 personal_talk = ["conversation:norhen_tali_*", "conversation:citapt_*tali*"]
+
+# Hand-checked facts the game data doesn't record.
+[le3.line_flags]
+# Her song in the Citadel apartment: one 51-second clip holds the whole song
+# (the next three lyric lines are 13 ms placeholder streams, so they're not
+# in the corpus).
+singing = ["le3.s769911_m"]
