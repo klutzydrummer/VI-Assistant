@@ -78,6 +78,17 @@ def write(folder, n_conversations=60, per_conversation=8, dim=32, classes=4, see
     for name, m in {"good": good, "lengthy": lengthy}.items():
         np.save(emb / f"{name}.npy", m.astype(np.float16))
         (emb / f"{name}.ids").write_text("".join(f"{i}\n" for i in ids))
+    # Crops of the first 120 clips: shorter crops are noisier copies.
+    crops = folder / "embed" / "crops"
+    crops.mkdir(parents=True, exist_ok=True)
+    crop_ids, crop_rows = [], []
+    for k in range(120):
+        for n, noise in [(0.5, 6.0), (1, 2.0), (1.5, 0.8), (2, 0.4)]:
+            crop_ids.append(f"{ids[k]}@{n:g}")
+            crop_rows.append(good[k] + noise * rng.standard_normal(dim))
+    for name, m in {"good": np.stack(crop_rows), "lengthy": np.stack(crop_rows)}.items():
+        np.save(crops / f"{name}.npy", m.astype(np.float16))
+        (crops / f"{name}.ids").write_text("".join(f"{i}\n" for i in crop_ids))
     avd = {cid: [0.3 + 0.1 * cls, 0.5, 0.4 + 0.05 * cls] for cid, _, cls in rows}
     eiv_names = ["Anger", "Amusement", "Sadness", "Teasing"]
     _jsonl(folder / "embed" / "scores.jsonl", [

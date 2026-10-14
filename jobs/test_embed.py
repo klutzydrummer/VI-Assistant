@@ -78,7 +78,7 @@ class JobTest(unittest.TestCase):
             (harvest / "audio").mkdir(parents=True)
             (prep / "audio16k").mkdir(parents=True)
             lines, prepped = [], []
-            for i in range(6):
+            for i in range(6):  # clip 4 and 5 are 2 s and 2.25 s; 5 is a bark
                 lid = f"le{i % 3 + 1}.s{i}_f"
                 flags = ["bark", "no_subtitle"] if i == 5 else []
                 lines.append({"id": lid, "text": "" if flags else f"Line {i}.", "flags": flags,
@@ -89,7 +89,8 @@ class JobTest(unittest.TestCase):
                                 "audio16k": {"path": f"audio16k/{lid}.flac", "sample_rate": 16_000}})  # fmt: skip
             (harvest / "lines.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines))
             (prep / "prep.jsonl").write_text("".join(json.dumps(r) + "\n" for r in prepped))
-            (d / "settings.json").write_text(json.dumps({"backend": "fake", "wavlm_layers": [6, 12, 18]}))
+            (d / "settings.json").write_text(json.dumps({"backend": "fake", "wavlm_layers": [6, 12, 18],
+                                                         "crops": {"min_source_s": 1.9, "lengths": [0.5, 1]}}))
             env = {**os.environ, "VI_INPUT_HARVEST": str(harvest), "VI_INPUT_PREP": str(prep),
                    "VI_OUT": str(d / "out"), "VI_SETTINGS": str(d / "settings.json"),
                    "VI_CHECKPOINT": str(d / "ckpt")}  # fmt: skip
@@ -110,6 +111,10 @@ class JobTest(unittest.TestCase):
             self.assertIn("Teasing", scores[0]["eiv"])
             self.assertEqual(len((out / "prosody.jsonl").read_text().splitlines()), 6)
             self.assertEqual(json.loads((out / "checks.json").read_text())["failed"], 0)
+            # Crops of the one long non-bark clip, at each length.
+            crop_ids = (out / "crops" / "bude_whisper.ids").read_text().split()
+            self.assertEqual(crop_ids, ["le2.s4_f@0.5", "le2.s4_f@1"])
+            self.assertEqual(np.load(out / "crops" / "wavlm_L06.npy").shape[0], 2)
 
 
 if __name__ == "__main__":

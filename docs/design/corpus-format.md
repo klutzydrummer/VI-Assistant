@@ -138,6 +138,7 @@ Written by `jobs/embed.py` on the rented GPU from prep's 16 kHz copies ([corpus-
   - `emotion2vec_plus_large`, `emotion2vec_base`: FunASR utterance embeddings
   - `bude_whisper`: the BUD-E-Whisper encoder output averaged over the frames that hold audio, the first ceil(duration × 50) of 1,500. Whisper pads every clip to 30 s; pooling the padding too would make the vector mostly encode length.
   - `minilm`: text embeddings of lines with words (not `nonverbal` or `no_subtitle`), so fewer rows
+- `crops/<name>.npy` + `<name>.ids`: the same embeddings for the centred 0.5, 1, 1.5 and 2 s of up to 300 non-bark clips of 4 s or more, ids `<id>@<seconds>`, for the shortest-usable-clip test.
 - `scores.jsonl`, by name:
   ```json
   {"id": "...", "eiv": {"Anger": 0.41, "Teasing": 1.2}, "eiv_quality": {"score_overall_quality": 2.6},
@@ -150,6 +151,7 @@ Written by `jobs/embed.py` on the rented GPU from prep's 16 kHz copies ([corpus-
 ### confounds: `confounds.json` + `cleaned.npy` + `cleaned.ids`
 Written by `jobs/confounds.py` at home (numpy, scikit-learn), following [corpus-pipeline.md](corpus-pipeline.md) step 4. Inputs: harvest (game, conversation, text, tags, flags, audio hash), prep (noise floor, level, duration), clean (flags) and embed.
 - `cleaned.npy` (float32) + `cleaned.ids`: the chosen candidate after PCA, per-game CORAL and LEACE, one row per clip, every clip (flagged ones too). Absent when nothing was chosen.
+- `cleaned_crops.npy` + `.ids`: embed's crops of the chosen candidate through the same fitted transform.
 - `confounds.json`:
   - `status`: `chosen` or `stopped`, with `chosen` (the candidate's name) or `stop_reason`
   - `comparable`: the comparable-clip rule and its size per game. Without structural tags in the harvest the rule says it fell back to every non-bark line.

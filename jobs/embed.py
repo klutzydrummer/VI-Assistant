@@ -18,15 +18,20 @@ docs/design/corpus-format.md, embed. Per clip, from prep's trimmed, levelled
   prosody, minilm         pitch, loudness and pace; text embeddings of the
                           lines with words. For reporting and naming.
 
+Crops: the centred 0.5, 1, 1.5 and 2 s of up to `crops.sources` long clips
+are embedded too (crops/<name>.npy, ids `<id>@<seconds>`), for the
+shortest-usable-clip test (spec, "Sample sizes, derived" 1).
+
 Choosing among the candidates happens at home (confounds). Every model is
 fetched at the revision the settings pin; embed.json records them.
 
 Outputs: embeddings/<name>.npy (float16, one row per clip) + .ids,
-scores.jsonl, prosody.jsonl, embed.json, checks.json.
+crops/<name>.npy + .ids, scores.jsonl, prosody.jsonl, embed.json,
+checks.json.
 
 Settings: backend ("fake" for tests), wavlm, wavlm_layers, emotion2vec_plus,
 emotion2vec_base, bude_whisper, eiv_small, eiv_plus, eiv_skip, avd,
-text_embed, revisions, batch, limit.
+text_embed, revisions, crops (lengths, sources, min_source_s), batch, limit.
 """
 
 import json
@@ -44,6 +49,7 @@ from vi_job import (
     log,
     out_dir,
     settings,
+    spread,
     write_jsonl,
 )
 
@@ -74,7 +80,12 @@ def main():
     rev = lambda key: revisions.get(repos[key])  # noqa: E731
     layers = list(s.get("wavlm_layers", range(6, 19)))
     batch = int(s.get("batch", 16))
-    log(f"embed: {len(clips)} clips")
+    crop = s.get("crops", {})
+    lengths = [float(x) for x in crop.get("lengths", [0.5, 1, 1.5, 2])]
+    long = [c for c in clips if c.duration_s >= float(crop.get("min_source_s", 4.0)) and "bark" not in c.flags]
+    crops = [replace(c, id=f"{c.id}@{n:g}") for c in spread(long, int(crop.get("sources", 300))) for n in lengths]
+    everything = clips + crops
+    log(f"embed: {len(clips)} clips and {len(crops)} crops")
     started = time.time()
 
     names = {}  # score columns, filled by the models that know them
@@ -83,7 +94,7 @@ def main():
         model = models.FakeEmbedder(layers)
         names = {"eiv": model.HEADS, "eiv_quality": model.QUALITY, "avd": ["arousal", "dominance", "valence"],
                  "emotion2vec_plus_large_classes": [f"class{i}" for i in range(9)]}  # fmt: skip
-        merge(vectors, ArrayCheckpoint("fake").run(clips, lambda part: [model(wav(c)) for c in part]))
+        merge(vectors, ArrayCheckpoint("fake").run(everything, lambda part: [model(wav(c)) for c in part]))
     else:
         passes = [
             ("wavlm", lambda: models.WavLMLayers(repos["wavlm"], rev("wavlm"), layers), one_by_one),
@@ -98,8 +109,8 @@ def main():
         ]  # fmt: skip
         for name, load, call in passes:
             saved = ArrayCheckpoint(name)
-            model = load() if saved.todo(clips) else None
-            merge(vectors, saved.run(clips, lambda part, m=model, f=call: f(m, part), chunk=batch))
+            model = load() if saved.todo(everything) else None
+            merge(vectors, saved.run(everything, lambda part, m=model, f=call: f(m, part), chunk=batch))
             if isinstance(model, models.BudEWhisper):
                 names["eiv"], names["eiv_quality"] = model.head_names, model.quality_names
             if isinstance(model, models.Emotion2VecEmbed) and model.labels:
@@ -128,6 +139,9 @@ def main():
     stored = {}
     for key in sorted({k for v in vectors.values() for k in v} - set(SCORES)):
         stored[key] = write_matrix(out / "embeddings", key, ids, [vectors[i][key] for i in ids])
+    crop_ids = [c.id for c in crops]
+    for key in sorted({k for i in crop_ids for k in vectors[i]} - set(SCORES)):
+        write_matrix(out / "crops", key, crop_ids, [vectors[i][key] for i in crop_ids])
     if text:
         tids = [c.id for c in worded]
         stored["minilm"] = write_matrix(out / "embeddings", "minilm", tids, [text[i] for i in tids])
@@ -143,6 +157,8 @@ def main():
     report = {
         "clips": len(ids),
         "embeddings": stored,
+        "crops": {"lengths": lengths, "sources": len(crops) // max(1, len(lengths)), "clips": len(crops),
+                  "placement": "centred"},  # fmt: skip
         "models": {k: {"repo": repos[k], "revision": rev(k), "resolved": resolved(repos[k], rev(k), fake)}
                    for k in DEFAULTS},  # fmt: skip
         "wavlm_layers": layers,
@@ -157,7 +173,7 @@ def main():
 
     import numpy as np
 
-    bad = sum(1 for i in ids for k, v in vectors[i].items() if not np.isfinite(np.asarray(v, dtype=np.float32)).all())
+    bad = sum(1 for i in ids + crop_ids for k, v in vectors[i].items() if not np.isfinite(np.asarray(v, dtype=np.float32)).all())
     long = sum(c.duration_s > 30 for c in clips)
     results = [
         checks.Check("non-finite vectors", bad, 0),
@@ -168,13 +184,20 @@ def main():
 
 
 def wav(clip):
+    """The clip's 16 kHz samples; for a crop (`<id>@<seconds>`), the centred
+    window of that length."""
     import numpy as np
     import soundfile as sf
 
     data, rate = sf.read(str(clip.audio16k), dtype="float32", always_2d=True)
     if rate != 16_000:
         raise ValueError(f"{clip.id}: prep's copy is {rate} Hz, not 16 kHz")
-    return np.ascontiguousarray(data.mean(axis=1))
+    data = data.mean(axis=1)
+    if "@" in clip.id:
+        n = int(round(float(clip.id.rsplit("@", 1)[1]) * rate))
+        start = max(0, (len(data) - n) // 2)
+        data = data[start : start + n]
+    return np.ascontiguousarray(data)
 
 
 def one_by_one(model, part):

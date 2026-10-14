@@ -32,7 +32,8 @@ writes the tables and `status: "stopped"` for Brandon, and cluster refuses
 to run. A bound is never loosened to pass.
 
 Outputs: confounds.json, cleaned.npy + cleaned.ids (the chosen candidate,
-float32), checks.json.
+float32), cleaned_crops.npy + .ids (embed's crops through the same
+transform), checks.json.
 
 Settings: pca_dims, selection_share, game_margin, max_length_r2,
 avd_max_drop, knn_k, folds, permutations, bootstrap, candidates, limit.
@@ -54,11 +55,11 @@ SEED = 7
 # --- data ---------------------------------------------------------------------
 
 
-def load_matrix(folder, name):
+def load_matrix(folder, name, sub="embeddings"):
     import numpy as np
 
-    m = np.load(folder / "embeddings" / f"{name}.npy").astype(np.float64)
-    ids = (folder / "embeddings" / f"{name}.ids").read_text().split()
+    m = np.load(folder / sub / f"{name}.npy").astype(np.float64)
+    ids = (folder / sub / f"{name}.ids").read_text().split()
     return m, ids
 
 
@@ -257,7 +258,9 @@ def nuisance(meta, with_duration):
 
 
 def clean(x, meta, comparable, dims, with_duration=False):
-    """PCA -> CORAL -> LEACE. Returns (cleaned, pca-space raw, info)."""
+    """PCA -> CORAL -> LEACE. Returns (cleaned, pca-space raw, info, apply),
+    where apply(x, game) runs the same fitted transform on other rows (the
+    crops)."""
     import numpy as np
     from sklearn.decomposition import PCA
 
@@ -272,7 +275,10 @@ def clean(x, meta, comparable, dims, with_duration=False):
     leace = Leace().fit(coloured[fit], z[fit])
     info = {"dims": dims, "explained": round(float(pca.explained_variance_ratio_.sum()), 4),
             "leace_fit_clips": int(len(fit)), "erased": int(z.shape[1]), "duration_erased": with_duration}  # fmt: skip
-    return leace.apply(coloured), raw, info
+    def apply(other, game):
+        return leace.apply(coral.apply(pca.transform(other), game))
+
+    return leace.apply(coloured), raw, info, apply
 
 
 # --- probes ---------------------------------------------------------------------
@@ -581,18 +587,18 @@ def main():
         x = x[[pos[i] for i in ids]]
         variants = {}
         for with_duration in (False, True):
-            cx, raw, info = clean(x, meta, comparable, dims, with_duration)
+            cx, raw, info, apply = clean(x, meta, comparable, dims, with_duration)
             ev = evaluate(cx, raw, meta, sel_rows, sel_comp, s, avd, text)
-            variants[with_duration] = (cx, raw, info, ev)
+            variants[with_duration] = (cx, raw, info, ev, apply)
             t = ev["tests"]
             if t["text_length_gone"] and t["duration_gone"]:
                 break  # duration is only erased when its effect is left
         with_duration = max(variants)  # the last one tried
-        cx, raw, info, ev = variants[with_duration]
+        cx, raw, info, ev, apply = variants[with_duration]
         results[name] = {"transform": info, "selection": ev, "passed": all(ev["tests"].values())}
         if with_duration:
             results[name]["without_duration_erasure"] = variants[False][3]["tests"]
-        cleaned[name] = (cx, raw)
+        cleaned[name] = (cx, raw, apply)
         log(f"confounds: {name}: {ev['tests']}")
 
     passing = [n for n in names if results[n]["passed"]]
@@ -606,7 +612,7 @@ def main():
     shortlist = sorted(passing, key=rank, reverse=True)[:2]
     perms, boots = int(s.get("permutations", 200)), int(s.get("bootstrap", 200))
     for n in shortlist:
-        cx, raw = cleaned[n]
+        cx, raw, _ = cleaned[n]
         results[n]["report"] = evaluate(cx, raw, meta, rep_rows, rep_comp, s, avd, text, perms, boots)
         results[n]["report_passed"] = all(results[n]["report"]["tests"].values())
     chosen = next((n for n in shortlist if results[n]["report_passed"]), None)
@@ -617,9 +623,18 @@ def main():
         summary["stop_reason"] = ("no candidate passed every acceptance test on the selection split"
                                   if not passing else "no shortlisted candidate passed on the report split")  # fmt: skip
     else:
-        cx, _ = cleaned[chosen]
+        cx, _, apply = cleaned[chosen]
         np.save(out / "cleaned.npy", cx.astype(np.float32))
         (out / "cleaned.ids").write_text("".join(f"{i}\n" for i in ids))
+        crops = embed / "crops" / f"{chosen}.npy"
+        if crops.exists():
+            cm, cids = load_matrix(embed, chosen, "crops")
+            keep = [k for k, c in enumerate(cids) if c.rsplit("@", 1)[0] in meta.index]
+            if keep:
+                cids = [cids[k] for k in keep]
+                game = np.array([meta.game[meta.index[c.rsplit("@", 1)[0]]] for c in cids])
+                np.save(out / "cleaned_crops.npy", apply(cm[keep], game).astype(np.float32))
+                (out / "cleaned_crops.ids").write_text("".join(f"{i}\n" for i in cids))
         log(f"confounds: chose {chosen}")
     stop(out, s, summary)
 

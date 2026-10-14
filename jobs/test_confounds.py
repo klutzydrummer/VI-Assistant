@@ -73,6 +73,7 @@ class JobTest(unittest.TestCase):
             self.assertEqual(report["excluded"], 1)  # the singing line
             ids = (d / "out" / "cleaned.ids").read_text().split()
             self.assertEqual(np.load(d / "out" / "cleaned.npy").shape[0], len(ids))
+            self.assertEqual(np.load(d / "out" / "cleaned_crops.npy").shape[0], 480)
 
 
 if __name__ == "__main__":
