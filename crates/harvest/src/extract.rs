@@ -1046,6 +1046,33 @@ fn path_to(c: &Conversation, target: (Kind, usize)) -> Vec<(Kind, usize)> {
     Vec::new()
 }
 
+/// Up to [`CONTEXT`] lines before `start`, oldest first, following the
+/// nearest predecessor with a line each step (the first, when there are
+/// several) and never visiting a node twice.
+fn path_back(
+    c: &Conversation,
+    subs: &Subtitles,
+    gender: Gender,
+    start: (Kind, usize),
+) -> Vec<(Kind, usize)> {
+    let mut seen = std::collections::BTreeSet::from([start]);
+    let mut out = Vec::new();
+    let mut at = start;
+    while out.len() < CONTEXT {
+        let Some(&prev) = nearest_lines(c, subs, gender, at, true)
+            .iter()
+            .find(|p| !seen.contains(*p))
+        else {
+            break;
+        };
+        seen.insert(prev);
+        out.push(prev);
+        at = prev;
+    }
+    out.reverse();
+    out
+}
+
 fn line_id(game: Game, string_id: i32, gender: Gender) -> String {
     format!("{}.s{}_{}", game.id(), string_id, gender.suffix())
 }
@@ -1123,11 +1150,19 @@ fn attach_context(
             "next".into(),
             ids(nearest_lines(c, subs, gender, at, false)),
         );
-        let path: Vec<&Node> = path_to(c, at)
+        let mut path: Vec<&Node> = path_to(c, at)
             .into_iter()
             .filter_map(|(k, i)| c.node(k, i))
             .filter(|n| node_text(subs, n, gender).is_some())
             .collect();
+        if path.is_empty() {
+            // Not reachable from a starting node (scripted conversations
+            // that begin partway in): follow the line's own predecessors.
+            path = path_back(c, subs, gender, at)
+                .into_iter()
+                .filter_map(|(k, i)| c.node(k, i))
+                .collect();
+        }
         line.context = path[path.len().saturating_sub(CONTEXT)..]
             .iter()
             .map(|n| dataset::corpus::ContextLine {
@@ -1245,6 +1280,18 @@ pub fn retag(
         .filter(|(l, b)| &l.scene_tags != *b)
         .count();
     dataset::corpus::write_lines(dir, &lines).map_err(|e| e.to_string())?;
+    // Keep harvest.json's notes in step with what the lines now carry.
+    let summary = dir.join("harvest.json");
+    if let Ok(text) = fs::read_to_string(&summary) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
+            if let Some(list) = v.get_mut("not_covered").and_then(Value::as_array_mut) {
+                list.retain(|x| x.as_str() != Some("scene tags"));
+            }
+            v["unknown_levels"] = json!(unknown);
+            fs::write(&summary, serde_json::to_string_pretty(&v).unwrap() + "\n")
+                .map_err(|e| format!("{}: {e}", summary.display()))?;
+        }
+    }
     Ok((changed, unknown))
 }
 
@@ -1455,6 +1502,14 @@ mod tests {
                 (Kind::Entry, 1),
                 (Kind::Reply, 1)
             ]
+        );
+        // Not reachable from a start: context follows predecessors.
+        let mut cut = c.clone();
+        cut.starting = vec![];
+        assert!(path_to(&cut, (Kind::Entry, 2)).is_empty());
+        assert_eq!(
+            path_back(&cut, &subs, g, (Kind::Entry, 2)),
+            [(Kind::Entry, 0), (Kind::Entry, 1), (Kind::Reply, 1)]
         );
         let mut graphs = Graphs::default();
         graphs
