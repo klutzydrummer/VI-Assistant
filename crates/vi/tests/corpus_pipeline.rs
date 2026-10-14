@@ -19,10 +19,11 @@ fn repo(rel: &str) -> String {
         .to_string()
 }
 
-/// The home stages need numpy, scipy and soundfile; the worker needs rsync.
+/// The home stages need numpy, scipy, scikit-learn and soundfile; the
+/// worker needs rsync.
 fn have_tools() -> bool {
     let py = Command::new("python3")
-        .args(["-c", "import tomllib, numpy, scipy, soundfile"])
+        .args(["-c", "import tomllib, numpy, scipy, sklearn, soundfile"])
         .output()
         .is_ok_and(|o| o.status.success());
     let rsync = Command::new("rsync").arg("--version").output().is_ok();
@@ -48,6 +49,7 @@ fn prep_clean_and_embed_with_fake_models() {
     let dir = tempfile::tempdir().unwrap();
     let on_worker = repo("jobs/on-worker.sh");
     let prep = repo("jobs/prep.py");
+    let confounds = repo("jobs/confounds.py");
     let pipeline = dir.path().join("dataset.toml");
     fs::write(
         &pipeline,
@@ -71,6 +73,11 @@ settings = {{ backend = "fake" }}
 command = [{on_worker:?}, "python3", "jobs/embed.py"]
 inputs = ["harvest", "prep"]
 settings = {{ backend = "fake", checks = "fail", wavlm_layers = [6, 18] }}
+
+[stage.confounds]
+command = ["python3", {confounds:?}]
+inputs = ["harvest", "prep", "clean", "embed"]
+settings = {{ permutations = 5, bootstrap = 10 }}
 "#
         ),
     )
@@ -125,4 +132,12 @@ settings = {{ backend = "fake", checks = "fail", wavlm_layers = [6, 18] }}
     }
     assert_eq!(lines(&embed.join("scores.jsonl")).len(), 24);
     assert!(embed.join("embed.json").is_file());
+
+    // Confounds ran on the fake vectors and said what it decided; 24 clips
+    // are too few to pass, which is a reported stop, not a crash.
+    let conf = dataset::runner::current_out(&corpus, "confounds").unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(conf.join("confounds.json")).unwrap()).unwrap();
+    assert!(["chosen", "stopped"].contains(&report["status"].as_str().unwrap()));
+    assert!(report["status"] == "chosen" || report["stop_reason"].is_string());
 }

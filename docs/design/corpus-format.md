@@ -147,6 +147,19 @@ Written by `jobs/embed.py` on the rented GPU from prep's 16 kHz copies ([corpus-
 - `prosody.jsonl`: `duration_s`, `f0_median_hz`, `f0_range_st`, `loudness_db`, `loudness_range_db`, `voiced_fraction`, `words_per_s`, as discover wrote them.
 - `embed.json`: per model the repo, the pinned revision and the commit it resolved to; the layers; the score names in order; how each embedding was pooled; package versions; run time.
 
+### confounds: `confounds.json` + `cleaned.npy` + `cleaned.ids`
+Written by `jobs/confounds.py` at home (numpy, scikit-learn), following [corpus-pipeline.md](corpus-pipeline.md) step 4. Inputs: harvest (game, conversation, text, tags, flags, audio hash), prep (noise floor, level, duration), clean (flags) and embed.
+- `cleaned.npy` (float32) + `cleaned.ids`: the chosen candidate after PCA, per-game CORAL and LEACE, one row per clip, every clip (flagged ones too). Absent when nothing was chosen.
+- `confounds.json`:
+  - `status`: `chosen` or `stopped`, with `chosen` (the candidate's name) or `stop_reason`
+  - `comparable`: the comparable-clip rule and its size per game. Without structural tags in the harvest the rule says it fell back to every non-bark line.
+  - `split`: conversations in the selection (30%) and report (70%) splits
+  - `excluded` (singing, subtitle_mismatch, far_voice: cleaned and kept, never fitted), `duplicate_takes` (byte-identical, counted once)
+  - `candidates.<name>`: `transform` (dimensions, variance kept, clips the eraser fitted, whether log duration had to be erased), `selection` and, for the shortlist, `report`, each with `before` and `after` probe tables (game k-NN balanced accuracy, text length, log duration and its square, noise floor, level, A/V/D as R², bark, stage direction and each tag of 20+ clips as AUC, text content as R² on MiniLM's top 5 components), `game` (k-NN and RBF-SVM balanced accuracy with the upper 95% bound: binomial on the selection split, conversation bootstrap plus a permutation p-value with game shuffled across conversations on the report split), `paired` (how often a take's nearest neighbour is its own other take, against chance) and `tests` (each acceptance test, pass or fail)
+  - `settings` and package versions
+
+The acceptance limits are the stage settings, fixed before results. Folds are grouped by conversation everywhere.
+
 ### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
 Written by `jobs/discover.py`.
 ```json
@@ -243,7 +256,7 @@ Vectors go to `vectors/<axis>.{gguf,safetensors}` and the report to `report.md` 
 These replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). The shapes below are proposals for the implementation PRs, all additive; each moves into its own section above once built. Outputs stay in stage folders, never in `lines.jsonl`.
 - **prep, clean:** built, see above.
 - **embed:** built, see above.
-- **confounds:** `confounds.json` (before and after probe tables, chosen candidate, acceptance results), `cleaned.npy` + `.ids`.
+- **confounds:** built, see above.
 - **cluster:** `clusters.jsonl` `{id, responsibilities: {...}, scores: {...}, cluster}`, `cluster.json` (k, BIC/ICL, merges, Jaccard per cluster, flags, enrichment).
 - **review (purity mode):** adds `purity` records to `reviews.jsonl` `{id, cluster, fits, foil, repeat, seconds, at}`.
 - **classes:** `classes.json`, `memberships.jsonl`, `eiv_labels.jsonl` (backup), `report.md`.
