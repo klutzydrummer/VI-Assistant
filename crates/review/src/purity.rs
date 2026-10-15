@@ -2,6 +2,9 @@
 //! whether each fits, then names, merges, splits or rejects the cluster.
 //! See `docs/design/corpus-pipeline.md`, step 6.
 //!
+//! - Each cluster opens with up to five reference clips, its most typical
+//!   members from different conversations, so there is something to judge
+//!   the first clip against. They (and their other takes) are never asked.
 //! - Members come stratified across scenes and conversations, so a cluster
 //!   isn't judged on one scene.
 //! - Every fifth clip is a foil: a clip from another cluster at a similar
@@ -46,6 +49,8 @@ pub const REPEAT_TARGET: usize = 50;
 /// A cluster the SPRT hasn't decided after this many members is decided by
 /// hand anyway.
 pub const MAX_MEMBERS: usize = 40;
+/// Reference clips per cluster, at most a quarter of its members.
+pub const REFERENCES: usize = 5;
 /// A foil must belong to the cluster with at most this responsibility.
 const FOIL_MAX_RESPONSIBILITY: f64 = 0.1;
 
@@ -135,7 +140,9 @@ pub struct Purity {
     root: PathBuf,
     /// Cluster ids in review order, with cluster.json's entry for each.
     pub classes: Vec<(String, Value)>,
-    /// Per cluster: members in listening order, and foils in order.
+    /// Per cluster: its reference clips, members in listening order, and
+    /// foils in order.
+    pub references: HashMap<String, Vec<String>>,
     order: HashMap<String, Vec<String>>,
     foils: HashMap<String, Vec<String>>,
     lines: HashMap<String, Value>,
@@ -179,6 +186,11 @@ fn inside(out: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// Round-robin over groups, each group's items in their own order.
+/// The line both takes of a clip share: `le2.s348112_f` -> `le2.s348112`.
+fn take_base(id: &str) -> &str {
+    id.rsplit_once('_').map_or(id, |(base, _)| base)
+}
+
 fn interleave(groups: Vec<Vec<String>>) -> Vec<String> {
     let mut out = Vec::new();
     let longest = groups.iter().map(Vec::len).max().unwrap_or(0);
@@ -278,17 +290,52 @@ impl Purity {
             .iter()
             .filter(|m| m.formed && audio.contains_key(&m.id) && lines.contains_key(&m.id))
             .collect();
+        let conversation = |id: &str| -> String {
+            lines[id]["source"]["conversation"]
+                .as_str()
+                .unwrap_or(id)
+                .to_string()
+        };
+        let mut references = HashMap::new();
         let mut order = HashMap::new();
         let mut foils = HashMap::new();
         for (class, _) in &classes {
+            // References: the members most surely in the cluster, one per
+            // conversation while that lasts.
+            let mut typical: Vec<&Membership> = playable
+                .iter()
+                .copied()
+                .filter(|m| &m.cluster == class)
+                .collect();
+            let own = |m: &Membership| m.responsibilities.get(class).copied().unwrap_or(0.0);
+            typical.sort_by(|a, b| {
+                own(b)
+                    .total_cmp(&own(a))
+                    .then_with(|| sha(&a.id).cmp(&sha(&b.id)))
+            });
+            let want = REFERENCES.min(typical.len() / 4);
+            let mut refs: Vec<String> = Vec::new();
+            let mut convs = HashSet::new();
+            for m in &typical {
+                if refs.len() < want && convs.insert(conversation(&m.id)) {
+                    refs.push(m.id.clone());
+                }
+            }
+            for m in &typical {
+                if refs.len() < want && !refs.contains(&m.id) {
+                    refs.push(m.id.clone());
+                }
+            }
+            let heard: HashSet<&str> = refs.iter().map(|id| take_base(id)).collect();
+
             // Members: by scene, then by conversation, each in hash order.
             let mut by_scene: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
-            for m in playable.iter().filter(|m| &m.cluster == class) {
+            for m in playable
+                .iter()
+                .filter(|m| &m.cluster == class && !heard.contains(take_base(&m.id)))
+            {
                 let line = &lines[&m.id];
-                let conv = line["source"]["conversation"]
-                    .as_str()
-                    .unwrap_or(&m.id)
-                    .to_string();
+                let conv = conversation(&m.id);
                 by_scene
                     .entry(scene_of(line))
                     .or_default()
@@ -335,6 +382,7 @@ impl Purity {
             }
             order.insert(class.clone(), members);
             foils.insert(class.clone(), chosen);
+            references.insert(class.clone(), refs);
         }
 
         let embed = current_out(&root, "embed")?;
@@ -387,6 +435,7 @@ impl Purity {
         Ok(Self {
             root,
             classes,
+            references,
             order,
             foils,
             lines,
@@ -753,6 +802,7 @@ impl Purity {
                 let waiting = self.next(c).is_some();
                 json!({
                     "cluster": c,
+                    "references": self.references.get(c).map_or(0, Vec::len),
                     "waiting": waiting,
                     "info": (!waiting).then(|| info(c)),
                     "state": state,
@@ -803,6 +853,16 @@ pub fn handle(p: &mut Purity, post: bool, url: &str, body: &str) -> Reply {
             None => Reply::NotFound,
         },
         // Replays of clips already answered (the reveal names them).
+        (false, path) if path.starts_with("/audio/ref/") => {
+            let clip = p.current().and_then(|c| {
+                let i: usize = path["/audio/ref/".len()..].parse().ok()?;
+                p.references.get(c)?.get(i)
+            });
+            match clip.and_then(|id| p.audio_path(id)) {
+                Some(path) => Reply::Audio(path.clone()),
+                None => Reply::NotFound,
+            }
+        }
         (false, path) if path.starts_with("/audio/") => {
             let id = decode(&path["/audio/".len()..]);
             let heard = p
@@ -877,8 +937,16 @@ mod tests {
     fn members_are_formed_and_foils_come_from_other_clusters() {
         let (_dir, p) = demo(120, 3);
         assert_eq!(p.classes.len(), 3);
-        let formed: usize = p.order.values().map(Vec::len).sum();
-        assert_eq!(formed, 108, "every tenth clip is unformed");
+        let formed: usize = p
+            .order
+            .values()
+            .chain(p.references.values())
+            .map(Vec::len)
+            .sum();
+        assert_eq!(
+            formed, 108,
+            "every tenth clip is unformed; references aren't asked"
+        );
         for (class, foils) in &p.foils {
             assert!(!foils.is_empty());
             assert!(foils.iter().all(|f| !p.order[class].contains(f)));
@@ -996,6 +1064,34 @@ mod tests {
         let (kappa, pairs) = p.kappa();
         assert!(pairs >= 3, "{pairs}");
         assert!(kappa.unwrap() < 1.0);
+    }
+
+    #[test]
+    fn references_are_typical_members_never_asked() {
+        let (_dir, p) = demo(200, 4);
+        for (class, _) in &p.classes {
+            let refs = &p.references[class];
+            assert!(!refs.is_empty() && refs.len() <= REFERENCES);
+            let heard: HashSet<&str> = refs.iter().map(|id| take_base(id)).collect();
+            assert!(p.order[class]
+                .iter()
+                .all(|id| !heard.contains(take_base(id))));
+            assert!(p.foils[class].iter().all(|id| !refs.contains(id)));
+        }
+        let mut p = p;
+        let current = p.current().unwrap().to_string();
+        let Reply::Json(s) = handle(&mut p, false, "/api/session", "") else {
+            panic!("session")
+        };
+        assert_eq!(s["current"]["references"], p.references[&current].len());
+        assert!(matches!(
+            handle(&mut p, false, "/audio/ref/0", ""),
+            Reply::Audio(_)
+        ));
+        assert!(matches!(
+            handle(&mut p, false, "/audio/ref/99", ""),
+            Reply::NotFound
+        ));
     }
 
     #[test]
