@@ -64,7 +64,8 @@ def purity_summary(records, members_available):
     false_yes = sum(r["fits"] for r in foils) / len(foils) if foils else None
     per = {}
     for c, available in members_available.items():
-        s = {"answers": 0, "members_yes": 0, "members_no": 0, "foils": 0, "llr": 0.0, "sprt": None}
+        s = {"answers": 0, "members_yes": 0, "members_no": 0, "foils": 0, "llr": 0.0, "sprt": None,
+             "skips": sum(r.get("kind") == "skip" and r.get("cluster") == c for r in records)}
         for r in answers:
             if r["cluster"] != c:
                 continue

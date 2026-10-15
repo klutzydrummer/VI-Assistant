@@ -48,6 +48,9 @@ class PurityTest(unittest.TestCase):
         self.assertEqual(per["c0"]["sprt"], "undecided")
         self.assertEqual(overall["false_yes"], 0.5)
         self.assertEqual(per["c0"]["purity"], 0.0)  # (0.5 - 0.5) / 0.5
+        skip = {"kind": "skip", "id": "m2", "cluster": "c0", "at": 0}
+        per, _ = classes.purity_summary(recs + [skip], {"c0": 2})
+        self.assertEqual((per["c0"]["skips"], per["c0"]["answers"]), (1, 6))  # a skip isn't an answer
         self.assertEqual(overall["repeat_pairs"], 2)
         self.assertEqual(overall["kappa"], 0.0)
 

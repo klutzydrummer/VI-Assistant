@@ -2,6 +2,12 @@
 //! whether each fits, then names, merges, splits or rejects the cluster.
 //! See `docs/design/corpus-pipeline.md`, step 6.
 //!
+//! - He picks which clusters to listen to; with several picked, clips
+//!   rotate between them (the one with fewest answers next), each judged
+//!   against its own cluster. With none picked, clusters go one at a time.
+//! - Any clip can be skipped. It goes back to the end of its queue and comes
+//!   up again later; skips are recorded, and counted per cluster, because
+//!   skipping only the hard clips would inflate purity.
 //! - Each cluster opens with up to five reference clips, its most typical
 //!   members from different conversations, so there is something to judge
 //!   the first clip against. They (and their other takes) are never asked.
@@ -91,6 +97,13 @@ pub enum Record {
         #[serde(default)]
         at: u64,
     },
+    /// A clip he skipped; it goes to the back of its queue.
+    Skip {
+        id: String,
+        cluster: String,
+        #[serde(default)]
+        at: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -116,6 +129,7 @@ pub struct ClassState {
     pub members_yes: usize,
     pub members_no: usize,
     pub foils: usize,
+    pub skips: usize,
     /// The SPRT's log likelihood ratio for purity 0.8 over 0.5.
     pub llr: f64,
     /// `pure`, `impure`, `undecided` (members ran out), or null (listening).
@@ -151,6 +165,9 @@ pub struct Purity {
     eiv_stats: BTreeMap<String, (f64, f64)>,
     prosody: HashMap<String, Value>,
     pub records: Vec<Record>,
+    /// The clusters he picked to listen to; empty means one at a time, in
+    /// order. Not saved: it's how he listens, not what he heard.
+    pub selected: Vec<String>,
 }
 
 fn sha(id: &str) -> String {
@@ -444,6 +461,7 @@ impl Purity {
             eiv_stats,
             prosody,
             records,
+            selected: Vec::new(),
         })
     }
 
@@ -465,12 +483,53 @@ impl Purity {
             .find(|r| matches!(r, Record::Decision { cluster, .. } if cluster == class))
     }
 
-    /// The cluster being reviewed: the first without a decision.
-    pub fn current(&self) -> Option<&str> {
-        self.classes
+    /// Where each clip skipped in a cluster was last skipped (its record
+    /// index), so skipped clips go to the back of the queue, oldest skip
+    /// first.
+    fn skipped(&self, class: &str) -> HashMap<&str, usize> {
+        self.records
             .iter()
-            .map(|(c, _)| c.as_str())
-            .find(|c| self.decision(c).is_none())
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Record::Skip { id, cluster, .. } if cluster == class => Some((id.as_str(), i)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The cluster being reviewed. With clusters picked: one that is ready
+    /// to decide, else the one with fewest answers (ties in review order).
+    /// With none picked, or all of them decided: the first without a
+    /// decision.
+    pub fn current(&self) -> Option<&str> {
+        let undecided = || {
+            self.classes
+                .iter()
+                .map(|(c, _)| c.as_str())
+                .filter(|c| self.decision(c).is_none())
+        };
+        let pool: Vec<&str> = undecided()
+            .filter(|c| self.selected.iter().any(|s| s == c))
+            .collect();
+        if pool.is_empty() {
+            return undecided().next();
+        }
+        pool.iter()
+            .find(|c| self.next(c).is_none())
+            .or_else(|| pool.iter().min_by_key(|c| self.answers(c).len()))
+            .copied()
+    }
+
+    /// Pick the clusters to listen to (empty: one at a time, in order).
+    pub fn select(&mut self, clusters: Vec<String>) -> Result<(), String> {
+        if let Some(bad) = clusters
+            .iter()
+            .find(|c| !self.classes.iter().any(|(id, _)| id == *c))
+        {
+            return Err(format!("no cluster {bad}"));
+        }
+        self.selected = clusters;
+        Ok(())
     }
 
     pub fn decided(&self) -> usize {
@@ -506,6 +565,11 @@ impl Purity {
             members_yes: 0,
             members_no: 0,
             foils: 0,
+            skips: self
+                .records
+                .iter()
+                .filter(|r| matches!(r, Record::Skip { cluster, .. } if cluster == class))
+                .count(),
             llr: 0.0,
             sprt: None,
             observed: None,
@@ -591,26 +655,35 @@ impl Purity {
                 _ => None,
             })
             .collect();
+        let skipped = self.skipped(class);
+        // The first candidate never skipped, else the one skipped longest ago.
+        let pick = |ids: &mut dyn Iterator<Item = &String>| -> Option<String> {
+            ids.enumerate()
+                .min_by_key(|(i, id)| (skipped.get(id.as_str()).copied(), *i))
+                .map(|(_, id)| id.clone())
+        };
         let slot = answers.len() + 1;
         let member = || {
-            self.order[class]
-                .iter()
-                .find(|id| !answered.contains(id.as_str()))
-                .map(|id| Item {
-                    id: id.clone(),
-                    kind: Kind::Member,
-                })
+            pick(
+                &mut self.order[class]
+                    .iter()
+                    .filter(|id| !answered.contains(id.as_str())),
+            )
+            .map(|id| Item {
+                id,
+                kind: Kind::Member,
+            })
         };
         if slot.is_multiple_of(REPEAT_EVERY) && self.repeats() < REPEAT_TARGET {
-            let again = answers.iter().find_map(|r| match r {
+            let again = pick(&mut answers.iter().filter_map(|r| match r {
                 Record::Answer {
                     id,
                     foil: false,
                     repeat: false,
                     ..
-                } if !repeated.contains(id.as_str()) => Some(id.clone()),
+                } if !repeated.contains(id.as_str()) => Some(id),
                 _ => None,
-            });
+            }));
             if let Some(id) = again {
                 return Some(Item {
                     id,
@@ -619,12 +692,14 @@ impl Purity {
             }
         }
         if slot.is_multiple_of(FOIL_EVERY) {
-            let foil = self.foils[class]
-                .iter()
-                .find(|id| !used_foils.contains(id.as_str()));
+            let foil = pick(
+                &mut self.foils[class]
+                    .iter()
+                    .filter(|id| !used_foils.contains(id.as_str())),
+            );
             if let Some(id) = foil {
                 return Some(Item {
-                    id: id.clone(),
+                    id,
                     kind: Kind::Foil,
                 });
             }
@@ -661,6 +736,27 @@ impl Purity {
             at: now(),
         })?;
         Ok(self.reveal(&item.id))
+    }
+
+    /// Skip the clip waiting: it goes to the back of its queue. Recorded,
+    /// so a restart resumes exactly and the skips can be counted. `n` as in
+    /// `answer`.
+    pub fn skip(&mut self, n: usize) -> Result<(), String> {
+        if n != self.records.len() {
+            return Err("the page is out of date; reload it".into());
+        }
+        let class = self
+            .current()
+            .ok_or("every cluster is decided")?
+            .to_string();
+        let item = self
+            .next(&class)
+            .ok_or("this cluster is ready to decide; no clip is waiting")?;
+        self.append(Record::Skip {
+            id: item.id,
+            cluster: class,
+            at: now(),
+        })
     }
 
     pub fn decide(
@@ -797,6 +893,7 @@ impl Purity {
         };
         json!({
             "n": self.records.len(),
+            "selected": self.selected,
             "current": current.map(|c| {
                 let state = self.state(c);
                 let waiting = self.next(c).is_some();
@@ -828,6 +925,16 @@ struct AnswerBody {
     fits: bool,
     #[serde(default)]
     seconds: f64,
+}
+
+#[derive(Deserialize)]
+struct NBody {
+    n: usize,
+}
+
+#[derive(Deserialize)]
+struct SelectBody {
+    clusters: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -881,6 +988,23 @@ pub fn handle(p: &mut Purity, post: bool, url: &str, body: &str) -> Reply {
                 .and_then(|b| p.answer(b.n, b.fits, b.seconds))
             {
                 Ok(reveal) => Reply::Json(json!({"reveal": reveal, "session": p.session()})),
+                Err(msg) => Reply::Bad(msg),
+            }
+        }
+        (true, "/api/skip") => {
+            let parsed: Result<NBody, _> = serde_json::from_str(body);
+            match parsed.map_err(|e| e.to_string()).and_then(|b| p.skip(b.n)) {
+                Ok(()) => Reply::Json(p.session()),
+                Err(msg) => Reply::Bad(msg),
+            }
+        }
+        (true, "/api/select") => {
+            let parsed: Result<SelectBody, _> = serde_json::from_str(body);
+            match parsed
+                .map_err(|e| e.to_string())
+                .and_then(|b| p.select(b.clusters))
+            {
+                Ok(()) => Reply::Json(p.session()),
                 Err(msg) => Reply::Bad(msg),
             }
         }
@@ -1034,6 +1158,74 @@ mod tests {
             matches!(&again.records[0], Record::Decision { name: Some(n), .. } if n == "teasing")
         );
         assert!(again.waiting().is_none());
+    }
+
+    #[test]
+    fn a_skipped_clip_goes_to_the_back_and_comes_back() {
+        let (dir, mut p) = demo(120, 3);
+        let first = p.waiting().unwrap();
+        assert!(p.skip(5).is_err(), "a stale page can't skip");
+        p.skip(0).unwrap();
+        let second = p.waiting().unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(p.state("c0").answers, 0, "a skip isn't an answer");
+        assert_eq!(p.state("c0").skips, 1);
+        // It comes back once every other member has been asked.
+        let mut seen = Vec::new();
+        while p.current() == Some("c0") && p.waiting().is_some() {
+            let item = p.waiting().unwrap();
+            if item.kind == Kind::Member {
+                seen.push(item.id.clone());
+            }
+            p.answer(p.records.len(), seen.len() % 2 == 0, 1.0).unwrap();
+        }
+        let members = &p.order["c0"];
+        if seen.len() == members.len() {
+            assert_eq!(seen.last(), Some(&first.id));
+        } else {
+            assert!(!seen.contains(&first.id));
+        }
+        // Skips persist, so a restart resumes exactly.
+        let again = Purity::load(dir.path()).unwrap();
+        assert_eq!(again.records, p.records);
+        assert_eq!(again.waiting(), p.waiting());
+    }
+
+    #[test]
+    fn a_skipped_foil_is_replaced_by_another_foil() {
+        let (_dir, mut p) = demo(120, 3);
+        for _ in 0..FOIL_EVERY - 1 {
+            answer_with(&mut p, |_| true);
+        }
+        let foil = p.waiting().unwrap();
+        assert_eq!(foil.kind, Kind::Foil);
+        p.skip(p.records.len()).unwrap();
+        let next = p.waiting().unwrap();
+        assert_eq!(next.kind, Kind::Foil, "the slot stays a foil");
+        assert_ne!(next.id, foil.id);
+    }
+
+    #[test]
+    fn picked_clusters_rotate_and_the_rest_wait() {
+        let (_dir, mut p) = demo(240, 4);
+        assert!(p.select(vec!["c9".into()]).is_err());
+        p.select(vec!["c1".into(), "c3".into()]).unwrap();
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            order.push(p.current().unwrap().to_string());
+            answer_with(&mut p, |n| n % 2 == 0);
+        }
+        assert_eq!(order, ["c1", "c3", "c1", "c3", "c1", "c3"]);
+        assert_eq!(p.state("c0").answers, 0);
+        // A picked cluster that is decided drops out; then the next undecided.
+        p.select(vec!["c2".into()]).unwrap();
+        p.decide("c2", Action::Reject, None, None, None).unwrap();
+        assert_eq!(p.current(), Some("c0"));
+        let Reply::Json(s) = handle(&mut p, true, "/api/select", r#"{"clusters":["c3"]}"#) else {
+            panic!("select failed")
+        };
+        assert_eq!(s["current"]["cluster"], "c3");
+        assert_eq!(s["selected"], json!(["c3"]));
     }
 
     #[test]
