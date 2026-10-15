@@ -3,7 +3,7 @@ harvest, prep, clean and embed outputs in the real formats, with known
 classes, a per-game recording chain, a text-length direction and a noise
 floor baked into the embeddings. No audio: these stages don't read any.
 
-    write(folder, n_conversations=60) -> {"classes": {id: class}, ...}
+    write(folder, n_conversations=60, eq=0.3) -> {"classes": {id: class}, ...}
 """
 
 import json
@@ -13,7 +13,7 @@ GAMES = ["le1", "le2", "le3"]
 WORDS = ["keelah", "shepard", "the", "drive", "core", "is", "humming", "nicely", "today", "flotilla"]
 
 
-def write(folder, n_conversations=60, per_conversation=8, dim=32, classes=4, seed=0):
+def write(folder, n_conversations=60, per_conversation=8, dim=32, classes=4, seed=0, eq=0.3):
     import numpy as np
 
     rng = np.random.default_rng(seed)
@@ -23,7 +23,7 @@ def write(folder, n_conversations=60, per_conversation=8, dim=32, classes=4, see
     floor_dir = rng.standard_normal(dim)
     # Each game's recording chain: an offset and a per-dimension gain, like
     # an EQ and a mix level.
-    chains = {g: (rng.standard_normal(dim) * 2.0, np.diag(np.exp(0.3 * rng.standard_normal(dim)))) for g in GAMES}
+    chains = {g: (rng.standard_normal(dim) * 2.0, np.diag(np.exp(eq * rng.standard_normal(dim)))) for g in GAMES}
     lines, prep, clips, rows, truth = [], [], [], [], {}
     for conv in range(n_conversations):
         game = GAMES[conv % 3]
