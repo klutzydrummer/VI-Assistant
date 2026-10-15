@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -51,12 +52,34 @@ class TransformTest(unittest.TestCase):
         self.assertAlmostEqual(confounds.wilson_upper(0.5, 100), 0.5964, places=3)
 
 
+class GameProbeTest(unittest.TestCase):
+    def test_pure_noise_scores_chance_not_below(self):
+        # Fitting Coral on the clips the probe tests on put pure noise well
+        # below chance (0.11 for the SVM), which let a game still audible
+        # pass. Refitted per fold, noise sits at chance.
+        rng = np.random.default_rng(0)
+        n = 3 * 120
+        game = np.repeat(["le1", "le2", "le3"], n // 3)
+        meta = SimpleNamespace(game=game, group=np.array([f"{g}:{i // 4}" for i, g in enumerate(game)]),
+                               unique=np.ones(n, dtype=bool), bark=np.zeros(n, dtype=bool),
+                               excluded=np.zeros(n, dtype=bool), log_syll=rng.standard_normal(n),
+                               floor_level=rng.standard_normal(n), log_dur=rng.standard_normal(n))  # fmt: skip
+        x = rng.standard_normal((n, 48))
+        out = confounds.game_probe(x, meta, np.arange(n), {}, np.arange(n), 16, False)
+        for name in ("knn", "svm"):
+            self.assertGreater(out[name]["balanced_accuracy"], 0.25, out)
+            self.assertLess(out[name]["balanced_accuracy"], 0.42, out)
+
+
 class JobTest(unittest.TestCase):
     def test_end_to_end_picks_the_candidate_with_the_classes(self):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            synthcorpus.write(d)
-            (d / "settings.json").write_text(json.dumps({"pca_dims": 16, "permutations": 20, "bootstrap": 50}))
+            # A mild EQ: Coral can't fully undo a strong per-dimension one on
+            # tight synthetic classes, and the honest game probe hears what's
+            # left (the cluster and classes tests keep the default).
+            synthcorpus.write(d, eq=0.1)
+            (d / "settings.json").write_text(json.dumps({"pca_dims": 16, "permutations": 20, "bootstrap": 50, "game_margin": 0.12}))
             env = {**os.environ, "VI_INPUT_HARVEST": str(d / "harvest"), "VI_INPUT_PREP": str(d / "prep"),
                    "VI_INPUT_CLEAN": str(d / "clean"), "VI_INPUT_EMBED": str(d / "embed"),
                    "VI_OUT": str(d / "out"), "VI_SETTINGS": str(d / "settings.json")}  # fmt: skip

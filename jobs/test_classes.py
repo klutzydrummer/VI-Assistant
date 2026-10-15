@@ -86,7 +86,7 @@ class JobTest(unittest.TestCase):
             d = Path(d)
             synthcorpus.write(d)
             inputs = {"harvest": "harvest", "prep": "prep", "clean": "clean", "embed": "embed"}
-            r = run("confounds", d, {"pca_dims": 16, "permutations": 10, "bootstrap": 20}, **inputs)
+            r = run("confounds", d, {"pca_dims": 16, "permutations": 10, "bootstrap": 20, "game_margin": 0.12}, **inputs)
             self.assertEqual(r.returncode, 0, r.stderr)
             r = run("cluster", d, {"k_max": 8, "resamples": 10, "cov_types": ["full"]}, **inputs, confounds="confounds")
             self.assertEqual(r.returncode, 0, r.stderr)

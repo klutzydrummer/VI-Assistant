@@ -103,7 +103,8 @@ max_length_r2 = 0.05   # text-length and duration probes' R^2 at most this
 avd_max_drop = 0.10    # A/V/D probe R^2 may fall at most this
 knn_k = 15
 folds = 5
-permutations = 200     # game shuffled across conversations, shortlist only
+permutations = 200     # game shuffled across conversations, report split
+selection_permutations = 10  # the same on the selection split (each refits the transform)
 bootstrap = 200        # conversation-level bound, shortlist only
 
 # Home, CPU. Finds the classes in confounds' cleaned space: shortest usable

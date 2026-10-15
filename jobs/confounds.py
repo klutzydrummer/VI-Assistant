@@ -16,10 +16,13 @@ confounds. For each candidate embedding from embed:
      fitted on every eligible clip but barks.
   5. Acceptance on the selection split (30% of conversations): game gone to
      k-NN and RBF-SVM probes, text length and duration gone to a linear
-     probe, the A/V/D guard holds. Then paired-take agreement.
-  6. The best passing candidate (paired-take agreement above chance, then
-     A/V/D) is reported on the other 70%, with conversation-level bootstrap
-     bounds and permutations of game across conversations.
+     probe, the A/V/D guard holds. Then paired-take agreement. The game
+     probes refit the whole transform inside each fold (folds grouped by
+     conversation, stratified by game) and are judged against chance or,
+     when higher, what they score with game shuffled across conversations.
+  6. Passing candidates, best first (paired-take agreement above chance,
+     then A/V/D), are reported on the other 70% until one passes, with
+     conversation-level bootstrap bounds and more permutations.
 
 Nuisance factors are erased; situation factors (scene and structural tags,
 bark, stage direction, level, text content) are only measured. Clips flagged
@@ -36,7 +39,8 @@ float32), cleaned_crops.npy + .ids (embed's crops through the same
 transform), checks.json.
 
 Settings: pca_dims, selection_share, game_margin, max_length_r2,
-avd_max_drop, knn_k, folds, permutations, bootstrap, candidates, limit.
+avd_max_drop, knn_k, folds, permutations, selection_permutations, bootstrap,
+candidates, limit.
 """
 
 import hashlib
@@ -257,23 +261,35 @@ def nuisance(meta, with_duration):
     return np.where(np.isfinite(z), z, med), known
 
 
-def clean(x, meta, comparable, dims, with_duration=False):
-    """PCA -> CORAL -> LEACE. Returns (cleaned, pca-space raw, info, apply),
-    where apply(x, game) runs the same fitted transform on other rows (the
-    crops)."""
-    import numpy as np
+def fit_pca(x, meta, comparable, dims, held=None):
     from sklearn.decomposition import PCA
 
-    dims = int(min(dims, len(comparable) - 1, x.shape[1]))
-    comparable = comparable[meta.unique[comparable]]
-    pca = PCA(n_components=dims, random_state=SEED).fit(x[comparable])
+    rows = comparable[meta.unique[comparable]]
+    if held is not None:
+        rows = rows[~held[rows]]
+    dims = int(min(dims, len(rows) - 1, x.shape[1]))
+    return PCA(n_components=dims, random_state=SEED).fit(x[rows])
+
+
+def clean(x, meta, comparable, dims, with_duration=False, held=None, game=None, pca=None):
+    """PCA -> CORAL -> LEACE. Returns (cleaned, pca-space raw, info, apply),
+    where apply(x, game) runs the same fitted transform on other rows (the
+    crops). Rows marked `held` touch none of the fits (the game probe's
+    held-out conversations); `game` replaces the game labels Coral levels
+    by (the probe's permutations); `pca` reuses a fitted PCA."""
+    import numpy as np
+
+    game = meta.game if game is None else game
+    held = np.zeros(len(game), dtype=bool) if held is None else held
+    pca = fit_pca(x, meta, comparable, dims, held) if pca is None else pca
+    comparable = comparable[meta.unique[comparable] & ~held[comparable]]
     raw = pca.transform(x)
-    coral = Coral().fit(raw, meta.game, comparable)
-    coloured = coral.apply(raw, meta.game)
+    coral = Coral().fit(raw, game, comparable)
+    coloured = coral.apply(raw, game)
     z, known = nuisance(meta, with_duration)
-    fit = np.flatnonzero(known & ~meta.bark & ~meta.excluded & meta.unique)
+    fit = np.flatnonzero(known & ~meta.bark & ~meta.excluded & meta.unique & ~held)
     leace = Leace().fit(coloured[fit], z[fit])
-    info = {"dims": dims, "explained": round(float(pca.explained_variance_ratio_.sum()), 4),
+    info = {"dims": pca.n_components_, "explained": round(float(pca.explained_variance_ratio_.sum()), 4),
             "leace_fit_clips": int(len(fit)), "erased": int(z.shape[1]), "duration_erased": with_duration}  # fmt: skip
     def apply(other, game):
         return leace.apply(coral.apply(pca.transform(other), game))
@@ -327,28 +343,72 @@ def wilson_upper(p, n, z=1.96):
     return centre + half
 
 
-def game_probe(x, meta, rows, s, permutations=0, bootstrap=0):
-    """Can k-NN or an RBF-SVM still tell the games apart? Balanced accuracy
-    out of fold, its analytic upper bound (rows as trials), and optionally a
+def game_probe(x, meta, rows, s, comparable, dims, with_duration, permutations=0, bootstrap=0):
+    """Can k-NN or an RBF-SVM still tell the games apart? The whole transform
+    is refitted inside each fold without the held-out conversations: fitted
+    on every clip, Coral levels each game's mean with the test clips in it,
+    which pushes the probe below chance even on pure noise and would let a
+    game that is still there pass. Balanced accuracy out of fold, its
+    analytic upper bound (rows as trials), and optionally a
     conversation-level bootstrap bound and a permutation p-value with game
-    shuffled across conversations, not clips."""
+    shuffled across conversations (Coral refitted to the shuffled labels)."""
     import numpy as np
+    from sklearn.base import clone
+    from sklearn.model_selection import StratifiedGroupKFold
     from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
     from sklearn.svm import SVC
 
     y, g = meta.game[rows], meta.group[rows]
     chance = 1 / max(1, len(set(y)))
     models = {"knn": KNeighborsClassifier(n_neighbors=int(s.get("knn_k", 15))),
               "svm": SVC(kernel="rbf", gamma="scale", C=1.0)}  # fmt: skip
-    k = int(s.get("folds", 5))
-    out = {"chance": round(chance, 4), "clips": int(len(rows)), "conversations": int(len(set(g)))}
+    out = {"chance": round(chance, 4), "clips": int(len(rows)), "conversations": int(len(set(g))),
+           "fit": "refitted per fold"}  # fmt: skip
+    # Each conversation is one game, so plain grouped folds can hold out a
+    # fold heavy in one game and train the probe against it: below chance on
+    # noise again. Stratified grouped folds keep the games balanced.
+    k = min(int(s.get("folds", 5)), len(set(g)))
+    split = StratifiedGroupKFold(n_splits=k, shuffle=True, random_state=SEED).split(rows, y, g) if k >= 2 else []
+    prepared = []
+    for train, test in split:
+        held = np.isin(meta.group, g[test])
+        prepared.append((train, test, held, fit_pca(x, meta, comparable, dims, held)))
+
+    def oof(game):
+        yr = game[rows]
+        pred = {name: np.empty(len(rows), dtype=yr.dtype) for name in models}
+        done = np.zeros(len(rows), dtype=bool)
+        for train, test, held, pca in prepared:
+            if len(set(yr[train])) < 2:
+                continue
+            cx, _, _, _ = clean(x, meta, comparable, dims, with_duration, held, game, pca)
+            for name, model in models.items():
+                est = clone(model)
+                if "n_neighbors" in est.get_params():  # tiny corpora (the smoke test)
+                    est.set_params(n_neighbors=min(est.n_neighbors, len(train)))
+                m = make_pipeline(StandardScaler(), est).fit(cx[rows[train]], yr[train])
+                pred[name][test] = m.predict(cx[rows[test]])
+            done[test] = True
+        return yr, pred, done
+
+    _, pred, done = oof(meta.game)
+    null = {name: [] for name in models}
     rng = np.random.default_rng(SEED)
-    for name, model in models.items():
-        pred, done = oof_classify(x[rows], y, g, model, k)
+    if permutations and done.any():
+        game_of = {c: meta.game[meta.group == c][0] for c in sorted(set(meta.group))}
+        convs = sorted(game_of)
+        for _ in range(permutations):
+            shuffled = dict(zip(convs, rng.permutation([game_of[c] for c in convs])))
+            yp, p, d = oof(np.array([shuffled[c] for c in meta.group]))
+            for name in models:
+                null[name].append(balanced_accuracy(yp[d], p[name][d]))
+    for name in models:
         if not done.any() or len(set(y)) < 2:
             out[name] = None
             continue
-        ba = balanced_accuracy(y[done], pred[done])
+        ba = balanced_accuracy(y[done], pred[name][done])
         r = {"balanced_accuracy": round(ba, 4), "upper": round(wilson_upper(ba, int(done.sum())), 4), "bound": "binomial"}
         if bootstrap:
             convs = np.array(sorted(set(g)))
@@ -357,20 +417,13 @@ def game_probe(x, meta, rows, s, permutations=0, bootstrap=0):
                 pick = rng.choice(convs, len(convs), replace=True)
                 idx = np.concatenate([np.flatnonzero((g == c) & done) for c in pick])
                 if len(set(y[idx])) == len(set(y)):
-                    stats.append(balanced_accuracy(y[idx], pred[idx]))
+                    stats.append(balanced_accuracy(y[idx], pred[name][idx]))
             r["upper"] = round(float(np.quantile(stats, 0.975)), 4)
             r["bound"] = f"conversation bootstrap, {len(stats)} draws"
-        if permutations:
-            game_of = {c: y[g == c][0] for c in set(g)}
-            convs = sorted(game_of)
-            null = []
-            for _ in range(permutations):
-                shuffled = dict(zip(convs, rng.permutation([game_of[c] for c in convs])))
-                yp = np.array([shuffled[c] for c in g])
-                p, d = oof_classify(x[rows], yp, g, model, k)
-                null.append(balanced_accuracy(yp[d], p[d]))
-            r["permutation_p"] = round((1 + sum(n >= ba for n in null)) / (1 + len(null)), 4)
-            r["permutation_null_p95"] = round(float(np.quantile(null, 0.95)), 4)
+        if null[name]:
+            r["permutation_p"] = round((1 + sum(n >= ba for n in null[name])) / (1 + len(null[name])), 4)
+            r["permutation_null_p95"] = round(float(np.quantile(null[name], 0.95)), 4)
+            r["permutation_null_median"] = round(float(np.median(null[name])), 4)
         out[name] = r
     return out
 
@@ -498,10 +551,13 @@ def accept(after, before, game, s):
     margin = float(s.get("game_margin", 0.05))
     max_r2 = float(s.get("max_length_r2", 0.05))
     max_drop = float(s.get("avd_max_drop", 0.10))
-    chance = game["chance"]
+    # Chance, raised to what each probe scores with game shuffled across
+    # conversations (the whole transform refitted the same way) when that is
+    # higher: on the real corpus the procedure alone scores up to 0.40.
     probes = [game[m] for m in ("knn", "svm") if game.get(m)]
     tests = {
-        "game_gone": bool(probes) and all(p["upper"] <= chance + margin for p in probes),
+        "game_gone": bool(probes)
+        and all(p["upper"] <= max(game["chance"], p.get("permutation_null_median", 0)) + margin for p in probes),
         "text_length_gone": (after["text_length_r2"] is None) or after["text_length_r2"] <= max_r2,
         "duration_gone": (after["log_duration_r2"] is None) or after["log_duration_r2"] <= max_r2,
         "avd_guard": (after.get("avd_r2") is None or before.get("avd_r2") is None)
@@ -510,11 +566,13 @@ def accept(after, before, game, s):
     return tests
 
 
-def evaluate(x, raw, meta, rows, comparable_rows, s, avd, text, permutations=0, bootstrap=0):
+def evaluate(x, cx, raw, meta, rows, comparable_rows, s, avd, text, fit, permutations=0, bootstrap=0):
+    """`fit` is (comparable, dims, with_duration): how the game probe refits
+    the transform in each fold."""
     before = factor_table(raw, meta, rows, s, text, avd)
-    after = factor_table(x, meta, rows, s, text, avd)
-    game = game_probe(x, meta, comparable_rows, s, permutations, bootstrap)
-    return {"before": before, "after": after, "game": game, "paired": paired_agreement(x, meta, rows),
+    after = factor_table(cx, meta, rows, s, text, avd)
+    game = game_probe(x, meta, comparable_rows, s, *fit, permutations, bootstrap)
+    return {"before": before, "after": after, "game": game, "paired": paired_agreement(cx, meta, rows),
             "tests": accept(after, before, game, s)}  # fmt: skip
 
 
@@ -588,7 +646,8 @@ def main():
         variants = {}
         for with_duration in (False, True):
             cx, raw, info, apply = clean(x, meta, comparable, dims, with_duration)
-            ev = evaluate(cx, raw, meta, sel_rows, sel_comp, s, avd, text)
+            ev = evaluate(x, cx, raw, meta, sel_rows, sel_comp, s, avd, text, (comparable, dims, with_duration),
+                          int(s.get("selection_permutations", 10)))  # fmt: skip
             variants[with_duration] = (cx, raw, info, ev, apply)
             t = ev["tests"]
             if t["text_length_gone"] and t["duration_gone"]:
@@ -598,7 +657,7 @@ def main():
         results[name] = {"transform": info, "selection": ev, "passed": all(ev["tests"].values())}
         if with_duration:
             results[name]["without_duration_erasure"] = variants[False][3]["tests"]
-        cleaned[name] = (cx, raw, apply)
+        cleaned[name] = (x, cx, raw, apply, with_duration)
         log(f"confounds: {name}: {ev['tests']}")
 
     passing = [n for n in names if results[n]["passed"]]
@@ -609,21 +668,34 @@ def main():
         lift = (p.get("top1", 0) - p.get("chance", 0)) if p.get("pairs") else 0
         return (lift, ev["after"].get("avd_r2") or 0)
 
-    shortlist = sorted(passing, key=rank, reverse=True)[:2]
+    # Every candidate that passed selection is reported, best first, until
+    # one passes: ranking by A/V/D kept after cleaning put the ones that
+    # lost the most first, and a top-two cut never tried the rest.
     perms, boots = int(s.get("permutations", 200)), int(s.get("bootstrap", 200))
-    for n in shortlist:
-        cx, raw, _ = cleaned[n]
-        results[n]["report"] = evaluate(cx, raw, meta, rep_rows, rep_comp, s, avd, text, perms, boots)
+    shortlist, chosen = [], None
+    for n in sorted(passing, key=rank, reverse=True):
+        x, cx, raw, _, with_duration = cleaned[n]
+        fit = (comparable, dims, with_duration)
+        # The permutations refit the transform hundreds of times; skip them
+        # when another test already fails.
+        ev = evaluate(x, cx, raw, meta, rep_rows, rep_comp, s, avd, text, fit)
+        if all(v for k, v in ev["tests"].items() if k != "game_gone"):
+            ev = evaluate(x, cx, raw, meta, rep_rows, rep_comp, s, avd, text, fit, perms, boots)
+        results[n]["report"] = ev
         results[n]["report_passed"] = all(results[n]["report"]["tests"].values())
-    chosen = next((n for n in shortlist if results[n]["report_passed"]), None)
+        shortlist.append(n)
+        log(f"confounds: {n} on the report split: {results[n]['report']['tests']}")
+        if results[n]["report_passed"]:
+            chosen = n
+            break
 
     summary |= {"status": "chosen" if chosen else "stopped", "chosen": chosen, "shortlist": shortlist,
                 "candidates": results}  # fmt: skip
     if chosen is None:
         summary["stop_reason"] = ("no candidate passed every acceptance test on the selection split"
-                                  if not passing else "no shortlisted candidate passed on the report split")  # fmt: skip
+                                  if not passing else "no candidate that passed selection passed on the report split")  # fmt: skip
     else:
-        cx, _, apply = cleaned[chosen]
+        _, cx, _, apply, _ = cleaned[chosen]
         np.save(out / "cleaned.npy", cx.astype(np.float32))
         (out / "cleaned.ids").write_text("".join(f"{i}\n" for i in ids))
         crops = embed / "crops" / f"{chosen}.npy"
