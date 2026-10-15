@@ -70,12 +70,13 @@
 
   <section class="panel hidden" id="listen">
     <h2 id="listen-title"></h2>
-    <p class="muted small">Does this clip fit the cluster? Nothing about it shows until you answer.</p>
+    <p class="muted small">Does this clip fit the cluster? Nothing about it shows until you answer. Skip puts it back in the pool for later.</p>
     <audio id="audio" controls preload="auto" style="width:100%"></audio>
     <div class="actions">
       <button class="yes" id="yes">Fits <kbd>Y</kbd></button>
       <button class="no" id="no">Doesn't fit <kbd>N</kbd></button>
       <button id="replay">Replay <kbd>Space</kbd></button>
+      <button id="skip">Skip <kbd>S</kbd></button>
       <span style="flex:1"></span>
       <button id="early" class="small">Decide this cluster now</button>
     </div>
@@ -121,8 +122,9 @@
 
   <section class="panel">
     <h2>Clusters</h2>
+    <p class="muted small">Tick the clusters to listen to; clips rotate between them, each judged against its own cluster. With none ticked, clusters come one at a time.</p>
     <table>
-      <thead><tr><th>Cluster</th><th>Size</th><th>Answered</th><th>Verdict</th><th>Purity</th><th>Decision</th></tr></thead>
+      <thead><tr><th>Listen</th><th>Cluster</th><th>Size</th><th>Answered</th><th>Skipped</th><th>Verdict</th><th>Purity</th><th>Decision</th></tr></thead>
       <tbody id="clusters"></tbody>
     </table>
     <p class="muted small" id="totals"></p>
@@ -167,10 +169,13 @@ function render() {
     const live = s.current && s.current.cluster === c.cluster;
     // Purity shows only once a cluster's listening is over.
     const over = st.sprt || d;
-    return `<tr><td>${esc(c.cluster)}${live ? ' ◂' : ''}</td><td class="num">${c.size ?? ''}</td>` +
-      `<td class="num">${st.answers}</td><td>${over ? esc(st.sprt ?? '') : ''}</td>` +
+    const picked = s.selected.includes(c.cluster);
+    const box = d ? '' : `<input type="checkbox" class="pick" value="${esc(c.cluster)}"${picked ? ' checked' : ''}>`;
+    return `<tr><td>${box}</td><td>${esc(c.cluster)}${live ? ' ◂' : ''}</td><td class="num">${c.size ?? ''}</td>` +
+      `<td class="num">${st.answers}</td><td class="num">${st.skips || ''}</td><td>${over ? esc(st.sprt ?? '') : ''}</td>` +
       `<td class="num">${over ? pct(st.purity) : ''}</td><td>${what}</td></tr>`;
   }).join('');
+  for (const box of document.querySelectorAll('.pick')) box.onchange = pick;
 
   const cur = s.current;
   show('done', !cur);
@@ -303,6 +308,38 @@ function next() {
   render();
 }
 
+async function pick() {
+  if (busy) { render(); return; }
+  const clusters = [...document.querySelectorAll('.pick:checked')].map((b) => b.value);
+  busy = true;
+  try {
+    session = await api('/api/select', {clusters});
+    if (!lastId) $('audio').pause();
+    early = false;
+    $('error').textContent = '';
+  } catch (e) {
+    $('error').textContent = e.message;
+  } finally {
+    busy = false;
+  }
+  render();
+}
+
+async function skip() {
+  if (busy || !session.current || !session.current.waiting || lastId || early) return;
+  busy = true;
+  try {
+    session = await api('/api/skip', {n: session.n});
+    $('audio').pause();
+    $('error').textContent = '';
+  } catch (e) {
+    $('error').textContent = e.message;
+  } finally {
+    busy = false;
+  }
+  render();
+}
+
 async function decide(action) {
   const cur = session.current;
   if (!cur || busy) return;
@@ -331,6 +368,7 @@ $('no').onclick = () => answer(false);
 $('replay').onclick = () => { const a = $('audio'); a.currentTime = 0; a.play(); };
 $('reveal-replay').onclick = () => { if (lastId) new Audio('/audio/' + encodeURIComponent(lastId)).play(); };
 $('next').onclick = next;
+$('skip').onclick = skip;
 $('early').onclick = () => { early = true; $('audio').pause(); render(); };
 $('back').onclick = () => { early = false; render(); };
 $('do-name').onclick = () => decide('name');
@@ -343,6 +381,7 @@ document.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   if (k === 'y') answer(true);
   else if (k === 'n') answer(false);
+  else if (k === 's') skip();
   else if (k === ' ') { e.preventDefault(); $('replay').click(); }
   else if (k === 'enter') next();
   else if (/^[1-9]$/.test(k)) playRef(Number(k) - 1);
