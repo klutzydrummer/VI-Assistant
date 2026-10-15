@@ -93,30 +93,56 @@ def noise_check(s, games=3, per_game=360, conv=5, dims=96, seed=0):
     return out
 
 
-def inductive_game_probe(x, d, s, dims):
-    """Check 1b: the whole transform refitted per fold on training rows only;
-    the held-out conversations never touch PCA, Coral or LEACE."""
+def inductive_game_probe(x, d, s, dims, with_duration, permutations=20):
+    """Check 1b: the whole transform refitted per fold on training rows only,
+    so held-out conversations never touch PCA, Coral or LEACE. Folds are
+    grouped by conversation and stratified by game: each conversation is one
+    game, so plain grouped folds can leave a fold heavy in one game and push
+    the probe below chance on their own. The null refits with game shuffled
+    across conversations, through exactly the same procedure."""
     import numpy as np
     from sklearn.base import clone
+    from sklearn.model_selection import StratifiedGroupKFold
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     meta, rows = d["meta"], d["rep_comp"]
     y, g = meta.game[rows], meta.group[rows]
-    pred = {name: np.empty(len(rows), dtype=y.dtype) for name in probes(s)}
-    done = np.zeros(len(rows), dtype=bool)
-    for train, test in cf.folds(g, int(s.get("folds", 5))):
-        held = rows[test]
+    split = StratifiedGroupKFold(n_splits=int(s.get("folds", 5)), shuffle=True, random_state=cf.SEED)
+    prepared = []
+    for train, test in split.split(rows, y, g):
+        held = np.isin(meta.group, g[test])
+        keep = ~held
         m = copy.copy(meta)
-        m.excluded = meta.excluded.copy()
-        m.excluded[np.isin(meta.group, meta.group[held])] = True  # out of LEACE's fit
-        fit_comp = d["comparable"][~np.isin(meta.group[d["comparable"]], meta.group[held])]
-        cx, _, _, _ = cf.clean(x, m, fit_comp, dims, with_duration=True)
-        for name, model in probes(s).items():
-            p = make_pipeline(StandardScaler(), clone(model)).fit(cx[rows[train]], y[train])
-            pred[name][test] = p.predict(cx[held])
-        done[test] = True
-    return {name: round(cf.balanced_accuracy(y[done], p[done]), 4) for name, p in pred.items()}
+        m.excluded = meta.excluded | held  # out of LEACE's fit
+        prepared.append((train, test, m, d["comparable"][keep[d["comparable"]]]))
+
+    def score(game):
+        yr = game[rows]
+        pred = {name: np.empty(len(rows), dtype=yr.dtype) for name in probes(s)}
+        for train, test, m, fit_comp in prepared:
+            m = copy.copy(m)
+            m.game = game
+            cx, _, _, _ = cf.clean(x, m, fit_comp, dims, with_duration)
+            for name, model in probes(s).items():
+                p = make_pipeline(StandardScaler(), clone(model)).fit(cx[rows[train]], yr[train])
+                pred[name][test] = p.predict(cx[rows[test]])
+        return {name: cf.balanced_accuracy(yr, p) for name, p in pred.items()}
+
+    observed = score(meta.game)
+    game_of = {c: meta.game[meta.group == c][0] for c in sorted(set(meta.group))}
+    convs = sorted(game_of)
+    rng = np.random.default_rng(cf.SEED)
+    null = {name: [] for name in probes(s)}
+    for _ in range(permutations):
+        shuffled = dict(zip(convs, rng.permutation([game_of[c] for c in convs])))
+        for name, v in score(np.array([shuffled[c] for c in meta.group])).items():
+            null[name].append(v)
+    return {name: {"balanced_accuracy": round(observed[name], 4),
+                   "null_median": round(float(np.median(null[name])), 4) if null[name] else None,
+                   "null_p95": round(float(np.quantile(null[name], 0.95)), 4) if null[name] else None,
+                   "permutation_p": round((1 + sum(v >= observed[name] for v in null[name])) / (1 + len(null[name])), 4)}
+            for name in observed}  # fmt: skip
 
 
 def nuisance_matrix(meta, rows):
@@ -182,7 +208,7 @@ def main():
         game = cf.game_probe(cx, d["meta"], d["rep_comp"], s)
         r = {"duration_erased": with_duration,
              "game_probe_as_run": {m: game[m]["balanced_accuracy"] for m in ("knn", "svm") if game.get(m)},
-             "game_probe_refit_per_fold": inductive_game_probe(x, d, s, dims),
+             "game_probe_refit_per_fold": inductive_game_probe(x, d, s, dims, with_duration),
              "avd": avd_check(raw, cx, d, s)}  # fmt: skip
         out["candidates"][name] = r
         print(f"{name}: done", file=sys.stderr, flush=True)
