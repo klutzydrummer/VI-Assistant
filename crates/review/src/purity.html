@@ -62,6 +62,12 @@
     <span class="muted small" id="progress"></span>
   </header>
 
+  <section class="panel hidden" id="refs">
+    <h2 id="refs-title"></h2>
+    <p class="muted small" id="refs-help">What this cluster sounds like: its most typical clips, from different conversations. Hear them before the first clip, and again whenever you like. They are never asked. Then <kbd>Space</kbd> plays the clip to judge.</p>
+    <div class="actions" id="refs-buttons"></div>
+  </section>
+
   <section class="panel hidden" id="listen">
     <h2 id="listen-title"></h2>
     <p class="muted small">Does this clip fit the cluster? Nothing about it shows until you answer.</p>
@@ -168,6 +174,7 @@ function render() {
 
   const cur = s.current;
   show('done', !cur);
+  renderRefs(cur);
   const listening = cur && cur.waiting && !early;
   show('listen', listening && !lastId);
   show('decide', cur && (!cur.waiting || early));
@@ -177,13 +184,40 @@ function render() {
   if (!cur.waiting || early) renderDecide(cur);
 }
 
+let refsFor = null;
+let refsHeard = new Set();
+let refPlayer = null;
+
+function renderRefs(cur) {
+  const n = cur ? cur.references || 0 : 0;
+  show('refs', n > 0);
+  if (!n || refsFor === cur.cluster) return;
+  refsFor = cur.cluster;
+  refsHeard = new Set();
+  $('refs-title').textContent = `Cluster ${cur.cluster}: reference clips`;
+  $('refs-buttons').innerHTML = Array.from({length: n}, (_, i) =>
+    `<button id="ref-${i}">Example ${i + 1} <kbd>${i + 1}</kbd></button>`).join('');
+  for (let i = 0; i < n; i++) $('ref-' + i).onclick = () => playRef(i);
+}
+
+function playRef(i) {
+  if (!session.current || !$('ref-' + i)) return;
+  $('audio').pause();
+  if (refPlayer) refPlayer.pause();
+  refPlayer = new Audio(`/audio/ref/${i}?c=${encodeURIComponent(session.current.cluster)}`);
+  refPlayer.play().catch(() => {});
+  refsHeard.add(i);
+  $('ref-' + i).classList.add('primary');
+}
+
 function loadClip(cur) {
   $('listen-title').textContent = `Cluster ${cur.cluster} · clip ${cur.state.answers + 1}`;
   const audio = $('audio');
   audio.src = `/audio/next?n=${session.n}`;
   started = null;
   audio.onplay = () => { if (started == null) started = Date.now(); };
-  audio.play().catch(() => {}); // autoplay may need one click first
+  // The first clip of a cluster waits until a reference has been heard.
+  if (cur.state.answers > 0 || !cur.references || refsHeard.size > 0) audio.play().catch(() => {});
 }
 
 function renderDecide(cur) {
@@ -311,6 +345,7 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'n') answer(false);
   else if (k === ' ') { e.preventDefault(); $('replay').click(); }
   else if (k === 'enter') next();
+  else if (/^[1-9]$/.test(k)) playRef(Number(k) - 1);
 });
 
 api('/api/session').then((s) => { session = s; render(); })
