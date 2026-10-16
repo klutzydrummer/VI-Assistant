@@ -18,13 +18,23 @@ brings it out. Per game, from the raw harvest audio:
   4. Periodicity: how cleanly periodic her voiced frames are. A noise or
      ring-mod layer lowers it. There is no unfiltered baseline, so compare
      games with each other rather than with a fixed number.
+  5. A doubled, pitch-shifted layer (fans guess one about 2 semitones up):
+     in voiced frames, the spectrum at k * f0 * r for k = 1..3, relative to
+     the frame, as a function of the ratio r. Her own harmonics peak at
+     r = 1; a second copy at a fixed ratio peaks there too (1.122 for +2
+     semitones). k stops at 3 so no r in 1.03-1.3 lands on a harmonic.
+  6. Moving notches (a flanger rather than a fixed delay): the comb's delay
+     tracked through each clip in 85 ms blocks. A fixed delay stays put; a
+     swept one spreads. Reported as the most common delay and the share of
+     blocks within 0.05 ms of it.
 
 Peaks are reported with a split-half check (odd and even clips): a real
 effect shows in both halves at the same place.
 
 Usage (from the repo root, at nice 19; reads the game disk once):
   python3 jobs/filter_probe.py corpus/tali [--limit N] [--out DIR]
-Prints JSON and writes ltas.csv, cepstrum.csv, envelope.csv and summary.json
+Prints JSON and writes ltas.csv, cepstrum.csv, envelope.csv, harmonics.csv and
+summary.json
 to DIR (default corpus/tali/analysis/filter). Changes no stage outputs.
 """
 
@@ -108,6 +118,80 @@ def periodicity(frames, sr):
     return float(np.median(vals)) if vals else None
 
 
+RATIOS = np.round(np.arange(0.9, 1.3001, 0.005), 3)
+
+
+def f0_of(fr, sr):
+    """Pitch of a frame by autocorrelation (80-400 Hz), or None if the frame
+    isn't clearly voiced."""
+    lo, hi = int(sr * 0.0025), int(sr * 0.0125)
+    fr = fr - fr.mean()
+    spec = np.fft.rfft(fr, 2 * len(fr))
+    ac = np.fft.irfft(np.abs(spec) ** 2)[: len(fr)]
+    if ac[0] <= 0:
+        return None
+    lag = lo + int(np.argmax(ac[lo:hi]))
+    if ac[lag] / ac[0] < 0.5:
+        return None
+    # Parabolic interpolation for a sub-sample lag.
+    a, b, c = ac[lag - 1], ac[lag], ac[lag + 1]
+    shift = 0.5 * (a - c) / (a - 2 * b + c) if (a - 2 * b + c) != 0 else 0.0
+    return sr / (lag + shift)
+
+
+def harmonic_profile(frames, sr, nfft=8192):
+    """Mean spectrum level (dB re the frame's median, 100-3000 Hz) at
+    k * f0 * r for k = 1..3, per ratio r in RATIOS, over voiced frames."""
+    freqs = np.fft.rfftfreq(nfft, 1 / sr)
+    band = (freqs >= 100) & (freqs <= 3000)
+    win = np.hanning(frames.shape[1])
+    rows = []
+    for fr in frames[:: max(1, len(frames) // 40)]:
+        f0 = f0_of(fr, sr)
+        if f0 is None:
+            continue
+        db = 20 * np.log10(np.abs(np.fft.rfft((fr - fr.mean()) * win, nfft)) + 1e-12)
+        db -= np.median(db[band])
+        rows.append(np.mean([np.interp(k * f0 * RATIOS, freqs, db) for k in (1, 2, 3)], axis=0))
+    return np.mean(rows, axis=0) if rows else None
+
+
+def comb_track(x, sr, nperseg=1024, block=8, lo_ms=0.45, hi_ms=1.3):
+    """The comb's delay (ms) in each 85 ms block of a clip: the peak of the
+    cepstrum of the block's log spectrum (200-8000 Hz) between lo_ms and
+    hi_ms."""
+    f, _, z = signal.stft(x, sr, nperseg=nperseg, noverlap=nperseg * 3 // 4, padded=False, boundary=None)
+    p = np.abs(z) ** 2
+    if p.shape[1] < block:
+        return []
+    e = p.sum(axis=0)
+    loud = e > e.max() * 1e-2
+    band = (f >= 200) & (f <= 8000)
+    df = f[1] - f[0]
+    out = []
+    for i in range(0, p.shape[1] - block + 1, block):
+        sel = loud[i : i + block]
+        if sel.sum() < block // 2:
+            continue
+        y = np.log(p[band, i : i + block][:, sel].mean(axis=1) + 1e-20)
+        y = (y - y.mean()) * np.hanning(len(y))
+        n = 16 * len(y)
+        c = np.abs(np.fft.rfft(y, n))
+        q = np.fft.rfftfreq(n, d=df) * 1000.0
+        keep = (q >= lo_ms) & (q <= hi_ms)
+        # Above its own slope (formants make the low end tall), and not at
+        # an edge of the range, where a slope would put it.
+        ck = c[keep] - signal.medfilt(c[keep], 31)
+        i = int(np.argmax(ck))
+        mad = np.median(np.abs(ck - np.median(ck))) * 1.4826 + 1e-20
+        # Only blocks with a clear comb: a voice alone mostly has none.
+        if 0 < i < len(ck) - 1 and ck[i] / mad > 5:
+            out.append(float(q[keep][i]))
+        else:
+            out.append(None)
+    return out
+
+
 def analyse(x, sr):
     """Per-clip measurements, or None if the clip is too short or silent."""
     x = np.asarray(x, dtype=np.float64)
@@ -122,7 +206,8 @@ def analyse(x, sr):
     env = clip_envelope(x, sr)
     if spec is None:
         return None
-    return {"spec": spec, "env": env, "periodicity": periodicity(frames, sr), "sr": sr}
+    return {"spec": spec, "env": env, "periodicity": periodicity(frames, sr), "sr": sr,
+            "harmonics": harmonic_profile(frames, sr), "comb": comb_track(x, sr)}  # fmt: skip
 
 
 def smooth_octave(g, db, fraction=3):
@@ -171,6 +256,20 @@ def cepstrum(g, spec, fmin=100.0, fmax=8000.0):
     return q[keep], c[keep]
 
 
+def ripple_db(g, spec, q_ms, fmin=150.0, fmax=5000.0, bins=20):
+    """Peak-to-peak depth (dB) of the EQ-flattened average spectrum folded
+    at a spacing of 1/q_ms. A real comb has deep notches (a delayed copy at
+    30% level gives about 5 dB, an equal one 10 dB or more); a large
+    cepstral z can still mean a ripple of a dB or less."""
+    db = 10 * np.log10(spec + 1e-30)
+    flat = db - smooth_octave(g, db, fraction=3)
+    sel = (g >= fmin) & (g <= fmax) & ~np.isnan(flat)
+    phase = (g[sel] * q_ms / 1000.0) % 1.0
+    idx = np.minimum((phase * bins).astype(int), bins - 1)
+    means = np.array([flat[sel][idx == b].mean() for b in range(bins)])
+    return round(float(means.max() - means.min()), 2)
+
+
 def peaks(x, y, min_z=6.0, top=5):
     """Peaks standing out from a running median, as robust z-scores."""
     base = signal.medfilt(y, 101 if len(y) > 101 else (len(y) // 2) * 2 - 1)
@@ -202,7 +301,7 @@ def summarise(results):
     spec = mean_spec(results)
     ltas, smooth = ltas_summary(g, spec)
     q, c = cepstrum(g, spec)
-    cep = {"all": peaks(q, c)}
+    cep = {"all": [p | {"ripple_db": ripple_db(g, spec, p["at"])} for p in peaks(q, c)]}
     env = mean_env(results)
     freqs = np.arange(1.0, 501.0)
     # From 20 Hz: below that is syllable rhythm, which is hers.
@@ -216,15 +315,58 @@ def summarise(results):
             hm = [peaks(freqs[lo:], 10 * np.log10(e[lo:] + 1e-30)) for e in he]
             mod["in_both_halves"] = both_halves(hm[0], hm[1], 2.0)
     per = [r["periodicity"] for r in results if r["periodicity"] is not None]
+
+    def mean_harm(rs):
+        hs = [r["harmonics"] for r in rs if r.get("harmonics") is not None]
+        return np.mean(np.stack(hs), axis=0) if hs else None
+
+    harm = mean_harm(results)
+    doubled = None
+    if harm is not None:
+        # From one semitone up: closer in, her own harmonic's skirt leaks.
+        side = RATIOS >= 1.06
+
+        def best_of(h):
+            i = int(np.argmax(np.where(side, h, -np.inf)))
+            return float(RATIOS[i]), float(h[i] - np.median(h[side]))
+
+        at1 = float(harm[np.argmin(np.abs(RATIOS - 1.0))])
+        ratio, prominence = best_of(harm)
+        doubled = {"best_ratio": ratio,
+                   "semitones": round(12 * float(np.log2(ratio)), 2),
+                   "prominence_db": round(prominence, 2),
+                   # At an end of the range it's the slope of her own
+                   # harmonic or of the next one, not a second layer.
+                   "at_range_end": bool(ratio <= 1.07 or ratio >= 1.29),
+                   "own_harmonic_db": round(at1 - float(np.median(harm[side])), 2)}  # fmt: skip
+        if min(len(h) for h in halves) >= 20:
+            hh = [mean_harm(h) for h in halves]
+            if all(h is not None for h in hh):
+                doubled["halves"] = [{"ratio": r, "prominence_db": round(p, 2)} for r, p in map(best_of, hh)]
+    tracked = [d for r in results for d in r.get("comb", [])]
+    delays = np.array([d for d in tracked if d is not None])
+    moving = None
+    if len(delays) >= 20:
+        hist, edges = np.histogram(delays, bins=np.arange(0.45, 1.3001, 0.01))
+        mode = float(edges[np.argmax(hist)] + 0.005)
+        found = [[d for d in r.get("comb", []) if d is not None] for r in results]
+        spreads = [np.subtract(*np.percentile(f, [75, 25])) for f in found if len(f) >= 4]
+        moving = {"blocks": len(tracked),
+                  "share_with_a_clear_comb": round(len(delays) / len(tracked), 3),
+                  "most_common_ms": round(mode, 3),
+                  "share_within_0_05ms": round(float(np.mean(np.abs(delays - mode) <= 0.05)), 3),
+                  "median_within_clip_iqr_ms": round(float(np.median(spreads)), 3) if spreads else None}  # fmt: skip
     return {"clips": len(results),
             "sample_rates": sorted({r["sr"] for r in results}),
             "ltas": ltas,
             "echo_ms": cep,
             "modulation_hz": mod,
+            "doubled_layer": doubled,
+            "comb_over_time": moving,
             "periodicity": {"median": round(float(np.median(per)), 3),
                             "p10": round(float(np.quantile(per, 0.1)), 3),
                             "p90": round(float(np.quantile(per, 0.9)), 3)} if per else None,
-            "_curves": {"spec": spec, "smooth": smooth, "cep": (q, c), "env": env}}  # fmt: skip
+            "_curves": {"spec": spec, "smooth": smooth, "cep": (q, c), "env": env, "harm": harm}}  # fmt: skip
 
 
 def current_out(corpus, stage):
@@ -289,6 +431,11 @@ def main():
         for i in range(500):
             vals = [games[n]["_curves"]["env"] for n in names]
             f.write(f"{i + 1}," + ",".join("" if v is None else f"{10 * np.log10(v[i] + 1e-30):.2f}" for v in vals) + "\n")
+    with open(out / "harmonics.csv", "w") as f:
+        f.write("ratio," + ",".join(names) + "\n")
+        for i, r in enumerate(RATIOS):
+            vals = [games[n]["_curves"]["harm"] for n in names]
+            f.write(f"{r:g}," + ",".join("" if v is None else f"{v[i]:.2f}" for v in vals) + "\n")
     report = {n: {k: v for k, v in s.items() if k != "_curves"} for n, s in games.items()}
     (out / "summary.json").write_text(json.dumps(report, indent=1))
     print(json.dumps(report, indent=1))
