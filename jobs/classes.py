@@ -213,7 +213,7 @@ def fmt(v, digits=3):
     return str(v)
 
 
-def report_md(confounds, cluster, classes, rejected, overall, failed, s):
+def report_md(confounds, cluster, classes, rejected, overall, failed, s, unassigned=None):
     lines = ["# Corpus classes report", ""]
     lines += [f"Status: **{s['status']}**", ""]
     if failed:
@@ -281,6 +281,8 @@ def report_md(confounds, cluster, classes, rejected, overall, failed, s):
                      f"{fmt(c['stability'].get('jaccard'))} |")  # fmt: skip
     if rejected:
         lines += ["", f"Rejected: {', '.join(rejected)}."]
+    if unassigned is not None:
+        lines += ["", f"Clips in no class (top class under {s.get('min_membership', 0.5)} responsibility): {unassigned}."]
     lines.append("")
     return "\n".join(lines)
 
@@ -325,13 +327,18 @@ def main():
     keys = [c["key"] for c in classes]
     is_formed = np.array([formed.get(i, False) for i in ids])
     top = resp.argmax(axis=1) if classes else np.zeros(len(ids), dtype=int)
+    # A clip belongs to its top class only if that class holds most of it: a
+    # clip of a rejected cluster sits weakly in everything, and the least bad
+    # kept class isn't its class.
+    min_membership = float(s.get("min_membership", 0.5))
+    assigned = (resp[np.arange(len(ids)), top] >= min_membership) if classes else np.zeros(len(ids), dtype=bool)
 
     min_purity = float(s.get("min_purity", 0.6))
     keep_jaccard = float(cluster["settings"].get("keep_jaccard", 0.75))
     failed = list(problems)
     for j, c in enumerate(classes):
-        c["size"] = int(((top == j) & is_formed).sum())
-        c["size_all_clips"] = int((top == j).sum())
+        c["size"] = int(((top == j) & assigned & is_formed).sum())
+        c["size_all_clips"] = int(((top == j) & assigned).sum())
         audits = [clusters[m] for m in c["clusters"]]
         if len(c["clusters"]) == 1 and c["status"] != "split_part":
             a = audits[0]
@@ -373,7 +380,7 @@ def main():
         failed.append(f"consistency rests on {overall['repeat_pairs']} repeats, not 50")
 
     write_jsonl(out / "memberships.jsonl", [
-        {"id": cid, "class": keys[top[i]] if keys else None,
+        {"id": cid, "class": keys[top[i]] if assigned[i] else None,
          "responsibilities": {k: round(float(resp[i, j]), 4) for j, k in enumerate(keys)},
          "scores": {k: round(float(score[i, j]), 3) for j, k in enumerate(keys)},
          "formed": bool(is_formed[i])}
@@ -402,13 +409,14 @@ def main():
         "status": s["status"],
         "classes": classes,
         "rejected": rejected,
+        "unassigned": int((~assigned).sum()),
         "purity": {"clusters": per, **overall},
         "failed": failed,
         "cluster_candidate": cluster.get("candidate"),
         "settings": {k: v for k, v in s.items() if k not in ("status",)},
     }
     (out / "classes.json").write_text(json.dumps(result, indent=1, sort_keys=True, default=float) + "\n")
-    (out / "report.md").write_text(report_md(confounds, cluster, classes, rejected, overall, failed, s))
+    (out / "report.md").write_text(report_md(confounds, cluster, classes, rejected, overall, failed, s, int((~assigned).sum())))
     log(f"classes: {kept} named, {len(rejected)} rejected, {len(failed)} check(s) failed; status {s['status']}")
     checks.finish(out, [
         checks.Check("named classes", kept, 2, kind="min", note="need at least 2"),
