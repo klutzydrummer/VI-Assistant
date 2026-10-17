@@ -25,6 +25,10 @@ fn have_rsync() -> bool {
 }
 
 fn run(dir: &Path, job: &str) -> Output {
+    run_with(dir, job, &[])
+}
+
+fn run_with(dir: &Path, job: &str, envs: &[(&str, String)]) -> Output {
     let pipeline = dir.join("pipeline.toml");
     fs::write(dir.join("extra.txt"), "extra\n").unwrap();
     fs::write(
@@ -49,6 +53,7 @@ settings = {{ judge = "gemma" }}
         .args(["dataset", "run", pipeline.to_str().unwrap()])
         .env("VI_WORKER_HOST", "local")
         .env("VI_WORKER_ROOT", dir.join("worker"))
+        .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
         .unwrap()
 }
@@ -95,6 +100,41 @@ pwd > "$VI_OUT/where.txt""#,
     let ran_in = fs::read_to_string(got.join("where.txt")).unwrap();
     assert!(Path::new(ran_in.trim()).starts_with(&worker), "{ran_in}");
     assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+}
+
+#[test]
+fn a_packed_input_arrives_whole_and_its_bundle_is_reused() {
+    if !have_rsync() {
+        return;
+    }
+    if Command::new("zstd").arg("--version").output().is_err() {
+        eprintln!("skipping: zstd is not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bundles = dir.path().join("bundles");
+    // Every input is packed, however small.
+    let envs = [
+        ("VI_PACK_MIN_KB", "0".to_string()),
+        ("VI_BUNDLE_DIR", bundles.display().to_string()),
+    ];
+    let job = r#"cat "$VI_INPUT_GEN/a.txt" > "$VI_OUT/b.txt""#;
+    let out = run_with(dir.path(), job, &envs);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("packed GEN"), "{stderr}");
+    assert!(stderr.contains("upload: 1/1"), "{stderr}");
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(fs::read_to_string(got.join("b.txt")).unwrap(), "hello\n");
+    assert_eq!(fs::read_dir(&bundles).unwrap().count(), 1);
+    assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+
+    // A changed job reruns the stage; the unchanged input's bundle is reused.
+    let out = run_with(dir.path(), &format!("{job}; true"), &envs);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("GEN already packed"), "{stderr}");
+    assert_eq!(fs::read_dir(&bundles).unwrap().count(), 1);
 }
 
 #[test]
