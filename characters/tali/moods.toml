@@ -1,0 +1,114 @@
+# The moods a friend and assistant needs, for the textscore stage to look for
+# in her lines (docs/design/corpus-pipeline.md, "Seeded moods"). Models only
+# nominate lines; nothing they say is stored as a label, and a mood becomes a
+# class only after Brandon's listening review.
+#
+# DRAFT: the full list from design/must-have-moods.md, before Brandon's cut.
+# Editing this file reruns textscore, a GPU stage, so finish the cut first.
+#
+# Every mood has an id (used in outputs), a description (a phrase finishing
+# "Tali is ..." in a sentence, read by every model) and whether her audio
+# clusters already found it. A line may carry several moods, or none.
+# Knobs are degrees rather than moods: each line gets one level of each.
+
+[[mood]]
+id = "warm"
+description = "warm and friendly"
+found = true
+
+[[mood]]
+id = "sad"
+description = "sad or grieving"
+found = true
+
+[[mood]]
+id = "angry"
+description = "angry or irritated"
+found = true
+
+[[mood]]
+id = "surprised"
+description = "surprised or caught off guard by news"
+found = true
+
+[[mood]]
+id = "amused"
+description = "amused, laughing along or enjoying a joke"
+
+[[mood]]
+id = "teasing"
+description = "teasing the listener playfully"
+
+[[mood]]
+id = "affectionate"
+description = "affectionate, tender or loving"
+
+[[mood]]
+id = "grateful"
+description = "grateful, thanking the listener"
+
+[[mood]]
+id = "apologetic"
+description = "apologetic, owning a mistake"
+
+[[mood]]
+id = "flustered"
+description = "flustered or embarrassed, rambling"
+
+[[mood]]
+id = "curious"
+description = "curious, wanting to know more"
+
+[[mood]]
+id = "reassuring"
+description = "reassuring or comforting the listener"
+
+[[mood]]
+id = "worried"
+description = "worried or concerned"
+
+[[mood]]
+id = "excited"
+description = "excited or enthusiastic"
+
+[[mood]]
+id = "proud"
+description = "proud of someone or of her people"
+
+[[mood]]
+id = "relieved"
+description = "relieved that something is over"
+
+[[mood]]
+id = "doubtful"
+description = "doubtful, confused or unsure"
+
+[[mood]]
+id = "sarcastic"
+description = "sarcastic or deadpan"
+
+[[mood]]
+id = "tired"
+description = "tired or weary"
+
+[[mood]]
+id = "informational"
+description = "simply informing or explaining, with no particular feeling"
+
+[[knob]]
+id = "energy"
+description = "how much energy and urgency her delivery needs"
+levels = [
+  { id = "calm", description = "calm and unhurried" },
+  { id = "normal", description = "speaking at an ordinary pace and energy" },
+  { id = "urgent", description = "urgent, under time pressure or in danger" },
+]
+
+[[knob]]
+id = "drunk"
+description = "how drunk she is"
+levels = [
+  { id = "sober", description = "sober" },
+  { id = "tipsy", description = "a little tipsy" },
+  { id = "drunk", description = "drunk, slurring and rambling" },
+]

@@ -205,6 +205,29 @@ Written by `jobs/classes.py` at home (numpy, scipy) from cluster, embed, confoun
 
 cluster also writes `components.npy` (float32, clips × GMM components, log w_c + log N(x | c), a duplicate take carrying its twin's) with `components.ids`, and the component weights in `cluster.json` under `gmm.weights`.
 
+### context: `context.jsonl` + `context.json`
+Written by `jobs/context.py` at home (standard library) from harvest, for the seeded moods ([corpus-pipeline.md](corpus-pipeline.md), "Seeded moods"). One record per line with words (not `nonverbal` or `no_subtitle`):
+```json
+{"id": "le2.s1_f", "game": "le2", "conversation": "...", "text": "Thank you, Shepard.",
+ "before": [{"speaker": "Shepard", "text": "..."}], "after": [{"speaker": "Shepard", "text": "..."}],
+ "listener": "Shepard", "scene_tags": ["normandy"], "stage_direction": null, "conversation_kind": "dialogue_choices",
+ "bark": false, "prompt": "Scene: normandy\nBefore:\nShepard: ...\n>>> Tali (to Shepard): Thank you, Shepard.\nAfter:\nShepard: ..."}
+```
+- `before`: the last `before` (3) lines of harvest's `context`; `after`: the first `after` (2) of `following`, all branches. Speaker ids are written as names.
+- `scene_tags`: without the structural tags. Harvest's `text` is used, not clean's transcript, so a clean rerun doesn't rerun textscore.
+- `prompt`: what every text model reads; her line is marked `>>>`.
+- `context.json`: counts (lines, left out, with lines before and after, with a director's note) and the settings.
+
+### textscore: `scores/` + `llm/` + `embeddings/` + `textscore.json`
+Written by `jobs/textscore.py` on the rented GPU from context and `characters/tali/moods.toml`. Manual; runs only on Brandon's ok for that run. Scores nominate lines for Brandon to hear; they are never labels.
+- `scores/<model>.jsonl`, `{"id", "scores": {...}}`, one per context line:
+  - `goemotions`: the 28 GoEmotions probabilities (sigmoid) of her line alone
+  - `nli`: entailment probability of "In the marked line, Tali is <description>." given the prompt, per mood id and per knob level (`energy:urgent`)
+  - `embedder`: cosine of the prompt's Qwen3-Embedding vector to each mood's and knob level's description, as a query
+- `llm/<name>.jsonl` (`gemma`, `qwen`): `{"id", "samples": [answer or null, ...], "raw_failed": [first unparseable answer]}`, an answer being `{"moods": [{"mood", "strength" 1–3, "reason"}], "<knob>": "<level>", ...}`, constrained by a JSON schema to moods.toml's ids; `samples` (2) per line at `temperature` 0.7, thinking off. `llm/<name>.prompt.txt` is the system prompt as sent.
+- `embeddings/qwen3_line.npy`, `qwen3_context.npy` (+ `.ids`): float16 vectors of her line and of the prompt; `qwen3_moods.npy` with the label keys as ids.
+- `textscore.json`: lines, labels, the moods and knobs as read, per model the repo, pinned revision and resolved commit, per LLM the parse failures and the share of lines whose two samples name the same moods, the NLI template and embedding instruction, sampling, packages, run time. `checks.json`: no line missed per model, under 2% unparseable samples per LLM.
+
 ### discover: `captions.jsonl`, `clusters.jsonl`, `prosody.jsonl`
 Written by `jobs/discover.py`.
 ```json
@@ -298,7 +321,7 @@ Records are `{"id": ...}` plus, for pairs, `{"id": ..., "neutral_text": ...}`.
 Vectors go to `vectors/<axis>.{gguf,safetensors}` and the report to `report.md` plus `samples/`. The runner already keys these by the model through the stage settings; copying the chosen vectors into the pack's vector store is a separate step.
 
 ### Corpus pipeline stages
-prep, clean, embed, confounds, cluster, the purity review and classes replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). Each has its section above. Outputs stay in stage folders, never in `lines.jsonl`.
+prep, clean, embed, confounds, cluster, the purity review and classes (with context and textscore for the seeded moods) replace discover, label and calibrate in Tali's pipeline (their jobs stay in `jobs/`, unused). Each has its section above. Outputs stay in stage folders, never in `lines.jsonl`.
 
 ## Pipeline file
 
