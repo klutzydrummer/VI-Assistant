@@ -26,7 +26,8 @@ command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
            "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scipy p.soundfile])",
            "--run", "python3 ../../jobs/prep.py"]
 inputs = ["harvest"]
-files = ["../../jobs/prep.py", "../../jobs/checks.py", "../../jobs/vi_job.py"]
+files = ["../../jobs/prep.py", "../../jobs/checks.py", "../../jobs/vi_job.py",
+         "../../jobs/eq_match.py", "../../jobs/filter_probe.py", "../../jobs/confounds.py"]
 
 [stage.prep.settings]
 checks = "warn"
@@ -36,6 +37,12 @@ target_lufs = -23    # one linear gain to this (BS.1770; RMS under rms_below_s)
 rms_below_s = 1.0
 max_peak_dbfs = -1   # the gain is capped so peaks stay under this
 bands = 16           # noise-floor spectrum bands, 50 Hz to 7.6 kHz
+# Per-game EQ match before the level, so the suit's different EQ in each game
+# doesn't steer the analysis models (for analysis only; the voice model keeps
+# the 24 kHz originals). Hear it first: `python3 jobs/eq_match.py corpus/tali`.
+# On since 2026-10-17 (Brandon). Changing it reruns prep and makes clean and
+# embed stale, which are GPU runs: Brandon's ok first.
+eq_match = true
 
 # GPU. Cuts each clip at prep's bounds, checks its subtitle with Whisper
 # (not barks, which have none), measures how much it sounds like her (speaker

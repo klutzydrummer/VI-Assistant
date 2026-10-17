@@ -105,7 +105,9 @@ Written by `jobs/prep.py`, at home on the CPU (numpy, scipy, soundfile). One tri
 - `gain_db`: the one linear gain to `target_lufs`, capped so the peak stays under `max_peak_dbfs` (`gain_capped`). Never dynamic compression.
 - `audio16k`: the trimmed, levelled clip at 16 kHz as 16-bit FLAC, for the models only. Harvest's 24 kHz WAVs are untouched. Absent for `silent` clips (trimmed under 0.2 s), which later stages skip.
 
-`prep.json` holds the settings, band edges, package versions, flag counts and the distributions of gain, noise floor and trimmed silence.
+- `eq_matched`: whether the clip went through its game's EQ correction (setting `eq_match`, off by default). The correction is fitted first on the comparable clips (`eq_match.fit`: `confounds.Meta.comparable` with its seed; clean's flags aren't known yet, so its exclusions are left out) and applied to the whole clip before the level, from 100 Hz to 9 kHz, capped at ±12 dB, with each octave's average offset removed. Trim bounds and the noise floor are always measured on the audio as shipped.
+
+`prep.json` holds the settings, band edges, package versions, flag counts and the distributions of gain, noise floor and trimmed silence. With `eq_match` on, it also holds `eq_match`: the clips each game was fitted on, the rule, and each game's correction in dB at the third-octave centres.
 
 Jobs with prep as an input get each clip's 16 kHz copy and prep record from `vi_job.load_clips()` (`clip.audio16k`, `clip.prep`).
 

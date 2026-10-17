@@ -152,5 +152,60 @@ class JobTest(unittest.TestCase):
             self.assertTrue(clips[0].audio16k.exists())
 
 
+class EqMatchTest(unittest.TestCase):
+    def test_the_correction_changes_colour_but_not_the_cut(self):
+        import eq_match
+        import filter_probe as fp
+
+        clip = np.concatenate([hiss(0.4, 1e-4, 1), hiss(1.5, 0.1, 2), hiss(0.4, 1e-4, 3)])
+        g = fp.grid()
+        dark = np.where(g > 2000, -10.0, 0.0)  # take 10 dB off the top
+        plain, eq = prep.prepare(clip, RATE), prep.prepare(clip, RATE, fir=eq_match.fir(dark, RATE))
+        self.assertEqual(plain["trim"], eq["trim"])
+        self.assertEqual(plain["noise_floor"], eq["noise_floor"])
+        for r in (plain, eq):  # both levelled to the target
+            self.assertFalse(r["gain_capped"])
+            self.assertAlmostEqual(r["level"]["db"] + r["gain_db"], -23, delta=0.01)
+
+        def top_share(x):
+            p = np.abs(np.fft.rfft(x)) ** 2
+            return p[np.fft.rfftfreq(len(x), 1 / 16_000) > 3000].sum() / p.sum()
+
+        self.assertLess(top_share(eq["audio16k"]), 0.3 * top_share(plain["audio16k"]))
+
+    def test_end_to_end_fits_one_correction_per_game(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            harvest = d / "harvest"
+            (harvest / "audio").mkdir(parents=True)
+            lines = []
+            rng = np.random.default_rng(0)
+            for game in ("le1", "le2"):
+                for i in range(12):
+                    x = hiss(1.0 + 0.1 * i, 0.1, int(rng.integers(1 << 30)))
+                    if game == "le1":
+                        from scipy import signal
+
+                        x = signal.sosfilt(signal.butter(2, 1500, fs=RATE, output="sos"), x)
+                    lid = f"{game}.s{i}_f"
+                    sf.write(harvest / "audio" / f"{lid}.wav", x, RATE, subtype="PCM_16")
+                    lines.append({"id": lid, "text": "Keelah se'lai.", "source": {"game": game},
+                                  "audio": {"path": f"audio/{lid}.wav", "duration_s": len(x) / RATE}})  # fmt: skip
+            (harvest / "lines.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines))
+            (d / "settings.json").write_text(json.dumps({"eq_match": True}))
+            env = {**os.environ, "VI_INPUT_HARVEST": str(harvest), "VI_OUT": str(d / "out"),
+                   "VI_SETTINGS": str(d / "settings.json")}  # fmt: skip
+            subprocess.run([sys.executable, str(JOBS / "prep.py")], env=env, check=True, capture_output=True)
+            recs = [json.loads(x) for x in (d / "out" / "prep.jsonl").read_text().splitlines()]
+            self.assertTrue(all(r["eq_matched"] for r in recs))
+            report = json.loads((d / "out" / "prep.json").read_text())["eq_match"]
+            self.assertEqual(sorted(report["fitted_on"]), ["le1", "le2"])
+            self.assertNotIn("rows", report)
+            # The darker game is brightened, the other darkened.
+            tilt = {g: v["4000"] - v["500"] for g, v in report["correction_db_at_third_octaves"].items()}
+            self.assertGreater(tilt["le1"], 6, tilt)
+            self.assertLess(tilt["le2"], -6, tilt)
+
+
 if __name__ == "__main__":
     unittest.main()
