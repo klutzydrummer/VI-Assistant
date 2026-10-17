@@ -1,5 +1,8 @@
 # What textscore.py needs on the worker. It runs in its own virtualenv
 # (vi_job.ensure_venv), because vLLM pins its own torch and transformers.
-vllm==0.30.0          # Gemma 4 and Qwen 3.6 with JSON-schema constrained output
-sentence-transformers  # Qwen3-Embedding
-huggingface_hub
+# Everything is pinned: unpinned, pip spent 20 minutes backtracking between
+# huggingface_hub 2.x (allowed by vLLM) and sentence-transformers (< 2.0).
+vllm==0.30.0                 # Gemma 4 and Qwen 3.6 with JSON-schema constrained output
+transformers==5.18.0
+huggingface_hub==1.33.0      # sentence-transformers 6.1 needs < 2.0
+sentence-transformers==6.1.0 # Qwen3-Embedding
