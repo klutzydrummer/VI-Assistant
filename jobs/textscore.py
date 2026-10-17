@@ -397,6 +397,8 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--llm":
         return llm_pass(sys.argv[2])
     s = settings()
+    # A dead download fails in a minute (and pip retries) instead of hanging.
+    os.environ.setdefault("PIP_DEFAULT_TIMEOUT", "60")
     ensure_venv("requirements-text.txt")
     fake = fake_models()
     out = out_dir()
