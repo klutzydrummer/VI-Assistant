@@ -40,9 +40,9 @@ bands = 16           # noise-floor spectrum bands, 50 Hz to 7.6 kHz
 # Per-game EQ match before the level, so the suit's different EQ in each game
 # doesn't steer the analysis models (for analysis only; the voice model keeps
 # the 24 kHz originals). Hear it first: `python3 jobs/eq_match.py corpus/tali`.
-# Turning it on reruns prep and makes clean and embed stale, which are GPU
-# runs: Brandon's ok first.
-eq_match = false
+# On since 2026-10-17 (Brandon). Changing it reruns prep and makes clean and
+# embed stale, which are GPU runs: Brandon's ok first.
+eq_match = true
 
 # GPU. Cuts each clip at prep's bounds, checks its subtitle with Whisper
 # (not barks, which have none), measures how much it sounds like her (speaker
