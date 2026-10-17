@@ -8,6 +8,7 @@
 //! [search]
 //! gpu_names = ["RTX 3090", "RTX 4090"]
 //! max_dph = 0.35
+//! countries = ["US", "CA"]
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -52,6 +53,10 @@ pub struct Search {
     /// flash attention, which most current TTS models expect.
     pub min_compute_cap: u32,
     pub verified: bool,
+    /// Two-letter country codes the worker may be in (Vast.ai's
+    /// geolocation). Empty means anywhere. Closer machines upload faster,
+    /// since one rsync stream slows down with the round trip.
+    pub countries: Vec<String>,
 }
 
 impl Default for Config {
@@ -79,6 +84,7 @@ impl Default for Search {
             min_cuda: 12.8,
             min_compute_cap: 800,
             verified: true,
+            countries: Vec::new(),
         }
     }
 }
@@ -137,6 +143,14 @@ impl Config {
         if !s.gpu_names.is_empty() {
             q["gpu_name"] = json!({"in": s.gpu_names});
         }
+        if !s.countries.is_empty() {
+            let codes: Vec<String> = s
+                .countries
+                .iter()
+                .map(|c| c.trim().to_uppercase())
+                .collect();
+            q["geolocation"] = json!({"in": codes});
+        }
         q
     }
 
@@ -181,6 +195,16 @@ mod tests {
         assert_eq!(q["dph_total"]["lte"], 0.3);
         assert_eq!(q["limit"], 3);
         assert_eq!(q["verified"]["eq"], true);
+        assert!(q.get("geolocation").is_none());
+    }
+
+    #[test]
+    fn countries_limit_where_the_worker_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud.toml");
+        std::fs::write(&path, "[search]\ncountries = [\"us\", \"CA\"]\n").unwrap();
+        let q = Config::load(&path).unwrap().offer_query(3);
+        assert_eq!(q["geolocation"]["in"], json!(["US", "CA"]));
     }
 
     #[test]

@@ -202,9 +202,18 @@ def parse(text, moods):
 
 
 def device():
+    """Always the GPU: on the CPU the NLI model crawls and vLLM can't run, so
+    a worker whose driver is too old for this torch fails here, not hours
+    later (2026-10-17: torch built for CUDA 13 on a CUDA 12.8 driver)."""
     import torch
 
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        sys.exit(
+            f"textscore: torch {torch.__version__} (built for CUDA {torch.version.cuda}) sees no GPU. "
+            "The worker's driver is probably older than that CUDA; rent with [search] min_cuda "
+            "at least that version in cloud.toml."
+        )
+    return "cuda"
 
 
 class GoEmotions:
