@@ -32,6 +32,7 @@ cp "$VI_INPUT_PING/token" "$VI_CHECKPOINT/token"
   gpu=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
   echo "gpu: ${gpu:-none}"
   echo "disk free: $(df -h . | awk "NR==2 {print \$4}")"
+  echo "gcc: $(command -v gcc >/dev/null && echo yes || echo "missing (Triton jobs such as textscore will fail; the boot script may still be installing it)")"
   python3 -c "import sys; print(\"python:\", sys.version.split()[0])" 2>/dev/null || echo "python: missing"
   python3 -c "import torch; print(\"torch:\", torch.__version__, \"cuda\" if torch.cuda.is_available() else \"no cuda\")" 2>/dev/null || echo "torch: missing"
 } >"$VI_OUT/worker.txt"'

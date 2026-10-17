@@ -45,7 +45,7 @@ min_gpu_ram_gb = 24
 max_dph = 0.40         # dollars per hour
 min_reliability = 0.98
 min_inet_down_mbps = 200
-min_cuda = 12.8
+min_cuda = 13.0
 min_compute_cap = 800  # Ampere or newer, for bf16 and flash attention
 verified = true
 countries = []         # e.g. ["US", "CA"]; empty = anywhere
@@ -53,7 +53,7 @@ countries = []         # e.g. ["US", "CA"]; empty = anywhere
 
 `countries` takes two-letter codes (Vast.ai's geolocation). A nearer worker uploads a little faster: one rsync stream slows down as the round trip grows.
 
-`min_cuda` must cover the CUDA that the jobs' torch was built for. textscore's vLLM brings torch built for CUDA 13, so it needs `min_cuda = 13.0`; on an older driver torch sees no GPU, and textscore stops at once rather than crawl on the CPU.
+`min_cuda` must cover the CUDA that the jobs' torch was built for. textscore's vLLM brings torch built for CUDA 13, hence the 13.0 default; on an older driver torch sees no GPU, and textscore stops at once rather than crawl on the CPU. Jobs built for CUDA 12 run on these newer drivers too. The boot script also installs gcc, which Triton (inside vLLM) needs at run time; `check-worker.sh` reports whether it's there.
 
 The API key comes from `$VAST_API_KEY` or `~/.config/vastai/vast_api_key` (where the `vastai` CLI saves it). Your ssh public key must be on your Vast account (Account, SSH keys); new instances get it automatically.
 
