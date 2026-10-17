@@ -132,6 +132,10 @@ class JobTest(unittest.TestCase):
                                        row["responsibilities"]["c0"] + row["responsibilities"]["c1"], places=3)
             gone = [m for i, m in got.items() if any(r["id"] == i and r["cluster"] == "c2" for r in rows)]
             self.assertTrue(all(m["responsibilities"]["calm"] + m["responsibilities"]["teasing"] < 0.5 for m in gone))
+            # ... so they belong to no class, and the sizes leave them out.
+            self.assertTrue(gone and all(m["class"] is None for m in gone))
+            self.assertEqual(result["unassigned"], sum(m["class"] is None for m in got.values()))
+            self.assertEqual(sum(c["size_all_clips"] for c in result["classes"]) + result["unassigned"], len(got))
 
             eiv = [json.loads(x) for x in (d / "classes" / "eiv_labels.jsonl").read_text().splitlines()]
             self.assertEqual(len(eiv), len(rows))
