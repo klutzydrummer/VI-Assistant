@@ -161,6 +161,48 @@ files = ["../../jobs/classes.py", "../../jobs/checks.py", "../../jobs/vi_job.py"
 checks = "warn"
 min_purity = 0.6        # below: flagged, Brandon's call to merge or reject
 
+# Home, CPU. Her lines with words and the conversation around each, rendered
+# once so every text model reads the same thing; the GPU worker gets only this
+# small file (docs/design/corpus-pipeline.md, "Seeded moods"). Standard
+# library only.
+[stage.context]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3", "--run", "python3 ../../jobs/context.py"]
+inputs = ["harvest"]
+files = ["../../jobs/context.py", "../../jobs/vi_job.py"]
+
+[stage.context.settings]
+before = 3   # lines of the conversation before hers
+after = 2    # lines that can follow hers
+
+# GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml
+# textscore`, after Brandon has seen the exact command and said ok to that
+# run. Every text model scores every line against every mood in moods.toml:
+# a GoEmotions classifier, a zero-shot NLI model, Qwen3-Embedding, and two
+# local LLMs (8-bit, on one 48 GB card), each twice per line. The scores only
+# pick which lines Brandon hears for a mood; the bake-off against his gold
+# lines happens at home. Editing moods.toml reruns it.
+[stage.textscore]
+command = ["../../jobs/on-worker.sh", "--put", "moods.toml", "python3", "jobs/textscore.py"]
+inputs = ["context"]
+files = ["../../jobs/textscore.py", "../../jobs/vi_job.py", "../../jobs/checks.py",
+         "../../jobs/requirements-text.txt", "moods.toml"]
+manual = true
+
+[stage.textscore.settings]
+checks = "warn"
+samples = 2          # answers per line from each LLM, to measure consistency
+temperature = 0.7
+max_moods = 4
+batch = 64
+
+[stage.textscore.settings.revisions]   # pinned 2026-10-17
+"SamLowe/roberta-base-go_emotions" = "d75048347613a25d77de8cf6412eaae9fa7b26be"
+"MoritzLaurer/deberta-v3-large-zeroshot-v2.0" = "cf44676c28ba7312e5c5f8f8d2c22b3e0c9cdae2"
+"Qwen/Qwen3-Embedding-4B" = "5cf2132abc99cad020ac570b19d031efec650f2b"
+"RedHatAI/gemma-4-31B-it-FP8-dynamic" = "d4ab4f579dd3516f97d8a6a4c98d0653480bad15"
+"Qwen/Qwen3.6-27B-FP8" = "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
+
 # The steer test (jobs/steer.py) read label's axes, which this pipeline no
 # longer has; it comes back built on the classes. Its old definition:
 # # GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml steer`.

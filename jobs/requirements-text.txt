@@ -1,0 +1,5 @@
+# What textscore.py needs on the worker. It runs in its own virtualenv
+# (vi_job.ensure_venv), because vLLM pins its own torch and transformers.
+vllm==0.30.0          # Gemma 4 and Qwen 3.6 with JSON-schema constrained output
+sentence-transformers  # Qwen3-Embedding
+huggingface_hub

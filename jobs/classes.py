@@ -24,6 +24,7 @@ Outputs: classes.json, memberships.jsonl, eiv_labels.jsonl, report.md,
 checks.json.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -107,6 +108,28 @@ def purity_summary(records, members_available):
     overall = {"false_yes": false_yes, "foils": len(foils), "kappa": kappa, "repeat_pairs": len(pairs),
                "answers": len(answers), "seconds": round(sum(r.get("seconds", 0) for r in answers), 1)}  # fmt: skip
     return per, overall
+
+
+def fingerprint(rows):
+    """The cluster run purity records belong to: a hash of every formed
+    clip's cluster. A rebuild that renumbers or reshapes the clusters gets a
+    new one, so decisions made on the old ids can't land on the wrong ones."""
+    text = "".join(f"{r['id']}\t{r['cluster']}\n" for r in sorted(rows, key=lambda r: r["id"]) if r.get("formed"))
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def for_run(records, run, legacy_run=None):
+    """The records made on this cluster run, and how many were not. A record
+    names its run in `run` (the review page writes it); one without counts
+    for any run, unless `legacy_run` says which it was made on."""
+    keep, other = [], 0
+    for r in records:
+        made_on = r.get("run", legacy_run)
+        if made_on is None or made_on == run:
+            keep.append(r)
+        else:
+            other += 1
+    return keep, other
 
 
 def decisions(records):
@@ -314,6 +337,10 @@ def main():
     log(f"classes: {len(records)} purity records" + ("" if records else " (no review yet)"))
 
     rows = read_jsonl(cluster_dir / "clusters.jsonl")
+    run = fingerprint(rows)
+    records, other_run = for_run(records, run)
+    if other_run:
+        log(f"classes: {other_run} purity records were made on another cluster run, not this one ({run})")
     ids = (cluster_dir / "components.ids").read_text().split()
     logp = np.load(cluster_dir / "components.npy").astype(np.float64)
     weights = np.asarray(cluster["gmm"]["weights"], dtype=np.float64)
@@ -336,6 +363,9 @@ def main():
     min_purity = float(s.get("min_purity", 0.6))
     keep_jaccard = float(cluster["settings"].get("keep_jaccard", 0.75))
     failed = list(problems)
+    if other_run:
+        failed.append(f"{other_run} purity records were made on another cluster run; map them onto this one "
+                      f"({run}) with jobs/remap_purity.py")  # fmt: skip
     for j, c in enumerate(classes):
         c["size"] = int(((top == j) & assigned & is_formed).sum())
         c["size_all_clips"] = int(((top == j) & assigned).sum())
@@ -410,6 +440,8 @@ def main():
         "classes": classes,
         "rejected": rejected,
         "unassigned": int((~assigned).sum()),
+        "cluster_run": run,
+        "purity_other_run": other_run,
         "purity": {"clusters": per, **overall},
         "failed": failed,
         "cluster_candidate": cluster.get("candidate"),

@@ -7,6 +7,8 @@ Source note: arXiv pages could not be opened from this sandbox. Claims taken fro
 ## Goal
 Find Tali's emotion and state classes in her own voice clips, without picking a list beforehand. Build one steering vector per class for both the voice model and the chat model. At runtime, mix and interpolate those vectors to get blends of, and transitions between, emotions and states. The six placeholder axes are gone, and the classes we find define the pack's variables.
 
+Added 2026-10-17 (Brandon): discovered classes alone are too limited, so the moods a friend and assistant needs are also looked for directly ("Seeded moods" below). Clustering stays, to find what nobody thought to ask for.
+
 ## The core analysis problem
 3,516 lines (202 min, re-extracted 2026-10-14) from three games, each recorded and processed differently. The 40-clip test showed two problems. The plain emotion embeddings mostly encoded **clip length**. The speaker embeddings identified the **game** 72% of the time. So the main risk is clusters that sort clips by recording conditions instead of emotion. Everything below is built to rule that out before we trust any cluster.
 
@@ -108,6 +110,19 @@ For each candidate:
 | Session flag | Your call, per cluster |
 | Purity below 0.6 | Merge with its nearest cluster or reject it, your call in the review |
 | A class below the minimum size | Merge, keep as a soft component, or flag. Never silently dropped |
+
+### Seeded moods (added 2026-10-17)
+Brandon's call: the classes the clusters happen to find aren't enough, so the moods an everyday friend and assistant needs are sought directly, from her lines' words and context. The list is `characters/tali/moods.toml` (drafted in the project's design/must-have-moods.md, cut by Brandon). One flat list; a line may carry several moods; vectors are later fitted jointly so mixes add up. Two degrees are knobs, not moods: energy (calm to urgent) and drunk (sober to drunk).
+
+1. **context** (home, CPU): one record per line with the lines around it, the scene and the director's note, rendered once so every model reads the same text.
+2. **textscore** (GPU, manual, Brandon's ok for that run): GoEmotions, zero-shot NLI, Qwen3-Embedding and two local LLMs (Gemma 4 31B and Qwen 3.6 27B, 8-bit) score every line against every mood. Each LLM answers twice per line. It needs no labels, so it runs once.
+3. **gold** (Brandon): about 150 lines labelled from text, stratified so every mood appears.
+4. **bake-off** (home, CPU; scripts first): every model against gold per mood (macro-F1 and run-to-run consistency; SetFit trained on gold by conversation-grouped folds). The rule picking a model per mood is written before results.
+5. **candidates** (home, CPU): the top lines per mood from its winner, re-ranked by audio-only tone (prosody, emotion2vec). Lines whose text and voice disagree go to a sarcasm list.
+6. **listening** (Brandon): candidates go through the purity review as pseudo-clusters, with the same foils, repeats and decisions.
+7. **classes**: discovered and confirmed seeded classes in one table. A seeded class whose split-half class-vector cosine reaches `class_cosine` (0.9) steers voice and chat; one that doesn't is chat only.
+
+Model output is never stored as a label; it only picks what Brandon hears.
 
 ### 7–9. Voice vectors, chat vectors, mixing (later work, out of scope)
 Notes on what the corpus must support:
