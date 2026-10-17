@@ -38,7 +38,9 @@ bands = 16
 eq_match = true
 limit = 600
 
-# GPU: only the two models the check reads, no crops, no text.
+# GPU: emotion2vec+, A/V/D and the WavLM layers (added 2026-10-17: the
+# first run showed emotion2vec+ ignores the EQ; WavLM carried far more game
+# signal), no crops, no text.
 [stage.embed]
 command = ["../../jobs/on-worker.sh", "python3", "jobs/embed.py"]
 inputs = ["harvest", "prep"]
@@ -47,11 +49,13 @@ files = ["../../jobs/embed.py", "../../jobs/models.py", "../../jobs/vi_job.py",
 
 [stage.embed.settings]
 checks = "warn"
-models = ["emotion2vec_plus", "avd"]
+models = ["emotion2vec_plus", "avd", "wavlm"]
+wavlm_layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 batch = 16
 crops = { sources = 0 }
 
 [stage.embed.settings.revisions]   # the main pipeline's pins
+"microsoft/wavlm-large" = "c1423ed94bb01d80a3f5ce5bc39f6026a0f4828c"
 "emotion2vec/emotion2vec_plus_large" = "6c303ba987b86b93193de93e34bb2b077a6bedc4"
 "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim" = "6eba34a2485ea31cb03600241787c3a5edab8626"
 

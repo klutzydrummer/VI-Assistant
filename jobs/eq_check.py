@@ -7,8 +7,9 @@ This compares those with the same clips' vectors and scores from the main
 corpus's last embed, which heard them without the EQ match. Same clips, same
 words, same levelling: the EQ is the only difference.
 
-  game probe   how well a linear classifier tells the game from the
-               emotion2vec+ vector (balanced accuracy, folds grouped by
+  game probe   how well a linear classifier tells the game from each
+               embedding both sides have (emotion2vec+, and the WavLM layers
+               when embed ran them; balanced accuracy, folds grouped by
                conversation, several shuffles). The suit's EQ differs per game,
                so if the match helps, this drops toward chance.
   kept         how much each clip's readings survive the EQ: per-clip cosine of
@@ -39,14 +40,19 @@ def current_out(corpus, stage):
     return d / (d / "current").read_text().strip() / "out"
 
 
-def read_embed(folder):
-    """{id: vector} for VECTOR and {id: scores record} from one embed output."""
+def read_embed(folder, names=None):
+    """({name: {id: vector}} for each embedding in `names` (default: all
+    but the text one), {id: scores record}) from one embed output."""
     import numpy as np
 
-    m = np.load(folder / "embeddings" / f"{VECTOR}.npy").astype(np.float64)
-    ids = (folder / "embeddings" / f"{VECTOR}.ids").read_text().split()
+    names = names or sorted(f.stem for f in (folder / "embeddings").glob("*.npy") if f.stem != "minilm")
+    vectors = {}
+    for name in names:
+        m = np.load(folder / "embeddings" / f"{name}.npy").astype(np.float64)
+        ids = (folder / "embeddings" / f"{name}.ids").read_text().split()
+        vectors[name] = dict(zip(ids, m, strict=True))
     scores = {r["id"]: r for r in read_jsonl(folder / "scores.jsonl")}
-    return dict(zip(ids, m, strict=True)), scores
+    return vectors, scores
 
 
 def game_probe(x, game, group, seeds=SHUFFLES):
@@ -78,18 +84,27 @@ def by_game(values, game):
 
 
 def compare(ids, game, group, before, after, scores_before, scores_after):
-    """The report, from paired vectors (rows in `ids` order) and scores."""
+    """The report, from paired vectors ({name: rows in `ids` order}, or one
+    array for VECTOR) and scores. `game_probe` and `kept` are VECTOR's;
+    `embeddings` has the same for every name."""
     import numpy as np
 
+    if not isinstance(before, dict):
+        before, after = {VECTOR: before}, {VECTOR: after}
     out = {"clips": len(ids), "per_game": {g: int((game == g).sum()) for g in sorted(set(game))},
-           "chance": round(1 / len(set(game)), 4)}  # fmt: skip
-    b, sb = game_probe(before, game, group)
-    a, sa = game_probe(after, game, group)
-    out["game_probe"] = {"before": round(b, 4), "before_sd": round(sb, 4),
-                         "after": round(a, 4), "after_sd": round(sa, 4)}  # fmt: skip
-    cos = np.sum(before * after, axis=1) / (np.linalg.norm(before, axis=1) * np.linalg.norm(after, axis=1) + 1e-12)
-    out["kept"] = {"vector_cosine_median": round(float(np.median(cos)), 4),
-                   "vector_cosine_p05": round(float(np.quantile(cos, 0.05)), 4)}  # fmt: skip
+           "chance": round(1 / len(set(game)), 4), "embeddings": {}}  # fmt: skip
+    for name in sorted(before):
+        x, y = before[name], after[name]
+        b, sb = game_probe(x, game, group)
+        a, sa = game_probe(y, game, group)
+        cos = np.sum(x * y, axis=1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1) + 1e-12)
+        out["embeddings"][name] = {
+            "game_probe": {"before": round(b, 4), "before_sd": round(sb, 4), "after": round(a, 4), "after_sd": round(sa, 4)},
+            "kept": {"vector_cosine_median": round(float(np.median(cos)), 4),
+                     "vector_cosine_p05": round(float(np.quantile(cos, 0.05)), 4)},
+        }  # fmt: skip
+    first = out["embeddings"].get(VECTOR) or next(iter(out["embeddings"].values()))
+    out["game_probe"], out["kept"] = first["game_probe"], first["kept"]
     for key in ("avd", "emotion2vec_plus_large_classes"):
         names = sorted(set.intersection(*[set(s.get(key, {})) for s in scores_before + scores_after]))
         if not names:
@@ -123,6 +138,12 @@ def markdown(r):
         f"- emotion2vec+ vector cosine, median {r['kept']['vector_cosine_median']:.3f}, "
         f"5th percentile {r['kept']['vector_cosine_p05']:.3f}",
     ]
+    if len(r.get("embeddings", {})) > 1:
+        lines += ["", "## Every embedding: game probe before → after (lower is better), median cosine", "",
+                  "| | without | with | cosine |", "|---|---|---|---|"]  # fmt: skip
+        for n, e in r["embeddings"].items():
+            g = e["game_probe"]
+            lines.append(f"| {n} | {g['before']:.3f} | {g['after']:.3f} | {e['kept']['vector_cosine_median']:.3f} |")
     for key, title in (("avd", "A/V/D"), ("emotion2vec_plus_large_classes", "emotion2vec+ classes")):
         if key not in r:
             continue
@@ -147,20 +168,22 @@ def main():
     out = out_dir()
     clips = [c for c in load_clips() if c.audio16k is not None]
     after, scores_after = read_embed(env_path("VI_INPUT_EMBED"))
-    before, scores_before = read_embed(main_embed)
-    clips = [c for c in clips if c.id in after and c.id in before and c.id in scores_before]
+    before, scores_before = read_embed(main_embed, sorted(after))
+    clips = [c for c in clips if c.id in scores_before and all(c.id in v for v in [*after.values(), *before.values()])]
     if len(clips) < 30:
         sys.exit(f"eq_check: only {len(clips)} clips embedded both ways")
     meta = cf.Meta(clips)
     ids = [c.id for c in clips]
-    r = compare(ids, meta.game, meta.group, np.stack([before[i] for i in ids]), np.stack([after[i] for i in ids]),
+    r = compare(ids, meta.game, meta.group, {n: np.stack([v[i] for i in ids]) for n, v in before.items()},
+                {n: np.stack([v[i] for i in ids]) for n, v in after.items()},
                 [scores_before[i] for i in ids], [scores_after[i] for i in ids])  # fmt: skip
     r["main_embed"] = str(main_embed)
     r["settings"] = {k: v for k, v in settings().items() if k != "backend"}
     (out / "report.json").write_text(json.dumps(r, indent=1, sort_keys=True) + "\n")
     (out / "report.md").write_text(markdown(r))
-    log(f"eq_check: game probe {r['game_probe']['before']:.3f} -> {r['game_probe']['after']:.3f} "
-        f"(chance {r['chance']:.3f}); read {out / 'report.md'}")  # fmt: skip
+    for n, e in r["embeddings"].items():
+        log(f"eq_check: {n} game probe {e['game_probe']['before']:.3f} -> {e['game_probe']['after']:.3f}")
+    log(f"eq_check: chance {r['chance']:.3f}; read {out / 'report.md'}")
 
 
 if __name__ == "__main__":
