@@ -1,0 +1,65 @@
+# Does the per-game EQ match help the analysis models? A subset check before
+# the whole corpus is re-embedded with it (Brandon, 2026-10-17).
+#   vi dataset run characters/tali/eq_check.toml
+# needs a worker (`vi cloud up`) for embed, the one GPU step: about 600 clips
+# through emotion2vec+ large and the A/V/D model only. Then read
+# corpus/tali-eq-check/stages/eq_check/current/out/report.md.
+#
+# Its own corpus folder, so the main pipeline's stages are untouched. The
+# "before" side is the main corpus's last embed, which heard the same clips
+# without the EQ match.
+
+corpus = "../../corpus/tali-eq-check"
+
+# Every line, hard-linked from the main corpus (no extra disk), so the EQ is
+# fitted on all the comparable clips like the real thing.
+[stage.harvest]
+command = ["sh", "-c", "cp -al \"$VI_CORPUS/../tali/harvest/.\" \"$VI_OUT/\" 2>/dev/null || cp -a \"$VI_CORPUS/../tali/harvest/.\" \"$VI_OUT/\""]
+files = ["../../corpus/tali/harvest/lines.jsonl"]
+
+# As in dataset.toml, with the EQ match on, for a spread of `limit` clips
+# (the same id-hash pick every time). The EQ is still fitted on every clip.
+[stage.prep]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scipy p.soundfile])",
+           "--run", "python3 ../../jobs/prep.py"]
+inputs = ["harvest"]
+files = ["../../jobs/prep.py", "../../jobs/checks.py", "../../jobs/vi_job.py",
+         "../../jobs/eq_match.py", "../../jobs/filter_probe.py", "../../jobs/confounds.py"]
+
+[stage.prep.settings]
+checks = "warn"
+top_db = 40
+pad_s = 0.05
+target_lufs = -23
+rms_below_s = 1.0
+max_peak_dbfs = -1
+bands = 16
+eq_match = true
+limit = 600
+
+# GPU: only the two models the check reads, no crops, no text.
+[stage.embed]
+command = ["../../jobs/on-worker.sh", "python3", "jobs/embed.py"]
+inputs = ["harvest", "prep"]
+files = ["../../jobs/embed.py", "../../jobs/models.py", "../../jobs/vi_job.py",
+         "../../jobs/checks.py", "../../jobs/requirements-gpu.txt"]
+
+[stage.embed.settings]
+checks = "warn"
+models = ["emotion2vec_plus", "avd"]
+batch = 16
+crops = { sources = 0 }
+
+[stage.embed.settings.revisions]   # the main pipeline's pins
+"emotion2vec/emotion2vec_plus_large" = "6c303ba987b86b93193de93e34bb2b077a6bedc4"
+"audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim" = "6eba34a2485ea31cb03600241787c3a5edab8626"
+
+# Home, CPU: the comparison with the main corpus's embed.
+[stage.eq_check]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7",
+           "nix-shell", "-p", "python3.withPackages (p: [p.numpy p.scikit-learn])",
+           "--run", "python3 ../../jobs/eq_check.py ../../corpus/tali"]
+inputs = ["harvest", "prep", "embed"]
+files = ["../../jobs/eq_check.py", "../../jobs/confounds.py", "../../jobs/checks.py",
+         "../../jobs/vi_job.py", "../../corpus/tali/stages/embed/current"]

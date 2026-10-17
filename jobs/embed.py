@@ -29,7 +29,9 @@ Outputs: embeddings/<name>.npy (float16, one row per clip) + .ids,
 crops/<name>.npy + .ids, scores.jsonl, prosody.jsonl, embed.json,
 checks.json.
 
-Settings: backend ("fake" for tests), wavlm, wavlm_layers, emotion2vec_plus,
+Settings: backend ("fake" for tests), models (the passes to run, default all:
+wavlm, emotion2vec_plus, emotion2vec_base, bude_whisper, avd, text), wavlm,
+wavlm_layers, emotion2vec_plus,
 emotion2vec_base, bude_whisper, eiv_small, eiv_plus, eiv_skip, avd,
 text_embed, revisions, crops (lengths, sources, min_source_s), batch, limit.
 """
@@ -107,6 +109,8 @@ def main():
                 repos["eiv_plus"], rev("eiv_plus"), skip=s.get("eiv_skip", ["score_content_enjoyment"])), batched),
             ("avd", lambda: models.AVD(repos["avd"], rev("avd")), one_by_one),
         ]  # fmt: skip
+        if "models" in s:
+            passes = [p for p in passes if p[0] in s["models"]]
         for name, load, call in passes:
             saved = ArrayCheckpoint(name)
             model = load() if saved.todo(everything) else None
@@ -128,6 +132,8 @@ def main():
     measure = models.fake_prosody if fake else models.prosody
     prosody = Checkpoint("prosody").run(clips, lambda part: [measure(heard[c.id]) for c in part])
     worded = [c for c in clips if c.has_words and "no_subtitle" not in c.flags]
+    if "text" not in s.get("models", ["text"]):
+        worded = []
     embedder = None
     saved = Checkpoint("text")
     if saved.todo(worded):
@@ -160,7 +166,7 @@ def main():
         "crops": {"lengths": lengths, "sources": len(crops) // max(1, len(lengths)), "clips": len(crops),
                   "placement": "centred"},  # fmt: skip
         "models": {k: {"repo": repos[k], "revision": rev(k), "resolved": resolved(repos[k], rev(k), fake)}
-                   for k in DEFAULTS},  # fmt: skip
+                   for k in DEFAULTS if ran(k, s)},  # fmt: skip
         "wavlm_layers": layers,
         "score_names": names,
         "pooling": {"wavlm": "mean over frames", "bude_whisper": "mean over the first ceil(duration x 50) "
@@ -206,6 +212,15 @@ def one_by_one(model, part):
 
 def batched(model, part):
     return model([wav(c) for c in part])
+
+
+def ran(key, s):
+    """Whether the `models` setting ran this DEFAULTS key's model (the EIV
+    heads ride on bude_whisper, the text embedder is "text")."""
+    chosen = s.get("models")
+    if chosen is None:
+        return True
+    return {"eiv_small": "bude_whisper", "eiv_plus": "bude_whisper", "text_embed": "text"}.get(key, key) in chosen
 
 
 def merge(into, results):
