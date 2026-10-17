@@ -165,6 +165,10 @@ pub struct Purity {
     eiv_stats: BTreeMap<String, (f64, f64)>,
     prosody: HashMap<String, Value>,
     pub records: Vec<Record>,
+    /// Which cluster run this is (`fingerprint`). Records name the run they
+    /// were made on, so a rebuild that renumbers the clusters can't put his
+    /// old decisions on the wrong ones; records without a run count for any.
+    pub run: String,
     /// The clusters he picked to listen to; empty means one at a time, in
     /// order. Not saved: it's how he listens, not what he heard.
     pub selected: Vec<String>,
@@ -175,6 +179,18 @@ fn sha(id: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// A hash of every formed clip's cluster, the same as jobs/classes.py's
+/// `fingerprint`, so the page and the classes stage agree on the run.
+fn fingerprint(memberships: &[Membership]) -> String {
+    let mut formed: Vec<&Membership> = memberships.iter().filter(|m| m.formed).collect();
+    formed.sort_by(|a, b| a.id.cmp(&b.id));
+    let text: String = formed
+        .iter()
+        .map(|m| format!("{}\t{}\n", m.id, m.cluster))
+        .collect();
+    sha(&text)[..12].to_string()
 }
 
 fn read_values(path: &Path) -> Result<Vec<Value>, Error> {
@@ -440,10 +456,12 @@ impl Purity {
             })
             .collect();
 
+        let run = fingerprint(&memberships);
         let path = root.join(PURITY);
         let records = if path.exists() {
             read_values(&path)?
                 .into_iter()
+                .filter(|v| v["run"].is_null() || v["run"].as_str() == Some(run.as_str()))
                 .filter_map(|v| serde_json::from_value(v).ok())
                 .collect()
         } else {
@@ -461,6 +479,7 @@ impl Purity {
             eiv_stats,
             prosody,
             records,
+            run,
             selected: Vec::new(),
         })
     }
@@ -799,7 +818,9 @@ impl Purity {
             .append(true)
             .open(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut line = serde_json::to_string(&record).expect("records serialize");
+        let mut value = serde_json::to_value(&record).expect("records serialize");
+        value["run"] = Value::String(self.run.clone());
+        let mut line = value.to_string();
         line.push('\n');
         file.write_all(line.as_bytes())
             .and_then(|()| file.sync_data())
@@ -1158,6 +1179,36 @@ mod tests {
             matches!(&again.records[0], Record::Decision { name: Some(n), .. } if n == "teasing")
         );
         assert!(again.waiting().is_none());
+    }
+
+    #[test]
+    fn fingerprint_matches_the_classes_stage() {
+        let m = |id: &str, cluster: &str, formed| Membership {
+            id: id.into(),
+            cluster: cluster.into(),
+            responsibilities: BTreeMap::new(),
+            formed,
+        };
+        // jobs/classes.py's fingerprint of the same rows.
+        let rows = [m("b", "c1", true), m("a", "c0", true), m("z", "c0", false)];
+        assert_eq!(fingerprint(&rows), "3dc5d47a4784");
+    }
+
+    #[test]
+    fn records_from_another_cluster_run_are_ignored() {
+        let (dir, mut p) = demo(60, 3);
+        p.decide("c0", Action::Name, Some("teasing".into()), None, None)
+            .unwrap();
+        let text = fs::read_to_string(dir.path().join(PURITY)).unwrap();
+        assert!(text.contains(&format!("\"run\":\"{}\"", p.run)));
+        // An old decision without a run still counts; one from another run doesn't.
+        let old = r#"{"kind":"decision","cluster":"c1","action":"reject","at":1}"#;
+        let other =
+            r#"{"kind":"decision","cluster":"c2","action":"reject","run":"0123456789ab","at":2}"#;
+        fs::write(dir.path().join(PURITY), format!("{text}{old}\n{other}\n")).unwrap();
+        let again = Purity::load(dir.path()).unwrap();
+        assert_eq!(again.records.len(), 2);
+        assert_eq!(again.current(), Some("c2"));
     }
 
     #[test]
