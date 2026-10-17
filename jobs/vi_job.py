@@ -233,9 +233,10 @@ class Clip:
         return bool(self.text.strip()) and not self.nonverbal
 
 
-def load_clips():
+def load_clips(limit=True):
     """Harvest's lines, with prep's trim and 16 kHz copy when prep has run
-    and clean's audio and transcript when clean has run.
+    and clean's audio and transcript when clean has run. `limit=False`
+    ignores the stage's `limit` setting.
 
     Clips prep found silent or clean dropped (`keep: false`) are left out.
     Without clean, a clip's duration is prep's trimmed one.
@@ -288,9 +289,9 @@ def load_clips():
                 line=line,
             )
         )
-    limit = settings().get("limit")
-    if limit:
-        clips = spread(clips, int(limit))
+    n = settings().get("limit") if limit else None
+    if n:
+        clips = spread(clips, int(n))
     return clips
 
 

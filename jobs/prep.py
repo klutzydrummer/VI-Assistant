@@ -39,7 +39,7 @@ import json
 import math
 
 import checks
-from vi_job import load_clips, log, out_dir, settings, write_jsonl
+from vi_job import load_clips, log, out_dir, settings, spread, write_jsonl
 
 RATE_16K = 16_000
 FRAME = 2048  # librosa.effects.trim's defaults, which clean used before prep
@@ -55,7 +55,8 @@ def main():
 
     s = settings()
     out = out_dir()
-    clips = load_clips()
+    every = load_clips(limit=False)
+    clips = spread(every, int(s["limit"])) if s.get("limit") else every
     top_db = float(s.get("top_db", 40))
     pad_s = float(s.get("pad_s", 0.05))
     target = float(s.get("target_lufs", -23))
@@ -67,7 +68,7 @@ def main():
     if s.get("eq_match", False):
         import eq_match
 
-        eq, eq_report = eq_match.fit(clips)
+        eq, eq_report = eq_match.fit(every)  # on every clip, whatever the limit
         log(f"prep: eq match {eq_report.get('fitted_on') or eq_report['skipped']}")
     firs = {}
 
