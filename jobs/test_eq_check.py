@@ -35,6 +35,23 @@ class CompareTest(unittest.TestCase):
         self.assertGreater(a["correlation"], 0.5)
         self.assertIn("Chance", eq_check.markdown(r))
 
+    def test_every_embedding_gets_its_own_probe(self):
+        rng = np.random.default_rng(1)
+        n = 150
+        game = np.array(["le1", "le2", "le3"] * (n // 3))
+        group = np.array([f"c{i}" for i in range(n)])
+        x = rng.standard_normal((n, 8))
+        shifted = x + np.array([{"le1": 3.0, "le2": 0.0, "le3": -3.0}[g] for g in game])[:, None]
+        before = {"emotion2vec_plus_large": x, "wavlm_L06": shifted}
+        after = {"emotion2vec_plus_large": x, "wavlm_L06": x}
+        same = scores(rng.random(n), rng.random(n))
+        r = eq_check.compare(list(range(n)), game, group, before, after, same, same)
+        self.assertEqual(sorted(r["embeddings"]), ["emotion2vec_plus_large", "wavlm_L06"])
+        w = r["embeddings"]["wavlm_L06"]["game_probe"]
+        self.assertGreater(w["before"] - w["after"], 0.3, w)
+        self.assertEqual(r["game_probe"], r["embeddings"]["emotion2vec_plus_large"]["game_probe"])
+        self.assertIn("wavlm_L06", eq_check.markdown(r))
+
 
 if __name__ == "__main__":
     unittest.main()
