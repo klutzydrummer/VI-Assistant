@@ -81,7 +81,9 @@ impl Default for Search {
             max_dph: 0.40,
             min_reliability: 0.98,
             min_inet_down_mbps: 200.0,
-            min_cuda: 12.8,
+            // textscore's vLLM brings torch built for CUDA 13; older
+            // drivers leave it no GPU. Newer drivers still run CUDA 12 jobs.
+            min_cuda: 13.0,
             min_compute_cap: 800,
             verified: true,
             countries: Vec::new(),
