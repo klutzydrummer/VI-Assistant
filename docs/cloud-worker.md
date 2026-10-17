@@ -11,6 +11,7 @@ Heavy jobs run on a GPU rented from Vast.ai. The worker keeps nothing that matte
 - `vi cloud ssh [command]`: a shell on the worker.
 - `jobs/check-worker.sh`: checks the full round trip a GPU stage makes. It sends a random token up through `on-worker.sh` as a stage input, runs a tiny job that copies it into its output and its checkpoint, and passes only if both copies come home matching. It prints what the worker has (GPU, disk free, Python, torch). Run it after `vi cloud up` to confirm home can reach the worker, send files, run code and get results and checkpoints back. All connections are home's ssh; the worker never connects to home.
 - `vi cloud env` and `vi cloud touch`: used by `jobs/on-worker.sh`.
+- `python3 jobs/progress.py corpus/tali [--watch 60]`: how far a running stage has got, as a percentage per pass, read from its log at home; `--watch` adds the time left in the current pass. It reads only logs, so it works for GPU and home stages alike and changes no stage's key.
 
 ## Keeping the budget safe
 Two guards, so a forgotten worker can't drain the credit:
