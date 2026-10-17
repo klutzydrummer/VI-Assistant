@@ -65,8 +65,10 @@ def corrections(curves):
     for game, c in curves.items():
         d = np.where(band, target - c, 0.0)
         d = np.clip(np.nan_to_num(d), -MAX_DB, MAX_DB)
-        # Remove the overall offset so the match changes colour, not level.
-        d[band] -= np.mean(d[band])
+        # Remove the overall offset so the match changes colour, not level:
+        # each octave weighs the same (the grid is linear, so a plain mean
+        # would be mostly the top octave).
+        d[band] -= np.average(d[band], weights=1 / g[band])
         out[game] = d
     return target, out
 
@@ -115,10 +117,39 @@ def page(rows, games, out):
     (out / "index.html").write_text("\n".join(parts))
 
 
-def main():
+def fit(clips, path=lambda c: c.audio):
+    """The per-game corrections, fitted on the comparable clips
+    (confounds.Meta.comparable, its fixed seed) read from `path(clip)`.
+    Returns ({game: correction_db on the probe's grid}, report), or
+    (None, {"skipped": why}) when fewer than two games have comparable clips."""
     import soundfile as sf
 
     import confounds as cf
+
+    rows, rule = cf.Meta(clips).comparable(np.random.default_rng(cf.SEED))
+    spectra = {}
+    for n, i in enumerate(rows):
+        c = clips[i]
+        x, sr = sf.read(str(path(c)), dtype="float64", always_2d=True)
+        s = fp.clip_spectrum(x.mean(axis=1), sr)
+        if s is not None:
+            spectra.setdefault(c.game, []).append(s)
+        if (n + 1) % 250 == 0:
+            print(f"eq_match: {n + 1}/{len(rows)}", file=sys.stderr, flush=True)
+    if len(spectra) < 2:
+        return None, {"skipped": f"comparable clips from {len(spectra)} game(s); needs 2", "rule": rule}
+    _, corr = corrections(game_curves(spectra))
+    g = fp.grid()
+    thirds = {game: {str(t): round(float(np.interp(t, g, d)), 1) for t in fp.THIRDS if F_LO <= t <= F_HI}
+              for game, d in corr.items()}  # fmt: skip
+    return corr, {"fitted_on": {gm: len(v) for gm, v in spectra.items()}, "rule": rule,
+                  "range_hz": [F_LO, F_HI], "max_db": MAX_DB,
+                  "correction_db_at_third_octaves": thirds, "rows": [int(i) for i in rows]}  # fmt: skip
+
+
+def main():
+    import soundfile as sf
+
     from vi_job import load_clips
 
     ap = argparse.ArgumentParser()
@@ -134,42 +165,23 @@ def main():
         except FileNotFoundError:
             pass
     clips = load_clips()
-    meta = cf.Meta(clips)
-    rng = np.random.default_rng(cf.SEED)
-    comparable, rule = meta.comparable(rng)
-    print(f"fitting on {len(comparable)} comparable clips ({rule})", file=sys.stderr)
 
     def raw(c):
         return harvest / c.line["audio"]["path"]  # as shipped
 
-    spectra = {}
-    for n, i in enumerate(comparable):
-        c = clips[i]
-        x, sr = sf.read(raw(c), always_2d=False)
-        x = x.mean(axis=1) if x.ndim > 1 else x
-        s = fp.clip_spectrum(np.asarray(x, dtype=np.float64), sr)
-        if s is not None:
-            spectra.setdefault(c.game, []).append(s)
-        if (n + 1) % 250 == 0:
-            print(f"{n + 1}/{len(comparable)}", file=sys.stderr, flush=True)
-    curves = game_curves(spectra)
-    target, corr = corrections(curves)
+    corr, report = fit(clips, raw)
+    if corr is None:
+        sys.exit(f"eq_match: {report['skipped']}")
+    comparable = report.pop("rows")
 
     out = Path(a.out) if a.out else Path(a.corpus) / "analysis" / "eq_match"
     (out / "audio").mkdir(parents=True, exist_ok=True)
-    g = fp.grid()
-    thirds = {}
-    for game, d in corr.items():
-        thirds[game] = {str(t): round(float(np.interp(t, g, d)), 1) for t in fp.THIRDS if F_LO <= t <= F_HI}
-    report = {"fitted_on": {gm: len(v) for gm, v in spectra.items()}, "rule": rule,
-              "range_hz": [F_LO, F_HI], "max_db": MAX_DB,
-              "correction_db_at_third_octaves": thirds}  # fmt: skip
-    (out / "eq_match.json").write_text(json.dumps(report | {"grid_hz": g.tolist(),
-        "target_db": np.nan_to_num(target).tolist(), "correction_db": {k: v.tolist() for k, v in corr.items()}}))  # fmt: skip
+    (out / "eq_match.json").write_text(json.dumps(report | {"grid_hz": fp.grid().tolist(),
+        "correction_db": {k: v.tolist() for k, v in corr.items()}}))  # fmt: skip
     print(json.dumps(report, indent=1))
 
     # Clips to hear: spread over each game's comparable clips (same rule, so
-    # what you hear is what the fit saw), plus barks for the short end.
+    # what you hear is what the fit saw).
     rows = []
     for game in sorted(corr):
         pool = [clips[i] for i in comparable if clips[i].game == game]

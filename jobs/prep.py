@@ -21,13 +21,18 @@ docs/design/corpus-format.md, prep. Per clip:
                vocal effort. The gain is capped so the peak stays under
                `max_peak_dbfs` (flag gain_capped). The level before the gain is
                kept as a covariate.
+  eq match     optional (setting eq_match, off by default): before the level,
+               the clip goes through its game's EQ correction, fitted first
+               on the comparable clips (eq_match.fit), so the three games'
+               suit EQ doesn't steer the analysis models. Trim bounds and the
+               noise floor come from the audio as shipped.
   audio16k     a 16 kHz FLAC copy, trimmed and levelled, for embedding only.
                The 24 kHz originals stay as harvest wrote them.
 
 Outputs: prep.jsonl, audio16k/<id>.flac, prep.json, checks.json.
 
 Settings: top_db, pad_s, target_lufs, rms_below_s, max_peak_dbfs, bands,
-limit. Needs numpy, scipy and soundfile (nix-shell at home); no GPU.
+eq_match, limit. Needs numpy, scipy and soundfile (nix-shell at home); no GPU.
 """
 
 import json
@@ -58,16 +63,28 @@ def main():
     max_peak = float(s.get("max_peak_dbfs", -1))
     edges = band_edges(int(s.get("bands", 16)))
     log(f"prep: {len(clips)} clips")
+    eq, eq_report = None, None
+    if s.get("eq_match", False):
+        import eq_match
+
+        eq, eq_report = eq_match.fit(clips)
+        log(f"prep: eq match {eq_report.get('fitted_on') or eq_report['skipped']}")
+    firs = {}
 
     (out / "audio16k").mkdir(exist_ok=True)
     records = []
     for c in clips:
         data, rate = sf.read(str(c.audio), dtype="float64", always_2d=True)
         data = data.mean(axis=1)
+        fir = None
+        if eq and c.game in eq:
+            if (c.game, rate) not in firs:
+                firs[c.game, rate] = eq_match.fir(eq[c.game], rate)
+            fir = firs[c.game, rate]
         r = prepare(data, rate, top_db=top_db, pad_s=pad_s, target_lufs=target,
-                    rms_below_s=rms_below_s, max_peak_dbfs=max_peak, edges=edges)  # fmt: skip
+                    rms_below_s=rms_below_s, max_peak_dbfs=max_peak, edges=edges, fir=fir)  # fmt: skip
         audio = r.pop("audio16k")
-        rec = {"id": c.id, **r, "flags": []}
+        rec = {"id": c.id, **r, "eq_matched": fir is not None, "flags": []}
         if r["duration_s"] < 0.2:
             rec["flags"].append("silent")
         else:
@@ -81,6 +98,9 @@ def main():
 
     write_jsonl(out / "prep.jsonl", records)
     report = summary(records, s, edges)
+    if eq_report is not None:
+        eq_report.pop("rows", None)
+        report["eq_match"] = eq_report
     (out / "prep.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
     log(f"prep: {report['flags']}")
     n = max(1, len(records))
@@ -96,9 +116,10 @@ def main():
 
 
 def prepare(data, rate, top_db=40.0, pad_s=0.05, target_lufs=-23.0, rms_below_s=1.0,
-            max_peak_dbfs=-1.0, edges=None):  # fmt: skip
+            max_peak_dbfs=-1.0, edges=None, fir=None):  # fmt: skip
     """Everything prep does to one mono float clip. Returns the record fields
-    plus `audio16k`, the trimmed, levelled 16 kHz samples."""
+    plus `audio16k`, the trimmed, levelled 16 kHz samples. `fir`, when given,
+    is the clip's EQ correction (eq_match.fir), applied before the level."""
     import numpy as np
 
     edges = edges or band_edges(16)
@@ -110,6 +131,10 @@ def prepare(data, rate, top_db=40.0, pad_s=0.05, target_lufs=-23.0, rms_below_s=
     floor = noise_floor(noise, rate, edges) if len(noise) >= MIN_NOISE_S * rate else None
 
     kept = data[lo:hi]
+    if fir is not None:
+        import eq_match
+
+        kept = eq_match.apply(data, fir)[lo:hi]  # filtered whole, so the cut edges have context
     duration = len(kept) / rate
     method = "rms" if duration < rms_below_s else "bs1770"
     level = rms_db(kept) if method == "rms" else integrated_loudness(kept, rate)
