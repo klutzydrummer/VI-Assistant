@@ -132,7 +132,9 @@ pilot measures real token counts instead of guessing:
 
 ## 6. The pilot (about $3 to $4, hard cap $5)
 
-The same 40 of Brandon's gold lines in every arm, sent through the batch API.
+The same 40 of Brandon's gold lines in every arm, sent through the batch API. The other
+110 gold lines are held out: the pilot never sees them, so they give an honest final check
+(section 7). Arm X's examples are drawn from the 110 and left out of that check.
 
 | Arm | Model | Effort | Shape | Prompt |
 |---|---|---|---|---|
@@ -180,6 +182,9 @@ Decision rule, fixed before any result is seen:
 - Every request and raw response is saved with the model, the schema version and the usage,
   so any later analysis is free. Failed or refused lines are retried one by one; a line that
   still fails is listed, not guessed.
+- **Final check on the 110 held-out gold lines**, which the full run labels anyway, at no
+  extra cost. The same measures as the pilot. If the result is far below the pilot's, the
+  choice was fitted to the 40, and Brandon hears about it before the vocabulary step.
 - Song lines (`singing`) are included and flagged, since energy still matters there.
 
 ## 8. After the run (pennies, or free)
@@ -193,7 +198,30 @@ Decision rule, fixed before any result is seen:
 3. These rankings feed the existing route: nominate, Brandon confirms by ear, then vectors.
    Model output is never stored as his label.
 
-## 9. What Brandon is asked to decide
+## 9. How the gold labels are used, and where they could mislead
+
+They help as a floor and hurt only if treated as the full truth or as a vocabulary:
+- **Scoring:** recall on his moods is fair, because the checklist contains his 21 words. A
+  missing mark on his side isn't evidence, since he often chose only the top few, so extras
+  are judged by him, never counted as errors. One annotator's labels make any model look
+  worse than it is, so differences are read against the A-A2 noise floor.
+- **What the model can't have:** he labelled by ear, and the model gets only words and
+  measurements. Misses on delivery-only cues (sarcasm, deadpan) are expected and show which
+  moods need his listening rather than the text.
+- **Squeezed words:** where the old list forced a near word (sad for lonely), the model may
+  give lonely 3 and sad 1. Recall uses a score of 1 or more and synonym families, so that
+  isn't a miss.
+- **Examples:** as few-shot examples they could narrow the vocabulary. They are kept only
+  if arm X earns it.
+- **Biased choice:** an arm that copies the old vocabulary could win on recall while finding
+  less. The extras-agreed measure is the counterweight, and both count in the decision rule.
+- **Thin moods:** 40 random lines have almost none of the rare moods, so the pilot judges
+  overall quality, not each mood. Rare and new moods (regret, lonely) are judged in his
+  listening review.
+- **After the run:** they set per-mood cut-offs for his 21 moods. New moods get their
+  cut-offs from the listening review.
+
+## 10. What Brandon is asked to decide
 
 1. Approve this plan. The PC session then changes digest.py and annotate.py to match and
    renders three prompts again for him to read. That step is free.
