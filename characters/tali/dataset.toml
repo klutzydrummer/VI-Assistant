@@ -203,6 +203,41 @@ batch = 64
 "RedHatAI/gemma-4-31B-it-FP8-dynamic" = "d4ab4f579dd3516f97d8a6a4c98d0653480bad15"
 "Qwen/Qwen3.6-27B-FP8" = "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
 
+# GPU, manual, each run only after Brandon's ok for it. Two decision models
+# (Kev-9B, Clef-flash) answer a yes/no question per mood and a rating per knob
+# for every line, as probabilities, writing no text (jobs/decide.py). On the
+# worker's own torch 2.8 / CUDA 12.8; it stops if a Qwen3.5 kernel falls back
+# to PyTorch. decide_smoke is the same job on 20 lines: run it first and read
+# its decide.json (load time, seconds per line, kernels) before decide.
+[stage.decide_smoke]
+command = ["../../jobs/on-worker.sh", "--put", "moods.toml", "python3", "jobs/decide.py"]
+inputs = ["context"]
+files = ["../../jobs/decide.py", "../../jobs/textscore.py", "../../jobs/vi_job.py", "../../jobs/checks.py",
+         "../../jobs/requirements-gpu.txt", "../../jobs/requirements-decide.txt", "moods.toml"]
+manual = true
+
+[stage.decide_smoke.settings]
+checks = "warn"
+limit = 20
+chunk = 10
+kev_source = "https://github.com/jaredpalmer/kev/archive/1f04cfa28e6a708485b28a9585010b9e436b776e.tar.gz"
+kev = { repo = "jaredpalmer/kev-9b", revision = "db029f08b290afd9fee4aa4bbcd9ae48602d1eb0" }   # pinned 2026-10-18
+clef = { repo = "Cloudflare/clef-flash", revision = "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3" }
+
+[stage.decide]
+command = ["../../jobs/on-worker.sh", "--put", "moods.toml", "python3", "jobs/decide.py"]
+inputs = ["context"]
+files = ["../../jobs/decide.py", "../../jobs/textscore.py", "../../jobs/vi_job.py", "../../jobs/checks.py",
+         "../../jobs/requirements-gpu.txt", "../../jobs/requirements-decide.txt", "moods.toml"]
+manual = true
+
+[stage.decide.settings]
+checks = "warn"
+chunk = 64
+kev_source = "https://github.com/jaredpalmer/kev/archive/1f04cfa28e6a708485b28a9585010b9e436b776e.tar.gz"
+kev = { repo = "jaredpalmer/kev-9b", revision = "db029f08b290afd9fee4aa4bbcd9ae48602d1eb0" }   # pinned 2026-10-18
+clef = { repo = "Cloudflare/clef-flash", revision = "8b2e5fd17c09fd49bc2880b805d5323ec7ff4ff3" }
+
 # The steer test (jobs/steer.py) read label's axes, which this pipeline no
 # longer has; it comes back built on the classes. Its old definition:
 # # GPU, manual: runs only as `vi dataset run characters/tali/dataset.toml steer`.
