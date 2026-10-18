@@ -127,7 +127,8 @@ Measures:
    his. A new mood the model rates higher, such as lonely, can't push one of his out of the
    top k, so finding better words is never penalised. Scattering 1s can't win this either.
    Gold says only what he heard within the old 20; new moods are judged by measure 3 and by
-   his listening review, never against gold.
+   his listening review, never against gold. Gold `informational` is left out of this
+   score, because the checklist redefines it as plain delivery.
 2. **Paired bootstrap** over lines for each arm against S0: a 95% interval on the
    difference. With 150 lines, a real gap of about 7 points shows; smaller ones don't.
 3. **Agreed-extra rate**: per arm, 25 random cases where it scored a mood 3 and Brandon
