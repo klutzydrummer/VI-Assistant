@@ -143,6 +143,10 @@ The same 40 of Brandon's gold lines in every arm, sent through the batch API.
 | G | Opus 5.5 | low | grouped | base; the gold line's conversation-mates come along and are reused in the full run if G wins |
 | X | Opus 5.5 | low | single | base plus Brandon's labelled examples |
 
+Free words are grouped into synonym families before any comparison (a first quick pass of
+the merge in section 8), so "remorse" in one arm and "regret" in another count as the same.
+Open-vocabulary benchmarks such as OV-MER do this for the same reason.
+
 What gets measured:
 1. **Gold recall**: of the moods Brandon marked, how many the checklist scores 1 or more.
    This is the fair half of the comparison. A mood the model adds that he didn't mark is
@@ -152,9 +156,12 @@ What gets measured:
    He marks agree or disagree while the clip plays. Roughly 250 clicks, about 20 minutes.
    This is the measure of what the open list adds, and it is his call, not the model's.
 3. **Energy** within one step of his rating (after binning), and **intoxication** exact.
-4. **Self-consistency** (A against A2): the noise floor. Differences between arms smaller
+4. **Over-reading neutral lines**: on lines Brandon marked informational, how often an arm
+   adds emotions at strength 2 or more. A GoEmotions study found GPT-4 tends to read feeling
+   into neutral sentences.
+5. **Self-consistency** (A against A2): the noise floor. Differences between arms smaller
    than this mean nothing.
-5. **Measured cost per line** for each arm, from the API's usage numbers.
+6. **Measured cost per line** for each arm, from the API's usage numbers.
 
 Decision rule, fixed before any result is seen:
 - Only arms whose measured full-run cost fits the remaining credit with a 15% margin qualify.
