@@ -6,7 +6,7 @@ with sources). The main changes from v1 are at the end.
 
 Goal: one paid pass of Claude over all 3,085 corpus lines that we never need to repeat. The
 output feeds a merged emotion vocabulary for Brandon to prune, per-mood rankings for his
-listening review, and in the end the per-mood control vectors for the TTS and the chat model.
+light spot check, and in the end the per-mood control vectors for the TTS and the chat model.
 
 Budget: $20 of API credit, everything included. Only text goes out (lines, conversation,
 scene data, voice measurements written as words). Audio never leaves home.
@@ -48,7 +48,7 @@ Per line, as in the current PC prompt (`corpus/tali/analysis/annotate/digest.py`
 
 System prompt, frozen and cached for an hour, about 1,600 tokens:
 1. Purpose: these labels pick her real recordings that teach a voice and chat model each
-   feeling, and Brandon checks the picks by ear. Mark what is in this line now, not what is
+   feeling, and Brandon spot-checks a few of them. Mark what is in this line now, not what is
    typical for her.
 2. A character brief of about 300 words: her arc per game, the suit, her speech habits.
 3. What each input section is.
@@ -127,13 +127,14 @@ Measures:
    his. A new mood the model rates higher, such as lonely, can't push one of his out of the
    top k, so finding better words is never penalised. Scattering 1s can't win this either.
    Gold says only what he heard within the old 20; new moods are judged by measure 3 and by
-   his listening review, never against gold. Gold `informational` is left out of this
+   agreement between samples, never against gold. Gold `informational` is left out of this
    score, because the checklist redefines it as plain delivery.
 2. **Paired bootstrap** over lines for each arm against S0: a 95% interval on the
    difference. With 150 lines, a real gap of about 7 points shows; smaller ones don't.
 3. **Agreed-extra rate**: per arm, 25 random cases where it scored a mood 3 and Brandon
    didn't mark it. Pooled and shuffled, arm hidden; he answers "is this feeling in the line,
-   in words or voice?" while the clip plays. About 100 clicks.
+   from what she says and the scene?" by reading the line in context; playing the clip is
+   optional. About 100 clicks.
 4. **Inflation**: how many moods per line score 2 or more, and how many lines have no zeros
    among the original 20.
 5. **Self-agreement**: S0 against S0 reversed. This shows the order effect and the noise.
@@ -149,12 +150,15 @@ Measures:
    and its inflation is at most 1.3 times S0's. If several qualify, the cheapest wins.
 4. Second sample: if S0 agrees with itself poorly (median agreement across moods below 0.6),
    a full second sample is the first use of the remaining money. Otherwise the second sample
-   covers only lines with some mood at 2 or more. H0 may serve as the second sample if its
+   covers only lines with some mood at 2 or more. Because positives now rest on the
+   two samples agreeing rather than on Brandon's ears, the second sample is the first use of
+   any remaining money. H0 may serve as the second sample if its
    recall at k is within 5 points of S0's.
 5. If nothing qualifies, stop and bring Brandon the options.
 
-Rare moods can't be judged on 150 random lines. They are judged by how often Brandon
-confirms the nominated lines in his listening review, which is recorded as the final test.
+Rare moods can't be judged on 150 random lines. They are judged by whether two independent
+samples agree on them (section 4), plus a light spot check: Brandon reads about 5 top-ranked
+lines per mood in context and marks any that are wrong. His ears are not a gate.
 
 ## 6. The full run, done so it never needs repeating
 
@@ -173,12 +177,13 @@ confirms the nominated lines in his listening review, which is recorded as the f
 1. **Vocabulary:** checklist moods plus other-feeling words, embedded locally and clustered.
    One small call over the word list alone (no game text) proposes families. Brandon prunes.
 2. **Score matrix:** lines × moods, averaged over samples. A mood that exists only in free
-   words is grown from the lines Brandon confirms by nearest-neighbour search on the text
+   words is grown from the lines both samples score highly, by nearest-neighbour search on the text
    embeddings we already have, with no paid rerun.
 3. **Rankings per mood:** by score, preferring lines where the mood stands out (fewer other
    3s), keeping some implied lines, and spread across games and scenes so the LE3 party
    doesn't fill amused and teasing.
-4. **Sets for vectors:** positives at 3 (or 2.5 averaged), confirmed by ear. Negatives at 0
+4. **Sets for vectors:** positives where both samples give 3 (or average 2.5 or more), with no
+   listening required. Brandon's spot check can remove lines but isn't needed to add them. Negatives at 0
    on that mood, matched on game, measured energy and length, ideally from the same session.
    A neutral baseline from lines with every mood at 1 or below. When vectors are fitted
    together, measured energy is factored out so a mood vector doesn't absorb the energy knob.
