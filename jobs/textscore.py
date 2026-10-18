@@ -201,6 +201,25 @@ def parse(text, moods):
 # --- models --------------------------------------------------------------------------------
 
 
+def cuda_lib_env():
+    """The environment for the vLLM passes, with the venv's NVIDIA library
+    folders first on LD_LIBRARY_PATH. vLLM's torch is built for CUDA 13 and
+    compiles kernels with NVRTC at start-up, and NVRTC finds its
+    libnvrtc-builtins by the library path; the image's own path points at its
+    CUDA 12.8, so Gemma stopped with "failed to open
+    libnvrtc-builtins.so.13.0" right after a 31 GB download (2026-10-18).
+    Exits at once when the venv has no such library at all."""
+    dirs = sorted({str(f.parent) for p in map(Path, sys.path) if (p / "nvidia").is_dir()
+                   for f in (p / "nvidia").glob("**/lib/lib*.so*")})  # fmt: skip
+    if not any(Path(d, n).exists() for d in dirs for n in os.listdir(d) if n.startswith("libnvrtc-builtins")):
+        sys.exit("textscore: no libnvrtc-builtins in this venv's nvidia packages; vLLM can't compile its kernels. "
+                 f"Looked in: {dirs or 'no nvidia/*/lib folders'}")  # fmt: skip
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = ":".join(dirs + [env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else dirs)
+    log(f"textscore: NVIDIA libraries first on the path for vLLM: {', '.join(dirs)}")
+    return env
+
+
 def device():
     """Always the GPU: on the CPU the NLI model crawls and vLLM can't run, so
     a worker whose driver is too old for this torch fails here, not hours
@@ -421,6 +440,8 @@ def main():
     batch = int(s.get("batch", 64))
     labels = moods.labels()
     log(f"textscore: {len(lines)} lines, {len(moods.moods)} moods, {len(moods.knobs)} knobs")
+    # Before any model loads, so a worker that can't run vLLM fails in seconds.
+    llm_env = cuda_lib_env() if "llm" in chosen and not fake else os.environ
     started = time.time()
     (out / "scores").mkdir(exist_ok=True)
     counts = {}
@@ -471,7 +492,7 @@ def main():
     llm_report = {}
     if "llm" in chosen:
         for name in llms:
-            subprocess.run([sys.executable, str(Path(__file__).resolve()), "--llm", name], check=True, env=os.environ)
+            subprocess.run([sys.executable, str(Path(__file__).resolve()), "--llm", name], check=True, env=llm_env)
             rows = read_jsonl(out / "llm" / f"{name}.jsonl")
             llm_report[name] = llm_summary(rows)
             counts[f"llm.{name}"] = len(rows)
