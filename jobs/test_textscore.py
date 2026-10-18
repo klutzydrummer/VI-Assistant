@@ -157,6 +157,7 @@ class CudaLibEnv(unittest.TestCase):
                 (lib / "libnvrtc-builtins.so.13.0").touch()
                 env = textscore.cuda_lib_env()
                 self.assertEqual(env["LD_LIBRARY_PATH"], f"{lib}:/usr/local/cuda/lib64")
+                self.assertEqual(env["VLLM_USE_FLASHINFER_SAMPLER"], "0")
             finally:
                 sys.path[:] = old_path
                 if old_ld is None:

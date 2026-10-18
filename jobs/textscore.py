@@ -208,7 +208,11 @@ def cuda_lib_env():
     libnvrtc-builtins by the library path; the image's own path points at its
     CUDA 12.8, so Gemma stopped with "failed to open
     libnvrtc-builtins.so.13.0" right after a 31 GB download (2026-10-18).
-    Exits at once when the venv has no such library at all."""
+    Exits at once when the venv has no such library at all.
+
+    Also turns off vLLM's FlashInfer top-k/top-p sampler: it JIT-compiles with
+    nvcc, which the runtime image lacks, so Gemma stopped at its first
+    sampling step (2026-10-18). vLLM's own PyTorch sampler needs no compiler."""
     dirs = sorted({str(f.parent) for p in map(Path, sys.path) if (p / "nvidia").is_dir()
                    for f in (p / "nvidia").glob("**/lib/lib*.so*")})  # fmt: skip
     if not any(Path(d, n).exists() for d in dirs for n in os.listdir(d) if n.startswith("libnvrtc-builtins")):
@@ -216,6 +220,7 @@ def cuda_lib_env():
                  f"Looked in: {dirs or 'no nvidia/*/lib folders'}")  # fmt: skip
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = ":".join(dirs + [env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else dirs)
+    env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     log(f"textscore: NVIDIA libraries first on the path for vLLM: {', '.join(dirs)}")
     return env
 
@@ -373,6 +378,24 @@ def llm_pass(name):
     (out / "llm" / f"{name}.prompt.txt").write_text(system + "\n")
 
 
+# A tiny model run through the same vLLM path before the 31 GB downloads, so a
+# missing compiler or library on the worker shows up in a minute.
+SMOKE_REPO, SMOKE_REVISION = "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"
+
+
+def llm_smoke():
+    """Called as `textscore.py --llm-smoke` by main(). Loads, compiles and
+    samples once, with the real JSON schema; the answer itself is thrown away."""
+    s = settings()
+    moods = load_moods()
+    max_moods = int(s.get("max_moods", 4))
+    cfg = {"repo": SMOKE_REPO, "max_model_len": 1024, "gpu_memory_utilization": 0.3}
+    generate = vllm_generate(cfg, {**s, "max_tokens": 16, "revisions": {SMOKE_REPO: SMOKE_REVISION}},
+                             schema(moods, max_moods), int(s.get("samples", 2)))  # fmt: skip
+    generate([[{"role": "user", "content": "Say hello."}]])
+    log("textscore: vLLM smoke test passed")
+
+
 def vllm_generate(cfg, s, shape, samples):
     from vllm import LLM, SamplingParams
 
@@ -424,6 +447,8 @@ def fake_generate(moods, samples):
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--llm":
         return llm_pass(sys.argv[2])
+    if sys.argv[1:] == ["--llm-smoke"]:
+        return llm_smoke()
     s = settings()
     # A dead download fails in a minute (and pip retries) instead of hanging.
     os.environ.setdefault("PIP_DEFAULT_TIMEOUT", "60")
@@ -442,6 +467,8 @@ def main():
     log(f"textscore: {len(lines)} lines, {len(moods.moods)} moods, {len(moods.knobs)} knobs")
     # Before any model loads, so a worker that can't run vLLM fails in seconds.
     llm_env = cuda_lib_env() if "llm" in chosen and not fake else os.environ
+    if "llm" in chosen and not fake:
+        subprocess.run([sys.executable, str(Path(__file__).resolve()), "--llm-smoke"], check=True, env=llm_env)
     started = time.time()
     (out / "scores").mkdir(exist_ok=True)
     counts = {}
