@@ -25,6 +25,8 @@ pub(crate) const USAGE: &str = "usage:
   vi review --demo <empty-folder> [--port N]
   vi review --purity <corpus-folder> [--port N]
   vi review --purity --demo <empty-folder> [--port N]
+  vi review --gold <corpus-folder> [--moods <moods.toml>] [--port N]
+  (every review mode also takes --host ADDR; default 127.0.0.1)
   vi cloud offers
   vi cloud up [--offer ID] [--yes]
   vi cloud down
@@ -164,18 +166,37 @@ fn pack_check(dir: PathBuf) -> ExitCode {
     }
 }
 
-/// Serve the label review page, or with `--purity` the cluster purity
-/// review, for a corpus on localhost.
+/// Serve the label review page, with `--purity` the cluster purity review,
+/// or with `--gold` the gold labelling page, for a corpus. On localhost
+/// unless `--host` names another address (a reverse proxy's bridge, say).
 fn review(args: &[&str]) -> ExitCode {
     let mut port = 8737u16;
+    let mut host = String::from("127.0.0.1");
     let mut demo = false;
     let mut purity = false;
+    let mut gold = false;
+    let mut moods = None;
     let mut dir = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match *arg {
             "--demo" => demo = true,
             "--purity" => purity = true,
+            "--gold" => gold = true,
+            "--moods" => match args.next() {
+                Some(m) => moods = Some(PathBuf::from(m)),
+                None => {
+                    eprintln!("--moods needs a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--host" => match args.next() {
+                Some(h) => host = h.to_string(),
+                None => {
+                    eprintln!("--host needs an address");
+                    return ExitCode::from(2);
+                }
+            },
             "--port" => match args.next().and_then(|p| p.parse().ok()) {
                 Some(p) => port = p,
                 None => {
@@ -216,7 +237,43 @@ fn review(args: &[&str]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("{host}:{port}");
+
+    if gold {
+        // characters/<name>/moods.toml next to corpus/<name>, unless given.
+        let moods = moods.unwrap_or_else(|| {
+            let name = dir.file_name().unwrap_or_default();
+            dir.join("../../characters").join(name).join("moods.toml")
+        });
+        let mut g = match review::gold::Gold::load(&dir, &moods) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "{} lines to label, {} labelled so far ({} moods, {} knobs from {})",
+            g.lines.len(),
+            g.labelled(),
+            g.moods.len(),
+            g.knobs.len(),
+            moods.display()
+        );
+        println!(
+            "gold labels at http://{addr}/  (Ctrl+C to stop; every save goes to {} as you go)",
+            dir.join(review::gold::GOLD).display()
+        );
+        return match review::server::serve_with(&addr, |post, url, body| {
+            review::gold::handle(&mut g, post, url, body)
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     if purity {
         let mut p = match review::purity::Purity::load(&dir) {

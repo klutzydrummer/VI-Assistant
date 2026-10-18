@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gold labels</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --yes: #2e7d4f; --no: #b3392f; --warn: #b8701a; --warn-soft: #f7e7d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --yes: #6fc492; --no: #e57b70; --warn: #e0a253; --warn-soft: #3d2f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 760px; margin: 0 auto; padding: 14px 16px 120px; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  h1 { font-size: 17px; margin: 0; }
+  h2 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .bar { flex: 1 1 120px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar div { height: 100%; background: var(--accent); width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .tag { display: inline-block; background: var(--accent-soft); border-radius: 999px; padding: 1px 9px; font-size: 12px; margin: 0 4px 6px 0; }
+  .flag { display: inline-block; background: var(--warn-soft); color: var(--warn); border-radius: 999px; padding: 1px 9px; font-size: 12px; margin: 0 4px 6px 0; }
+  .ctx p { margin: 3px 0; color: var(--muted); font-size: 14px; }
+  .ctx b { font-weight: 600; }
+  .say { font-size: 19px; margin: 8px 0; padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 6px; }
+  button {
+    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 10px; padding: 10px 12px; cursor: pointer; touch-action: manipulation;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .moods { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  .mood { text-align: left; padding: 9px 11px; min-height: 52px; }
+  .mood .d { display: block; font-size: 12px; color: var(--muted); line-height: 1.25; }
+  .mood.on { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+  .mood.on .d { color: inherit; opacity: .85; }
+  .knob { margin: 8px 0; }
+  .knob .seg { display: flex; gap: 6px; flex-wrap: wrap; }
+  .knob .seg button { flex: 1 1 0; min-width: 90px; }
+  .knob .seg button.on { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .unsure.on { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+  textarea { font: inherit; width: 100%; min-height: 44px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--panel); color: var(--text); }
+  .dock {
+    position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line);
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  }
+  .dock .in { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; }
+  .dock button { padding: 12px; }
+  .dock .save { flex: 1; background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+  .saved { color: var(--yes); }
+  .err { color: var(--no); }
+  .hidden { display: none; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Gold labels</h1>
+    <span id="progress" class="muted small"></span>
+    <div class="bar"><div id="barfill"></div></div>
+  </header>
+  <p id="msg" class="small muted"></p>
+
+  <div id="card" class="panel hidden">
+    <div id="tags"></div>
+    <div id="before" class="ctx"></div>
+    <div id="say" class="say"></div>
+    <div id="after" class="ctx"></div>
+    <div id="state" class="small muted"></div>
+  </div>
+
+  <div id="form" class="hidden">
+    <h2>Moods it really carries <span class="muted" style="text-transform:none;font-weight:400">(any number, or none)</span></h2>
+    <div id="moods" class="moods"></div>
+    <h2>Knobs</h2>
+    <div id="knobs"></div>
+    <h2>Anything else</h2>
+    <div class="row">
+      <button id="unsure" class="unsure" type="button">Unsure</button>
+      <span class="small muted">judge from the words and situation only</span>
+    </div>
+    <p><textarea id="notes" placeholder="Note (optional)"></textarea></p>
+    <details><summary>How to label</summary>
+      <p class="small">Tap every mood the line really carries, or none. Pick one level per knob. Mark it unsure when you would want to hear it.
+      You can go back and change any line; the last save counts. Every save is written to gold.jsonl immediately.</p>
+    </details>
+  </div>
+</main>
+
+<div class="dock">
+  <div class="in">
+    <button id="prev" type="button" aria-label="Previous line">&lsaquo;</button>
+    <button id="save" class="save" type="button">Save &amp; next</button>
+    <button id="skip" type="button" aria-label="Next line without saving">&rsaquo;</button>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let session = null, n = 1, picked = new Set(), knobs = {}, unsure = false, shownAt = Date.now();
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  return r.json();
+}
+
+function showProgress() {
+  $("progress").textContent = `${session.labelled} / ${session.count} labelled · line ${n}`;
+  $("barfill").style.width = `${(100 * session.labelled) / Math.max(1, session.count)}%`;
+}
+
+function buildForm() {
+  $("moods").innerHTML = session.moods.map((m) =>
+    `<button type="button" class="mood" data-id="${esc(m.id)}">${esc(m.id)}<span class="d">${esc(m.description)}</span></button>`).join("");
+  $("knobs").innerHTML = session.knobs.map((k) =>
+    `<div class="knob"><div class="small muted">${esc(k.id)}: ${esc(k.description)}</div><div class="seg">` +
+    k.levels.map((lv) => `<button type="button" data-knob="${esc(k.id)}" data-level="${esc(lv.id)}" title="${esc(lv.description)}">${esc(lv.id)}</button>`).join("") +
+    `</div></div>`).join("");
+  $("moods").onclick = (e) => {
+    const b = e.target.closest(".mood"); if (!b) return;
+    const id = b.dataset.id; picked.has(id) ? picked.delete(id) : picked.add(id); paint();
+  };
+  $("knobs").onclick = (e) => {
+    const b = e.target.closest("button[data-knob]"); if (!b) return;
+    const k = b.dataset.knob, v = b.dataset.level;
+    if (knobs[k] === v) delete knobs[k]; else knobs[k] = v; paint();
+  };
+}
+
+function paint() {
+  document.querySelectorAll(".mood").forEach((b) => b.classList.toggle("on", picked.has(b.dataset.id)));
+  document.querySelectorAll("button[data-knob]").forEach((b) => b.classList.toggle("on", knobs[b.dataset.knob] === b.dataset.level));
+  $("unsure").classList.toggle("on", unsure);
+}
+
+function lines(list) {
+  return (list || []).map((l) => `<p><b>${esc(l.speaker)}:</b> ${esc(l.text)}</p>`).join("");
+}
+
+async function show(k) {
+  n = Math.min(Math.max(1, k), session.count);
+  const item = await api(`/api/item?n=${n}`);
+  const line = item.line, label = item.label;
+  $("tags").innerHTML = (line.scene ? line.scene.split(", ").map((t) => `<span class="tag">${esc(t)}</span>`).join("") : "") +
+    (line.listener ? `<span class="tag">to ${esc(line.listener)}</span>` : "") +
+    (line.stage_direction ? `<span class="flag">${esc(line.stage_direction)}</span>` : "");
+  $("before").innerHTML = lines(line.before);
+  $("say").innerHTML = `<b>Tali:</b> ${esc(line.text)}`;
+  $("after").innerHTML = lines(line.after);
+  picked = new Set(label ? label.moods : []);
+  knobs = label ? { ...label.knobs } : {};
+  unsure = label ? !!label.unsure : false;
+  $("notes").value = label ? label.notes || "" : "";
+  $("state").innerHTML = label ? `<span class="saved">saved</span> · last save counts` : "not labelled yet";
+  $("prev").disabled = n <= 1; $("skip").disabled = n >= session.count;
+  $("card").classList.remove("hidden"); $("form").classList.remove("hidden");
+  paint(); showProgress(); shownAt = Date.now(); window.scrollTo(0, 0);
+  history.replaceState(null, "", `#${n}`);
+}
+
+async function save() {
+  $("save").disabled = true; $("msg").textContent = "";
+  try {
+    session = await api("/api/label", {
+      n, moods: [...picked], knobs, unsure, notes: $("notes").value, seconds: (Date.now() - shownAt) / 1000,
+    });
+    const after = session.done.findIndex((d, i) => !d && i + 1 > n);
+    const open = after >= 0 ? after + 1 : session.next;
+    if (open) await show(open);
+    else { showProgress(); $("msg").innerHTML = `<span class="saved">All ${session.count} lines labelled.</span> You can still go back and change any.`; }
+  } catch (e) { $("msg").innerHTML = `<span class="err">Not saved: ${esc(e.message)}</span>`; }
+  $("save").disabled = false;
+}
+
+$("unsure").onclick = () => { unsure = !unsure; paint(); };
+$("save").onclick = save;
+$("prev").onclick = () => show(n - 1);
+$("skip").onclick = () => show(n + 1);
+// Typing #N (or the browser's back button) jumps to that line.
+window.addEventListener("hashchange", () => {
+  const k = parseInt(location.hash.slice(1), 10);
+  if (session && k > 0 && k !== n) show(k);
+});
+
+(async () => {
+  try {
+    session = await api("/api/session");
+    buildForm();
+    const hash = parseInt(location.hash.slice(1), 10);
+    await show(hash > 0 ? hash : session.next || 1);
+  } catch (e) { $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+})();
+</script>
+</body>
+</html>
