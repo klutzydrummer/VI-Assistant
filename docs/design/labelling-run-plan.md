@@ -1,215 +1,178 @@
-# Open-vocabulary labelling run: the plan (v2)
+# Claude labelling run: the plan (v3)
 
-Status: proposal v2, 2026-10-18, for Brandon to approve. Nothing has been sent to the API.
-v2 adopts an independent critic's review (`/mnt/project-files/annotate/critic-review.md`,
-with sources). The main changes from v1 are at the end.
+Status: proposal v3, 2026-10-18, for Brandon to approve. Nothing has been sent to the API.
+Checked against `labelling-run-requirements.md` and `/mnt/project-files/design/what-brandon-wants.md`.
 
-Goal: one paid pass of Claude over all 3,085 corpus lines that we never need to repeat. The
-output feeds a merged emotion vocabulary for Brandon to prune, per-mood rankings for his
-light spot check, and in the end the per-mood control vectors for the TTS and the chat model.
+**What changed in v3 (Brandon, 23:55):** Claude is the main source of mood labels. Brandon's
+150 gold labels, and the old 20-word list they were picked from, are removed from everything:
+the prompt, the scoring and the model choice. His ears are an optional spot check only. The
+$20 is Claude credit alone, separate from Vast credit.
 
-Budget: $20 of API credit, everything included. Only text goes out (lines, conversation,
-scene data, voice measurements written as words). Audio never leaves home.
+Goal: label all 3,085 corpus lines once, well enough to build the mood vocabulary, per-mood
+rankings, and per-mood control vectors (voice and chat), plus the energy, drunk and hungover
+knobs. Only text goes out: lines, conversation, scene data, and voice measurements in words.
 
-## 1. What each line gets
+## 1. The shape: Claude finds the moods, then Claude scores every line on them
 
-A **complete checklist**: a 0 to 3 score for every mood on a fixed list, on every line.
-Control vectors need clean positives *and* trustworthy zeros, and an open word list can't
-give zeros: a missing word could mean "not there" or "not mentioned". Every mood that might
-become a vector must have a complete score, or adding it later means paying again.
+There are two ways to label. Each covers the other's weakness, so the plan uses both in order.
 
-**Other feelings**: free words for anything the checklist misses or names too broadly. These
-catch what we didn't ask for. They seed later moods without a rerun (section 7).
+**Open listing** (no list given): Claude names whatever emotions it sees. This is best for
+finding moods, including ones nobody thought of. It's weak for building vectors, for three
+reasons:
+- **Omissions:** the model names what stands out and drops the rest, differently on similar
+  lines. So a missing word doesn't mean the mood is absent, and nothing can be ranked.
+- **Synonyms:** "remorse" and "regret" split one mood into two thin ones.
+- **No zeros:** a vector needs lines that clearly *lack* the mood, as well as lines that have it.
 
-The checklist is built in two steps:
-1. The 20 moods in `characters/tali/moods.toml`, plus seven the old list had no room for:
-   afraid, determined, regretful, lonely, guilty, hopeful, irritated. That's 27.
-2. A $0.40 probe on 30 non-gold lines (section 5) collects free words. About 10 of the most
-   useful (candidates: homesick or longing, resigned, defiant, frustrated, nervous, hurt,
-   protective, impressed, disgusted, playful) are added, **after Brandon okays the list**.
-   Then the list is frozen at about 37 moods.
+**Scoring against a list**: every line gets a 0 to 3 for every mood. This gives the complete,
+rankable scores and real zeros that the vectors need. But it only covers moods on the list.
 
-The checklist has boundaries for the overlapping pairs (angry vs irritated, worried vs
-afraid, flustered vs embarrassed, sad vs lonely vs regretful). `informational` is redefined
-as "plain delivery, no particular feeling", and `tired` lives only in `body`.
+So:
+1. **Pass 1, discover (open listing):** Claude lists the emotions in every line, freely.
+2. **Vocabulary:** Claude merges its own words into mood families. The list comes from Claude
+   reading her lines, not from Brandon's list.
+3. **Pass 2, score:** Claude scores every line 0 to 3 on every family, plus the knobs, plus free
+   words for anything still missing.
 
-A gold mapping table is written before any paid call. For example, gold angry ← the higher of
-angry and irritated.
+Pass 1 and pass 2 are two independent views of each line. Where they agree, a line is a
+trusted positive or a trusted zero, with no listening needed.
 
-## 2. What goes in
+**One exception to "Claude's list only":** the friend-and-assistant moods Brandon asked for
+(`design/must-have-moods.md`, e.g. reassuring, grateful, teasing) must be covered. After pass 1,
+any that Claude's vocabulary lacks are added to pass 2's list, so they get complete scores too.
+This list isn't the gold labels, and pass 1 never sees it.
 
-Per line, as in the current PC prompt (`corpus/tali/analysis/annotate/digest.py`):
+## 2. What goes in (both passes)
+
+Per line, built by `digest.py` on Brandon's PC:
 - `<where>`: game, scene tags, conversation, listener.
 - `<before>`: up to three lines before hers, including Shepard's choice.
-- `<line>`: her line plus the director's note. `TEMP:` notes are flagged as placeholders.
+- `<line>`: her line plus the director's note; `TEMP:` notes are flagged as placeholders.
 - `<replies>`: what follows, with alternatives marked "only one of these plays".
-- `<voice>`: pace, pitch, pitch movement, loudness and loudness variation in words, against
-  her lines **from the same game** (LE1 is mastered darker).
+- `<voice>`: pace, pitch, pitch movement, loudness and loudness variation in words, compared
+  with her lines from the same game.
 
-System prompt, frozen and cached for an hour, about 1,600 tokens:
-1. Purpose: these labels pick her real recordings that teach a voice and chat model each
-   feeling, and Brandon spot-checks a few of them. Mark what is in this line now, not what is
-   typical for her.
-2. A character brief of about 300 words: her arc per game, the suit, her speech habits.
+System prompt, frozen and cached for an hour:
+1. Purpose: these labels pick her recorded lines that teach a voice and chat model how she
+   sounds and talks in each feeling. Judge this line at this moment, not what's typical for her.
+2. A character brief of about 300 words: her arc in each game, the suit, her speech habits.
 3. What each input section is.
-4. Each output field, defined once.
-5. The checklist moods with one-line definitions and the boundaries.
-6. Scale: 0 = not there, or too faint to notice; 1 = a faint undertone; 2 = clearly present;
-   3 = a main feeling (two moods can both be 3).
-7. Rules: score every mood; a 0 is a real claim and should be used freely; other feelings
-   only for what the checklist misses; when a line could belong to two branches, judge the
-   most likely one.
+4. Each output field, defined once with one name.
 
-Left out: the speech-emotion classifier readings (wrong on two of three rendered examples,
-and anchoring) and few-shot examples from the gold lines (they teach the old list and carry
-known majority and recency biases). The code computes a `context_thin` flag (no lines before,
-no scene) instead of asking the model.
+Left out: Brandon's gold labels and old word list, any examples, and the speech-emotion
+classifier readings (wrong for her filtered voice). The code adds a `context_thin` flag
+(no lines before, no scene) instead of asking the model.
 
-## 3. What comes out (structured outputs; all keys required)
+## 3. What comes out
+
+Structured outputs; the API enforces the schema.
+
+**Pass 1 (open):**
 
 | Field | Type | Meaning |
 |---|---|---|
-| `reading` | text, about 15 words, first | what is going on for her in this moment; a short read before scoring |
-| `doing` | text, at most 8 words | what she does with the line: teasing Garrus, reporting a position |
-| `checklist` | object, about 37 keys, each 0 to 3 | as above |
-| `other_feelings` | list of `{word, strength 1 to 3}` | only what the checklist misses; often empty |
-| `stated` | stated, implied, none | whether her strongest feeling is said outright or only implied |
+| `reading` | text, about 15 words, first | what is going on for her in this moment |
+| `emotions` | list of `{word, strength 1 to 3}`, strongest first | every feeling present, in everyday words; empty only for a plain neutral report |
+| `doing` | text, at most 8 words | what she does with the line |
+
+**Pass 2 (score):**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `reading` | text, about 15 words, first | as above |
+| `scores` | object, one key per family, each 0 to 3 | 0 not there, 1 faint undertone, 2 clearly present, 3 a main feeling |
+| `other_feelings` | list of `{word, strength}` | anything no family covers; often empty |
+| `stated` | stated, implied, none | whether her strongest feeling is said outright |
 | `opposite_meaning` | true, false | sarcasm, irony, forced cheer |
-| `energy` | 1 to 5 | 1 subdued, 2 calm, 3 normal talk, 4 animated or raised, 5 urgent or shouting; covers loud excitement, not only danger |
+| `energy` | 1 to 5 | subdued, calm, normal, animated, urgent or shouting; covers loud excitement, not only danger |
 | `intoxication` | 0 to 3 | sober, tipsy, drunk, very drunk |
 | `body` | list from tired, sick, injured, out_of_breath, hungover | physical state |
 
-Dropped since v1: the per-emotion reasons and `basis` (the model can't hear her, so "rests on
-delivery" was guesswork), `confidence` (verbalised confidence is poorly calibrated; agreement
-between two samples is used instead), and `delivery_matches_words` (replaced by
-`opposite_meaning`). About 260 output tokens per line. Enum integers keep values on the scale.
+Integer fields are enums, so values stay on the scale.
 
-## 4. Models and shape
+## 4. Models and cost
 
-One line per request through the batch API (half price), keyed by line id. Grouping several
-lines per request is dropped: labels smear across a scene, the schema can't enforce how many
-answers come back, one failure loses several lines, and with caching it saves little.
+One line per request through the batch API (half price). No grouping: labels smear across a
+scene and one failure loses several lines.
 
-Configurations the pilot compares:
-- **S0**: Sonnet 5.5, thinking off (`between_tools`), effort low. About $5.5 for all lines with
-  the cache, $10 without.
-- **S1**: Sonnet 5.5, thinking on, effort low. About $10 to $15.
-- **O1**: Opus 5.5, effort low (thinking can't be turned off on Opus). About $15 to $20 with
-  the cache, $24 to $29 without. It fits only if caching works and its thinking stays short.
-- **H0**: Haiku 5.5, thinking off. About $0.50. Only as a cheap second opinion.
+Batch prices per million tokens: Sonnet 5.5 $1 in, $5 out; Opus 5.5 $2 in, $10 out. Sonnet can
+run with thinking off; Opus always thinks a little, even at effort low. Prices are re-checked
+the day of the run.
 
-These figures assume a 1,600-token cached prefix, a 320-token line and 260 output tokens.
-Prices are re-checked the day of the run.
+| Step | Default | Estimate |
+|---|---|---|
+| Pilot | 60 lines × 3 configurations × 2 samples | about $1 |
+| Pass 1, all lines, open | Sonnet, thinking off (Opus if the pilot says so) | about $3 to $4 (Opus: about $10 to $12) |
+| Vocabulary | one call over the word list alone | about $0.10 |
+| Pass 2, all lines, about 40 to 60 families | Sonnet, thinking off | about $6 to $9 |
+| Reserve | a second pass-2 sample on unclear lines | the rest |
 
-**Two samples per line where money allows**, the second with the checklist in reverse
-order, so order effects average out. Scores are averaged, and disagreement between the two
-samples marks uncertain lines.
+The total is about $11 to $15 on Sonnet. Opus for pass 1 brings it to about $18 to $22, which
+fits only if the pilot measures lower costs than estimated. These estimates assume a cached
+1,000 to 1,600-token prefix, a 320-token line, and 150 (pass 1) or 350 (pass 2) output tokens.
 
-## 5. Pilot
+## 5. Pilot (about $1), choosing the model without gold
 
-**P0 (free):** the PC session renders three prompts for Brandon and counts real input tokens
-(`count_tokens` is free). The gold mapping table and the decision rule below are committed
-before any paid call.
+P0 (free): the PC renders three prompts of each pass for Brandon to read, and counts real
+input tokens with the free `count_tokens` call.
 
-**P1, cost and vocabulary probe (about $0.40):** 30 random non-gold lines through S0, S1, O1
-and H0. It measures real tokens and thinking per configuration, parse failures and refusals,
-and collects free words for the extra checklist moods. Bugs get fixed here and only here.
-Then Brandon okays the extra moods and **the prompt is frozen** (hash recorded).
+P1: 60 random lines, pass-1 style, through Opus (effort low), Sonnet (thinking off) and Sonnet
+(effort low), **each run twice**. Words are grouped into families before comparing. It measures:
+1. **Self-agreement:** how much each configuration agrees with its own second run. This is
+   the noise floor.
+2. **Agreement with Opus:** how close each Sonnet setup comes to Opus, the strongest model.
+3. **Cost per line**, from the API's usage numbers, plus parse failures and refusals.
+4. Optional for Brandon, by reading only: on 20 lines he picks which of two unlabelled lists
+   fits the line better. About 20 clicks.
 
-**P2, quality (about $3):** all 150 gold lines through every configuration whose measured
-projection fits, plus S0 again in reverse order. The winner's labels for those 150 lines
-are kept as their final labels, so nothing is bought twice.
+Decision rule, fixed before any result:
+- Sonnet thinking off is the default.
+- Opus (or Sonnet with thinking) replaces it only if Sonnet's agreement with Opus is clearly
+  below Opus's agreement with itself (by more than 0.1 on family overlap), **and** the full-run
+  projection still fits $20 with a $1.50 reserve. If Brandon does the optional picks, Opus also
+  has to win most of them.
+- If nothing fits, stop and bring Brandon the options.
 
-Measures:
-1. **Recall at k, on the old 20 moods only**: per line, rank the model's scores for the 20
-   moods Brandon could choose from (new moods mapped in through the gold table, such as
-   irritated into angry), take the top k (k = the number he marked), and check they contain
-   his. A new mood the model rates higher, such as lonely, can't push one of his out of the
-   top k, so finding better words is never penalised. Scattering 1s can't win this either.
-   Gold says only what he heard within the old 20; new moods are judged by measure 3 and by
-   agreement between samples, never against gold. Gold `informational` is left out of this
-   score, because the checklist redefines it as plain delivery.
-2. **Paired bootstrap** over lines for each arm against S0: a 95% interval on the
-   difference. With 150 lines, a real gap of about 7 points shows; smaller ones don't.
-3. **Agreed-extra rate**: per arm, 25 random cases where it scored a mood 3 and Brandon
-   didn't mark it. Pooled and shuffled, arm hidden; he answers "is this feeling in the line,
-   from what she says and the scene?" by reading the line in context; playing the clip is
-   optional. About 100 clicks.
-4. **Inflation**: how many moods per line score 2 or more, and how many lines have no zeros
-   among the original 20.
-5. **Self-agreement**: S0 against S0 reversed. This shows the order effect and the noise.
-6. **Energy** against measured loudness and pace, and within one step of his rating;
-   **intoxication** exact.
+Bugs get fixed in the pilot and only there. Then both prompts are frozen (hash recorded).
 
-**Decision rule (fixed before results):**
-1. An arm qualifies only if its measured cost for all lines, plus 20%, fits the remaining
-   credit minus a $1.50 reserve.
-2. The default is S0.
-3. S1 or O1 replaces it only if all of these hold: its recall at k beats S0 with the
-   bootstrap interval clear of zero; its agreed-extra rate is no more than 10 points lower;
-   and its inflation is at most 1.3 times S0's. If several qualify, the cheapest wins.
-4. Second sample: if S0 agrees with itself poorly (median agreement across moods below 0.6),
-   a full second sample is the first use of the remaining money. Otherwise the second sample
-   covers only lines with some mood at 2 or more. Because positives now rest on the
-   two samples agreeing rather than on Brandon's ears, the second sample is the first use of
-   any remaining money. H0 may serve as the second sample if its
-   recall at k is within 5 points of S0's.
-5. If nothing qualifies, stop and bring Brandon the options.
+## 6. The runs, done so they never need repeating
 
-Rare moods can't be judged on 150 random lines. They are judged by whether two independent
-samples agree on them (section 4), plus a light spot check: Brandon reads about 5 top-ranked
-lines per mood in context and marks any that are wrong. His ears are not a gate.
+- Brandon okays pass 1 after the pilot, and pass 2 after seeing the vocabulary. Each is its
+  own go line.
+- Lines are shuffled across chunks. The first chunk is 300 lines, and the run stops if: cost per
+  line is more than 20% over projection; parse failures, truncations or refusals top 1%; or the
+  cache isn't being read (then re-project).
+- A running spend counter from the usage numbers stops everything at $20 minus the reserve.
+- Every request and raw response is stored with the model id, prompt hash and usage. Failures
+  are retried once on the same model, and anything still failing is listed. No silent switch
+  to another model.
 
-## 6. The full run, done so it never needs repeating
+## 7. Vocabulary (between the passes)
 
-- Brandon sees the measured projection and okays this specific run.
-- Lines are shuffled across chunks, so games and scenes don't line up with time.
-- The first chunk is 300 lines. It stops if: cost per line is more than 20% over the
-  projection; parse failures or truncations top 1%; refusals top 1%; the cache isn't being
-  read (then re-project); or any mood's share of 3s drifts beyond half or double its pilot value.
-- A running spend counter from the usage numbers stops the run at the budget minus reserve.
-- Every request and raw response is stored with the model id, schema version, prompt hash,
-  checklist order and usage. Failures are retried once on the same model; anything still
-  failing is listed. No silent switch to another model.
+- Pass 1 words are lowercased and lemmatised, then grouped with a local text embedder.
+- One small Claude call over the word list alone (no game text) names the families and drops
+  near-duplicates. Families seen in fewer than about 5 lines are kept as free words, not scored.
+- The coverage check adds any must-have mood the families lack.
+- Brandon may skim the list. It isn't a gate.
 
-## 7. After the run (free or pennies)
+## 8. After pass 2 (free)
 
-1. **Vocabulary:** checklist moods plus other-feeling words, embedded locally and clustered.
-   One small call over the word list alone (no game text) proposes families. Brandon prunes.
-2. **Score matrix:** lines × moods, averaged over samples. A mood that exists only in free
-   words is grown from the lines both samples score highly, by nearest-neighbour search on the text
-   embeddings we already have, with no paid rerun.
-3. **Rankings per mood:** by score, preferring lines where the mood stands out (fewer other
-   3s), keeping some implied lines, and spread across games and scenes so the LE3 party
-   doesn't fill amused and teasing.
-4. **Sets for vectors:** positives where both samples give 3 (or average 2.5 or more), with no
-   listening required. Brandon's spot check can remove lines but isn't needed to add them. Negatives at 0
-   on that mood, matched on game, measured energy and length, ideally from the same session.
-   A neutral baseline from lines with every mood at 1 or below. When vectors are fitted
-   together, measured energy is factored out so a mood vector doesn't absorb the energy knob.
+1. **Score matrix:** lines × families, 0 to 3.
+2. **Two-view agreement:** a line is a trusted positive for a mood when pass 2 scores it 3, or
+   2 with pass 1 having named it. It's a trusted zero when pass 2 scores 0 and pass 1 didn't
+   name it. Disagreements are flagged; the reserve buys a second pass-2 sample on those.
+3. **Rankings per mood:** by score, preferring lines where the mood stands out, spread across
+   games and scenes so one event (the LE3 party) doesn't fill a mood.
+4. **Sets for vectors:** trusted positives against trusted zeros, matched on game, measured
+   energy and length. Measured energy is factored out, so a mood vector doesn't absorb the
+   energy knob. Thin moods are flagged for synthetic expansion later.
+5. **Brandon's spot check (optional):** reading about 5 top lines per mood, playing the clip
+   only if he wants. It can remove lines; it never gates a mood.
 
-## 8. Budget
-
-P1 $0.40, P2 about $3, the full run on S0 $5.5 to $10 (less the 150 lines already done),
-a second sample on all or part of the lines $3 to $6, and the vocabulary call $0.10. That is
-about $12 to $19, within $20 with a reserve. Opus wins only if it earns it under the rule and
-the probe shows it fits.
+Open, not decided here: what checks that a mood sounds consistent in her voice before it gets
+a voice vector (open question 1 on the one-page goals). This plan only produces the labels.
 
 ## 9. What Brandon is asked to decide
 
-1. Approve this plan. The PC session then rebuilds digest.py and annotate.py to match and
-   renders three prompts (P0, free).
-2. Approve P1 ($0.40) after reading the renders, and later the extra moods it suggests.
-3. Approve P2 (about $3), and finally the full run once its measured cost is known.
-
-## Changes from v1, and why
-
-- The pilot moves from 40 gold lines to all 150 (40 lines gives about ±9 points, too noisy
-  for a 5-point rule). It uses recall at k and a bootstrap instead of "any score of 1".
-- The checklist grows from a probe before it's frozen, so new moods don't need a second run.
-- Sonnet without thinking becomes the default; v1 wrongly assumed thinking can't be turned
-  off. Haiku is added as a cheap second opinion.
-- The grouped arm, the few-shot arm and the Opus-medium arm are dropped.
-- Two samples in different orders replace the model's own confidence score.
-- Labels are shaped for control vectors: real zeros, matched negatives, energy factored out.
-- Fixed: moods.toml has 20 moods, not 21; `tired` was listed twice.
+1. Approve v3. The PC rebuilds `digest.py` and `annotate.py` and renders example prompts (free).
+2. The pilot (about $1), then pass 1, then pass 2: each on its own go line.
