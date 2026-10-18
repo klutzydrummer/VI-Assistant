@@ -141,5 +141,29 @@ class JobTest(unittest.TestCase):
             self.assertIn("resuming, 4 already done", again.stderr)
 
 
+
+class CudaLibEnv(unittest.TestCase):
+    def test_venv_nvidia_libraries_go_first_and_missing_builtins_stop_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            lib = Path(d, "nvidia", "cu13", "lib")
+            lib.mkdir(parents=True)
+            (lib / "libnvrtc.so.13").touch()
+            old_path, old_ld = sys.path[:], os.environ.get("LD_LIBRARY_PATH")
+            sys.path.insert(0, d)
+            os.environ["LD_LIBRARY_PATH"] = "/usr/local/cuda/lib64"
+            try:
+                with self.assertRaises(SystemExit):
+                    textscore.cuda_lib_env()
+                (lib / "libnvrtc-builtins.so.13.0").touch()
+                env = textscore.cuda_lib_env()
+                self.assertEqual(env["LD_LIBRARY_PATH"], f"{lib}:/usr/local/cuda/lib64")
+            finally:
+                sys.path[:] = old_path
+                if old_ld is None:
+                    os.environ.pop("LD_LIBRARY_PATH", None)
+                else:
+                    os.environ["LD_LIBRARY_PATH"] = old_ld
+
+
 if __name__ == "__main__":
     unittest.main()
