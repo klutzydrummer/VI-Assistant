@@ -121,8 +121,13 @@ projection fits, plus S0 again in reverse order. The winner's labels for those 1
 are kept as their final labels, so nothing is bought twice.
 
 Measures:
-1. **Recall at k**: per line, do the model's top k moods (k = the number Brandon marked),
-   mapped through the gold table, contain his? Scattering 1s can't win this.
+1. **Recall at k, on the old 20 moods only**: per line, rank the model's scores for the 20
+   moods Brandon could choose from (new moods mapped in through the gold table, such as
+   irritated into angry), take the top k (k = the number he marked), and check they contain
+   his. A new mood the model rates higher, such as lonely, can't push one of his out of the
+   top k, so finding better words is never penalised. Scattering 1s can't win this either.
+   Gold says only what he heard within the old 20; new moods are judged by measure 3 and by
+   his listening review, never against gold.
 2. **Paired bootstrap** over lines for each arm against S0: a 95% interval on the
    difference. With 150 lines, a real gap of about 7 points shows; smaller ones don't.
 3. **Agreed-extra rate**: per arm, 25 random cases where it scored a mood 3 and Brandon
