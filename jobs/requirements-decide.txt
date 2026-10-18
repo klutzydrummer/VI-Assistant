@@ -1,0 +1,17 @@
+# What decide.py needs on the worker on top of requirements-gpu.txt, all on the
+# image's own torch 2.8 / CUDA 12.8 (none of these asks for another torch).
+# kev's own code is installed separately (decide.install), without its
+# dependency pins, which want Python 3.12.
+#
+# Qwen3.5's Gated DeltaNet layers: transformers uses these two packages when
+# they import, else a slow PyTorch reference (decide.py stops on that). PyPI has
+# only causal-conv1d's source, which needs nvcc to build, so it comes as the
+# prebuilt wheel for exactly torch 2.8 / CUDA 12 / Python 3.11 / cxx11 ABI.
+causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+flash-linear-attention==0.5.2 # the gated delta rule (Triton, compiled at first use with gcc); the version kev pins
+fla-core==0.5.2
+peft==0.21.2                  # Kev-9B is a LoRA
+accelerate>=1.15
+datasets>=3.0                 # imported by kev.data
+pydantic>=2.9
+fastapi>=0.115                # imported by kev.serve; nothing is served
