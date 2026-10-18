@@ -3,10 +3,12 @@
 //! reviewer's corrections. See `docs/design/review-page.md`.
 //!
 //! `purity` is the corpus pipeline's listening step: does each clip fit its
-//! cluster, then name, merge, split or reject it.
+//! cluster, then name, merge, split or reject it. `gold` is where Brandon
+//! labels a sample of her lines from their text, for the text-model bake-off.
 
 pub mod corpus;
 pub mod fixture;
+pub mod gold;
 pub mod purity;
 pub mod queue;
 pub mod server;
