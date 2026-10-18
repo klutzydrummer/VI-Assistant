@@ -7,8 +7,11 @@
 //!   ids and the order are read; the model scores in it never reach the page,
 //!   so nothing anchors him.
 //! - Each line shows its scene, the lines before, hers, and the lines after,
-//!   from the context stage, the same text the models read. No audio: the
-//!   models judged from the words, so he does too.
+//!   from the context stage, the same text the models read, with a play
+//!   button for her line as the game has it (harvest's clip, suit and all).
+//!   He labels what is really there in her words and voice together; each
+//!   label records whether he played the clip, so the bake-off can tell
+//!   heard labels from read ones.
 //! - Per line: every mood that's really there (any number, or none), one level
 //!   per knob, an unsure flag and a note. The moods and knobs are
 //!   `moods.toml`'s.
@@ -19,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -65,6 +68,9 @@ pub struct Label {
     pub unsure: bool,
     #[serde(default)]
     pub notes: String,
+    /// Whether he played the clip before saving.
+    #[serde(default)]
+    pub heard: bool,
     #[serde(default)]
     pub seconds: f64,
     #[serde(default)]
@@ -80,6 +86,8 @@ pub struct Line {
     pub after: Vec<Value>,
     pub stage_direction: Option<String>,
     pub listener: Option<String>,
+    /// Whether her clip can be played.
+    pub audio: bool,
 }
 
 pub struct Gold {
@@ -88,6 +96,8 @@ pub struct Gold {
     pub knobs: Vec<Knob>,
     pub lines: Vec<Line>,
     pub labels: HashMap<String, Label>,
+    /// Her clip per line, from harvest; lines without one get no play button.
+    audio: HashMap<String, PathBuf>,
 }
 
 fn read_values(path: &Path) -> Result<Vec<Value>, Error> {
@@ -142,12 +152,33 @@ impl Gold {
                 "no gold sample: run analysis/gold/sample_gold.py",
             ));
         }
+        // Her clips as the game has them. Harvest paths are relative to its
+        // output and may not leave it.
+        let mut clips: HashMap<String, PathBuf> = HashMap::new();
+        if let Some(harvest) = current_out(&root, "harvest")? {
+            let path = harvest.join("lines.jsonl");
+            if path.exists() {
+                for v in read_values(&path)? {
+                    if let (Some(id), Some(rel)) = (v["id"].as_str(), v["audio"]["path"].as_str()) {
+                        let rel = Path::new(rel);
+                        if rel
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+                        {
+                            clips.insert(id.to_string(), harvest.join(rel));
+                        }
+                    }
+                }
+            }
+        }
+
         let mut picks: Vec<(u64, String)> = read_values(&sample)?
             .into_iter()
             .filter_map(|r| Some((r["n"].as_u64()?, r["id"].as_str()?.to_string())))
             .collect();
         picks.sort();
         let mut lines = Vec::new();
+        let mut audio = HashMap::new();
         for (_, id) in picks {
             let Some(c) = context.get(&id) else { continue };
             let prompt = c["prompt"].as_str().unwrap_or("");
@@ -165,7 +196,11 @@ impl Gold {
                 after: c["after"].as_array().cloned().unwrap_or_default(),
                 stage_direction: c["stage_direction"].as_str().map(str::to_string),
                 listener: c["listener"].as_str().map(str::to_string),
+                audio: clips.contains_key(&id),
             });
+            if let Some(p) = clips.remove(&id) {
+                audio.insert(id, p);
+            }
         }
 
         let mut labels = HashMap::new();
@@ -183,7 +218,14 @@ impl Gold {
             knobs: file.knob,
             lines,
             labels,
+            audio,
         })
+    }
+
+    /// Her clip for line `n` (1-based).
+    pub fn audio_path(&self, n: usize) -> Option<&PathBuf> {
+        let line = self.lines.get(n.checked_sub(1)?)?;
+        self.audio.get(&line.id)
     }
 
     pub fn labelled(&self) -> usize {
@@ -254,6 +296,7 @@ impl Gold {
             knobs,
             unsure: body.unsure,
             notes: body.notes.trim().to_string(),
+            heard: body.heard,
             seconds: body.seconds.max(0.0),
             at: now(),
         };
@@ -285,24 +328,28 @@ pub struct LabelBody {
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
+    pub heard: bool,
+    #[serde(default)]
     pub seconds: f64,
 }
 
 pub fn handle(g: &mut Gold, post: bool, url: &str, body: &str) -> Reply {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let n: Option<usize> = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("n="))
+        .and_then(|v| v.parse().ok());
     match (post, path) {
         (false, "/") => Reply::Page(PAGE),
         (false, "/api/session") => Reply::Json(g.session()),
-        (false, "/api/item") => {
-            let n = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("n="))
-                .and_then(|v| v.parse().ok());
-            match n.and_then(|n| g.item(n)) {
-                Some(v) => Reply::Json(v),
-                None => Reply::NotFound,
-            }
-        }
+        (false, "/audio") => match n.and_then(|n| g.audio_path(n)) {
+            Some(p) => Reply::Audio(p.clone()),
+            None => Reply::NotFound,
+        },
+        (false, "/api/item") => match n.and_then(|n| g.item(n)) {
+            Some(v) => Reply::Json(v),
+            None => Reply::NotFound,
+        },
         (true, "/api/label") => {
             let parsed: Result<LabelBody, _> = serde_json::from_str(body);
             match parsed.map_err(|e| e.to_string()).and_then(|b| g.label(b)) {
@@ -373,6 +420,21 @@ levels = [{ id = "sober", description = "sober" }, { id = "drunk", description =
                 .collect::<String>(),
         )
         .unwrap();
+        let harvest = root.join("stages/harvest/h1/out");
+        fs::create_dir_all(harvest.join("audio")).unwrap();
+        fs::write(root.join("stages/harvest/current"), "h1\n").unwrap();
+        fs::write(harvest.join("audio/a.wav"), b"RIFFa").unwrap();
+        fs::write(
+            harvest.join("lines.jsonl"),
+            [
+                json!({"id": "a", "audio": {"path": "audio/a.wav"}}),
+                json!({"id": "b", "audio": {"path": "../../escape.wav"}}),
+            ]
+            .iter()
+            .map(|v| v.to_string() + "\n")
+            .collect::<String>(),
+        )
+        .unwrap();
         let moods = root.join("moods.toml");
         fs::write(&moods, MOODS).unwrap();
         (dir, moods)
@@ -388,6 +450,7 @@ levels = [{ id = "sober", description = "sober" }, { id = "drunk", description =
                 .collect(),
             unsure: false,
             notes: String::new(),
+            heard: false,
             seconds: 3.0,
         }
     }
@@ -478,6 +541,30 @@ levels = [{ id = "sober", description = "sober" }, { id = "drunk", description =
             handle(&mut g, true, "/api/label", "{nope"),
             Reply::Bad(_)
         ));
+    }
+
+    #[test]
+    fn plays_her_clip_and_records_whether_he_heard_it() {
+        let (dir, moods) = corpus();
+        let mut g = Gold::load(dir.path(), &moods).unwrap();
+        assert!(g.lines[0].audio);
+        // A path that leaves harvest's folder is never served.
+        assert!(!g.lines[1].audio);
+        match handle(&mut g, false, "/audio?n=1", "") {
+            Reply::Audio(p) => assert!(p.ends_with("audio/a.wav")),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            handle(&mut g, false, "/audio?n=2", ""),
+            Reply::NotFound
+        ));
+        assert!(matches!(
+            handle(&mut g, false, "/audio?n=9", ""),
+            Reply::NotFound
+        ));
+        handle(&mut g, true, "/api/label", r#"{"n": 1, "heard": true}"#);
+        let g = Gold::load(dir.path(), &moods).unwrap();
+        assert!(g.labels["a"].heard);
     }
 
     #[test]

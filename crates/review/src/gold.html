@@ -62,6 +62,7 @@
   .err { color: var(--no); }
   .hidden { display: none; }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  audio { width: 100%; margin: 4px 0 6px; }
 </style>
 </head>
 <body>
@@ -77,6 +78,8 @@
     <div id="tags"></div>
     <div id="before" class="ctx"></div>
     <div id="say" class="say"></div>
+    <audio id="clip" controls preload="none" class="hidden"></audio>
+    <div id="noclip" class="small muted hidden">No clip for this line.</div>
     <div id="after" class="ctx"></div>
     <div id="state" class="small muted"></div>
   </div>
@@ -89,11 +92,12 @@
     <h2>Anything else</h2>
     <div class="row">
       <button id="unsure" class="unsure" type="button">Unsure</button>
-      <span class="small muted">judge from the words and situation only</span>
+      <span class="small muted">judge from her words, the situation and her voice</span>
     </div>
     <p><textarea id="notes" placeholder="Note (optional)"></textarea></p>
     <details><summary>How to label</summary>
-      <p class="small">Tap every mood the line really carries, or none. Pick one level per knob. Mark it unsure when you would want to hear it.
+      <p class="small">Play her line, then tap every mood it really carries, in her words or her voice, or none. Pick one level per knob. Mark it unsure when you can't tell.
+      Each save notes whether you played the clip.
       You can go back and change any line; the last save counts. Every save is written to gold.jsonl immediately.</p>
     </details>
   </div>
@@ -109,7 +113,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let session = null, n = 1, picked = new Set(), knobs = {}, unsure = false, shownAt = Date.now();
+let session = null, n = 1, picked = new Set(), knobs = {}, unsure = false, heard = false, shownAt = Date.now();
 
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
@@ -162,6 +166,11 @@ async function show(k) {
   $("before").innerHTML = lines(line.before);
   $("say").innerHTML = `<b>Tali:</b> ${esc(line.text)}`;
   $("after").innerHTML = lines(line.after);
+  const clip = $("clip");
+  clip.pause();
+  if (line.audio) { clip.src = `/audio?n=${n}`; clip.classList.remove("hidden"); $("noclip").classList.add("hidden"); }
+  else { clip.removeAttribute("src"); clip.load(); clip.classList.add("hidden"); $("noclip").classList.remove("hidden"); }
+  heard = label ? !!label.heard : false;
   picked = new Set(label ? label.moods : []);
   knobs = label ? { ...label.knobs } : {};
   unsure = label ? !!label.unsure : false;
@@ -177,7 +186,7 @@ async function save() {
   $("save").disabled = true; $("msg").textContent = "";
   try {
     session = await api("/api/label", {
-      n, moods: [...picked], knobs, unsure, notes: $("notes").value, seconds: (Date.now() - shownAt) / 1000,
+      n, moods: [...picked], knobs, unsure, heard, notes: $("notes").value, seconds: (Date.now() - shownAt) / 1000,
     });
     const after = session.done.findIndex((d, i) => !d && i + 1 > n);
     const open = after >= 0 ? after + 1 : session.next;
@@ -188,6 +197,7 @@ async function save() {
 }
 
 $("unsure").onclick = () => { unsure = !unsure; paint(); };
+$("clip").addEventListener("play", () => { heard = true; });
 $("save").onclick = save;
 $("prev").onclick = () => show(n - 1);
 $("skip").onclick = () => show(n + 1);

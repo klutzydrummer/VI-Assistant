@@ -58,12 +58,44 @@ pub fn serve_with(
             Reply::Json(v) => request.respond(
                 Response::from_string(v.to_string()).with_header(header("application/json")),
             ),
-            Reply::Audio(path) => match std::fs::File::open(&path) {
-                Ok(file) => request.respond(
-                    Response::from_file(file)
-                        .with_header(header(audio_type(&path)))
-                        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap()),
-                ),
+            Reply::Audio(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    // Phone browsers (Safari above all) only play media
+                    // served in byte ranges.
+                    let range = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Range"))
+                        .map(|h| h.value.as_str().to_string());
+                    let len = bytes.len();
+                    let base = |r: Response<std::io::Cursor<Vec<u8>>>| {
+                        r.with_header(header(audio_type(&path)))
+                            .with_header(Header::from_bytes("Accept-Ranges", "bytes").unwrap())
+                            .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
+                    };
+                    match range.as_deref().map(|r| byte_range(r, len)) {
+                        None => request.respond(base(Response::from_data(bytes))),
+                        Some(Some((start, end))) => request.respond(
+                            base(Response::from_data(bytes[start..=end].to_vec()))
+                                .with_status_code(206)
+                                .with_header(
+                                    Header::from_bytes(
+                                        "Content-Range",
+                                        format!("bytes {start}-{end}/{len}"),
+                                    )
+                                    .unwrap(),
+                                ),
+                        ),
+                        Some(None) => request.respond(
+                            Response::from_string("range not satisfiable")
+                                .with_status_code(416)
+                                .with_header(
+                                    Header::from_bytes("Content-Range", format!("bytes */{len}"))
+                                        .unwrap(),
+                                ),
+                        ),
+                    }
+                }
                 Err(e) => request.respond(
                     Response::from_string(format!("{}: {e}", path.display())).with_status_code(404),
                 ),
@@ -229,6 +261,29 @@ fn audio_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// The inclusive byte span a `Range: bytes=...` header asks for in a file of
+/// `len` bytes, or None if it can't be served. Only one span is honoured.
+fn byte_range(header: &str, len: usize) -> Option<(usize, usize)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    let spec = spec.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        ("", suffix) => {
+            let n: usize = suffix.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            (len.saturating_sub(n), len.checked_sub(1)?)
+        }
+        (a, "") => (a.parse().ok()?, len.checked_sub(1)?),
+        (a, b) => (
+            a.parse().ok()?,
+            b.parse::<usize>().ok()?.min(len.checked_sub(1)?),
+        ),
+    };
+    (start <= end && end < len).then_some((start, end))
+}
+
 /// Percent-decoding for ids in paths.
 pub(crate) fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -249,4 +304,24 @@ pub(crate) fn decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::byte_range;
+
+    #[test]
+    fn byte_ranges() {
+        assert_eq!(byte_range("bytes=0-", 10), Some((0, 9)));
+        assert_eq!(byte_range("bytes=0-1", 10), Some((0, 1)));
+        assert_eq!(byte_range("bytes=2-99", 10), Some((2, 9)));
+        assert_eq!(byte_range("bytes=-4", 10), Some((6, 9)));
+        assert_eq!(byte_range("bytes=-40", 10), Some((0, 9)));
+        assert_eq!(byte_range("bytes=3-5, 7-8", 10), Some((3, 5)));
+        assert_eq!(byte_range("bytes=10-", 10), None);
+        assert_eq!(byte_range("bytes=5-2", 10), None);
+        assert_eq!(byte_range("bytes=-0", 10), None);
+        assert_eq!(byte_range("bytes=0-", 0), None);
+        assert_eq!(byte_range("items=0-1", 10), None);
+    }
 }
