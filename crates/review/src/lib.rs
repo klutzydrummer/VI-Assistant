@@ -5,7 +5,10 @@
 //! `purity` is the corpus pipeline's listening step: does each clip fit its
 //! cluster, then name, merge, split or reject it. `gold` is where Brandon
 //! labels a sample of her lines from their text, for the text-model bake-off.
+//! `channel` is where he marks, by ear, which clips carry a radio or other
+//! effect on top of the suit filter.
 
+pub mod channel;
 pub mod corpus;
 pub mod fixture;
 pub mod gold;

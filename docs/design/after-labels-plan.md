@@ -10,6 +10,16 @@ Checked against `what-brandon-wants.md`; his concerns and where each is applied 
 Steps 1 to 4 are free and run at home on CPU (nice 19). Step 5 is the only rental, and it does
 both the chat and the voice vectors, since an 8B model on his 4 cores would take days.
 
+**0. Channel check (home, free; added by Brandon 2026-10-19).**
+Some clips carry an extra effect on top of the suit filter (radio, comms, others). Six simple
+per-clip measures (`corpus/tali/analysis/after_labels/channel.py`) turned out to follow her pitch
+and loudness more than any effect, so Brandon marks about 40 clips by ear on his phone
+(`vi review --channel corpus/tali`, appending to `corpus/tali/channel.jsonl`; the sample is
+`analysis/after_labels/sample_channel.py`, and the page never shows why a clip was picked). A
+research thread then tests AFx-Rep, Fx-Encoder++ and the six measures against his marks, and the
+winner gives each clip an effect score. Step 3 matches pairs on it and checks that no mood's
+direction is just the effect.
+
 **1. Mood list and counts (home, free).**
 Claude's families plus the must-have moods become one flat, multi-label list in `moods.toml`,
 with energy and drunk (hungover as an option) as separate knobs. For each mood, count trusted
