@@ -169,8 +169,11 @@ Bugs get fixed in the pilot and only there. Then both prompts are frozen (hash r
 5. **Brandon's spot check (optional):** reading about 5 top lines per mood, playing the clip
    only if he wants. It can remove lines; it never gates a mood.
 
-Open, not decided here: what checks that a mood sounds consistent in her voice before it gets
-a voice vector (open question 1 on the one-page goals). This plan only produces the labels.
+Voice check (Brandon, 2026-10-19): before a mood gets a voice vector, it must pass an audio
+probe on the existing embeddings (A) and a split-half stability test of its vector (B), both at
+home and free. Then one steering test on the TTS (D) confirms them. Moods that fail become
+chat-only. See `/mnt/project-files/design/voice-consistency-check.md`. This plan only produces
+the labels those checks use.
 
 ## 9. What Brandon is asked to decide
 

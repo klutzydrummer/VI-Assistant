@@ -21,3 +21,4 @@ Goals for the whole project: `/mnt/project-files/design/what-brandon-wants.md`.
 | 13 | Cover the moods that matter for friend and assistant chat (10-17) | Any must-have mood missing from Claude's vocabulary is added to pass 2 |
 | 14 | Output feeds the vocabulary, per-mood rankings, and control vectors for voice and chat (10-13, 10-17) | Plan sections 7 and 8: families, rankings spread across games, trusted positives against matched zeros, energy factored out |
 | 15 | Lines for him to copy go in code blocks (10-17) | Every go line is sent in a code block |
+| 16 | A mood gets a voice vector only after the audio probe (A), split-half stability (B), then the steering test (D) (10-19) | Plan section 8; the trusted positives and matched zeros are exactly what A and B need |
