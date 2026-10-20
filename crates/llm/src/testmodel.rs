@@ -12,8 +12,9 @@ const N_HEAD: usize = 4;
 const N_FF: usize = 128;
 const N_CTX: u32 = 16384;
 
-/// `<unk>`, `<s>`, `</s>`, then one token per byte.
-const N_VOCAB: usize = 3 + 256;
+/// `<unk>`, `<s>`, `</s>`, one token per byte, then `<think>` and
+/// `</think>` (user-defined, as in Qwen's vocabulary).
+const N_VOCAB: usize = 3 + 256 + 2;
 
 const CHATML: &str = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
@@ -21,7 +22,16 @@ pub fn write(path: &Path, seed: u64) -> std::io::Result<()> {
     build(seed).write(std::fs::File::create(path)?)
 }
 
+/// [`write`] with `n_layer` layers instead of [`N_LAYER`].
+pub fn write_layers(path: &Path, seed: u64, n_layer: usize) -> std::io::Result<()> {
+    build_layers(seed, n_layer).write(std::fs::File::create(path)?)
+}
+
 pub fn build(seed: u64) -> Gguf {
+    build_layers(seed, N_LAYER)
+}
+
+pub fn build_layers(seed: u64, n_layer: usize) -> Gguf {
     let mut g = Gguf::default();
     let mut kv = |k: &str, v: Value| {
         g.metadata.insert(k.to_string(), v);
@@ -30,7 +40,7 @@ pub fn build(seed: u64) -> Gguf {
     kv("general.name", Value::Str("vi-test-tiny".into()));
     kv("llama.context_length", Value::U32(N_CTX));
     kv("llama.embedding_length", Value::U32(N_EMBD as u32));
-    kv("llama.block_count", Value::U32(N_LAYER as u32));
+    kv("llama.block_count", Value::U32(n_layer as u32));
     kv("llama.feed_forward_length", Value::U32(N_FF as u32));
     kv("llama.attention.head_count", Value::U32(N_HEAD as u32));
     kv("llama.attention.head_count_kv", Value::U32(N_HEAD as u32));
@@ -45,11 +55,15 @@ pub fn build(seed: u64) -> Gguf {
         Value::Str("<s>".into()),
         Value::Str("</s>".into()),
     ];
-    // Token types: 2 unknown, 3 control, 6 byte.
+    // Token types: 2 unknown, 3 control, 4 user-defined, 6 byte.
     let mut types = vec![Value::I32(2), Value::I32(3), Value::I32(3)];
     for b in 0..=255u8 {
         tokens.push(Value::Str(format!("<0x{b:02X}>")));
         types.push(Value::I32(6));
+    }
+    for t in ["<think>", "</think>"] {
+        tokens.push(Value::Str(t.into()));
+        types.push(Value::I32(4));
     }
     kv(
         "tokenizer.ggml.scores",
@@ -77,7 +91,7 @@ pub fn build(seed: u64) -> Gguf {
     add(&mut g, "token_embd.weight".into(), vec![e, v], 1.0);
     add(&mut g, "output_norm.weight".into(), vec![e], 0.0);
     add(&mut g, "output.weight".into(), vec![e, v], s);
-    for i in 0..N_LAYER {
+    for i in 0..n_layer {
         add(&mut g, format!("blk.{i}.attn_norm.weight"), vec![e], 0.0);
         for w in ["attn_q", "attn_k", "attn_v", "attn_output"] {
             add(&mut g, format!("blk.{i}.{w}.weight"), vec![e, e], s);

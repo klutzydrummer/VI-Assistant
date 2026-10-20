@@ -1,0 +1,20 @@
+# Dialogue models that control vectors are built for. One entry per model
+# file; vectors live under the file's SHA-256, so a new model, quant or
+# fine-tune is a new entry plus `vi vectors build <id>` (see
+# crates/llm/src/registry.rs). Files go in models/ (or $VI_MODELS), which
+# `vi vectors fetch <id>` fills and checks against sha256.
+
+# Brandon's pick (2026-10-20). Vision and MTP are used when talking to her,
+# not when building vectors.
+["qwen3.8-27b-q8"]
+repo = "ggml-org/Qwen3.8-27B-GGUF"
+file = "Qwen3.8-27B-Q8_0.gguf"
+sha256 = "aab65c67ef0dad127960efef9247f1832bca105faa1c7a052cc039b223cf86a1"
+mmproj = "mmproj-Qwen3.8-27B-Q8_0.gguf"
+mtp = "mtp-Qwen3.8-27B-Q8_0.gguf"
+
+# Same qwen35 architecture, small enough for the home smoke on CPU.
+["qwen3.5-0.8b-q8"]
+repo = "ggml-org/Qwen3.5-0.8B-GGUF"
+file = "Qwen3.5-0.8B-Q8_0.gguf"
+sha256 = "37ae482d336108d23516fa35e8e0c4126688d81018b87178a18d752a1357814f"

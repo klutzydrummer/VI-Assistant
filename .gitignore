@@ -11,3 +11,6 @@ corpus/
 
 # Python bytecode from running the jobs.
 __pycache__/
+
+# Dialogue model files (models.toml says which).
+models/

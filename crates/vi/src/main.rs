@@ -7,6 +7,7 @@ mod chat;
 mod cloud;
 mod dataset;
 mod harvest;
+mod vectors;
 
 pub(crate) const USAGE: &str = "usage:
   vi pack check <character-folder>
@@ -34,10 +35,14 @@ pub(crate) const USAGE: &str = "usage:
   vi cloud status
   vi cloud reap
   vi cloud ssh [command]
-  vi cloud env | touch";
+  vi cloud env | touch
+  vi vectors <fetch|preflight|capture|fit|build|check|layers|selftest> ... (vi vectors help lists them)";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "vectors") {
+        return vectors::run(&args[1..]);
+    }
     let force = take_flag(&mut args, "--force");
     let lines = take_option(&mut args, "--lines");
     let model = chat::ModelArgs {

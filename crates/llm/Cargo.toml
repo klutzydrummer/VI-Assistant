@@ -13,11 +13,14 @@ vulkan = ["llama-cpp-sys-2/vulkan"]
 [dependencies]
 engine = { path = "../engine" }
 llama-cpp-sys-2 = { version = "0.1.159", default-features = false }
+matrixmultiply = "0.3"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 charpack = { path = "../charpack" }
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "sync", "macros"] }

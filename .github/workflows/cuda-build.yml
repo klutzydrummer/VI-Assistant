@@ -1,0 +1,98 @@
+name: CUDA build
+
+# Builds `vi --features cuda` for the rented GPU worker, separately from CI
+# (it takes a while, and CI must not need a GPU). The worker image has no
+# compiler, so nothing is built there: this artifact is what goes over.
+# Then the artifact is run inside the worker image, without a GPU, on the
+# tiny test model (preflight, capture, fit, steered generation), to prove it
+# starts, links and captures before any money is spent.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/llm/**"
+      - "crates/vi/**"
+      - "Cargo.lock"
+      - ".github/workflows/cuda-build.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/llm/**"
+      - "crates/vi/**"
+      - "Cargo.lock"
+      - ".github/workflows/cuda-build.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Ubuntu 22.04 (glibc 2.35), the same as the worker image: a 24.04 build
+    # may not start there.
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    env:
+      CUDA_PATH: /usr/local/cuda
+      # Only the rental GPUs (A6000 / RTX 30xx = 86, L40S / RTX 40xx = 89);
+      # offers are filtered to match. Passed to llama.cpp's CMake.
+      CMAKE_CUDA_ARCHITECTURES: "86-real;89-real"
+      CUDAARCHS: "86-real;89-real"
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential cmake clang libclang-dev pkg-config
+          cmake --version
+          ldd --version | head -1
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build vi with CUDA
+        run: cargo build --release -p vi --features cuda
+      - name: Check what it links
+        run: |
+          ldd target/release/vi
+          # Only the driver's libcuda may be dynamic among the CUDA libraries.
+          if ldd target/release/vi | grep -E 'libcudart|libcublas'; then
+            echo "CUDA runtime is linked dynamically" >&2; exit 1
+          fi
+          objdump -T target/release/vi | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+      - name: Package
+        run: |
+          mkdir -p dist/ci-only
+          cp target/release/vi dist/
+          # The driver's libcuda.so.1 is on the worker; CI has no driver, so
+          # the test job borrows the toolkit's stub to let the binary start.
+          cp /usr/local/cuda/lib64/stubs/libcuda.so dist/ci-only/libcuda.so.1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vi-cuda-linux-x86_64
+          path: dist/
+          retention-days: 30
+
+  in-worker-image:
+    needs: build
+    runs-on: ubuntu-latest
+    container: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vi-cuda-linux-x86_64
+          path: dist
+      - name: Worker image facts
+        run: |
+          cat /etc/os-release | head -2
+          ldd --version | head -1
+      - name: Selftest on the tiny model, no GPU
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/dist/ci-only
+          VI_LLAMA_LOG: "1"
+        run: |
+          chmod +x dist/vi
+          ldd dist/vi
+          dist/vi vectors selftest --dir /tmp/selftest --gpu-layers -1
