@@ -104,6 +104,83 @@ pub fn build_layers(seed: u64, n_layer: usize) -> Gguf {
     g
 }
 
+/// [`write_qwen35`]'s model: Qwen3.5's hybrid layout (gated DeltaNet
+/// layers with every fourth layer full attention), tiny and random.
+pub fn write_qwen35(path: &Path, seed: u64, n_layer: usize) -> std::io::Result<()> {
+    build_qwen35(seed, n_layer).write(std::fs::File::create(path)?)
+}
+
+pub fn build_qwen35(seed: u64, n_layer: usize) -> Gguf {
+    // The llama vocabulary and chat template, on the qwen35 architecture.
+    let mut g = build_layers(seed, 1);
+    g.tensors.retain(|t| !t.name.starts_with("blk."));
+    g.metadata.retain(|k, _| !k.starts_with("llama."));
+    let (e, f, hd, nh) = (N_EMBD as u64, N_FF as u64, 16u64, 4u64);
+    let (k_heads, v_heads, state) = (2u64, 4u64, 16u64);
+    let value_dim = v_heads * state;
+    let conv_dim = 2 * k_heads * state + value_dim;
+    let mut kv = |k: &str, v: Value| {
+        g.metadata.insert(format!("qwen35.{k}"), v);
+    };
+    kv("context_length", Value::U32(N_CTX));
+    kv("embedding_length", Value::U32(N_EMBD as u32));
+    kv("block_count", Value::U32(n_layer as u32));
+    kv("feed_forward_length", Value::U32(N_FF as u32));
+    kv("attention.head_count", Value::U32(nh as u32));
+    kv("attention.head_count_kv", Value::U32(2));
+    kv("attention.key_length", Value::U32(hd as u32));
+    kv("attention.value_length", Value::U32(hd as u32));
+    kv("attention.layer_norm_rms_epsilon", Value::F32(1e-6));
+    kv("rope.dimension_count", Value::U32(hd as u32));
+    kv(
+        "rope.dimension_sections",
+        Value::Array([4, 2, 2, 0].map(Value::I32).to_vec()),
+    );
+    kv("ssm.conv_kernel", Value::U32(4));
+    kv("ssm.inner_size", Value::U32(value_dim as u32));
+    kv("ssm.state_size", Value::U32(state as u32));
+    kv("ssm.time_step_rank", Value::U32(v_heads as u32));
+    kv("ssm.group_count", Value::U32(k_heads as u32));
+    kv("full_attention_interval", Value::U32(4));
+    g.metadata
+        .insert("general.architecture".into(), Value::Str("qwen35".into()));
+
+    let mut rng = Rng(seed.wrapping_mul(31) | 1);
+    let mut add = |g: &mut Gguf, name: String, dims: Vec<u64>, scale: f32, offset: f32| {
+        let n = dims.iter().product::<u64>() as usize;
+        let data = (0..n).map(|_| offset + rng.uniform() * scale).collect();
+        g.add_f32(name, dims, data);
+    };
+    let s = 1.0 / (N_EMBD as f32).sqrt();
+    for i in 0..n_layer {
+        let b = |t: &str| format!("blk.{i}.{t}");
+        add(&mut g, b("attn_norm.weight"), vec![e], 0.0, 1.0);
+        add(&mut g, b("post_attention_norm.weight"), vec![e], 0.0, 1.0);
+        if (i + 1) % 4 == 0 {
+            add(&mut g, b("attn_q.weight"), vec![e, 2 * hd * nh], s, 0.0);
+            add(&mut g, b("attn_k.weight"), vec![e, 2 * hd], s, 0.0);
+            add(&mut g, b("attn_v.weight"), vec![e, 2 * hd], s, 0.0);
+            add(&mut g, b("attn_output.weight"), vec![hd * nh, e], s, 0.0);
+            add(&mut g, b("attn_q_norm.weight"), vec![hd], 0.0, 1.0);
+            add(&mut g, b("attn_k_norm.weight"), vec![hd], 0.0, 1.0);
+        } else {
+            add(&mut g, b("attn_qkv.weight"), vec![e, conv_dim], s, 0.0);
+            add(&mut g, b("attn_gate.weight"), vec![e, value_dim], s, 0.0);
+            add(&mut g, b("ssm_conv1d.weight"), vec![4, conv_dim], 0.5, 0.0);
+            add(&mut g, b("ssm_dt.bias"), vec![v_heads], 0.5, 0.0);
+            add(&mut g, b("ssm_a"), vec![v_heads], 0.3, -0.7);
+            add(&mut g, b("ssm_beta.weight"), vec![e, v_heads], s, 0.0);
+            add(&mut g, b("ssm_alpha.weight"), vec![e, v_heads], s, 0.0);
+            add(&mut g, b("ssm_norm.weight"), vec![state], 0.0, 1.0);
+            add(&mut g, b("ssm_out.weight"), vec![value_dim, e], s, 0.0);
+        }
+        add(&mut g, b("ffn_gate.weight"), vec![e, f], s, 0.0);
+        add(&mut g, b("ffn_up.weight"), vec![e, f], s, 0.0);
+        add(&mut g, b("ffn_down.weight"), vec![f, e], s, 0.0);
+    }
+    g
+}
+
 /// xorshift64*, enough for reproducible weights.
 struct Rng(u64);
 

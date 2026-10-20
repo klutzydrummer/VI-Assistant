@@ -189,4 +189,37 @@ fn builds_checks_and_relayers_vectors() {
     assert!(l.contains("1 vectors now use band:2-4"), "{l}");
     let toml = fs::read_to_string(d.join("built/joint/vectors.toml")).unwrap();
     assert!(toml.contains("layers = [2, 4]"), "{toml}");
+
+    // A full-decode build of the same lines, compared with the reuse one.
+    let full = vi(
+        d,
+        &[
+            "build",
+            "tiny",
+            "--registry",
+            "models.toml",
+            "--messages",
+            "messages.jsonl",
+            "--labels",
+            "labels.jsonl",
+            "--pairs",
+            "pairs.jsonl",
+            "--store",
+            "store-full",
+            "--out",
+            "built-full",
+            "--no-reuse",
+            "--skip-preflight",
+            "--threads",
+            "2",
+        ],
+    );
+    assert!(full.contains("Captured 60 lines"), "{full}");
+    let c = vi(d, &["compare", "store", "store-full"]);
+    assert!(
+        c.contains("layer   1:") && c.contains("worst noise vs spread"),
+        "{c}"
+    );
+    let c = vi(d, &["compare", "built/joint", "built-full/joint"]);
+    assert!(c.contains("loud layer 1: cosine"), "{c}");
 }
