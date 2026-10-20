@@ -95,8 +95,19 @@ on Qwen3.5-0.8B, and in the first minutes of the rental on the 27B, while the fu
 it can.
 1. **Layer test:** plant a known vector with `llama_set_adapter_cvec` at layer *k*, capture, and check
    that the shift appears at layer *k*'s `l_out` and not at *k-1*'s. Repeat for a few *k*.
-2. **Reuse test:** a handful of lines with and without prefix reuse; per line, cosine ≥ 0.9999 and
-   relative error ≤ 1e-3 at every layer (DeltaNet's chunking makes results close, not bit-exact).
+2. **Reuse test** (revised 2026-10-20 after the 0.8B home preflight: Q8_0 on CPU gave per-line
+   cosine 0.99992 but relative error 1.2e-2 on every line, because quantized matmuls amplify last-bit
+   order differences). Two gates, then a warning:
+   - **The copy itself is exact.** Decode a few lines as prefix then suffix in two separate
+     `llama_decode` calls *without* `seq_cp`, and again with reuse. Those two do the same arithmetic in
+     the same chunks, so they must match within 1e-3 relative error per line and layer. This isolates
+     a broken state copy from ordinary rounding.
+   - **Reuse doesn't move the vectors.** Capture two sets' lines (at least ~100 lines) with reuse and
+     with full decodes, fit both, and require every vector at every layer within the recommended range
+     to agree at cosine ≥ 0.999 with norms within 1% (`vi vectors compare`). Both fits use the same
+     lines, so this measures only what reuse changes.
+   - The per-line full-decode comparison is kept as a reported warning, with the noise shown against
+     the line-to-line spread at each layer, not as a gate.
 3. **GPU against CPU** (rental only): the tiny test model captured on GPU matches its CPU capture.
 Any failure stops the run before the main capture.
 
@@ -304,7 +315,7 @@ clears everything, so every turn re-reads the whole conversation. Replies are co
 | M4 mean_diff weighting | mean of pair differences |
 | M5 nuisances | measured energy added; conversation counts; conversation fixed-effects diagnostic |
 | M6 callback guard | 2-D check, per-layer count check, layers 1..n_layer-2, preflight layer test on every real model |
-| M7 reuse settings | `n_seq_max = 2`, `kv_unified`, relative tolerance, also on the 27B |
+| M7 reuse settings | `n_seq_max = 2`, `kv_unified`, also on the 27B; gate revised to an exact-copy check plus a fit-level check after the 0.8B preflight |
 | L1 store at home | `--store` on a disk with 6 GB free; `line_head` and log-probabilities captured now |
 | L2 pooling | `pre_line` dropped; last prompt token included in `line_mean` |
 | L3 sources | design cites the vendored llama.cpp in `llama-cpp-sys-2 0.1.159` |
