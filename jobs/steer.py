@@ -346,8 +346,11 @@ class TTS:
 
     def _generate(self, audio, text, sentence, s):
         self.torch.manual_seed(s)
+        # The talker runs at 12 audio frames a second. qwen-tts allows 2048 (about 170 s), so a steered
+        # voice that never ends would run that long: cap it at a generous length for the sentence.
+        cap = int(12 * (0.8 * len(sentence.split()) + 4))
         wavs, sr = self.model.generate_voice_clone(
-            text=sentence, language="English", ref_audio=audio, ref_text=text
+            text=sentence, language="English", ref_audio=audio, ref_text=text, max_new_tokens=cap
         )
         return wavs[0], sr
 
