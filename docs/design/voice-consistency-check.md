@@ -54,7 +54,9 @@ worth it if A and B leave many moods unclear.
 
 - **Passes A and B:** voice and chat vector, then D confirms.
 - **Passes the text side only:** chat vector; the voice borrows the nearest passing moods.
-- **Borderline:** a blend at lower strength, flagged, and a candidate for synthetic expansion.
+- **Borderline:** a voice vector, flagged, and a candidate for synthetic expansion. It starts at full
+  strength; test D lowers it only if the steered audio misbehaves (Brandon, 2026-10-20). Playful, amused,
+  romance and teasing take this route.
 
 ## Recommendation
 
