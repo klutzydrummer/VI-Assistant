@@ -28,7 +28,7 @@ nobody asked for.
 - B: build each mood's vector from two random halves; the halves must point the same way.
 - Energy and game are factored out first, so a mood vector doesn't learn the energy knob.
 Each mood gets its route: **voice and chat** (passes), **chat only** (fails; the voice borrows
-the nearest passing moods), **thin** (real but rare; blend or lower strength, flagged), or
+the nearest passing moods), **thin** (real but rare; blend, flagged, full strength unless test D says to lower it), or
 **missing** (persona prompt only). Output: one table, mood by route, with counts.
 
 **4. Chat contrast sets (home, free).**

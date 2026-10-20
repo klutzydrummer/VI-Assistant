@@ -51,7 +51,7 @@ Cut this to a core of about 12 to 15. Mark each line **keep**, **cut** or **merg
 Each kept mood gets one of four build routes, decided by her data, not by us:
 - **voice and chat**: enough lines, your listening confirms them, and they sound consistent.
 - **chat only**: she says it but has no consistent sound; the voice borrows the nearest class or a mix.
-- **thin**: real but rare (under about 30 lines); built as a blend or at lower strength, and flagged.
+- **thin**: real but rare (under about 30 lines); built as a blend, flagged, at full strength first; strength is lowered only if steering test D shows it misbehaving.
 - **missing**: she never does it; persona prompt only, no vector.
 
 Counting candidate lines per mood is cheap CPU work at home and comes next, after your cut.
