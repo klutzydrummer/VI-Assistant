@@ -113,7 +113,7 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
     log("fit-level reuse check");
     let pairs_all = pairs();
     let (sets, lines) = capture::fit_check_lines(&prepared, &pairs_all, None);
-    let range = capture::default_check_range(&cap.layers);
+    let range = capture::default_check_range(&cap.layers, cap.llama().n_layer());
     let fit_check = capture::reuse_fit_check(
         &mut cap,
         &lines,

@@ -46,8 +46,8 @@ pub const USAGE: &str = "  vi vectors fetch <model-id>
   vi vectors selftest [--dir <folder>]
   (model commands also take --models <folder> (default $VI_MODELS or models/), --registry <models.toml>,
    --gpu-layers N, --threads N; fit and build take --mem-mb N; the fit-level reuse check takes
-   --check-sets a,b (default: the first sets, to 100+ lines) and --check-layers A-B (default: the
-   middle half))";
+   --check-sets a,b (default: the first sets, to 100+ lines) and --check-layers A-B (default: 20-80%
+   of the model's depth))";
 
 struct Args {
     pos: Vec<String>,
@@ -373,7 +373,7 @@ fn print_preflight(p: &capture::Preflight) {
 
 fn print_fit_check(f: &capture::FitCheck) {
     println!(
-        "  fit-level reuse check on {} lines of {}: layers {}-{}, worst cosine {:.6}, worst norm change {:.2}% -> {}",
+        "  fit-level reuse check on {} lines of {}: gate covers layers {}-{}, worst cosine there {:.6}, worst norm change {:.2}% -> {}",
         f.lines,
         f.sets.join(", "),
         f.layers.0,
@@ -410,7 +410,7 @@ fn fit_check(
                 y.parse().map_err(|_| format!("--check-layers {r}?"))?,
             )
         }
-        None => capture::default_check_range(&cap.layers),
+        None => capture::default_check_range(&cap.layers, cap.llama().n_layer()),
     };
     let f = capture::reuse_fit_check(cap, &lines, sets, &labels, &pairs, range, dir, |s| {
         println!("  fit-level reuse check: capturing {s}")

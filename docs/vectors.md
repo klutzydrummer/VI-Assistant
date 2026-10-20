@@ -58,8 +58,9 @@ only when two gates pass (design, preflight step 2, revised 2026-10-20 after the
 - **Fit-level check** (`capture` and `build` when they reuse, `preflight` with `--labels`/`--pairs`):
   the lines of the first contrast sets (100+ lines, or `--check-sets a,b`) are captured with the
   persona reused and decoded whole, both are fitted with the same labels and pairs, and every
-  vector (joint and mean_diff) at every layer in `--check-layers` (default: the middle half of the
-  captured layers) must agree at cosine ≥ 0.999 with norms within 1%. Its stores and
+  vector (joint and mean_diff) at every layer in `--check-layers` (default: layers 20-80% of the
+  way through the model, where the band and best-layer search look; the report names the layers
+  covered) must agree at cosine ≥ 0.999 with norms within 1%. Its stores and
   `fit-check.json` go next to the store (`<store>-fit-check/`).
 
 Reuse against a whole decode is still compared per line and reported, with the noise per layer set

@@ -865,7 +865,7 @@ impl Capturer {
 pub struct FitCheck {
     pub lines: usize,
     pub sets: Vec<String>,
-    /// Layers gated; every layer is reported.
+    /// Layers gated (inclusive); every layer is reported.
     pub layers: (u32, u32),
     /// Joint and mean_diff, prefixed `joint:` and `mean_diff:`.
     pub vectors: Vec<crate::compare::VectorDiff>,
@@ -981,11 +981,14 @@ pub fn reuse_fit_check(
     })
 }
 
-/// The layers the fit-level gate checks by default: the middle half of the
-/// captured ones, where chat vectors are applied.
-pub fn default_check_range(layers: &[usize]) -> (u32, u32) {
-    let n = layers.len();
-    (layers[n / 4] as u32, layers[(3 * n / 4).min(n - 1)] as u32)
+/// The layers the fit-level gate checks by default: 20-80% of the model's
+/// depth, the window the band and best-layer search work in, so whichever
+/// layer the chat check settles on is covered. Clamped to the captured
+/// layers.
+pub fn default_check_range(layers: &[usize], n_layer: usize) -> (u32, u32) {
+    let lo = (n_layer * 2).div_ceil(10).max(layers[0]);
+    let hi = (n_layer * 8 / 10).min(layers[layers.len() - 1]).max(lo);
+    (lo as u32, hi as u32)
 }
 
 // ------------------------------------------------------------- the capture
@@ -1116,6 +1119,14 @@ mod tests {
         let mut x = tensor([4, 5, 1, 1]);
         unsafe { t.receive(&mut x, 1, "l_out-2") };
         assert!(t.error.take().unwrap().contains("more than once"));
+    }
+
+    #[test]
+    fn the_fit_check_covers_20_to_80_percent_of_depth() {
+        let captured: Vec<usize> = (1..=62).collect();
+        assert_eq!(default_check_range(&captured, 64), (13, 51));
+        let tiny: Vec<usize> = (1..=4).collect();
+        assert_eq!(default_check_range(&tiny, 6), (2, 4));
     }
 
     #[test]
