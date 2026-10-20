@@ -226,7 +226,9 @@ At home, CPU, Qwen3.5-0.8B (same `qwen35` hybrid design), as part of step 5's on
 - `vi vectors preflight` (layer and reuse tests on the hybrid model);
 - the byte-equal prompt check against `vi chat`;
 - two real sets end to end: capture, fit, measure peak RAM and tokens per second; compare `mean_diff`
-  with cvector-generator's `mean` on the same pairs (high cosine expected after its layer shift);
+  with cvector-generator's `mean` on the same pairs (high cosine expected after its layer shift). The
+  official llama.cpp images don't ship `llama-cvector-generator` (built only with `GGML_BACKEND_DL` off),
+  so this comparison uses a CPU build at home or is skipped; nothing on the rental depends on it;
 - `vi vectors check` on one mood and one two-mood blend, single layer and telescoping band.
 
 The fit runs at home after the rental, so a fit bug costs no rental money; what has to be right before
