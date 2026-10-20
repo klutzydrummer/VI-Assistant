@@ -73,6 +73,11 @@ fn builds_checks_and_relayers_vectors() {
         "{out}"
     );
     assert!(out.contains("Captured 60 lines"), "{out}");
+    assert!(
+        out.contains("copy test") && out.contains("fit-level reuse check on"),
+        "{out}"
+    );
+    assert!(d.join("store-fit-check/fit-check.json").exists());
     for f in [
         "joint/loud.gguf",
         "joint/natural/loud.gguf",

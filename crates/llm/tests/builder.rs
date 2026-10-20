@@ -43,7 +43,9 @@ fn selftest_passes_end_to_end() {
         .layer_test
         .iter()
         .all(|c| c.leak_before.is_some()));
-    assert!(r.preflight.reuse_test.iter().all(|c| c.ok));
+    assert!(r.preflight.copy_test.iter().all(|c| c.ok));
+    assert!(!r.preflight.reuse_spread.is_empty());
+    assert!(r.fit_check.passed, "{:#?}", r.fit_check);
     assert!(r.gpu_vs_cpu_ok, "{:?}", r.gpu_vs_cpu);
     assert_eq!(r.lines, llm::selftest::LINES);
     assert!(r.steered_differs);

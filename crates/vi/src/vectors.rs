@@ -33,7 +33,9 @@ use llm::vectors::Scheme;
 
 pub const USAGE: &str = "  vi vectors fetch <model-id>
   vi vectors preflight <model-id> --messages <messages.jsonl> [--character <folder>] [--no-think]
+      [--labels <l.jsonl> --pairs <p.jsonl> [--check-dir <folder>]]
   vi vectors capture <model-id> --messages <messages.jsonl> --store <folder> [--skip-preflight] [--no-reuse] [--no-think]
+      [--labels <l.jsonl> --pairs <p.jsonl>] (needed to reuse the persona after the preflight)
   vi vectors fit --store <folder> --labels <labels.jsonl> --pairs <pairs.jsonl> --out <folder> [--head]
   vi vectors build <model-id> --messages <m.jsonl> --labels <l.jsonl> --pairs <p.jsonl> [--store <folder>] [--out <folder>]
       [--no-think] [--skip-preflight] [--no-reuse]
@@ -43,7 +45,9 @@ pub const USAGE: &str = "  vi vectors fetch <model-id>
   vi vectors compare <store-a> <store-b> | <method-folder-a> <method-folder-b>
   vi vectors selftest [--dir <folder>]
   (model commands also take --models <folder> (default $VI_MODELS or models/), --registry <models.toml>,
-   --gpu-layers N, --threads N; fit and build take --mem-mb N)";
+   --gpu-layers N, --threads N; fit and build take --mem-mb N; the fit-level reuse check takes
+   --check-sets a,b (default: the first sets, to 100+ lines) and --check-layers A-B (default: 20-80%
+   of the model's depth))";
 
 struct Args {
     pos: Vec<String>,
@@ -340,15 +344,79 @@ fn print_preflight(p: &capture::Preflight) {
             if c.ok { "ok" } else { "FAILED" }
         );
     }
-    for c in &p.reuse_test {
+    for c in &p.copy_test {
         println!(
-            "  reuse test {}: worst cosine {:.6}, worst relative error {:.2e} -> {}",
+            "  copy test {}: persona copied against the same decodes without the copy, \
+             worst relative error {:.2e} -> {}",
             c.line_id,
-            c.min_cos,
             c.max_rel,
             if c.ok { "ok" } else { "FAILED" }
         );
     }
+    let worst = p.reuse_test.iter().map(|c| c.max_rel).fold(0.0, f64::max);
+    println!(
+        "  reuse against whole decodes ({} lines, reported only): worst relative error {worst:.2e}{}",
+        p.reuse_test.len(),
+        if p.reuse_warning {
+            " (over 1e-3: rounding, judged by the fit-level check)"
+        } else {
+            ""
+        }
+    );
+    for d in &p.reuse_spread {
+        println!(
+            "    layer {:>3}: noise against the lines' spread {:.2e}, shared by every line {:.2}",
+            d.layer, d.noise_vs_spread, d.shared
+        );
+    }
+}
+
+fn print_fit_check(f: &capture::FitCheck) {
+    println!(
+        "  fit-level reuse check on {} lines of {}: gate covers layers {}-{}, worst cosine there {:.6}, worst norm change {:.2}% -> {}",
+        f.lines,
+        f.sets.join(", "),
+        f.layers.0,
+        f.layers.1,
+        f.worst_cos,
+        f.worst_norm * 100.0,
+        if f.passed { "ok" } else { "FAILED" }
+    );
+}
+
+/// The fit-level reuse gate, on the lines of the first contrast sets.
+fn fit_check(
+    a: &Args,
+    cap: &mut Capturer,
+    prepared: &[capture::Prepared],
+    dir: &Path,
+) -> Result<capture::FitCheck, String> {
+    let (labels, _) = fit::read_jsonl::<LabelRow>(&a.path("labels")?)?;
+    let (pairs, _) = fit::read_jsonl::<Pair>(&a.path("pairs")?)?;
+    let sets: Option<Vec<String>> = a
+        .get("check-sets")
+        .map(|s| s.split(',').map(str::to_string).collect());
+    let (sets, lines) = capture::fit_check_lines(prepared, &pairs, sets.as_deref());
+    if lines.len() < 2 {
+        return Err("the fit-level reuse check found no lines in the contrast sets".into());
+    }
+    let range = match a.get("check-layers") {
+        Some(r) => {
+            let (x, y) = r
+                .split_once('-')
+                .ok_or_else(|| format!("--check-layers {r}? (like 6-18)"))?;
+            (
+                x.parse().map_err(|_| format!("--check-layers {r}?"))?,
+                y.parse().map_err(|_| format!("--check-layers {r}?"))?,
+            )
+        }
+        None => capture::default_check_range(&cap.layers, cap.llama().n_layer()),
+    };
+    let f = capture::reuse_fit_check(cap, &lines, sets, &labels, &pairs, range, dir, |s| {
+        println!("  fit-level reuse check: capturing {s}")
+    })?;
+    print_fit_check(&f);
+    Ok(f)
 }
 
 fn preflight_cmd(a: &Args) -> Result<(), String> {
@@ -361,10 +429,23 @@ fn preflight_cmd(a: &Args) -> Result<(), String> {
     let t = Instant::now();
     let p = cap.preflight(&prepared)?;
     print_preflight(&p);
-    println!("preflight took {:.1}s", t.elapsed().as_secs_f64());
     if !p.passed {
         return Err("preflight failed; nothing should be captured on this model".into());
     }
+    if a.get("labels").is_some() {
+        let dir = a
+            .get("check-dir")
+            .map_or_else(|| std::env::temp_dir().join("vi-fit-check"), PathBuf::from);
+        if !fit_check(a, &mut cap, &prepared, &dir)?.passed {
+            println!("preflight took {:.1}s", t.elapsed().as_secs_f64());
+            return Err("reuse moves the vectors on this model: capture with --no-reuse".into());
+        }
+    } else {
+        println!(
+            "  (no --labels/--pairs: the fit-level reuse check didn't run; capture needs it to reuse)"
+        );
+    }
+    println!("preflight took {:.1}s", t.elapsed().as_secs_f64());
     println!("preflight passed");
     Ok(())
 }
@@ -383,12 +464,34 @@ fn capture_into(a: &Args, m: &Model, messages: &Path, store: &Path) -> Result<()
         let layers_ok = p.layer_test.iter().all(|c| c.ok);
         if !layers_ok || (!p.passed && reuse) {
             return Err(if layers_ok {
-                "the reuse test failed; the capture didn't start (--no-reuse decodes every \
-                 prompt whole instead, slower but exact)"
+                "the copy test failed: the reused persona isn't an exact copy; the capture \
+                 didn't start (--no-reuse decodes every prompt whole instead)"
                     .into()
             } else {
                 "the layer test failed; the capture didn't start".into()
             });
+        }
+        if reuse {
+            if a.get("labels").is_none() || a.get("pairs").is_none() {
+                return Err(
+                    "reusing the persona needs the fit-level check: pass --labels and \
+                     --pairs, or --no-reuse"
+                        .into(),
+                );
+            }
+            let dir = PathBuf::from(format!("{}-fit-check", store.display()));
+            let f = fit_check(a, &mut cap, &prepared, &dir)?;
+            let _ = fs::write(
+                dir.join("fit-check.json"),
+                serde_json::to_string_pretty(&f).unwrap(),
+            );
+            if !f.passed {
+                return Err(
+                    "reuse moves the vectors on this model; the capture didn't start \
+                     (--no-reuse decodes every prompt whole instead)"
+                        .into(),
+                );
+            }
         }
         Some(p)
     };
@@ -610,6 +713,7 @@ fn selftest_cmd(a: &Args) -> Result<(), String> {
     let gpu: i32 = a.num("gpu-layers")?.unwrap_or(-1);
     let r = llm::selftest::run(&dir, gpu, |s| println!("  {s}"))?;
     print_preflight(&r.preflight);
+    print_fit_check(&r.fit_check);
     println!(
         "  GPU offload {}; capture with --gpu-layers {gpu} against CPU: worst cosine {:.6}, \
          worst relative error {:.2e} -> {}",

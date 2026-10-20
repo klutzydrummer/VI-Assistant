@@ -47,24 +47,34 @@ under `nice -n 19` (plus `ionice -c3` on the game disk, `ionice -c2 -n7` on the 
   saying `</think>` is `never_steered`. Neither is judged or counted as a steering result, and
   `check` prints their rate per mood after each run (raise `max_tokens` if it's common).
 
-## When the reuse test fails
+## Persona reuse: the copy test and the fit-level check
 
-The reuse test compares each line captured with the decoded persona reused against the same line
-decoded whole, and wants a relative error under 1e-3. On quantized weights that can fail without
-anything being wrong: CPU matmuls on Q8_0 weights round the activations to 8 bits, so a last-bit
-difference in summation order (the persona's cache cells sit elsewhere in the two decodes) flips
-some roundings and spreads. On the tiny test model, Q8_0 weights turn a 2e-7 difference into 1.2e-3,
-while the vectors fit from the two captures still agree to a cosine above 0.9998 per layer.
-What matters is whether the difference moves the vectors. To find out on a model:
+Each line's capture reuses the persona, decoded once and copied with `seq_cp`. Reuse is allowed
+only when two gates pass (design, preflight step 2, revised 2026-10-20 after the 0.8B home run):
 
-1. Capture the same lines twice, once with `--no-reuse` (`--skip-preflight` on both).
-2. `vi vectors compare <store> <store-no-reuse>`: per layer, the difference against the lines' own
-   spread, and how much of it every line shares (a shared shift cancels in every contrast and in
-   the fit's intercept).
-3. Fit both and `vi vectors compare <out>/joint <out-no-reuse>/joint`: cosine and norm ratio per
-   vector and layer.
+- **Copy test** (preflight, a few lines): the copied persona against the same two decodes without
+  the copy, in an empty cache so the arithmetic and the cache cells are the same. They must match
+  within 1e-3 relative error per line and layer; a failure is a real copy bug.
+- **Fit-level check** (`capture` and `build` when they reuse, `preflight` with `--labels`/`--pairs`):
+  the lines of the first contrast sets (100+ lines, or `--check-sets a,b`) are captured with the
+  persona reused and decoded whole, both are fitted with the same labels and pairs, and every
+  vector (joint and mean_diff) at every layer in `--check-layers` (default: layers 20-80% of the
+  way through the model, where the band and best-layer search look; the report names the layers
+  covered) must agree at cosine ≥ 0.999 with norms within 1%. Its stores and
+  `fit-check.json` go next to the store (`<store>-fit-check/`).
 
-`build` and `capture` both take `--no-reuse`.
+Reuse against a whole decode is still compared per line and reported, with the noise per layer set
+against the lines' own spread, but it doesn't stop the run: on quantized weights it differs by
+rounding (CPU matmuls on Q8_0 round activations to 8 bits, so a last-bit difference in summation
+order, from the persona's cache cells sitting elsewhere, spreads; on the tiny test model Q8_0
+weights turn 2e-7 into 1.2e-3 while the copy test stays at 0).
+
+If a gate fails, capture with `--no-reuse` (`build` and `capture` both take it). To compare any two
+captures of the same lines, or two fits, by hand:
+- `vi vectors compare <store> <other-store>`: per layer, the difference against the lines' spread,
+  and how much of it every line shares (a shared shift cancels in every contrast and in the fit's
+  intercept).
+- `vi vectors compare <out>/joint <other-out>/joint`: cosine and norm ratio per vector and layer.
 
 ## Swapping the model
 
@@ -133,8 +143,9 @@ Same `qwen35` architecture as Qwen3.8-27B. Run from the repo, in the nix-shell t
 2. `target/release/vi vectors fetch qwen3.5-0.8b-q8 --models <disk with space>/models` (0.8 GB).
 3. Make `messages.jsonl`, `labels.jsonl` and `pairs.jsonl` for two real sets (only the lines in
    those sets, or all lines if time allows).
-4. `nice -n 19 target/release/vi vectors preflight qwen3.5-0.8b-q8 --models ... --messages ... --character characters/tali`
-   (layer test, reuse test on the hybrid model, persona byte-equal to `vi chat`'s).
+4. `nice -n 19 target/release/vi vectors preflight qwen3.5-0.8b-q8 --models ... --messages ... --character characters/tali --labels ... --pairs ...`
+   (layer test, copy test and fit-level reuse check on the hybrid model, persona byte-equal to
+   `vi chat`'s).
 5. `nice -n 19 target/release/vi vectors build qwen3.5-0.8b-q8 --models ... --messages ... --labels ... --pairs ... --store <disk>/store --out <disk>/vectors`
    under a peak-RAM measure (`/usr/bin/time -v`); note the lines/s it prints.
 6. A small plan for `vi vectors check`: one mood and one two-mood blend, `single:<mid>` and a

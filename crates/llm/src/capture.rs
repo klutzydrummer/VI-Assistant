@@ -46,6 +46,10 @@ pub const HEAD_TOKENS: usize = 8;
 /// Preflight tolerances: prefix reuse against a fresh decode.
 pub const REUSE_MIN_COS: f64 = 0.9999;
 pub const REUSE_MAX_REL: f64 = 1e-3;
+/// The copy test's limit, per line and layer.
+pub const COPY_MAX_REL: f64 = 1e-3;
+/// Lines in the reported full-decode comparison.
+pub const REUSE_WARNING_LINES: usize = 20;
 
 /// One line to capture: her persona, the line she answers, her line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -242,6 +246,18 @@ unsafe extern "C" fn tap_cb(t: *mut sys::ggml_tensor, ask: bool, user: *mut c_vo
     true
 }
 
+/// Where a capture's persona comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Persona {
+    /// Copied from sequence 0 with `seq_cp`.
+    Reused,
+    /// Decoded again into sequence 1, beside sequence 0's.
+    Fresh,
+    /// Decoded into sequence 1 of an empty cache, in two decodes like the
+    /// reused path: the same arithmetic in the same cells, without the copy.
+    Alone,
+}
+
 pub struct Capturer {
     // Dropped first: the context must go before the tap it points at.
     llama: Llama,
@@ -424,9 +440,20 @@ impl Capturer {
     }
 
     /// Capture one prepared line. With `reuse`, the persona comes from
-    /// sequence 0; without, it's decoded afresh (the reuse test's
-    /// reference, and the fallback).
+    /// sequence 0; without, it's decoded afresh (the full-decode
+    /// comparison, and the fallback).
     pub fn capture(&mut self, p: &Prepared, reuse: bool) -> Result<LineSummary, String> {
+        self.capture_with(
+            p,
+            if reuse {
+                Persona::Reused
+            } else {
+                Persona::Fresh
+            },
+        )
+    }
+
+    fn capture_with(&mut self, p: &Prepared, persona: Persona) -> Result<LineSummary, String> {
         let n_prefix = self.prefix.len();
         if !p.tokens.starts_with(&self.prefix) {
             return Err(format!(
@@ -434,16 +461,24 @@ impl Capturer {
                 p.line_id
             ));
         }
-        self.ensure_prefix()?;
+        if persona == Persona::Alone {
+            // An empty cache, so the persona lands in the cells sequence 0
+            // gets when it's decoded for reuse.
+            self.clear_seq(0)?;
+            self.prefix_ready = false;
+        } else {
+            self.ensure_prefix()?;
+        }
         self.clear_seq(1)?;
-        if reuse {
-            unsafe {
+        match persona {
+            Persona::Reused => unsafe {
                 let mem = sys::llama_get_memory(self.llama.ctx());
                 sys::llama_memory_seq_cp(mem, 0, 1, -1, -1);
+            },
+            Persona::Fresh | Persona::Alone => {
+                let prefix = self.prefix.clone();
+                self.decode(&prefix, 0, 1, 0..0)?;
             }
-        } else {
-            let prefix = self.prefix.clone();
-            self.decode(&prefix, 0, 1, 0..0)?;
         }
         let rest = &p.tokens[n_prefix..];
         // Indexes in `rest`: the lead-in, the prompt's last token, her line.
@@ -659,7 +694,17 @@ pub struct ReuseCheck {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Preflight {
     pub layer_test: Vec<LayerCheck>,
+    /// The gate on reuse: the copied persona against the same two decodes
+    /// without the copy. `ok` is a relative error within [`COPY_MAX_REL`].
+    pub copy_test: Vec<ReuseCheck>,
+    /// Reported, not a gate: each line with the persona reused against
+    /// decoded whole, which also differs by rounding (quantized matmuls
+    /// amplify last-bit order differences).
     pub reuse_test: Vec<ReuseCheck>,
+    /// The same, per layer, against the lines' own spread.
+    pub reuse_spread: Vec<crate::compare::LayerDiff>,
+    /// Some line misses the old per-line tolerance.
+    pub reuse_warning: bool,
     pub passed: bool,
 }
 
@@ -747,13 +792,40 @@ impl Capturer {
         Ok(out)
     }
 
-    /// The reuse test: lines captured with and without prefix reuse agree.
-    pub fn reuse_test(&mut self, lines: &[Prepared]) -> Result<Vec<ReuseCheck>, String> {
+    /// The copy test: each line with the persona copied by `seq_cp`
+    /// against the same two decodes without the copy.
+    pub fn copy_test(&mut self, lines: &[Prepared]) -> Result<Vec<ReuseCheck>, String> {
         let e = self.n_embd();
         let mut out = Vec::new();
         for p in lines {
+            let alone = self.capture_with(p, Persona::Alone)?;
+            let reused = self.capture_with(p, Persona::Reused)?;
+            let (c1, r1) = compare(&alone.mean, &reused.mean, e);
+            let (c2, r2) = compare(&alone.head, &reused.head, e);
+            let max_rel = r1.max(r2);
+            out.push(ReuseCheck {
+                line_id: p.line_id.clone(),
+                min_cos: c1.min(c2),
+                max_rel,
+                ok: max_rel <= COPY_MAX_REL,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The reported comparison: lines captured with and without prefix
+    /// reuse, per line and per layer against the lines' spread.
+    pub fn reuse_test(
+        &mut self,
+        lines: &[Prepared],
+    ) -> Result<(Vec<ReuseCheck>, Vec<crate::compare::LayerDiff>), String> {
+        let e = self.n_embd();
+        let mut out = Vec::new();
+        let mut diffs = crate::compare::Diffs::new(&self.layers, e);
+        for p in lines {
             let fresh = self.capture(p, false)?;
             let reused = self.capture(p, true)?;
+            diffs.add(&fresh.mean, &reused.mean);
             let (c1, r1) = compare(&fresh.mean, &reused.mean, e);
             let (c2, r2) = compare(&fresh.head, &reused.head, e);
             let (min_cos, max_rel) = (c1.min(c2), r1.max(r2));
@@ -764,21 +836,159 @@ impl Capturer {
                 ok: min_cos >= REUSE_MIN_COS && max_rel <= REUSE_MAX_REL,
             });
         }
-        Ok(out)
+        Ok((out, diffs.finish()))
     }
 
-    /// Both tests on the first few lines.
+    /// The layer test, the copy test on a few lines, and the reported
+    /// full-decode comparison. Reuse also needs [`reuse_fit_check`] to pass.
     pub fn preflight(&mut self, lines: &[Prepared]) -> Result<Preflight, String> {
         let first = lines.first().ok_or("no lines to test")?;
         let layer_test = self.layer_test(first, 0x5eed)?;
-        let reuse_test = self.reuse_test(&lines[..lines.len().min(5)])?;
-        let passed = layer_test.iter().all(|c| c.ok) && reuse_test.iter().all(|c| c.ok);
+        let copy_test = self.copy_test(&lines[..lines.len().min(5)])?;
+        let (reuse_test, reuse_spread) =
+            self.reuse_test(&lines[..lines.len().min(REUSE_WARNING_LINES)])?;
+        let reuse_warning = reuse_test.iter().any(|c| !c.ok);
+        let passed = layer_test.iter().all(|c| c.ok) && copy_test.iter().all(|c| c.ok);
         Ok(Preflight {
             layer_test,
+            copy_test,
             reuse_test,
+            reuse_spread,
+            reuse_warning,
             passed,
         })
     }
+}
+
+/// The fit-level reuse gate's result.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FitCheck {
+    pub lines: usize,
+    pub sets: Vec<String>,
+    /// Layers gated (inclusive); every layer is reported.
+    pub layers: (u32, u32),
+    /// Joint and mean_diff, prefixed `joint:` and `mean_diff:`.
+    pub vectors: Vec<crate::compare::VectorDiff>,
+    pub worst_cos: f64,
+    pub worst_norm: f64,
+    pub passed: bool,
+}
+
+pub const FIT_MIN_COS: f64 = 0.999;
+pub const FIT_MAX_NORM: f64 = 0.01;
+pub const FIT_MIN_LINES: usize = 100;
+
+/// The lines of the first contrast sets (by name, or `sets`) until there
+/// are at least [`FIT_MIN_LINES`].
+pub fn fit_check_lines<'a>(
+    lines: &'a [Prepared],
+    pairs: &[crate::fit::Pair],
+    sets: Option<&[String]>,
+) -> (Vec<String>, Vec<&'a Prepared>) {
+    let mut by_set: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        Default::default();
+    for p in pairs {
+        let s = by_set.entry(p.set.as_str()).or_default();
+        s.insert(p.pos.as_str());
+        s.insert(p.zero.as_str());
+    }
+    let mut chosen = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for (set, members) in &by_set {
+        let take = match sets {
+            Some(want) => want.iter().any(|w| w == set),
+            None => chosen.len() < 2 || ids.len() < FIT_MIN_LINES,
+        };
+        if take {
+            chosen.push(set.to_string());
+            ids.extend(members.iter().copied());
+        }
+    }
+    let subset = lines
+        .iter()
+        .filter(|p| ids.contains(p.line_id.as_str()))
+        .collect();
+    (chosen, subset)
+}
+
+/// The fit-level reuse gate: capture `lines` with the persona reused and
+/// decoded whole, fit both with the same labels and pairs, and require
+/// every vector at every layer in `range` to agree at cosine
+/// [`FIT_MIN_COS`] with norms within [`FIT_MAX_NORM`]. Stores go in `dir`.
+#[allow(clippy::too_many_arguments)]
+pub fn reuse_fit_check(
+    cap: &mut Capturer,
+    lines: &[&Prepared],
+    sets: Vec<String>,
+    labels: &[crate::fit::LabelRow],
+    pairs: &[crate::fit::Pair],
+    range: (u32, u32),
+    dir: &Path,
+    mut progress: impl FnMut(&str),
+) -> Result<FitCheck, String> {
+    let owned: Vec<Prepared> = lines.iter().map(|p| (*p).clone()).collect();
+    let mut fits = Vec::new();
+    for (name, reuse) in [("reused", true), ("whole", false)] {
+        progress(&format!("{} lines, persona {name}", owned.len()));
+        let store = dir.join(name);
+        let _ = fs::remove_dir_all(&store);
+        let run = CaptureRun {
+            model_file: Path::new("fit-check"),
+            model_sha256: "fit-check",
+            messages_sha256: "fit-check",
+            store: &store,
+            reuse,
+        };
+        capture_all(cap, &owned, &run, None, |_, _| {})?;
+        let mut s = crate::store::Store::open(&store)?;
+        fits.push(crate::fit::fit(
+            &mut s,
+            labels,
+            pairs,
+            ("fit-check", "fit-check"),
+            &crate::fit::FitOptions::default(),
+            |_| {},
+        )?);
+    }
+    let mut vectors = Vec::new();
+    for (method, a, b) in [
+        ("joint", &fits[0].joint, &fits[1].joint),
+        ("mean_diff", &fits[0].mean_diff, &fits[1].mean_diff),
+    ] {
+        for mut d in crate::compare::vector_maps(a, b)? {
+            d.vector = format!("{method}:{}", d.vector);
+            vectors.push(d);
+        }
+    }
+    let gated = || {
+        vectors
+            .iter()
+            .filter(|d| d.layer >= range.0 && d.layer <= range.1)
+    };
+    let worst_cos = gated().map(|d| d.cos).fold(1.0, f64::min);
+    let worst_norm = gated()
+        .map(|d| (d.norm_ratio - 1.0).abs())
+        .fold(0.0, f64::max);
+    let passed = gated().next().is_some() && worst_cos >= FIT_MIN_COS && worst_norm <= FIT_MAX_NORM;
+    Ok(FitCheck {
+        lines: owned.len(),
+        sets,
+        layers: range,
+        vectors,
+        worst_cos,
+        worst_norm,
+        passed,
+    })
+}
+
+/// The layers the fit-level gate checks by default: 20-80% of the model's
+/// depth, the window the band and best-layer search work in, so whichever
+/// layer the chat check settles on is covered. Clamped to the captured
+/// layers.
+pub fn default_check_range(layers: &[usize], n_layer: usize) -> (u32, u32) {
+    let lo = (n_layer * 2).div_ceil(10).max(layers[0]);
+    let hi = (n_layer * 8 / 10).min(layers[layers.len() - 1]).max(lo);
+    (lo as u32, hi as u32)
 }
 
 // ------------------------------------------------------------- the capture
@@ -909,6 +1119,14 @@ mod tests {
         let mut x = tensor([4, 5, 1, 1]);
         unsafe { t.receive(&mut x, 1, "l_out-2") };
         assert!(t.error.take().unwrap().contains("more than once"));
+    }
+
+    #[test]
+    fn the_fit_check_covers_20_to_80_percent_of_depth() {
+        let captured: Vec<usize> = (1..=62).collect();
+        assert_eq!(default_check_range(&captured, 64), (13, 51));
+        let tiny: Vec<usize> = (1..=4).collect();
+        assert_eq!(default_check_range(&tiny, 6), (2, 4));
     }
 
     #[test]
