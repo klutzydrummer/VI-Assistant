@@ -1,9 +1,10 @@
 # Steering vector builder: design
 
-Status: design draft 2, 2026-10-20. Built on `steering-builder-research.md`; draft 1 was reviewed in
-`steering-builder-critique.md` (thread "Critical review of steering builder") and every finding is
-addressed here (see "Review findings and where they went" at the end). Nothing is implemented.
-Implementation starts only after Brandon's go.
+Status: design draft 2, **approved by Brandon 2026-10-20 15:03** ("full strength = best single layer at
+1.0, telescoping bands; joint default; go implement"). Built on `steering-builder-research.md`; draft 1
+was reviewed in `steering-builder-critique.md` (thread "Critical review of steering builder") and every
+finding is addressed here (see "Review findings and where they went" at the end). Implementation is in
+its own thread.
 
 ## Goal
 
@@ -144,7 +145,7 @@ already carry their companions and double-count when added. Joint is the default
 
 Thin and flagged moods are still built and still start at full strength (Brandon, PR #62).
 
-## What "full strength" means (Brandon's call)
+## What "full strength" means (decided by Brandon, 2026-10-20)
 
 Vectors keep their natural size. A vector measured at layer *L* is the whole gap between her mood lines
 and her plain lines at that point, already accumulated by the layers before. So:
