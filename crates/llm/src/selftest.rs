@@ -23,6 +23,7 @@ pub const LINES: usize = 60;
 pub struct SelfTest {
     pub gpu_offload_supported: bool,
     pub preflight: Preflight,
+    pub fit_check: capture::FitCheck,
     /// Worst cosine and relative error, capture on `gpu_layers` against CPU.
     pub gpu_vs_cpu: (f64, f64),
     pub gpu_vs_cpu_ok: bool,
@@ -105,10 +106,24 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
     testmodel::write_layers(&model, 11, LAYERS).map_err(|e| e.to_string())?;
     let msgs = messages();
 
-    log("preflight: layer and reuse tests");
+    log("preflight: layer, copy and reuse tests");
     let mut cap = load(&model, gpu_layers, &msgs)?;
     let prepared = cap.prepare(&msgs)?;
     let preflight = cap.preflight(&prepared)?;
+    log("fit-level reuse check");
+    let pairs_all = pairs();
+    let (sets, lines) = capture::fit_check_lines(&prepared, &pairs_all, None);
+    let range = capture::default_check_range(&cap.layers);
+    let fit_check = capture::reuse_fit_check(
+        &mut cap,
+        &lines,
+        sets,
+        &labels(),
+        &pairs_all,
+        range,
+        &dir.join("fit-check"),
+        |_| {},
+    )?;
 
     log("capture");
     let store_dir = dir.join("store");
@@ -201,10 +216,11 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
     )?;
     let steered_differs = steered.tokens != plain.tokens;
 
-    let passed = preflight.passed && gpu_vs_cpu_ok && steered_differs;
+    let passed = preflight.passed && fit_check.passed && gpu_vs_cpu_ok && steered_differs;
     Ok(SelfTest {
         gpu_offload_supported: unsafe { llama_cpp_sys_2::llama_supports_gpu_offload() },
         preflight,
+        fit_check,
         gpu_vs_cpu: (min_cos, max_rel),
         gpu_vs_cpu_ok,
         lines: store.lines.len(),

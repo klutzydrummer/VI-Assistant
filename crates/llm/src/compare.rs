@@ -42,6 +42,87 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// Per-layer sums for [`LayerDiff`], fed one line's summaries at a time.
+pub struct Diffs {
+    e: usize,
+    layers: Vec<usize>,
+    n: usize,
+    sum_a: Vec<f64>,
+    sum_aa: Vec<f64>,
+    sum_d: Vec<f64>,
+    sum_dd: Vec<f64>,
+    rel: Vec<Vec<f64>>,
+    min_cos: Vec<f64>,
+}
+
+impl Diffs {
+    pub fn new(layers: &[usize], n_embd: usize) -> Self {
+        let k = layers.len();
+        Self {
+            e: n_embd,
+            layers: layers.to_vec(),
+            n: 0,
+            sum_a: vec![0.0; k * n_embd],
+            sum_aa: vec![0.0; k],
+            sum_d: vec![0.0; k * n_embd],
+            sum_dd: vec![0.0; k],
+            rel: vec![Vec::new(); k],
+            min_cos: vec![1.0; k],
+        }
+    }
+
+    /// One line's summaries (layers x n_embd) from each side.
+    pub fn add(&mut self, a: &[f32], b: &[f32]) {
+        let e = self.e;
+        for s in 0..self.layers.len() {
+            let x: Vec<f64> = a[s * e..(s + 1) * e].iter().map(|&v| v.into()).collect();
+            let y: Vec<f64> = b[s * e..(s + 1) * e].iter().map(|&v| v.into()).collect();
+            let d: Vec<f64> = x.iter().zip(&y).map(|(p, q)| p - q).collect();
+            let (xx, yy, dd) = (dot(&x, &x), dot(&y, &y), dot(&d, &d));
+            self.rel[s].push(dd.sqrt() / xx.sqrt().max(1e-30));
+            let cos = if xx == 0.0 && yy == 0.0 {
+                1.0
+            } else {
+                dot(&x, &y) / (xx * yy).sqrt().max(1e-30)
+            };
+            self.min_cos[s] = self.min_cos[s].min(cos);
+            self.sum_aa[s] += xx;
+            self.sum_dd[s] += dd;
+            for j in 0..e {
+                self.sum_a[s * e + j] += x[j];
+                self.sum_d[s * e + j] += d[j];
+            }
+        }
+        self.n += 1;
+    }
+
+    pub fn finish(mut self) -> Vec<LayerDiff> {
+        let (e, nf) = (self.e, self.n.max(1) as f64);
+        (0..self.layers.len())
+            .map(|s| {
+                let mean_a = &self.sum_a[s * e..(s + 1) * e];
+                let mean_d = &self.sum_d[s * e..(s + 1) * e];
+                let mean_aa = dot(mean_a, mean_a) / (nf * nf);
+                let spread = (self.sum_aa[s] / nf - mean_aa).max(0.0);
+                let mean_dd = dot(mean_d, mean_d) / (nf * nf);
+                let msd = self.sum_dd[s] / nf;
+                let noise = (msd - mean_dd).max(0.0);
+                let mut r = std::mem::take(&mut self.rel[s]);
+                r.sort_by(f64::total_cmp);
+                LayerDiff {
+                    layer: self.layers[s],
+                    median_rel: r.get(r.len() / 2).copied().unwrap_or(0.0),
+                    worst_rel: r.last().copied().unwrap_or(0.0),
+                    min_cos: self.min_cos[s],
+                    vs_spread: (msd / spread.max(1e-30)).sqrt(),
+                    shared: (mean_dd / msd.max(1e-300)).sqrt(),
+                    noise_vs_spread: (noise / spread.max(1e-30)).sqrt(),
+                }
+            })
+            .collect()
+    }
+}
+
 /// Compare `line_mean` in two stores of the same lines and layers.
 pub fn stores(a: &mut Store, b: &mut Store) -> Result<Vec<LayerDiff>, String> {
     if a.meta.layers != b.meta.layers || a.meta.n_embd != b.meta.n_embd {
@@ -61,58 +142,13 @@ pub fn stores(a: &mut Store, b: &mut Store) -> Result<Vec<LayerDiff>, String> {
     }
     let mut ra = vec![0.0f32; k * e];
     let mut rb = vec![0.0f32; k * e];
-    let mut sum_a = vec![0.0f64; k * e];
-    let mut sum_aa = vec![0.0f64; k];
-    let mut sum_d = vec![0.0f64; k * e];
-    let mut sum_dd = vec![0.0f64; k];
-    let mut rel: Vec<Vec<f64>> = vec![Vec::with_capacity(n); k];
-    let mut min_cos = vec![1.0f64; k];
+    let mut diffs = Diffs::new(&a.meta.layers, e);
     for i in 0..n {
         a.read(Summary::Mean, i, 0..k, &mut ra)?;
         b.read(Summary::Mean, i, 0..k, &mut rb)?;
-        for s in 0..k {
-            let x: Vec<f64> = ra[s * e..(s + 1) * e].iter().map(|&v| v.into()).collect();
-            let y: Vec<f64> = rb[s * e..(s + 1) * e].iter().map(|&v| v.into()).collect();
-            let d: Vec<f64> = x.iter().zip(&y).map(|(p, q)| p - q).collect();
-            let (xx, yy, dd) = (dot(&x, &x), dot(&y, &y), dot(&d, &d));
-            rel[s].push(dd.sqrt() / xx.sqrt().max(1e-30));
-            let cos = if xx == 0.0 && yy == 0.0 {
-                1.0
-            } else {
-                dot(&x, &y) / (xx * yy).sqrt().max(1e-30)
-            };
-            min_cos[s] = min_cos[s].min(cos);
-            sum_aa[s] += xx;
-            sum_dd[s] += dd;
-            for j in 0..e {
-                sum_a[s * e + j] += x[j];
-                sum_d[s * e + j] += d[j];
-            }
-        }
+        diffs.add(&ra, &rb);
     }
-    let nf = n as f64;
-    Ok((0..k)
-        .map(|s| {
-            let mean_a = &sum_a[s * e..(s + 1) * e];
-            let mean_d = &sum_d[s * e..(s + 1) * e];
-            let mean_aa = dot(mean_a, mean_a) / (nf * nf);
-            let spread = (sum_aa[s] / nf - mean_aa).max(0.0);
-            let mean_dd = dot(mean_d, mean_d) / (nf * nf);
-            let msd = sum_dd[s] / nf;
-            let noise = (msd - mean_dd).max(0.0);
-            let mut r = std::mem::take(&mut rel[s]);
-            r.sort_by(f64::total_cmp);
-            LayerDiff {
-                layer: a.meta.layers[s],
-                median_rel: r[r.len() / 2],
-                worst_rel: r[r.len() - 1],
-                min_cos: min_cos[s],
-                vs_spread: (msd / spread.max(1e-30)).sqrt(),
-                shared: (mean_dd / msd.max(1e-300)).sqrt(),
-                noise_vs_spread: (noise / spread.max(1e-30)).sqrt(),
-            }
-        })
-        .collect())
+    Ok(diffs.finish())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -124,7 +160,7 @@ pub struct VectorDiff {
     pub norm_ratio: f64,
 }
 
-fn natural(dir: &Path) -> Result<BTreeMap<String, BTreeMap<u32, Vec<f32>>>, String> {
+fn natural(dir: &Path) -> Result<Vectors, String> {
     let nat = dir.join("natural");
     let mut out = BTreeMap::new();
     for entry in fs::read_dir(&nat).map_err(|e| format!("{}: {e}", nat.display()))? {
@@ -141,15 +177,21 @@ fn natural(dir: &Path) -> Result<BTreeMap<String, BTreeMap<u32, Vec<f32>>>, Stri
 
 /// Compare the natural vectors of two method folders (`.../joint`).
 pub fn vectors(a: &Path, b: &Path) -> Result<Vec<VectorDiff>, String> {
-    let (va, vb) = (natural(a)?, natural(b)?);
+    vector_maps(&natural(a)?, &natural(b)?)
+}
+
+type Vectors = BTreeMap<String, BTreeMap<u32, Vec<f32>>>;
+
+/// [`vectors`] on vectors in memory (name -> layer -> direction).
+pub fn vector_maps(va: &Vectors, vb: &Vectors) -> Result<Vec<VectorDiff>, String> {
     let mut out = Vec::new();
-    for (name, layers) in &va {
+    for (name, layers) in va {
         let Some(other) = vb.get(name) else {
-            return Err(format!("{} has no {name}", b.display()));
+            return Err(format!("the second fit has no {name}"));
         };
         for (&l, x) in layers {
             let Some(y) = other.get(&l) else {
-                return Err(format!("{} has no {name} at layer {l}", b.display()));
+                return Err(format!("the second fit has no {name} at layer {l}"));
             };
             let x: Vec<f64> = x.iter().map(|&v| v.into()).collect();
             let y: Vec<f64> = y.iter().map(|&v| v.into()).collect();
