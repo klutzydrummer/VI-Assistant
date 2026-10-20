@@ -41,10 +41,27 @@ Each mood gets its route: **voice and chat** (passes), **chat only** (fails; the
 the nearest passing moods), **thin** (real but rare; blend or lower strength, flagged), or
 **missing** (persona prompt only). Output: one table, mood by route, with counts.
 
+Outcome (2026-10-20, `corpus/tali/analysis/after_labels/step3.py --guard resid`): AFx-Rep was the
+effect detector (fx_detect, 90 marks), and its 71 effect clips are left out of the voice sets only.
+The channel guard uses the six channel measures with her pitch, loudness, rate and game taken out.
+The raw measures follow her voice, so as first written the guard failed moods for having a clear
+sound (Brandon chose the fix after seeing both). Result: 11 voice-and-chat moods (urgency, alarm,
+tension, gratitude, protectiveness, subdued, sadness, indignation, warmth, matter_of_fact, grim),
+55 chat-only, 11 thin (apologetic passes but has 25 lines). Playful, amused, romance and teasing
+still trip the fixed guard (party and Normandy mixing, likely) and go to test D as borderline.
+
+**Vector strength (Brandon, 2026-10-20):** every vector, thin and borderline ones included, starts at
+full strength in test D. It is lowered only if it performs badly there (gibberish, off-character, or
+too much of the mood), never in advance. A note that it *may* need lowering is all that's recorded
+beforehand.
+
 **4. Chat contrast sets (home, free).**
 For each mood and knob, her trusted positive lines against her matched trusted zeros, wrapped
 in her persona prompt, written as the prompt files llama.cpp's `cvector-generator` takes. The
-dialogue model is the GGUF the engine already embeds (`vi chat --model`).
+dialogue model is the GGUF the engine already embeds (`vi chat --model`). Built 2026-10-20
+(`after_labels/step4.py`): 80 sets (77 moods, plus energy, intoxication and hungover), stored as chat
+messages and rendered with the chosen model's own chat template on the rental
+(`after_labels/render_cvector.py --gguf`), since the model is picked in step 5.
 
 **5. Chat and voice vectors, and the steering test, part D (one rental, his go).**
 - Chat: build each vector from step 4's files, fitted together so blends add up. A strength
