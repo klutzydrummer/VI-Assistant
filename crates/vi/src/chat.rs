@@ -22,6 +22,7 @@ const HELP: &str = "Type to talk. Commands:
   /event <id>   apply an event directly, e.g. /event drink
   /state <id>   force a state, e.g. /state sober
   /status       show state, variables and vector strengths
+  /thinking     show what she thought before her last reply
   /quit         leave";
 
 pub struct ModelArgs {
@@ -145,6 +146,7 @@ fn talk<L: Dialogue + Explain>(mut session: Session, dialogue: &L, setup: &str) 
         session.pack.manifest.short_name
     );
     let stdin = std::io::stdin();
+    let mut thinking: Option<String> = None;
     loop {
         print!("you> ");
         std::io::stdout().flush().ok();
@@ -158,6 +160,10 @@ fn talk<L: Dialogue + Explain>(mut session: Session, dialogue: &L, setup: &str) 
             ("/quit", _) => break,
             ("/help", _) => println!("{HELP}"),
             ("/status", _) => status(&session),
+            ("/thinking", _) => match &thinking {
+                Some(t) if !t.is_empty() => println!("{t}"),
+                _ => println!("  no thinking on the last reply"),
+            },
             ("/event", id) => {
                 match session.machine.apply(&mut session.snapshot, id.trim()) {
                     Ok(changes) => {
@@ -188,6 +194,16 @@ fn talk<L: Dialogue + Explain>(mut session: Session, dialogue: &L, setup: &str) 
                         for c in &r.changes {
                             println!("  state: {} -> {}", c.from, c.to);
                         }
+                        if let Some(t) = r.thinking.as_ref().filter(|t| !t.is_empty()) {
+                            println!(
+                                "  thought first: {} words, not spoken (/thinking shows it)",
+                                t.split_whitespace().count()
+                            );
+                            if r.reply.is_empty() {
+                                println!("  her thinking never finished, so she said nothing");
+                            }
+                        }
+                        thinking = r.thinking.clone();
                         println!("  llm vectors: {}", strengths(&r.llm_vectors));
                         dialogue.explain();
                         status(&session);

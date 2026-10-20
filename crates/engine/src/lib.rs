@@ -107,6 +107,31 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_never_spoken_or_remembered() {
+        let mut session = tali();
+        let director = RulesDirector::new(session.machine.spec());
+        let dialogue = ScriptedDialogue::new([
+            "<think>\nThinking Process: 1. He sounds tired. 2. Be warm.\n</think>\n\nHey. Rough day?",
+        ]);
+        let voice = RecordingVoice::default();
+        let report = block(session.turn("Hi.", &director, &dialogue, &voice)).unwrap();
+        assert_eq!(report.reply, "Hey. Rough day?");
+        assert_eq!(
+            report.thinking.as_deref(),
+            Some("Thinking Process: 1. He sounds tired. 2. Be warm.")
+        );
+        let spoken: Vec<String> = voice
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect();
+        assert_eq!(spoken, vec!["Hey.", "Rough day?"]);
+        assert_eq!(session.history[1].text, "Hey. Rough day?");
+    }
+
+    #[test]
     fn a_failed_turn_changes_nothing() {
         struct Broken;
         impl crate::pipeline::Dialogue for Broken {

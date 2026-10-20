@@ -82,6 +82,105 @@ fn is_abbreviation(s: &str, dot: usize) -> bool {
     )
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ThinkState {
+    /// Nothing but whitespace yet; a `<think>` may still be coming.
+    #[default]
+    Start,
+    Thinking,
+    /// Just past `</think>`, dropping the whitespace before the reply.
+    AfterThink,
+    Reply,
+}
+
+/// Separates a reasoning model's `<think>…</think>` block from what the
+/// character says, as the text streams. Only a block at the very start
+/// counts; tags split across chunks are handled. A block that never closes
+/// (out of tokens) is all thinking and leaves no reply.
+#[derive(Debug, Default)]
+pub struct ThinkSplitter {
+    state: ThinkState,
+    buf: String,
+    thinking: String,
+    thought: bool,
+}
+
+impl ThinkSplitter {
+    /// Add a chunk and return the part of it that's reply, if any.
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.buf.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            match self.state {
+                ThinkState::Start => {
+                    let text = self.buf.trim_start();
+                    if let Some(rest) = text.strip_prefix(THINK_OPEN) {
+                        self.buf = rest.to_string();
+                        self.state = ThinkState::Thinking;
+                        self.thought = true;
+                    } else if THINK_OPEN.starts_with(text) {
+                        return out;
+                    } else {
+                        self.state = ThinkState::Reply;
+                    }
+                }
+                ThinkState::Thinking => match self.buf.find(THINK_CLOSE) {
+                    Some(end) => {
+                        self.thinking.push_str(&self.buf[..end]);
+                        self.buf.drain(..end + THINK_CLOSE.len());
+                        self.state = ThinkState::AfterThink;
+                    }
+                    None => {
+                        // Keep what could be the start of a split `</think>`.
+                        let keep = (1..THINK_CLOSE.len())
+                            .rev()
+                            .find(|&n| self.buf.ends_with(&THINK_CLOSE[..n]))
+                            .unwrap_or(0);
+                        let cut = self.buf.len() - keep;
+                        self.thinking.push_str(&self.buf[..cut]);
+                        self.buf.drain(..cut);
+                        return out;
+                    }
+                },
+                ThinkState::AfterThink => {
+                    let text = self.buf.trim_start();
+                    if text.is_empty() {
+                        self.buf.clear();
+                        return out;
+                    }
+                    self.buf = text.to_string();
+                    self.state = ThinkState::Reply;
+                }
+                ThinkState::Reply => {
+                    out.push_str(&self.buf);
+                    self.buf.clear();
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Whatever reply is left once the stream ends.
+    pub fn finish(&mut self) -> String {
+        let rest = std::mem::take(&mut self.buf);
+        match self.state {
+            ThinkState::Thinking => {
+                self.thinking.push_str(&rest);
+                String::new()
+            }
+            _ => rest,
+        }
+    }
+
+    /// The thinking so far, trimmed; `None` if the model didn't think.
+    pub fn thinking(&self) -> Option<String> {
+        self.thought.then(|| self.thinking.trim().to_string())
+    }
+}
+
 /// Strip what a voice can't say: markdown, emoji, bracketed asides and
 /// stray whitespace. Words are never changed.
 pub fn normalize(s: &str) -> String {
@@ -144,6 +243,56 @@ mod tests {
         assert!(s.push("That's very strong.").is_empty());
         assert_eq!(s.push(" Mmm."), vec!["That's very strong."]);
         assert_eq!(s.finish().as_deref(), Some("Mmm."));
+    }
+
+    fn split_think(chunks: &[&str]) -> (Option<String>, String) {
+        let mut s = ThinkSplitter::default();
+        let mut reply: String = chunks.iter().map(|c| s.push(c)).collect();
+        reply.push_str(&s.finish());
+        (s.thinking(), reply)
+    }
+
+    #[test]
+    fn keeps_thinking_out_of_the_reply() {
+        assert_eq!(
+            split_think(&["<think>\nShe'd be glad.\n</think>\n\nKeelah!"]),
+            (Some("She'd be glad.".into()), "Keelah!".into())
+        );
+        assert_eq!(split_think(&["Keelah!"]), (None, "Keelah!".into()));
+        assert_eq!(
+            split_think(&["<think>\nThinking Process: 1. Greet."]),
+            (Some("Thinking Process: 1. Greet.".into()), String::new())
+        );
+        assert_eq!(
+            split_think(&["<think>\n\n</think>\n\nHi."]),
+            (Some(String::new()), "Hi.".into())
+        );
+    }
+
+    #[test]
+    fn finds_think_tags_split_across_chunks() {
+        assert_eq!(
+            split_think(&[
+                "\n<thi",
+                "nk>Hmm, a ",
+                "drink. </th",
+                "ink>",
+                "\n",
+                "Oh. ",
+                "Thanks."
+            ]),
+            (Some("Hmm, a drink.".into()), "Oh. Thanks.".into())
+        );
+        assert_eq!(split_think(&["<th", "e end"]), (None, "<the end".into()));
+        assert_eq!(split_think(&["<"]), (None, "<".into()));
+    }
+
+    #[test]
+    fn only_a_leading_think_block_counts() {
+        assert_eq!(
+            split_think(&["I said <think> once."]),
+            (None, "I said <think> once.".into())
+        );
     }
 
     #[test]
