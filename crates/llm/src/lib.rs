@@ -85,6 +85,12 @@ impl Dialogue for LlamaDialogue {
             }));
             let prompt = inner.llama.format_chat(&messages)?;
             let mut receiver_gone = false;
+            // Templates with thinking on (Qwen3.5) end the prompt inside an
+            // open `<think>`, so the reply starts mid-thought. Say so, so the
+            // pipeline keeps the thinking out of what she says.
+            if opens_thinking(&prompt) && out.blocking_send("<think>".to_string()).is_err() {
+                return Err("the reply's listener went away".to_string());
+            }
             let generation =
                 inner
                     .llama
@@ -105,5 +111,24 @@ impl Dialogue for LlamaDialogue {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+}
+
+/// Whether a formatted prompt leaves a think block open for the reply.
+fn opens_thinking(prompt: &str) -> bool {
+    prompt.trim_end().ends_with("<think>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opens_thinking;
+
+    #[test]
+    fn sees_a_prompt_left_inside_a_think_block() {
+        assert!(opens_thinking("<|im_start|>assistant\n<think>\n"));
+        assert!(!opens_thinking(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(!opens_thinking("<|im_start|>assistant\n"));
     }
 }

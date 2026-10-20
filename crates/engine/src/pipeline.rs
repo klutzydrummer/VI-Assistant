@@ -3,7 +3,8 @@
 //! 1. The director reads the user's message and picks events.
 //! 2. The state machine applies them.
 //! 3. The dialogue model streams a plain-text reply, steered by the
-//!    mixing table's `llm` vectors.
+//!    mixing table's `llm` vectors. A leading `<think>…</think>` block is
+//!    kept apart: it's never voiced or stored as her line.
 //! 4. Each sentence, as soon as it's complete, is cleaned up, directed and
 //!    voiced with the `tts` vectors, while the rest is still streaming.
 //! 5. Time passes for the state machine, and the turn is committed.
@@ -20,7 +21,7 @@ use tokio::sync::mpsc;
 
 use crate::director::{Delivery, Director, SentenceContext, TurnContext};
 use crate::prompt::system_prompt;
-use crate::text::{normalize, SentenceSplitter};
+use crate::text::{normalize, SentenceSplitter, ThinkSplitter};
 
 /// How many past messages go to the dialogue model.
 const HISTORY_WINDOW: usize = 20;
@@ -74,6 +75,9 @@ pub struct TurnReport {
     pub changes: Vec<Change>,
     pub llm_vectors: BTreeMap<String, f32>,
     pub reply: String,
+    /// The model's thinking before its reply, for debugging; `None` if it
+    /// didn't think.
+    pub thinking: Option<String>,
     pub sentences: Vec<(String, Delivery)>,
 }
 
@@ -148,6 +152,7 @@ impl Session {
         let (tx, mut rx) = mpsc::channel::<String>(64);
         let produce = dialogue.stream(&req, tx);
         let consume = async {
+            let mut think = ThinkSplitter::default();
             let mut splitter = SentenceSplitter::default();
             let mut reply = String::new();
             let mut sentences = Vec::new();
@@ -174,19 +179,25 @@ impl Session {
                 }
             };
             while let Some(chunk) = rx.recv().await {
+                let chunk = think.push(&chunk);
                 reply.push_str(&chunk);
                 for raw in splitter.push(&chunk) {
                     sentences.extend(voice_one(raw).await?);
                 }
             }
+            let chunk = think.finish();
+            reply.push_str(&chunk);
+            for raw in splitter.push(&chunk) {
+                sentences.extend(voice_one(raw).await?);
+            }
             if let Some(raw) = splitter.finish() {
                 sentences.extend(voice_one(raw).await?);
             }
-            Ok::<_, String>((reply, sentences))
+            Ok::<_, String>((reply, think.thinking(), sentences))
         };
         let (produced, consumed) = tokio::join!(produce, consume);
         produced?;
-        let (reply, sentences) = consumed?;
+        let (reply, thinking, sentences) = consumed?;
 
         changes.extend(self.machine.end_turn(&mut snap));
 
@@ -207,6 +218,7 @@ impl Session {
             changes,
             llm_vectors: req.vectors,
             reply: normalize(&reply),
+            thinking,
             sentences,
         })
     }
