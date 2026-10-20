@@ -68,6 +68,20 @@ fn load_model(args: &ModelArgs, path: &PathBuf) -> Result<LlamaDialogue, String>
         Some(dir) => VectorBank::load_dir(dir, llama.n_embd(), llama.n_layer())?,
         None => VectorBank::empty(llama.n_embd(), llama.n_layer()),
     };
+    // Vectors from `vi vectors` name the model file they were built on.
+    if bank.knows_its_model() {
+        println!(
+            "Checking the vectors were built for this model file (hashed once, then cached)..."
+        );
+        let sha = llm::registry::sha256_cached(path)?;
+        if let Some((name, other)) = bank.built_for_other(&sha).first() {
+            return Err(format!(
+                "vector {name} was built for model {other}, not {} ({sha}); \
+                 rebuild the vectors for this model with vi vectors build",
+                path.display()
+            ));
+        }
+    }
     let names: Vec<_> = bank.names().collect();
     println!(
         "Control vectors: {}",

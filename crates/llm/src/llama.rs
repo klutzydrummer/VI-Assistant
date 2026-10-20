@@ -138,6 +138,15 @@ unsafe extern "C" fn log(level: sys::ggml_log_level, text: *const c_char, _: *mu
 
 impl Llama {
     pub fn load(config: &ModelConfig) -> Result<Self, String> {
+        Self::load_with(config, |_| {})
+    }
+
+    /// [`Llama::load`], with a last say over the context's parameters (the
+    /// capture's sequences, batch sizes and eval callback).
+    pub(crate) fn load_with(
+        config: &ModelConfig,
+        tweak: impl FnOnce(&mut sys::llama_context_params),
+    ) -> Result<Self, String> {
         init_backend();
         let path = path_cstring(&config.path)?;
         unsafe {
@@ -154,6 +163,7 @@ impl Llama {
                 cp.n_threads = n;
                 cp.n_threads_batch = n;
             }
+            tweak(&mut cp);
             let ctx = sys::llama_init_from_model(model, cp);
             if ctx.is_null() {
                 sys::llama_model_free(model);
@@ -181,6 +191,38 @@ impl Llama {
 
     pub fn n_layer(&self) -> usize {
         self.n_layer
+    }
+
+    pub(crate) fn ctx(&self) -> *mut sys::llama_context {
+        self.ctx
+    }
+
+    pub(crate) fn vocab(&self) -> *const sys::llama_vocab {
+        self.vocab
+    }
+
+    /// `general.architecture` from the model file.
+    pub fn architecture(&self) -> String {
+        let mut buf = [0u8; 128];
+        let n = unsafe {
+            sys::llama_model_meta_val_str(
+                self.model,
+                c"general.architecture".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n <= 0 {
+            return String::new();
+        }
+        String::from_utf8_lossy(&buf[..(n as usize).min(buf.len() - 1)]).into_owned()
+    }
+
+    /// The chat template `format_chat` uses: the model's own, or "chatml".
+    pub fn chat_template(&self) -> String {
+        self.template
+            .as_deref()
+            .map_or_else(|| "chatml".into(), |t| t.to_string_lossy().into_owned())
     }
 
     /// Length of the steering buffer [`Llama::generate`] expects.
@@ -272,19 +314,22 @@ impl Llama {
     }
 
     fn set_steering(&mut self, steer: Option<&[f32]>) -> Result<(), String> {
+        self.set_steering_layers(steer, 1, self.n_layer as i32 - 1)
+    }
+
+    /// Steer only layers `first..=last` with `steer` (`steer_len()` floats).
+    pub(crate) fn set_steering_layers(
+        &mut self,
+        steer: Option<&[f32]>,
+        first: i32,
+        last: i32,
+    ) -> Result<(), String> {
         let (data, len) = match steer {
             Some(s) => (s.as_ptr(), s.len()),
             None => (ptr::null(), 0),
         };
         let rc = unsafe {
-            sys::llama_set_adapter_cvec(
-                self.ctx,
-                data,
-                len,
-                self.n_embd as i32,
-                1,
-                self.n_layer as i32 - 1,
-            )
+            sys::llama_set_adapter_cvec(self.ctx, data, len, self.n_embd as i32, first, last)
         };
         if rc != 0 {
             return Err("llama.cpp rejected the control vector".into());

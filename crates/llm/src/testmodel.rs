@@ -21,7 +21,16 @@ pub fn write(path: &Path, seed: u64) -> std::io::Result<()> {
     build(seed).write(std::fs::File::create(path)?)
 }
 
+/// [`write`] with `n_layer` layers instead of [`N_LAYER`].
+pub fn write_layers(path: &Path, seed: u64, n_layer: usize) -> std::io::Result<()> {
+    build_layers(seed, n_layer).write(std::fs::File::create(path)?)
+}
+
 pub fn build(seed: u64) -> Gguf {
+    build_layers(seed, N_LAYER)
+}
+
+pub fn build_layers(seed: u64, n_layer: usize) -> Gguf {
     let mut g = Gguf::default();
     let mut kv = |k: &str, v: Value| {
         g.metadata.insert(k.to_string(), v);
@@ -30,7 +39,7 @@ pub fn build(seed: u64) -> Gguf {
     kv("general.name", Value::Str("vi-test-tiny".into()));
     kv("llama.context_length", Value::U32(N_CTX));
     kv("llama.embedding_length", Value::U32(N_EMBD as u32));
-    kv("llama.block_count", Value::U32(N_LAYER as u32));
+    kv("llama.block_count", Value::U32(n_layer as u32));
     kv("llama.feed_forward_length", Value::U32(N_FF as u32));
     kv("llama.attention.head_count", Value::U32(N_HEAD as u32));
     kv("llama.attention.head_count_kv", Value::U32(N_HEAD as u32));
@@ -77,7 +86,7 @@ pub fn build(seed: u64) -> Gguf {
     add(&mut g, "token_embd.weight".into(), vec![e, v], 1.0);
     add(&mut g, "output_norm.weight".into(), vec![e], 0.0);
     add(&mut g, "output.weight".into(), vec![e, v], s);
-    for i in 0..N_LAYER {
+    for i in 0..n_layer {
         add(&mut g, format!("blk.{i}.attn_norm.weight"), vec![e], 0.0);
         for w in ["attn_q", "attn_k", "attn_v", "attn_output"] {
             add(&mut g, format!("blk.{i}.{w}.weight"), vec![e, e], s);

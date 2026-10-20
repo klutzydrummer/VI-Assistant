@@ -16,8 +16,16 @@ use std::sync::{Arc, Mutex};
 use engine::pipeline::{Dialogue, DialogueRequest, Role};
 use tokio::sync::mpsc;
 
+pub mod capture;
+pub mod check;
+pub mod f16;
+pub mod fit;
 pub mod gguf;
+mod linalg;
 pub mod llama;
+pub mod registry;
+pub mod selftest;
+pub mod store;
 pub mod testmodel;
 pub mod vectors;
 
@@ -66,6 +74,21 @@ impl LlamaDialogue {
     }
 }
 
+/// The `(role, content)` messages a turn's prompt is rendered from. The
+/// vector capture builds its prompts through this too, so they match
+/// `vi chat`'s byte for byte.
+pub fn chat_messages(req: &DialogueRequest) -> Vec<(&'static str, &str)> {
+    let mut messages = vec![("system", req.system.as_str())];
+    messages.extend(req.messages.iter().map(|m| {
+        let role = match m.role {
+            Role::User => "user",
+            Role::Character => "assistant",
+        };
+        (role, m.text.as_str())
+    }));
+    messages
+}
+
 impl Dialogue for LlamaDialogue {
     async fn stream(&self, req: &DialogueRequest, out: mpsc::Sender<String>) -> Result<(), String> {
         let inner = self.inner.clone();
@@ -75,15 +98,7 @@ impl Dialogue for LlamaDialogue {
             let mut guard = inner.lock().map_err(|_| "dialogue model poisoned")?;
             let inner = &mut *guard;
             let blend = inner.bank.blend(&req.vectors);
-            let mut messages = vec![("system", req.system.as_str())];
-            messages.extend(req.messages.iter().map(|m| {
-                let role = match m.role {
-                    Role::User => "user",
-                    Role::Character => "assistant",
-                };
-                (role, m.text.as_str())
-            }));
-            let prompt = inner.llama.format_chat(&messages)?;
+            let prompt = inner.llama.format_chat(&chat_messages(&req))?;
             let mut receiver_gone = false;
             let generation =
                 inner

@@ -18,8 +18,9 @@ llm = { path = "../llm" }
 dataset = { path = "../dataset" }
 harvest = { path = "../harvest" }
 review = { path = "../review" }
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
+ureq = { version = "2", features = ["native-certs"] }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"

@@ -135,6 +135,8 @@ pub struct VectorBank {
     n_embd: usize,
     n_layer: usize,
     vectors: BTreeMap<String, Vector>,
+    /// Vector name to the model SHA-256 its file says it was built for.
+    built_for: BTreeMap<String, String>,
 }
 
 /// One turn's blended vector.
@@ -155,6 +157,7 @@ impl VectorBank {
             n_embd,
             n_layer,
             vectors: BTreeMap::new(),
+            built_for: BTreeMap::new(),
         }
     }
 
@@ -187,6 +190,9 @@ impl VectorBank {
             )
             .map_err(|e| format!("{}: {e}", path.display()))?;
             v.hash = hex(&Sha256::digest(&bytes));
+            if let Some(sha) = g.metadata.get(MODEL_SHA_KEY).and_then(|v| v.as_str()) {
+                bank.built_for.insert(name.clone(), sha.to_string());
+            }
             bank.vectors.insert(name, v);
         }
         if let Some(name) = limits.keys().next() {
@@ -204,6 +210,20 @@ impl VectorBank {
         }
         self.vectors.insert(name.into(), vector);
         Ok(())
+    }
+
+    /// Vectors whose file names a model other than `model_sha256`.
+    pub fn built_for_other(&self, model_sha256: &str) -> Vec<(&str, &str)> {
+        self.built_for
+            .iter()
+            .filter(|(_, sha)| *sha != model_sha256)
+            .map(|(n, sha)| (n.as_str(), sha.as_str()))
+            .collect()
+    }
+
+    /// Whether any vector says which model it was built for.
+    pub fn knows_its_model(&self) -> bool {
+        !self.built_for.is_empty()
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -267,9 +287,170 @@ pub fn uniform_gguf(direction: &[f32], n_layer: usize) -> Gguf {
     g
 }
 
+/// How a vector's per-layer directions are applied across layers. The
+/// builder measures a direction `d_L` at every layer's output; "full
+/// strength" is the best single layer at 1.0 (Brandon, 2026-10-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// `d_L` at layer L only.
+    Single(u32),
+    /// `d_A` at A, then each later layer's own extra gap `d_L - d_(L-1)`:
+    /// the stream carries each layer's measured gap, at full strength.
+    Telescoping(u32, u32),
+    /// `d_L / K` on each of the K layers (comparison only).
+    OverK(u32, u32),
+    /// `d_L / sqrt(K)` on each of the K layers (comparison only).
+    OverSqrtK(u32, u32),
+}
+
+impl Scheme {
+    /// `single:32`, `band:24-40` (telescoping), `band-k:24-40`, `band-sqrtk:24-40`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad = || format!("{s:?}: expected single:L, band:A-B, band-k:A-B or band-sqrtk:A-B");
+        let (kind, arg) = s.split_once(':').ok_or_else(bad)?;
+        if kind == "single" {
+            return Ok(Self::Single(arg.parse().map_err(|_| bad())?));
+        }
+        let (a, b) = arg.split_once('-').ok_or_else(bad)?;
+        let (a, b): (u32, u32) = (a.parse().map_err(|_| bad())?, b.parse().map_err(|_| bad())?);
+        if a == 0 || b < a {
+            return Err(bad());
+        }
+        match kind {
+            "band" => Ok(Self::Telescoping(a, b)),
+            "band-k" => Ok(Self::OverK(a, b)),
+            "band-sqrtk" => Ok(Self::OverSqrtK(a, b)),
+            _ => Err(bad()),
+        }
+    }
+
+    pub fn layers(&self) -> [u32; 2] {
+        match *self {
+            Self::Single(l) => [l, l],
+            Self::Telescoping(a, b) | Self::OverK(a, b) | Self::OverSqrtK(a, b) => [a, b],
+        }
+    }
+
+    /// Apply to a vector's natural per-layer directions.
+    pub fn apply(
+        &self,
+        natural: &BTreeMap<u32, Vec<f32>>,
+    ) -> Result<BTreeMap<u32, Vec<f32>>, String> {
+        let [a, b] = self.layers();
+        let get = |l: u32| {
+            natural
+                .get(&l)
+                .ok_or_else(|| format!("no direction measured at layer {l}"))
+        };
+        let k = (b - a + 1) as f32;
+        let mut out = BTreeMap::new();
+        for l in a..=b {
+            let d = get(l)?;
+            let v = match *self {
+                Self::Single(_) => d.clone(),
+                Self::Telescoping(..) if l == a => d.clone(),
+                Self::Telescoping(..) => {
+                    let prev = get(l - 1)?;
+                    d.iter().zip(prev).map(|(x, p)| x - p).collect()
+                }
+                Self::OverK(..) => d.iter().map(|x| x / k).collect(),
+                Self::OverSqrtK(..) => d.iter().map(|x| x / k.sqrt()).collect(),
+            };
+            out.insert(l, v);
+        }
+        Ok(out)
+    }
+
+    pub fn name(&self) -> String {
+        match *self {
+            Self::Single(l) => format!("single:{l}"),
+            Self::Telescoping(a, b) => format!("band:{a}-{b}"),
+            Self::OverK(a, b) => format!("band-k:{a}-{b}"),
+            Self::OverSqrtK(a, b) => format!("band-sqrtk:{a}-{b}"),
+        }
+    }
+}
+
+/// A vector file's `direction.<layer>` tensors.
+pub fn directions(g: &Gguf) -> Result<BTreeMap<u32, Vec<f32>>, String> {
+    let mut out = BTreeMap::new();
+    for t in &g.tensors {
+        if let Some(l) = t.name.strip_prefix("direction.") {
+            let l = l
+                .parse()
+                .map_err(|_| format!("bad layer in tensor name {:?}", t.name))?;
+            let d = t
+                .data
+                .clone()
+                .ok_or_else(|| format!("{:?} is not F32", t.name))?;
+            out.insert(l, d);
+        }
+    }
+    Ok(out)
+}
+
+/// A control-vector file holding `dirs`, with extra metadata.
+pub fn vector_gguf(
+    dirs: &BTreeMap<u32, Vec<f32>>,
+    n_layer: usize,
+    model_hint: &str,
+    extra: &[(&str, crate::gguf::Value)],
+) -> Gguf {
+    use crate::gguf::Value;
+    let mut g = Gguf::default();
+    g.metadata.insert(
+        "general.architecture".into(),
+        Value::Str("controlvector".into()),
+    );
+    g.metadata.insert(
+        "controlvector.model_hint".into(),
+        Value::Str(model_hint.into()),
+    );
+    g.metadata.insert(
+        "controlvector.layer_count".into(),
+        Value::I32(n_layer as i32 - 1),
+    );
+    for (k, v) in extra {
+        g.metadata.insert((*k).into(), v.clone());
+    }
+    for (l, d) in dirs {
+        g.add_f32(format!("direction.{l}"), vec![d.len() as u64], d.clone());
+    }
+    g
+}
+
+/// The model SHA-256 a vector file was built for, if it says.
+pub const MODEL_SHA_KEY: &str = "vi.model_sha256";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schemes_telescope_and_compare() {
+        let nat: BTreeMap<u32, Vec<f32>> = [
+            (1, vec![1.0]),
+            (2, vec![3.0]),
+            (3, vec![4.0]),
+            (4, vec![8.0]),
+        ]
+        .into();
+        let t = Scheme::parse("band:2-4").unwrap().apply(&nat).unwrap();
+        assert_eq!(t, [(2, vec![3.0]), (3, vec![1.0]), (4, vec![4.0])].into());
+        // The increments add back up to the last layer's full gap.
+        assert_eq!(t.values().map(|v| v[0]).sum::<f32>(), 8.0);
+        let s = Scheme::parse("single:3").unwrap().apply(&nat).unwrap();
+        assert_eq!(s, [(3, vec![4.0])].into());
+        let k = Scheme::parse("band-k:1-2").unwrap().apply(&nat).unwrap();
+        assert_eq!(k, [(1, vec![0.5]), (2, vec![1.5])].into());
+        assert!(Scheme::parse("band:4-2").is_err());
+        assert!(Scheme::parse("band:0-2").is_err());
+        assert!(Scheme::parse("band:3-5").unwrap().apply(&nat).is_err());
+        assert_eq!(
+            Scheme::parse("band-sqrtk:2-4").unwrap().name(),
+            "band-sqrtk:2-4"
+        );
+    }
 
     fn bank() -> VectorBank {
         // n_embd 2, 3 layers: blocks for layers 1 and 2.
