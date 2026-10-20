@@ -38,15 +38,27 @@ under 1 GB.
 `format_chat` (`llama_chat_apply_template`) that `vi chat` uses. The Python renderer only supplies
 messages per line: `{line_id, system, user, assistant}` (persona, the line she answers, her line); the
 Rust side owns the template. In the engine's llama.cpp that template is plain ChatML ending in
-`<|im_start|>assistant\n`, with no think block (`src/llama-chat.cpp:99,256` in `llama-cpp-sys-2
-0.1.159`), not the GGUF's jinja template that `render_cvector.py --gguf` used. Whether Qwen3.8 needs an
-empty think block at run time is step 5's call; the capture follows whatever `format_chat` does, so it
-changes together with `vi chat`.
+`<|im_start|>assistant\n` (`src/llama-chat.cpp:99,256` in `llama-cpp-sys-2 0.1.159`), not the GGUF's
+jinja template that `render_cvector.py --gguf` used.
+
+**Thinking (Brandon, 2026-10-20: thinking stays on for real use; off is fine for tests).** With the
+prompt ending at `<|im_start|>assistant\n`, Qwen3.8 thinks first: `<think>…</think>`, then the reply.
+Her lines are replies; we have no thinking to go with them. So each capture prompt is
+`format_chat(persona, the line she answers)` + `<think>\n\n</think>\n\n` + her line + end of turn: her
+line sits exactly where a reply sits after thinking, behind a closed think block. This is Qwen's own
+empty-thinking form, so the same prompt is also exactly what a thinking-off test sees.
+- What this can't capture is how a reply's activations shift after a *long* real think block, since
+  the reply tokens also attend to it. The vectors are measured on reply tokens and applied to reply
+  tokens, so they should carry over; the step 5 chat check with thinking on is what confirms it.
+- If a mood steers with thinking off but not with it on, the fallback is a second capture for that
+  mood's lines with model-written thinking (unsteered) before her line. That costs generation (a few
+  hundred tokens per line), so it's only built if the chat check calls for it, on Brandon's go.
+
 - The whole prompt is tokenized once. Her line's token span comes from piece offsets.
 - The persona prefix must tokenize identically on its own (prefix reuse depends on it); the capture
   refuses to run otherwise.
-- A smoke check confirms that the capture prompt and `vi chat`'s prompt for the same exchange are
-  byte-equal.
+- A smoke check confirms that the capture prompt, up to and including `<|im_start|>assistant\n`, is
+  byte-equal to `vi chat`'s prompt for the same exchange.
 
 **Decoding.**
 - Context: `n_seq_max = 2`, `kv_unified = true` (otherwise `n_ctx` is split per sequence and every
@@ -68,10 +80,10 @@ per-architecture setting (default `l_out`). It fails the run unless:
   llama.cpp, and layer `n_layer-1` is cropped to output rows, so neither is captured.
 
 **Summaries per line and layer** (F32 accumulation, stored as F16):
-- `line_mean`: mean over her line's tokens **plus** the last prompt token. Those are exactly the
-  positions `vi chat` steers (it decodes the prompt unsteered, then steers the last prompt token and
-  every generated token).
-- `line_head`: the same over the last prompt token and her first 8 tokens, where a reply's tone is set.
+- `line_mean`: mean over her line's tokens **plus** the `</think>` and blank-line tokens before it.
+  Those are exactly the positions steered in `reply` scope (stage 3), which switches steering on at
+  `</think>`.
+- `line_head`: the same over those lead-in tokens and her first 8 tokens, where a reply's tone is set.
   Cheap to keep now; it would otherwise need another rental.
 - per line, not per layer: her line's mean token log-probability and the token count, from logits
   requested only for her line's tokens.
@@ -171,6 +183,22 @@ llama-server would mean something else in `vi chat`. So the step 5 chat check ru
 without restarting the model, which also saves rental time. The judge (the same model unsteered) runs in
 the same process. The check itself is step 5's (the suit thread owns the prompts, the judge and the
 pass rule); this builder supplies the command and the steering path.
+
+**Thinking and steering scope.** `vi vectors check` takes `--thinking on|off` and
+`--steer reply|all`, and step 5 runs it with thinking on in both scopes:
+- `reply` (default): the prompt and the whole think block are decoded unsteered; steering switches on
+  when `</think>` is decoded, so the first reply token is already steered. This matches where the vectors
+  were measured, and keeps her reasoning, which assistant work depends on, unsteered.
+- `all`: every generated token is steered, thinking included, as `vi chat` does today. Her mood may then
+  shape what she decides to say as well as how, at some risk to the reasoning.
+- `off` thinking appends `<think>\n\n</think>\n\n` to the prompt, so both scopes behave the same.
+This needs one change to `crates/llm`: `Llama::generate` gains a steering scope. In `reply` scope it
+decodes with steering off until it samples `</think>` (one special token in Qwen's vocabulary; the code
+looks it up by text and refuses a model where it isn't a single token), sets the blend with
+`llama_set_adapter_cvec`, and decodes `</think>` and everything after it steered. Switching the vector
+mid-generation is the same call `generate` already makes between the prompt and the first token.
+`max_tokens` has to cover the think block too. Which scope `vi chat` uses is decided from step 5's
+result; `reply` is the proposed default.
 
 ## Output
 
@@ -280,4 +308,5 @@ clears everything, so every turn re-reads the whole conversation. Replies are co
 | L1 store at home | `--store` on a disk with 6 GB free; `line_head` and log-probabilities captured now |
 | L2 pooling | `pre_line` dropped; last prompt token included in `line_mean` |
 | L3 sources | design cites the vendored llama.cpp in `llama-cpp-sys-2 0.1.159` |
+| Thinking on (Brandon, after review) | captures behind an empty think block; `vi vectors check --thinking on\|off --steer reply\|all`; `Llama::generate` gains a steering scope; `line_mean` covers the `reply`-scope positions |
 | L4 cvector `fabs` | noted in research; nothing reuses that code |
