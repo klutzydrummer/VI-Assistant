@@ -8,7 +8,9 @@
 //! The step 5 thread owns what is checked: the prompts, the judge's
 //! questions and the pass rule. This runs a plan of trials, each a chat
 //! with a blend and a layer scheme, optionally followed by the same model
-//! unsteered answering a judge prompt about the reply. Blends and schemes
+//! unsteered answering a judge prompt about the reply. When the model
+//! thinks first, the thinking is kept apart and the judge sees only what
+//! she says after `</think>`. Blends and schemes
 //! change per trial without reloading the model.
 //!
 //! A plan is JSON lines:
@@ -71,7 +73,11 @@ pub struct TrialResult {
     pub scheme: String,
     pub applied: BTreeMap<String, f32>,
     pub missing: Vec<String>,
+    /// The reply after any `</think>`: what she says, and what the judge sees.
     pub reply: String,
+    /// The thinking before `</think>`, when the model thought first.
+    #[serde(default)]
+    pub thinking: Option<String>,
     pub reply_tokens: usize,
     pub stopped: String,
     pub judge: Option<String>,
@@ -179,12 +185,13 @@ impl Checker {
         let g = self
             .llama
             .generate(&prompt, blend.data.as_deref(), &sampling, |_| true)?;
+        let (thinking, reply) = split_thinking(&g.text);
         let judge = match &t.judge {
             None => None,
             Some(js) => {
                 let filled: Vec<(String, String)> = js
                     .iter()
-                    .map(|m| (m.role.clone(), m.content.replace("{reply}", &g.text)))
+                    .map(|m| (m.role.clone(), m.content.replace("{reply}", &reply)))
                     .collect();
                 let refs: Vec<(&str, &str)> = filled
                     .iter()
@@ -200,7 +207,8 @@ impl Checker {
             scheme: t.scheme.clone().unwrap_or_else(|| "vectors.toml".into()),
             applied: blend.applied,
             missing: blend.missing,
-            reply: g.text,
+            reply,
+            thinking,
             reply_tokens: g.tokens.len(),
             stopped: match g.stop {
                 Stop::EndOfTurn => "end_of_turn",
@@ -211,6 +219,17 @@ impl Checker {
             judge,
             seconds: start.elapsed().as_secs_f64(),
         })
+    }
+}
+
+/// Split a reply into the thinking before `</think>` and what she says.
+pub fn split_thinking(text: &str) -> (Option<String>, String) {
+    match text.split_once("</think>") {
+        Some((think, reply)) => {
+            let think = think.trim_start().trim_start_matches("<think>").trim();
+            (Some(think.to_string()), reply.trim().to_string())
+        }
+        None => (None, text.to_string()),
     }
 }
 
@@ -249,4 +268,18 @@ pub fn run_plan(
         n += 1;
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_thinking;
+
+    #[test]
+    fn splits_thinking_from_the_reply() {
+        assert_eq!(
+            split_thinking("<think>\nShe'd be glad.\n</think>\n\nKeelah!"),
+            (Some("She'd be glad.".into()), "Keelah!".into())
+        );
+        assert_eq!(split_thinking("Keelah!"), (None, "Keelah!".into()));
+    }
 }
