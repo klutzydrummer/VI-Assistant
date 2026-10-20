@@ -110,7 +110,7 @@ fn builds_checks_and_relayers_vectors() {
         serde_json::json!({"id": "plain", "messages": [{"role": "user", "content": "Hi"}],
                            "max_tokens": 8}),
         serde_json::json!({"id": "loud-band", "messages": [{"role": "user", "content": "Hi"}],
-                           "steer": {"loud": 1.0}, "scheme": "band:2-4", "max_tokens": 8,
+                           "steer": {"loud": 1.0}, "scheme": "band:2-4", "max_tokens": 8, "thinking": false,
                            "judge": [{"role": "user", "content": "Rate: {reply}"}],
                            "judge_max_tokens": 4}),
         serde_json::json!({"id": "loud-toml", "messages": [{"role": "user", "content": "Hi"}],
@@ -153,6 +153,9 @@ fn builds_checks_and_relayers_vectors() {
     assert_eq!(results[2]["think"], "on");
     assert_eq!(results[2]["scope"], "reply");
     assert_eq!(results[2]["steer_start"], "never");
+    // ...and ran out of tokens doing it: no reply, not judged.
+    assert_eq!(results[2]["outcome"], "truncated");
+    assert_eq!(results[3]["outcome"], "reply");
     // Thinking off: the prompt's own </think> starts it.
     assert_eq!(results[3]["think"], "off");
     assert_eq!(results[3]["steer_start"], "prompt");

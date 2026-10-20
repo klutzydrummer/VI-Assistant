@@ -31,9 +31,17 @@
 //! `scheme` is `single:L`, `band:A-B` (telescoping), `band-k:A-B` or
 //! `band-sqrtk:A-B`, built from the folder's `natural/` vectors; without
 //! it the folder's own bank and `vectors.toml` are used, exactly as
-//! `vi chat` would load them. `max_tokens` covers the thinking too. The
-//! judge runs with the trial's thinking setting and sees only its reply's
-//! text after `</think>`; its own thinking is dropped. Results are
+//! `vi chat` would load them. `max_tokens` covers the thinking too.
+//! `thinking` takes `"on"`/`"off"` or `true`/`false`; `steer_scope` (or
+//! `scope`) takes `"reply"`/`"all"`. The judge thinks only with
+//! `judge_thinking` (off by default), and sees only the text after
+//! `</think>`.
+//!
+//! A trial whose thinking never closed (out of tokens) has no reply, and in
+//! the `reply` scope was never steered: its `outcome` is `truncated` and it
+//! isn't judged. One in the `reply` scope that never said `</think>` for any
+//! other reason is `never_steered`, also unjudged. Neither counts as a
+//! steering result; [`summarize`] gives their rate per mood. Results are
 //! appended as JSON lines, and a rerun skips ids already there.
 
 use std::collections::{BTreeMap, HashMap};
@@ -54,7 +62,7 @@ pub struct ChatMessage {
 }
 
 /// Whether the model thinks before it replies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Thinking {
     #[default]
@@ -76,6 +84,22 @@ impl Thinking {
         match self {
             Self::On => "on",
             Self::Off => "off",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Thinking {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Bool(true) => Ok(Self::On),
+            Raw::Bool(false) => Ok(Self::Off),
+            Raw::Text(s) => Self::parse(&s).map_err(serde::de::Error::custom),
         }
     }
 }
@@ -119,8 +143,11 @@ pub struct Trial {
     #[serde(default)]
     pub thinking: Option<Thinking>,
     /// Steering scope, `reply` or `all`.
-    #[serde(default)]
+    #[serde(default, alias = "steer_scope")]
     pub scope: Option<Scope>,
+    /// Whether the judge thinks first; off by default.
+    #[serde(default)]
+    pub judge_thinking: Option<Thinking>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +178,13 @@ pub struct TrialResult {
     pub steer_start: String,
     #[serde(default)]
     pub steer_start_token: Option<usize>,
+    /// `reply`, or `truncated` (thinking never closed) or `never_steered`
+    /// (`reply` scope, no `</think>`): those two aren't judged and aren't
+    /// steering results.
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub judge_think: String,
 }
 
 pub struct Checker {
@@ -267,7 +301,22 @@ impl Checker {
             self.llama
                 .generate_scoped(&prompt, blend.data.as_deref(), scope, &sampling, |_| true)?;
         let (thinking, reply) = split_thinking(&g.text);
+        let open_thinking =
+            g.text.trim_start().starts_with("<think>") && !g.text.contains("</think>");
+        let outcome = if open_thinking && g.stop == Stop::MaxTokens {
+            "truncated"
+        } else if scope == Scope::Reply && g.steer_start == SteerStart::Never {
+            if g.stop == Stop::MaxTokens {
+                "truncated"
+            } else {
+                "never_steered"
+            }
+        } else {
+            "reply"
+        };
+        let judge_think = t.judge_thinking.unwrap_or(Thinking::Off);
         let judge = match &t.judge {
+            Some(_) if outcome != "reply" => None,
             None => None,
             Some(js) => {
                 let filled: Vec<(String, String)> = js
@@ -278,7 +327,7 @@ impl Checker {
                     .iter()
                     .map(|(r, c)| (r.as_str(), c.as_str()))
                     .collect();
-                let jp = with_thinking(self.llama.format_chat(&refs)?, think);
+                let jp = with_thinking(self.llama.format_chat(&refs)?, judge_think);
                 let sampling = Sampling::greedy(t.judge_max_tokens.unwrap_or(max));
                 let text = self.llama.generate(&jp, None, &sampling, |_| true)?.text;
                 Some(split_thinking(&text).1)
@@ -312,6 +361,8 @@ impl Checker {
                 SteerStart::Prompt(i) | SteerStart::Reply(i) => Some(i),
                 SteerStart::Never => None,
             },
+            outcome: outcome.into(),
+            judge_think: judge_think.name().into(),
         })
     }
 }
@@ -336,6 +387,43 @@ pub fn split_thinking(text: &str) -> (Option<String>, String) {
             None => (None, text.to_string()),
         },
     }
+}
+
+/// Per mood (the trial's `steer` names; `(unsteered)` for none), how many
+/// trials there were and how many had no steered reply.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MoodOutcomes {
+    pub trials: usize,
+    pub truncated: usize,
+    pub never_steered: usize,
+}
+
+pub fn summarize(results: &[TrialResult]) -> BTreeMap<String, MoodOutcomes> {
+    let mut out: BTreeMap<String, MoodOutcomes> = BTreeMap::new();
+    for r in results {
+        let mut moods: Vec<&String> = r.applied.keys().chain(&r.missing).collect();
+        moods.sort();
+        moods.dedup();
+        let unsteered = "(unsteered)".to_string();
+        if moods.is_empty() {
+            moods.push(&unsteered);
+        }
+        for m in moods {
+            let c = out.entry(m.clone()).or_default();
+            c.trials += 1;
+            match r.outcome.as_str() {
+                "truncated" => c.truncated += 1,
+                "never_steered" => c.never_steered += 1,
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Every result in a results file.
+pub fn read_results(path: &Path) -> Result<Vec<TrialResult>, String> {
+    Ok(crate::fit::read_jsonl::<TrialResult>(path)?.0)
 }
 
 /// Run every trial in `plan` not already in `out`, appending results.
@@ -377,7 +465,25 @@ pub fn run_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::split_thinking;
+    use super::{split_thinking, Thinking, Trial};
+
+    #[test]
+    fn reads_step_5s_field_names() {
+        let t: Trial = serde_json::from_str(
+            r#"{"id": "a", "messages": [], "thinking": true, "steer_scope": "all",
+                "judge_thinking": false}"#,
+        )
+        .unwrap();
+        assert_eq!(t.thinking, Some(Thinking::On));
+        assert_eq!(t.scope, Some(crate::llama::Scope::All));
+        assert_eq!(t.judge_thinking, Some(Thinking::Off));
+        let t: Trial = serde_json::from_str(
+            r#"{"id": "b", "messages": [], "thinking": "off", "scope": "reply"}"#,
+        )
+        .unwrap();
+        assert_eq!(t.thinking, Some(Thinking::Off));
+        assert_eq!(t.scope, Some(crate::llama::Scope::Reply));
+    }
 
     #[test]
     fn splits_thinking_from_the_reply() {

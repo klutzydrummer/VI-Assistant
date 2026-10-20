@@ -535,6 +535,16 @@ fn check_cmd(a: &Args) -> Result<(), String> {
         )
     })?;
     println!("{n} trials run");
+    // Trials with no steered reply aren't steering results; show how often
+    // that happens, so max_tokens can be raised if it's common.
+    let all = llm::check::read_results(&a.path("results")?)?;
+    println!("Per mood: trials, truncated (thinking ran out of tokens), never steered:");
+    for (mood, c) in llm::check::summarize(&all) {
+        println!(
+            "  {mood}: {} trials, {} truncated, {} never steered",
+            c.trials, c.truncated, c.never_steered
+        );
+    }
     Ok(())
 }
 

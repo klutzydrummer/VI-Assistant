@@ -39,8 +39,12 @@ under `nice -n 19` (plus `ionice -c3` on the game disk, `ionice -c2 -n7` on the 
   `off` ends the prompt with the empty think block, so both scopes start at the prompt's `</think>`
   and the last prompt token respectively. `max_tokens` covers the thinking (default 1000 with
   thinking on, 200 off). Each result records `think`, `scope`, and where steering started
-  (`steer_start`: `prompt`, `reply` or `never`, with `steer_start_token`). The judge runs with the
-  trial's thinking setting and only its text after `</think>` is kept.
+  (`steer_start`: `prompt`, `reply` or `never`, with `steer_start_token`). The judge answers without
+  thinking unless the trial sets `judge_thinking`, and only its text after `</think>` is kept.
+- A trial whose thinking runs out of tokens before `</think>` has no reply and, in the `reply` scope,
+  was never steered: its `outcome` is `truncated`. One in the `reply` scope that ends without ever
+  saying `</think>` is `never_steered`. Neither is judged or counted as a steering result, and
+  `check` prints their rate per mood after each run (raise `max_tokens` if it's common).
 
 ## Swapping the model
 
@@ -73,12 +77,13 @@ may appear in several pairs.
 
 **plan.jsonl** for the chat check (step 5 writes the prompts, judge and pass rule). `scheme`:
 `single:L`, `band:A-B` (telescoping), `band-k:A-B`, `band-sqrtk:A-B`; leave it out to use the
-folder's own `vectors.toml`. `thinking` (`on`/`off`) and `scope` (`reply`/`all`) override the run's
-`--thinking`/`--steer` for one trial. `{reply}` in the judge messages is replaced by the steered reply; the
+folder's own `vectors.toml`. `thinking` (`"on"`/`"off"` or `true`/`false`) and `steer_scope` (or
+`scope`: `"reply"`/`"all"`) override the run's `--thinking`/`--steer` for one trial;
+`judge_thinking` (default off) lets the judge think first. `{reply}` in the judge messages is replaced by the steered reply; the
 judge is the same model, unsteered. Reruns skip ids already in the results.
 ```json
 {"id": "warmth-single32-1", "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}],
- "steer": {"warmth": 1.0}, "scheme": "single:32", "max_tokens": 1000, "thinking": "on", "scope": "reply",
+ "steer": {"warmth": 1.0}, "scheme": "single:32", "max_tokens": 1000, "thinking": true, "steer_scope": "reply",
  "judge": [{"role": "user", "content": "...{reply}..."}]}
 ```
 
