@@ -13,7 +13,7 @@ largest matter_of_fact at 665) without the ~51 GB of RAM llama.cpp's tool would 
 Read from source (`tools/cvector-generator/`, llama.cpp master 707616f, 2026-10-20).
 
 - **Each pair is decoded from scratch, twice.** For pair *i* it clears the KV cache, decodes the whole
-  positive prompt, then the whole negative prompt (`get_hidden_layers`). The ~1,200-token persona is
+  positive prompt, then the whole negative prompt (`get_hidden_layers`). The ~1,100-token persona is
   prefilled 17,972 times; every line that appears in several sets is redone each time.
 - **Token-by-token diffs, aligned by position.** Both prompts are padded to the same length with the
   `" "` token, then `pos[t] - neg[t]` is taken at every position *t* and layer (`calc_diff`). Rows that
@@ -116,6 +116,20 @@ the data give the same direction (split-half cosine, the same as voice check B)?
 similarity among a set's per-pair differences also predicts better steering (arXiv 2505.22637). All of
 these come from per-line summaries, no generation needed.
 
+**Streaming PCA, if it's ever wanted.** PCA needn't hold every row either: a streamed covariance
+(`d x d` per layer, above), Oja's rule or incremental SVD (one pass, `d x k` memory), or a randomized
+sketch (Halko et al.: multiply the rows by a random `d x (k+p)` matrix as they stream, then a small SVD)
+all give the top components in bounded memory. Since mean difference is the better steering direction
+(section 2), PCA is kept only as a comparison, and the streamed covariance for one set at a time is the
+simplest exact route.
+
+**Quantized GGUF versus BF16 activations.** Vectors are read from the same residual stream they're
+added to, so building on the exact file and llama.cpp version used at chat time removes one source of
+mismatch. Q8_0 is very close to BF16 (per-block 8-bit weights), so a Q8_0-built vector should transfer to
+BF16 tools and to lower quants of the same model nearly unchanged. That's an expectation, not something
+measured here; the step 5 chat check on the quant she runs is what confirms it. Libraries built on HF
+transformers (repeng, EasySteer) would read BF16 activations of a model we then run as a GGUF.
+
 ## 4. Reliability limits worth knowing
 
 Tan et al. (arXiv 2407.12404, NeurIPS 2024): steerability varies a lot across inputs and concepts, some
@@ -153,7 +167,7 @@ The last option is feasible with what we have:
 - `crates/llm` already reads and writes GGUF (`gguf.rs`), loads control vectors (`vectors.rs`), and has a
   tiny random llama model for tests that need no download (`testmodel.rs`).
 
-**Prefix reuse.** Every prompt starts with the same persona (~1,200 tokens) and differs only in the line
+**Prefix reuse.** Every prompt starts with the same persona (~1,100 tokens) and differs only in the line
 she answers and her line (~100 tokens). Decoding the persona once and reusing it cuts the tokens to
 decode by roughly 10x. For the full-attention layers that's an ordinary KV cache copy. For the Gated
 DeltaNet layers, llama.cpp's recurrent memory supports `llama_memory_seq_cp` (the destination shares the
