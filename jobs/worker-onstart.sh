@@ -8,8 +8,9 @@
 mkdir -p /root/vi-jobs && rm -rf /root/vi-jobs/* && touch /root/vi-jobs/.active
 # gcc: Triton (vLLM, and transformers models that use it) compiles a small
 # helper at run time, and the pytorch runtime image ships no compiler.
-for t in rsync curl pgrep gcc; do command -v $t >/dev/null || missing=1; done
-[ -n "$missing" ] && { apt-get update -qq; apt-get install -y -qq rsync curl procps gcc; } >/var/log/vi-onstart.log 2>&1
+# sox: qwen-tts calls it (voicesteer).
+for t in rsync curl pgrep gcc sox; do command -v $t >/dev/null || missing=1; done
+[ -n "$missing" ] && { apt-get update -qq; apt-get install -y -qq rsync curl procps gcc sox; } >/var/log/vi-onstart.log 2>&1
 cat >/root/vi-watchdog.sh <<'EOF'
 IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(date +%s)
 API=https://console.vast.ai/api/v0/instances/$CONTAINER_ID/
