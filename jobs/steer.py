@@ -300,13 +300,14 @@ class TTS:
     layers. Hidden states are read and changed only on single-token steps,
     i.e. while it generates audio, not while it reads the prompt."""
 
-    def __init__(self, model_id, layers=None):
+    def __init__(self, model_id, layers=None, device="cuda:0"):
         import torch
         from qwen_tts import Qwen3TTSModel
 
         self.torch = torch
+        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32  # CPU only for smoke tests
         self.model = Qwen3TTSModel.from_pretrained(
-            model_id, device_map="cuda:0", dtype=torch.bfloat16, attn_implementation="sdpa"
+            model_id, device_map=device, dtype=dtype, attn_implementation="sdpa"
         )
         blocks = self.model.model.talker.model.layers
         n = len(blocks)

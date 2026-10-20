@@ -104,6 +104,42 @@ the check. Nothing else changes.
   card with room for context.
 - **Total:** about 6-7 h, so roughly **$4-5 of Vast credit**, with max hours at 8 for this rental.
 
+## Update, 2026-10-20 (Brandon's decisions and what the build found)
+
+- **Decided:** Qwen3.8-27B Q8_0; the judge is the same model, unsteered; the test-D probe is refit
+  on raw features; voice vectors come from her clips only.
+- **Chat vectors and the chat check now come from the builder thread** (`vi vectors build` and
+  `vi vectors check`, PR #64). They run on `vi chat`'s own steering path, not llama-server, so
+  llama.cpp's images aren't used on the worker. Two things in this plan are moot:
+  - The images are Ubuntu 24.04 (glibc 2.38), and their llama-server wouldn't start in our Ubuntu
+    22.04 worker image.
+  - They don't ship cvector-generator: it's built only without GGML_BACKEND_DL.
+  The builder's memory doesn't depend on pair count, so the 64 GB RAM filter is dropped.
+- **GPUs:** `vi`'s CUDA build targets archs 86 and 89, so `~/.config/vi/cloud.toml` now searches only
+  48 GB cards of those archs (L40S, L40, RTX 6000 Ada, RTX 5880 Ada, RTX A6000, A40;
+  `min_compute_cap = 860`). Blackwell and Hopper cards are out.
+- **Chat check, thinking on:** every vector is tried two ways. `steer_scope: "reply"` adds the vector
+  only after `</think>`; `"all"` steers every generated token, thinking included. Both run with
+  thinking on, and the judge (not thinking) sees only what she says. Plan and scoring:
+  `corpus/tali/analysis/after_labels/check_plan.py` (strength 1 first, lowered to 0.5 then 0.25 only
+  for vectors that go off). It needs three Trial fields from the builder: `thinking`, `steer_scope`,
+  `judge_thinking` (asked for).
+  - Size: 80 vectors × 4 prompts × 2 scopes = 640 steered trials, plus the baselines. Unsteered
+    replies are the same for every vector, so judging one reply once per mood would save another
+    320 generations (asked for).
+  - Time: at about 25 tokens/s for the 27B on an L40S, and up to 700 tokens a trial, that's about
+    3 hours.
+- **Engine (for later, Brandon):** with thinking on, `vi chat` must strip the think block from what
+  she says and speaks. Today it's left in.
+- **Voice:**
+  - `jobs/voicesteer.py` is built and tested on fake models: her pairs from step 3, full strength
+    first, lowered only if she loses her voice or the words, scored by the test-D probe.
+  - `voice_probe.py` writes its inputs. The 16 moods' probes reach held-out AUC 0.64-0.87 on raw
+    features.
+  - Found at home: qwen-tts needs `sox`, now in the worker's boot script.
+- **Revised total:** builder capture (minutes), chat check (about 3 h), and voice vectors plus test D
+  (about 2 h). About 5-6 h on an arch-86/89 48 GB card at about $0.61/h, so **about $3.50-4**.
+
 ## Decisions for Brandon
 
 1. **Model:** Qwen3.8-27B (decided). Still open: the quant, Q8_0 (29.0 GB, closest to the original),

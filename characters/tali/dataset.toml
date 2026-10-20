@@ -267,3 +267,27 @@ clef = { repo = "Cloudflare/clef-flash", revision = "8b2e5fd17c09fd49bc2880b805d
 # # Citadel party while scene tags are still missing:
 # [stage.steer.settings.refs]
 # # intoxication = ["le3.s...", ...]
+
+# GPU, manual (step 5 of docs/design/after-labels-plan.md; plan in step5-rental-plan.md):
+# `vi dataset run characters/tali/dataset.toml voicesteer`. Voice vectors on Qwen3-TTS for the
+# moods the voice gate passed, plus the borderline four, each tried at full strength first and
+# lowered only if it loses her voice or the words; then test D's automatic scores. Its two input
+# files come from corpus/tali/analysis/after_labels/voice_probe.py. About 2 h on an L40S.
+[stage.voicesteer]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/voicesteer.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py",
+         "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt",
+         "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.voicesteer.settings]
+model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"   # models.toml [tts."qwen3-tts-1.7b-base"]
+refs_per_side = 32         # pairs per mood used to build its vector, strongest first
+capture_sentences = 2
+lower = [0.5, 0.25]        # tried in turn only if strength 1 loses her voice or the words
+max_similarity_drop = 0.05 # voice: ECAPA cosine to her neutral clips may fall this much below neutral lines'
+max_wer = 0.15             # words: Whisper's word error rate at most this
+min_lift = 0.1             # the probe must rise this much over neutral on average
+min_share = 0.75           # and on at least this share of the test sentences
