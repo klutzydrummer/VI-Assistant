@@ -65,17 +65,53 @@ path has passed a cheap smoke test at home.
 3. The probe on one generated clip: features, then a score.
 4. On the rental: `jobs/check-worker.sh`, then the real thing.
 
+## The dialogue model: Qwen3.8-27B, and swapping it later (Brandon, 2026-10-20)
+
+Brandon picked Qwen3.8-27B (vision, MTP), and wants it easy to swap: Qwen 4 is coming, and so may a
+modified model or a fine-tune. Checked:
+- **What it is:** a 27B dense model, 64 layers, hidden size 5,120. Its layers mix Gated DeltaNet (linear
+  attention) with full attention, every fourth one. It has an MTP draft head and a separate vision
+  projector (mmproj, ~0.9 GB).
+- **llama.cpp runs it as the `qwen35` architecture.** That builder applies control vectors
+  (`build_cvec`) and names each layer's output `l_out`, which is what cvector-generator reads. The
+  engine's vendored llama.cpp (llama-cpp-sys-2 0.1.159) has `qwen35` too.
+  - Note for Qwen 4: llama.cpp's current `qwen4exp` builder applies control vectors but has no `l_out`
+    name, so cvector-generator couldn't capture it yet. That gets checked when it lands.
+- **GGUF:** Qwen ships none; `unsloth/Qwen3.8-27B-GGUF` has Q8_0 (29.0 GB), UD-Q6_K_XL (25.3 GB),
+  UD-Q4_K_M (16.5 GB) and others, plus mmproj. Vectors fit the exact file they're built on.
+- **Vision and MTP only matter when talking to her**, not for building vectors (text prompts):
+  `--mmproj` and `--spec-type draft-mtp` at inference. Speculative decoding doesn't change what the
+  steered model says, only how fast. Whether llama-server runs MTP and control vectors together gets
+  tested on the rental; it's not needed for the vectors. The engine itself doesn't do MTP yet.
+- **Home smoke model:** Qwen3.5-0.8B (same `qwen35` architecture, hybrid layers, 0.5 GB), so the home
+  test runs the same code path on CPU.
+
+**Easy to swap.** Every model is an entry in one registry file: id, Hugging Face repo, file, sha256,
+mmproj, a flag for MTP, or a local path for a fine-tune. Everything built from a model is stored
+under that model's hash (`vectors/<character>/<llm|tts>/<model-hash>/`, as already planned). One
+command per target redoes it all from step 4's chat sets, which don't depend on the model:
+render with that model's chat template, generate, check. `vi chat` refuses to load vectors whose
+hash doesn't match the model. A new model is then: add an entry, rent, run that command, and read
+the check. Nothing else changes.
+
+**Revised for 27B:**
+- **cvector memory:** 5,120 dims × 63 layers × 4 bytes is about 1.3 MB per differing token. The
+  largest set uncapped (matter_of_fact, ~40k rows) would need about 51 GB of RAM; capped at 200 pairs
+  it's about 16 GB.
+- **Prefill:** about 23 M tokens uncapped, about 16 M capped at 200 per set. At an estimated
+  1,500-2,500 tokens/s on an L40S, that's about 2-3 h capped.
+- **Judge:** the same 27B, unsteered (no second model to download or fit). Q8_0 (29 GB) fits a 48 GB
+  card with room for context.
+- **Total:** about 6-7 h, so roughly **$4-5 of Vast credit**, with max hours at 8 for this rental.
+
 ## Decisions for Brandon
 
-1. **Dialogue model and quant.** The README's example is Qwen3-8B. Which GGUF file? Vectors are tied to
-   the exact model.
-2. **Judge for the chat check:** (a) self-hosted on the rental, e.g. a ~32B instruct model at Q4 next to
-   the 8B (no API cost, adds about 20 GB of download); (b) Claude API (about $1 per pass, and only $1.26
-   is left there); (c) only an automatic gibberish check, plus Brandon reading a few samples per vector.
-3. **Pairs per chat set:** all 8,986 (best estimate, about 2 h of prefill), or capped at 200 per set
-   (about 6,100 pairs, about 1.4 h). The cap only affects the biggest sets.
-4. **Probe features for test D:** (a) refit step 3's probe on raw emotion2vec+ and prosody (simple; pairs
-   are within-game anyway), or (b) save the confounds stage's fitted transform and apply it to the
-   generated audio (same features as step 3, more code).
-5. **Voice vector source:** her clips only (the plan), or also the "designed" pairs `steer` supports
-   (VoiceDesign speaks the same sentence with and without the mood).
+1. **Model:** Qwen3.8-27B (decided). Still open: the quant, Q8_0 (29.0 GB, closest to the original),
+   UD-Q6_K_XL (25.3 GB) or UD-Q4_K_M (16.5 GB). Vectors match the file, so pick what she'll run on.
+2. **Judge for the chat check:** the same model, unsteered (recommended now that it's 27B), or an
+   automatic gibberish check plus Brandon reading samples.
+3. **Pairs per chat set:** capped at 200 (recommended for 27B: about 16 GB of RAM and 2-3 h), or all
+   (needs 64+ GB of RAM free for one set and about 3-4 h).
+4. **Probe features for test D:** refit on raw emotion2vec+ and prosody (recommended), or save the
+   confounds transform.
+5. **Voice vector source:** her clips only first (recommended), designed pairs only if a mood fails.
