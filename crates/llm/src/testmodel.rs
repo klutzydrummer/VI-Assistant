@@ -12,8 +12,9 @@ const N_HEAD: usize = 4;
 const N_FF: usize = 128;
 const N_CTX: u32 = 16384;
 
-/// `<unk>`, `<s>`, `</s>`, then one token per byte.
-const N_VOCAB: usize = 3 + 256;
+/// `<unk>`, `<s>`, `</s>`, one token per byte, then `<think>` and
+/// `</think>` (user-defined, as in Qwen's vocabulary).
+const N_VOCAB: usize = 3 + 256 + 2;
 
 const CHATML: &str = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
@@ -54,11 +55,15 @@ pub fn build_layers(seed: u64, n_layer: usize) -> Gguf {
         Value::Str("<s>".into()),
         Value::Str("</s>".into()),
     ];
-    // Token types: 2 unknown, 3 control, 6 byte.
+    // Token types: 2 unknown, 3 control, 4 user-defined, 6 byte.
     let mut types = vec![Value::I32(2), Value::I32(3), Value::I32(3)];
     for b in 0..=255u8 {
         tokens.push(Value::Str(format!("<0x{b:02X}>")));
         types.push(Value::I32(6));
+    }
+    for t in ["<think>", "</think>"] {
+        tokens.push(Value::Str(t.into()));
+        types.push(Value::I32(4));
     }
     kv(
         "tokenizer.ggml.scores",

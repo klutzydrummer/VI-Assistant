@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use charpack::Pack;
 use engine::director::{Delivery, RulesDirector};
 use engine::pipeline::{Session, Voice};
-use llm::llama::{Llama, ModelConfig, Sampling, Stop};
+use llm::llama::{Llama, ModelConfig, Sampling, Scope, SteerStart, Stop, EMPTY_THINK};
 use llm::testmodel::{self, N_EMBD, N_LAYER};
 use llm::vectors::{uniform_gguf, Limits, Vector, VectorBank};
 use llm::LlamaDialogue;
@@ -100,6 +100,63 @@ fn steering_changes_the_reply_and_keeps_the_prompt_cache_valid() {
     // Same blend, same reply.
     let drunk_again = run(&mut llama, &prompt, blend.data.as_deref());
     assert_eq!(drunk_again.tokens, drunk.tokens);
+}
+
+#[test]
+fn reply_scope_steers_from_think_end_on() {
+    let mut llama = load("scope");
+    let think_end = llama.think_end().unwrap();
+    let chat = llama
+        .format_chat(&[("system", "You are Tali."), ("user", "Have a drink!")])
+        .unwrap();
+    let blend = bank().blend(&BTreeMap::from([("drunk".to_string(), 0.8)]));
+    let steer = blend.data.as_deref();
+    let greedy = Sampling::greedy(24);
+    let plain = run(&mut llama, &chat, None);
+
+    // Thinking on: until `</think>` comes, nothing is steered.
+    let open = llama
+        .generate_scoped(&chat, steer, Scope::Reply, &greedy, |_| true)
+        .unwrap();
+    assert!(
+        !open.tokens.contains(&think_end),
+        "the random model said </think>"
+    );
+    assert_eq!(open.steer_start, SteerStart::Never);
+    assert_eq!(open.tokens, plain.tokens);
+
+    // When it comes, steering starts at it: the same reply up to and
+    // including it, then a steered one. The random model never says
+    // `</think>`, so a token it does say stands in for it.
+    let k = 5;
+    let stand_in = plain.tokens[k];
+    let k = plain.tokens.iter().position(|&t| t == stand_in).unwrap();
+    let switched = llama
+        .generate_switching(&chat, steer, Some(stand_in), false, &greedy, &mut |_| true)
+        .unwrap();
+    assert_eq!(switched.steer_start, SteerStart::Reply(k));
+    assert_eq!(switched.tokens[..=k], plain.tokens[..=k]);
+    assert_ne!(switched.tokens, plain.tokens);
+
+    // Thinking off: the prompt closes the think block, and steering starts
+    // at its `</think>`.
+    let closed = format!("{chat}{EMPTY_THINK}");
+    let at = llama.tokenize(&closed).unwrap();
+    let pos = at.iter().rposition(|&t| t == think_end).unwrap();
+    let plain_closed = run(&mut llama, &closed, None);
+    let reply = llama
+        .generate_scoped(&closed, steer, Scope::Reply, &greedy, |_| true)
+        .unwrap();
+    assert_eq!(reply.steer_start, SteerStart::Prompt(pos));
+    assert_ne!(reply.tokens, plain_closed.tokens);
+    let all = llama
+        .generate_scoped(&closed, steer, Scope::All, &greedy, |_| true)
+        .unwrap();
+    assert_eq!(all.steer_start, SteerStart::Prompt(at.len() - 1));
+
+    // The cache still holds only unsteered tokens.
+    assert_eq!(run(&mut llama, &closed, None).tokens, plain_closed.tokens);
+    assert_eq!(run(&mut llama, &chat, None).tokens, plain.tokens);
 }
 
 #[test]

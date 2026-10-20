@@ -30,11 +30,12 @@ use llm::store::{Store, Summary};
 use llm::vectors::Scheme;
 
 pub const USAGE: &str = "  vi vectors fetch <model-id>
-  vi vectors preflight <model-id> --messages <messages.jsonl> [--character <folder>]
-  vi vectors capture <model-id> --messages <messages.jsonl> --store <folder> [--skip-preflight] [--no-reuse]
+  vi vectors preflight <model-id> --messages <messages.jsonl> [--character <folder>] [--no-think]
+  vi vectors capture <model-id> --messages <messages.jsonl> --store <folder> [--skip-preflight] [--no-reuse] [--no-think]
   vi vectors fit --store <folder> --labels <labels.jsonl> --pairs <pairs.jsonl> --out <folder> [--head]
-  vi vectors build <model-id> --messages <m.jsonl> --labels <l.jsonl> --pairs <p.jsonl> [--store <folder>] [--out <folder>]
+  vi vectors build <model-id> --messages <m.jsonl> --labels <l.jsonl> --pairs <p.jsonl> [--store <folder>] [--out <folder>] [--no-think]
   vi vectors check <model-id> --vectors <method-folder> --plan <plan.jsonl> --results <results.jsonl>
+      [--thinking on|off] [--steer reply|all]
   vi vectors layers <method-folder> <single:L | band:A-B | band-k:A-B | band-sqrtk:A-B> [--only a,b]
   vi vectors selftest [--dir <folder>]
   (model commands also take --models <folder> (default $VI_MODELS or models/), --registry <models.toml>,
@@ -46,7 +47,7 @@ struct Args {
     flags: Vec<String>,
 }
 
-const FLAGS: [&str; 3] = ["--head", "--skip-preflight", "--no-reuse"];
+const FLAGS: [&str; 4] = ["--head", "--skip-preflight", "--no-reuse", "--no-think"];
 
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut a = Args {
@@ -266,18 +267,26 @@ fn load_capturer(
     let mc = config(a, m)?;
     println!("Loading {}...", m.path.display());
     let probe = Llama::load(&mc)?;
-    let (max_tokens, max_rest) = capture::sizes(&probe, lines)?;
+    // Her line behind an empty think block, unless --no-think (comparison only).
+    let think = !a.flag("--no-think");
+    let (max_tokens, max_rest) = capture::sizes(&probe, lines, think)?;
     drop(probe);
     let mut opts = CaptureOptions::new(mc);
     opts.layer_tensor = m.entry.layer_tensor.clone();
+    opts.think = think;
     let mut cap = Capturer::load(&opts, max_tokens, max_rest)?;
     let prepared = cap.prepare(lines)?;
     println!(
-        "{} lines; persona {} tokens decoded once; longest prompt {max_tokens} tokens; layers {}..={}",
+        "{} lines; persona {} tokens decoded once; longest prompt {max_tokens} tokens; layers {}..={}; {}",
         lines.len(),
         cap.prefix_tokens(),
         cap.layers[0],
-        cap.layers[cap.layers.len() - 1]
+        cap.layers[cap.layers.len() - 1],
+        if think {
+            "her line behind an empty think block, pooled from </think>"
+        } else {
+            "no think block (--no-think), pooled from the last prompt token"
+        }
     );
     Ok((cap, prepared))
 }
@@ -506,11 +515,23 @@ fn check_cmd(a: &Args) -> Result<(), String> {
     }
     println!("Loading {}...", m.path.display());
     let llama = Llama::load(&mc)?;
-    let mut checker = llm::check::Checker::new(llama, &a.path("vectors")?, &sha)?;
+    let mut defaults = llm::check::CheckDefaults::default();
+    if let Some(t) = a.get("thinking") {
+        defaults.thinking = llm::check::Thinking::parse(t)?;
+    }
+    if let Some(s) = a.get("steer") {
+        defaults.scope = llm::llama::Scope::parse(s)?;
+    }
+    println!(
+        "Thinking {}, steering {} (trials may override)",
+        defaults.thinking.name(),
+        defaults.scope.name()
+    );
+    let mut checker = llm::check::Checker::new(llama, &a.path("vectors")?, &sha, defaults)?;
     let n = llm::check::run_plan(&mut checker, &a.path("plan")?, &a.path("results")?, |r| {
         println!(
-            "  {} [{}] {} tokens in {:.1}s",
-            r.id, r.scheme, r.reply_tokens, r.seconds
+            "  {} [{}, thinking {}, steer {} from {}] {} tokens in {:.1}s",
+            r.id, r.scheme, r.think, r.scope, r.steer_start, r.reply_tokens, r.seconds
         )
     })?;
     println!("{n} trials run");

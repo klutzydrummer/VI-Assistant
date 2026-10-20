@@ -48,8 +48,12 @@ pub struct Meta {
     pub messages_sha256: String,
     /// Tokens of the shared persona prefix, decoded once and reused.
     pub prefix_tokens: usize,
-    /// Her first tokens averaged into `line_head` (after the last prompt token).
+    /// Her first tokens averaged into `line_head` (after the lead-in).
     pub head_tokens: usize,
+    /// Her line sat behind an empty think block, and the summaries pool
+    /// from `</think>` on; else from the last prompt token.
+    #[serde(default)]
+    pub think: bool,
     pub n_lines_total: usize,
     #[serde(default)]
     pub complete: bool,
@@ -421,6 +425,7 @@ mod tests {
             messages_sha256: "m".into(),
             prefix_tokens: 5,
             head_tokens: 8,
+            think: true,
             n_lines_total: n_lines,
             complete: false,
             preflight: None,

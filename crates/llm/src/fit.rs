@@ -1216,6 +1216,7 @@ mod tests {
             messages_sha256: "m".into(),
             prefix_tokens: 1,
             head_tokens: 8,
+            think: true,
             n_lines_total: 400,
             complete: false,
             preflight: None,

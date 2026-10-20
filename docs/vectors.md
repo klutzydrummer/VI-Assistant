@@ -8,10 +8,10 @@ telescoping bands). Code: `crates/llm/src/{capture,fit,check,store,registry}.rs`
 ```
 vi vectors fetch <model-id>                 download a models.toml entry, check its SHA-256
 vi vectors preflight <model-id> --messages m.jsonl [--character characters/tali]
-vi vectors capture <model-id> --messages m.jsonl --store <folder>
+vi vectors capture <model-id> --messages m.jsonl --store <folder> [--no-think]
 vi vectors fit --store <folder> --labels l.jsonl --pairs p.jsonl --out <folder>
 vi vectors build <model-id> --messages m.jsonl --labels l.jsonl --pairs p.jsonl [--store <folder>]
-vi vectors check <model-id> --vectors <out>/joint --plan plan.jsonl --results results.jsonl
+vi vectors check <model-id> --vectors <out>/joint --plan plan.jsonl --results results.jsonl [--thinking on|off] [--steer reply|all]
 vi vectors layers <out>/joint single:32 | band:24-40 [--only warmth,teasing]
 vi vectors selftest
 ```
@@ -21,6 +21,26 @@ Model commands also take `--models <folder>` (default `$VI_MODELS`, else `models
 `vectors/<name>/llm/<model-sha256>/capture/` and the vectors next to it unless `--store`/`--out`
 say otherwise (`--name`, default `tali`). At home, put the store on a disk with 6 GB free and run
 under `nice -n 19` (plus `ionice -c3` on the game disk, `ionice -c2 -n7` on the system disk).
+
+## Thinking (Brandon, 2026-10-20: on for real use, off is fine for tests)
+
+- **Capture** puts each of her lines behind an empty think block: `vi chat`'s prompt for the
+  exchange (byte-equal through `<|im_start|>assistant\n`), then `<think>\n\n</think>\n\n`, then her
+  line, exactly where a reply sits after thinking. `line_mean` pools over `</think>`, the blank line
+  and her line; `line_head` over that lead-in and her first 8 tokens; the log-probability covers her
+  line only. Nothing follows her line: with causal attention an end-of-turn token after it can't
+  change what's pooled. `--no-think` (on `preflight`, `capture`, `build`) captures without the block,
+  pooling from the last prompt token, for comparison only; the store's `capture.json` records which
+  (`think`), and a store won't resume under the other setting.
+- **Check** runs with thinking `on` and steering scope `reply` by default. `reply` leaves the prompt and
+  the thinking unsteered and switches steering on when the model samples `</think>` (looked up by
+  text; a model where it isn't one token is refused), so her reply is steered from its first token.
+  `all` steers from the last prompt token on, thinking included, as `vi chat` does today. Thinking
+  `off` ends the prompt with the empty think block, so both scopes start at the prompt's `</think>`
+  and the last prompt token respectively. `max_tokens` covers the thinking (default 1000 with
+  thinking on, 200 off). Each result records `think`, `scope`, and where steering started
+  (`steer_start`: `prompt`, `reply` or `never`, with `steer_start_token`). The judge runs with the
+  trial's thinking setting and only its text after `</think>` is kept.
 
 ## Swapping the model
 
@@ -53,11 +73,12 @@ may appear in several pairs.
 
 **plan.jsonl** for the chat check (step 5 writes the prompts, judge and pass rule). `scheme`:
 `single:L`, `band:A-B` (telescoping), `band-k:A-B`, `band-sqrtk:A-B`; leave it out to use the
-folder's own `vectors.toml`. `{reply}` in the judge messages is replaced by the steered reply; the
+folder's own `vectors.toml`. `thinking` (`on`/`off`) and `scope` (`reply`/`all`) override the run's
+`--thinking`/`--steer` for one trial. `{reply}` in the judge messages is replaced by the steered reply; the
 judge is the same model, unsteered. Reruns skip ids already in the results.
 ```json
 {"id": "warmth-single32-1", "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}],
- "steer": {"warmth": 1.0}, "scheme": "single:32", "max_tokens": 200,
+ "steer": {"warmth": 1.0}, "scheme": "single:32", "max_tokens": 1000, "thinking": "on", "scope": "reply",
  "judge": [{"role": "user", "content": "...{reply}..."}]}
 ```
 
@@ -92,6 +113,7 @@ Same `qwen35` architecture as Qwen3.8-27B. Run from the repo, in the nix-shell t
 5. `nice -n 19 target/release/vi vectors build qwen3.5-0.8b-q8 --models ... --messages ... --labels ... --pairs ... --store <disk>/store --out <disk>/vectors`
    under a peak-RAM measure (`/usr/bin/time -v`); note the lines/s it prints.
 6. A small plan for `vi vectors check`: one mood and one two-mood blend, `single:<mid>` and a
-   telescoping `band:`, plus the unsteered reply.
+   telescoping `band:`, plus the unsteered reply, with thinking on in both scopes (`reply`, `all`)
+   and once with thinking off.
 7. Optional: compare `mean_diff` with `llama-cvector-generator --method mean` on the same pairs,
    if a CPU llama.cpp build is at hand (expect a high cosine after its one-layer shift).

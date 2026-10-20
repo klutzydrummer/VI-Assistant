@@ -115,6 +115,10 @@ fn builds_checks_and_relayers_vectors() {
                            "judge_max_tokens": 4}),
         serde_json::json!({"id": "loud-toml", "messages": [{"role": "user", "content": "Hi"}],
                            "steer": {"loud": 1.0, "nope": 0.5}, "max_tokens": 8}),
+        serde_json::json!({"id": "loud-off", "messages": [{"role": "user", "content": "Hi"}],
+                           "steer": {"loud": 1.0}, "max_tokens": 8, "thinking": "off"}),
+        serde_json::json!({"id": "loud-all", "messages": [{"role": "user", "content": "Hi"}],
+                           "steer": {"loud": 1.0}, "max_tokens": 8, "scope": "all"}),
     ];
     jsonl!(&d.join("plan.jsonl"), &plan);
     vi(
@@ -130,6 +134,10 @@ fn builds_checks_and_relayers_vectors() {
             "plan.jsonl",
             "--results",
             "results.jsonl",
+            "--thinking",
+            "on",
+            "--steer",
+            "reply",
             "--threads",
             "2",
         ],
@@ -139,7 +147,17 @@ fn builds_checks_and_relayers_vectors() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(results.len(), 3);
+    assert_eq!(results.len(), 5);
+    // Thinking on, reply scope: the random model never closes its thinking,
+    // so nothing was steered.
+    assert_eq!(results[2]["think"], "on");
+    assert_eq!(results[2]["scope"], "reply");
+    assert_eq!(results[2]["steer_start"], "never");
+    // Thinking off: the prompt's own </think> starts it.
+    assert_eq!(results[3]["think"], "off");
+    assert_eq!(results[3]["steer_start"], "prompt");
+    assert_eq!(results[4]["scope"], "all");
+    assert_eq!(results[4]["steer_start"], "prompt");
     assert_eq!(results[1]["scheme"], "band:2-4");
     assert!(results[1]["judge"].is_string());
     assert_eq!(results[2]["missing"][0], "nope");

@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::capture::{self, CaptureOptions, CaptureRun, Capturer, LineMessages, Preflight};
 use crate::fit::{self, FitOptions, LabelRow, Pair};
-use crate::llama::{Llama, ModelConfig, Sampling};
+use crate::llama::{Llama, ModelConfig, Sampling, Scope, EMPTY_THINK};
 use crate::store::Store;
 use crate::testmodel;
 use crate::vectors::{Scheme, VectorBank};
@@ -93,7 +93,7 @@ fn load(model: &Path, gpu_layers: i32, lines: &[LineMessages]) -> Result<Capture
     mc.n_threads = Some(2);
     let opts = CaptureOptions::new(mc.clone());
     let probe = Llama::load(&mc)?;
-    let (max_tokens, max_rest) = capture::sizes(&probe, lines)?;
+    let (max_tokens, max_rest) = capture::sizes(&probe, lines, opts.think)?;
     drop(probe);
     Capturer::load(&opts, max_tokens, max_rest)
 }
@@ -178,8 +178,11 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
     mc.n_threads = Some(2);
     let mut llama = Llama::load(&mc)?;
     let bank = VectorBank::load_dir(&out.join("joint"), llama.n_embd(), llama.n_layer())?;
+    // Thinking off, steered from `</think>` on: where the vectors were measured.
     let prompt = llama.format_chat(&[("system", "You are Tali."), ("user", "Hi")])?;
-    let plain = llama.generate(&prompt, None, &Sampling::greedy(12), |_| true)?;
+    let prompt = format!("{prompt}{EMPTY_THINK}");
+    let plain =
+        llama.generate_scoped(&prompt, None, Scope::Reply, &Sampling::greedy(12), |_| true)?;
     // The natural size of a random model's vector is tiny; scale it up so
     // the test sees the steering path change the reply.
     let blend = bank.blend(&BTreeMap::from([("loud".to_string(), 1.0)]));
@@ -189,7 +192,13 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
         .iter()
         .map(|x| x * 200.0)
         .collect();
-    let steered = llama.generate(&prompt, Some(&data), &Sampling::greedy(12), |_| true)?;
+    let steered = llama.generate_scoped(
+        &prompt,
+        Some(&data),
+        Scope::Reply,
+        &Sampling::greedy(12),
+        |_| true,
+    )?;
     let steered_differs = steered.tokens != plain.tokens;
 
     let passed = preflight.passed && gpu_vs_cpu_ok && steered_differs;

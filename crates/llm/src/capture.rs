@@ -4,8 +4,9 @@
 //! `docs/design/steering-builder-design.md`.
 //!
 //! - Prompts are rendered with [`crate::chat_messages`] and
-//!   [`Llama::format_chat`], the same code `vi chat` runs, and tokenized
-//!   whole. Her line is the tokens after the prompt's own tokens; the
+//!   [`Llama::format_chat`], the same code `vi chat` runs, followed by an
+//!   empty think block (`<think>\n\n</think>\n\n`) so her line sits where
+//!   a reply sits after thinking, and tokenized whole. Her line is the tokens after the prompt's own tokens; the
 //!   capture refuses a line whose prompt doesn't tokenize identically on
 //!   its own, and refuses a persona prefix that doesn't either.
 //! - The persona is decoded once into sequence 0. Each line copies it into
@@ -14,10 +15,13 @@
 //! - An eval callback reads `<layer_tensor>-<il>` for layers
 //!   `1..=n_layer-2` and fails the run unless each arrives exactly once
 //!   per decode as a 2-D F32 tensor of `n_embd` x the batch's tokens.
-//! - Summaries: `line_mean` over the last prompt token and her line (the
-//!   positions `vi chat` steers), `line_head` over the last prompt token
-//!   and her first `head_tokens`, the mean residual norm over line_mean's
-//!   positions, and her line's mean token log-probability.
+//! - Summaries: `line_mean` over `</think>`, the blank line after it and
+//!   her line (the positions the `reply` steering scope steers),
+//!   `line_head` over that lead-in and her first `head_tokens`, the mean
+//!   residual norm over line_mean's positions, and her line's mean token
+//!   log-probability. Without the think block (`think: false`, kept for
+//!   comparison) the lead-in is the last prompt token, as the `all` scope
+//!   steers.
 
 use std::ffi::{c_void, CStr};
 use std::fs;
@@ -89,6 +93,11 @@ pub struct CaptureOptions {
     /// `<layer_tensor>-<il>` is read per layer.
     pub layer_tensor: String,
     pub head_tokens: usize,
+    /// Put her line behind an empty think block (`<think>\n\n</think>\n\n`),
+    /// where a reply sits after thinking, and pool from `</think>` on: the
+    /// positions the `reply` steering scope steers. Off pools from the last
+    /// prompt token, as the `all` scope steers; kept for comparison.
+    pub think: bool,
 }
 
 impl CaptureOptions {
@@ -97,6 +106,7 @@ impl CaptureOptions {
             model,
             layer_tensor: "l_out".into(),
             head_tokens: HEAD_TOKENS,
+            think: true,
         }
     }
 }
@@ -109,6 +119,8 @@ pub struct Prepared {
     pub tokens: Vec<llama_token>,
     /// Tokens of the prompt alone; her line is `tokens[n_prompt..]`.
     pub n_prompt: usize,
+    /// Where the pooled lead-in starts: `</think>`, or the last prompt token.
+    pub lead_in: usize,
     pub text_sha256: String,
 }
 
@@ -237,6 +249,7 @@ pub struct Capturer {
     pub layers: Vec<usize>,
     n_ubatch: usize,
     head_tokens: usize,
+    think: bool,
     prefix: Vec<llama_token>,
     prefix_ready: bool,
 }
@@ -297,6 +310,7 @@ impl Capturer {
             layers,
             n_ubatch,
             head_tokens: opts.head_tokens,
+            think: opts.think,
             prefix: Vec::new(),
             prefix_ready: false,
         })
@@ -323,10 +337,10 @@ impl Capturer {
     /// share. Fails on any line whose tokens don't extend its prompt's and
     /// the prefix's.
     pub fn prepare(&mut self, lines: &[LineMessages]) -> Result<Vec<Prepared>, String> {
-        let (prefix_text, prepared) = prepare(&self.llama, lines)?;
+        let (prefix_text, prepared) = prepare(&self.llama, lines, self.think)?;
         let prefix = self.llama.tokenize(&prefix_text)?;
         for p in &prepared {
-            if !p.tokens.starts_with(&prefix) || p.n_prompt <= prefix.len() {
+            if !p.tokens.starts_with(&prefix) || p.lead_in < prefix.len() {
                 return Err(format!(
                     "line {}: the persona prefix doesn't tokenize the same on its own, \
                      so it can't be decoded once and reused",
@@ -351,6 +365,10 @@ impl Capturer {
 
     pub fn prefix_tokens(&self) -> usize {
         self.prefix.len()
+    }
+
+    pub fn think(&self) -> bool {
+        self.think
     }
 
     fn decode(
@@ -428,15 +446,16 @@ impl Capturer {
             self.decode(&prefix, 0, 1, 0..0)?;
         }
         let rest = &p.tokens[n_prefix..];
-        // Index (in `rest`) of the prompt's last token, then her line.
+        // Indexes in `rest`: the lead-in, the prompt's last token, her line.
+        let lead = p.lead_in - n_prefix;
         let a = p.n_prompt - 1 - n_prefix;
         let len = rest.len();
         let rows = self.row_floats();
         {
             let tap = &mut *self.tap;
             tap.n_tokens = len;
-            tap.mean_rows = (a, len);
-            tap.head_rows = (a, (a + 1 + self.head_tokens).min(len));
+            tap.mean_rows = (lead, len);
+            tap.head_rows = (lead, (a + 1 + self.head_tokens).min(len));
             tap.seen = vec![0; self.layers.len()];
             tap.mean = vec![0.0; rows];
             tap.head = vec![0.0; rows];
@@ -471,7 +490,8 @@ impl Capturer {
         })
     }
 
-    /// Mean log-probability of `rest[a+1..]`, from the logits at `a..len-1`.
+    /// Mean log-probability of her line, `rest[a+1..]`, from the logits at
+    /// `a..len-1`.
     fn logprob(&self, rest: &[llama_token], a: usize) -> f64 {
         let n_vocab = unsafe { sys::llama_vocab_n_tokens(self.llama.vocab()) } as usize;
         let mut total = 0.0f64;
@@ -505,9 +525,14 @@ impl Capturer {
     }
 }
 
-/// Render every line's prompt the way `vi chat` does, tokenize it, and
-/// find the persona text all prompts start with.
-fn prepare(llama: &Llama, lines: &[LineMessages]) -> Result<(String, Vec<Prepared>), String> {
+/// Render every line's prompt the way `vi chat` does (plus the empty think
+/// block when `think`), tokenize it, and find the persona text all prompts
+/// start with.
+fn prepare(
+    llama: &Llama,
+    lines: &[LineMessages],
+    think: bool,
+) -> Result<(String, Vec<Prepared>), String> {
     let system = &lines[0].system;
     if let Some(l) = lines.iter().find(|l| &l.system != system) {
         return Err(format!(
@@ -526,13 +551,27 @@ fn prepare(llama: &Llama, lines: &[LineMessages]) -> Result<(String, Vec<Prepare
     if lines.iter().any(|l| l.user.is_none()) {
         prefix = common_prefix(&prefix, &render(None)?).to_string();
     }
+    let think_end = if think {
+        Some(llama.think_end()?)
+    } else {
+        None
+    };
     let mut out = Vec::with_capacity(lines.len());
     for l in lines {
         if l.assistant.is_empty() {
             return Err(format!("line {} is empty", l.line_id));
         }
-        let prompt = render(l.user.as_deref())?;
+        let prompt = capture_prompt(&render(l.user.as_deref())?, think);
         let prompt_tokens = llama.tokenize(&prompt)?;
+        let lead_in = match think_end {
+            None => prompt_tokens.len() - 1,
+            Some(t) => prompt_tokens.iter().rposition(|&p| p == t).ok_or_else(|| {
+                format!(
+                    "line {}: the empty think block doesn't tokenize to </think>",
+                    l.line_id
+                )
+            })?,
+        };
         let tokens = llama.tokenize(&format!("{prompt}{}", l.assistant))?;
         if !tokens.starts_with(&prompt_tokens) || tokens.len() == prompt_tokens.len() {
             return Err(format!(
@@ -544,10 +583,21 @@ fn prepare(llama: &Llama, lines: &[LineMessages]) -> Result<(String, Vec<Prepare
             line_id: l.line_id.clone(),
             tokens,
             n_prompt: prompt_tokens.len(),
+            lead_in,
             text_sha256: sha256_text(&l.assistant),
         });
     }
     Ok((prefix.to_string(), out))
+}
+
+/// A capture prompt: `vi chat`'s prompt for the exchange, then the empty
+/// think block when `think`. Her line follows it.
+pub fn capture_prompt(chat_prompt: &str, think: bool) -> String {
+    if think {
+        format!("{chat_prompt}{}", crate::llama::EMPTY_THINK)
+    } else {
+        chat_prompt.to_string()
+    }
 }
 
 /// The request `vi chat` would send for this exchange.
@@ -574,8 +624,8 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 }
 
 /// Token counts the capture needs to size its context.
-pub fn sizes(llama: &Llama, lines: &[LineMessages]) -> Result<(usize, usize), String> {
-    let (prefix, prepared) = prepare(llama, lines)?;
+pub fn sizes(llama: &Llama, lines: &[LineMessages], think: bool) -> Result<(usize, usize), String> {
+    let (prefix, prepared) = prepare(llama, lines, think)?;
     let n_prefix = llama.tokenize(&prefix)?.len();
     let max_tokens = prepared.iter().map(|p| p.tokens.len()).max().unwrap_or(0);
     let max_rest = prepared
@@ -771,6 +821,7 @@ pub fn capture_all(
         messages_sha256: run.messages_sha256.to_string(),
         prefix_tokens: cap.prefix_tokens(),
         head_tokens: cap.head_tokens,
+        think: cap.think,
         n_lines_total: lines.len(),
         complete: false,
         preflight: None,

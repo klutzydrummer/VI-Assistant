@@ -1,9 +1,15 @@
 //! Stage 3's harness: the chat check, run on `vi chat`'s own steering path
-//! ([`Llama::generate`] and [`VectorBank::blend`]: unsteered prompt, steered
-//! last prompt token and reply, each vector on its own layers), so the
-//! strengths it settles mean the same in `vi chat`. llama-server steers
-//! differently (every token, one layer range for all vectors) and isn't
-//! used.
+//! ([`Llama::generate_scoped`] and [`VectorBank::blend`]: unsteered
+//! prompt, then steered, each vector on its own layers), so the strengths
+//! it settles mean the same in `vi chat`. llama-server steers differently
+//! (every token, one layer range for all vectors) and isn't used.
+//!
+//! Thinking is on by default: the prompt ends where the model starts its
+//! think block. Off appends an empty one (`<think>\n\n</think>\n\n`).
+//! The steering scope is `reply` by default: the prompt and the thinking
+//! stay unsteered and steering starts at `</think>`, where the vectors were
+//! measured; `all` steers from the last prompt token on, thinking included,
+//! as `vi chat` does today. Both can be set per trial.
 //!
 //! The step 5 thread owns what is checked: the prompts, the judge's
 //! questions and the pass rule. This runs a plan of trials, each a chat
@@ -18,15 +24,17 @@
 //! ```json
 //! {"id": "warmth-1", "messages": [{"role": "system", "content": "..."},
 //!   {"role": "user", "content": "..."}], "steer": {"warmth": 1.0},
-//!  "scheme": "single:32", "max_tokens": 200,
+//!  "scheme": "single:32", "max_tokens": 600, "thinking": "on", "scope": "reply",
 //!  "judge": [{"role": "user", "content": "Rate the warmth of: {reply}"}]}
 //! ```
 //!
 //! `scheme` is `single:L`, `band:A-B` (telescoping), `band-k:A-B` or
 //! `band-sqrtk:A-B`, built from the folder's `natural/` vectors; without
 //! it the folder's own bank and `vectors.toml` are used, exactly as
-//! `vi chat` would load them. Results are appended as JSON lines, and a
-//! rerun skips ids already there.
+//! `vi chat` would load them. `max_tokens` covers the thinking too. The
+//! judge runs with the trial's thinking setting and sees only its reply's
+//! text after `</think>`; its own thinking is dropped. Results are
+//! appended as JSON lines, and a rerun skips ids already there.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -36,13 +44,56 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::gguf::Gguf;
-use crate::llama::{Llama, Sampling, Stop};
+use crate::llama::{Llama, Sampling, Scope, SteerStart, Stop, EMPTY_THINK};
 use crate::vectors::{directions, Limits, Scheme, Vector, VectorBank, MODEL_SHA_KEY};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+/// Whether the model thinks before it replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Thinking {
+    #[default]
+    On,
+    /// The prompt closes an empty think block.
+    Off,
+}
+
+impl Thinking {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            _ => Err(format!("thinking is on or off, not {s:?}")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// The run's settings, which a trial may override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckDefaults {
+    pub thinking: Thinking,
+    pub scope: Scope,
+}
+
+impl Default for CheckDefaults {
+    fn default() -> Self {
+        Self {
+            thinking: Thinking::On,
+            scope: Scope::Reply,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +116,11 @@ pub struct Trial {
     pub judge: Option<Vec<ChatMessage>>,
     #[serde(default)]
     pub judge_max_tokens: Option<usize>,
+    #[serde(default)]
+    pub thinking: Option<Thinking>,
+    /// Steering scope, `reply` or `all`.
+    #[serde(default)]
+    pub scope: Option<Scope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +138,19 @@ pub struct TrialResult {
     pub stopped: String,
     pub judge: Option<String>,
     pub seconds: f64,
+    /// `on` or `off`.
+    #[serde(default)]
+    pub think: String,
+    /// `reply` or `all`.
+    #[serde(default)]
+    pub scope: String,
+    /// Where steering started: `prompt` (at the token named by
+    /// `steer_start_token`), `reply` (at the sampled `</think>`, reply token
+    /// `steer_start_token`), or `never` (`</think>` didn't come).
+    #[serde(default)]
+    pub steer_start: String,
+    #[serde(default)]
+    pub steer_start_token: Option<usize>,
 }
 
 pub struct Checker {
@@ -89,6 +158,7 @@ pub struct Checker {
     dir: PathBuf,
     natural: BTreeMap<String, BTreeMap<u32, Vec<f32>>>,
     banks: HashMap<String, VectorBank>,
+    defaults: CheckDefaults,
 }
 
 fn file_model_sha(g: &Gguf) -> Option<String> {
@@ -101,7 +171,12 @@ fn file_model_sha(g: &Gguf) -> Option<String> {
 impl Checker {
     /// `dir` is a method folder written by the fit (`.../joint`). Refuses
     /// vectors built for another model file.
-    pub fn new(llama: Llama, dir: &Path, model_sha256: &str) -> Result<Self, String> {
+    pub fn new(
+        llama: Llama,
+        dir: &Path,
+        model_sha256: &str,
+        defaults: CheckDefaults,
+    ) -> Result<Self, String> {
         let mut natural = BTreeMap::new();
         let nat_dir = dir.join("natural");
         if nat_dir.is_dir() {
@@ -131,6 +206,7 @@ impl Checker {
             dir: dir.to_path_buf(),
             natural,
             banks: HashMap::new(),
+            defaults,
         })
     }
 
@@ -171,8 +247,13 @@ impl Checker {
             .iter()
             .map(|m| (m.role.as_str(), m.content.as_str()))
             .collect();
-        let prompt = self.llama.format_chat(&messages)?;
-        let max = t.max_tokens.unwrap_or(200);
+        let think = t.thinking.unwrap_or(self.defaults.thinking);
+        let scope = t.scope.unwrap_or(self.defaults.scope);
+        let prompt = with_thinking(self.llama.format_chat(&messages)?, think);
+        let max = t.max_tokens.unwrap_or(match think {
+            Thinking::On => 1000,
+            Thinking::Off => 200,
+        });
         let sampling = match t.temperature {
             Some(temp) if temp > 0.0 => Sampling {
                 temperature: temp,
@@ -182,9 +263,9 @@ impl Checker {
             },
             _ => Sampling::greedy(max),
         };
-        let g = self
-            .llama
-            .generate(&prompt, blend.data.as_deref(), &sampling, |_| true)?;
+        let g =
+            self.llama
+                .generate_scoped(&prompt, blend.data.as_deref(), scope, &sampling, |_| true)?;
         let (thinking, reply) = split_thinking(&g.text);
         let judge = match &t.judge {
             None => None,
@@ -197,9 +278,10 @@ impl Checker {
                     .iter()
                     .map(|(r, c)| (r.as_str(), c.as_str()))
                     .collect();
-                let jp = self.llama.format_chat(&refs)?;
-                let sampling = Sampling::greedy(t.judge_max_tokens.unwrap_or(200));
-                Some(self.llama.generate(&jp, None, &sampling, |_| true)?.text)
+                let jp = with_thinking(self.llama.format_chat(&refs)?, think);
+                let sampling = Sampling::greedy(t.judge_max_tokens.unwrap_or(max));
+                let text = self.llama.generate(&jp, None, &sampling, |_| true)?.text;
+                Some(split_thinking(&text).1)
             }
         };
         Ok(TrialResult {
@@ -218,18 +300,41 @@ impl Checker {
             .into(),
             judge,
             seconds: start.elapsed().as_secs_f64(),
+            think: think.name().into(),
+            scope: scope.name().into(),
+            steer_start: match g.steer_start {
+                SteerStart::Prompt(_) => "prompt",
+                SteerStart::Reply(_) => "reply",
+                SteerStart::Never => "never",
+            }
+            .into(),
+            steer_start_token: match g.steer_start {
+                SteerStart::Prompt(i) | SteerStart::Reply(i) => Some(i),
+                SteerStart::Never => None,
+            },
         })
     }
 }
 
+fn with_thinking(prompt: String, thinking: Thinking) -> String {
+    match thinking {
+        Thinking::On => prompt,
+        Thinking::Off => prompt + EMPTY_THINK,
+    }
+}
+
 /// Split a reply into the thinking before `</think>` and what she says.
+/// Thinking that never closed (out of tokens) leaves no reply.
 pub fn split_thinking(text: &str) -> (Option<String>, String) {
     match text.split_once("</think>") {
         Some((think, reply)) => {
             let think = think.trim_start().trim_start_matches("<think>").trim();
             (Some(think.to_string()), reply.trim().to_string())
         }
-        None => (None, text.to_string()),
+        None => match text.trim_start().strip_prefix("<think>") {
+            Some(think) => (Some(think.trim().to_string()), String::new()),
+            None => (None, text.to_string()),
+        },
     }
 }
 
@@ -281,5 +386,9 @@ mod tests {
             (Some("She'd be glad.".into()), "Keelah!".into())
         );
         assert_eq!(split_thinking("Keelah!"), (None, "Keelah!".into()));
+        assert_eq!(
+            split_thinking("<think>\nStill thinking"),
+            (Some("Still thinking".into()), String::new())
+        );
     }
 }

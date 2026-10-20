@@ -1,7 +1,7 @@
 //! The vector builder on the tiny random model: no GPU, no downloads.
 
 use llm::capture::{self, CaptureOptions, Capturer, LineMessages};
-use llm::llama::{Llama, ModelConfig};
+use llm::llama::{Llama, ModelConfig, EMPTY_THINK};
 use llm::testmodel;
 
 fn model(name: &str, layers: usize) -> std::path::PathBuf {
@@ -13,12 +13,22 @@ fn model(name: &str, layers: usize) -> std::path::PathBuf {
 }
 
 fn capturer(path: &std::path::Path, tensor: &str, lines: &[LineMessages]) -> Capturer {
+    capturer_think(path, tensor, lines, true)
+}
+
+fn capturer_think(
+    path: &std::path::Path,
+    tensor: &str,
+    lines: &[LineMessages],
+    think: bool,
+) -> Capturer {
     let mut mc = ModelConfig::new(path);
     mc.n_threads = Some(2);
     let probe = Llama::load(&mc).unwrap();
-    let (max_tokens, max_rest) = capture::sizes(&probe, lines).unwrap();
+    let (max_tokens, max_rest) = capture::sizes(&probe, lines, think).unwrap();
     let mut opts = CaptureOptions::new(mc);
     opts.layer_tensor = tensor.into();
+    opts.think = think;
     Capturer::load(&opts, max_tokens, max_rest).unwrap()
 }
 
@@ -44,21 +54,53 @@ fn selftest_passes_end_to_end() {
 fn capture_prompts_are_vi_chats_prompts() {
     let path = model("prompts", 4);
     let lines = llm::selftest::messages();
-    let mut cap = capturer(&path, "l_out", &lines);
-    let prepared = cap.prepare(&lines).unwrap();
     let llama = Llama::load(&ModelConfig::new(&path)).unwrap();
-    for (l, p) in lines.iter().zip(&prepared) {
-        // What `vi chat` renders for the same exchange, through the same code.
-        let req = capture::request(&l.system, l.user.as_deref());
-        let prompt = llama.format_chat(&llm::chat_messages(&req)).unwrap();
-        let tokens = llama.tokenize(&prompt).unwrap();
-        assert_eq!(&p.tokens[..p.n_prompt], tokens.as_slice(), "{}", l.line_id);
-        assert!(prompt.ends_with("<|im_start|>assistant\n"));
-        let line = llama.tokenize(&format!("{prompt}{}", l.assistant)).unwrap();
-        assert_eq!(p.tokens, line);
+    let think_end = llama.think_end().unwrap();
+    for think in [true, false] {
+        let mut cap = capturer_think(&path, "l_out", &lines, think);
+        let prepared = cap.prepare(&lines).unwrap();
+        for (l, p) in lines.iter().zip(&prepared) {
+            // What `vi chat` renders for the same exchange, through the same code.
+            let req = capture::request(&l.system, l.user.as_deref());
+            let prompt = llama.format_chat(&llm::chat_messages(&req)).unwrap();
+            assert!(prompt.ends_with("<|im_start|>assistant\n"));
+            let chat = llama.tokenize(&prompt).unwrap();
+            assert!(p.tokens.starts_with(&chat), "{}", l.line_id);
+            let full = if think {
+                format!("{prompt}{EMPTY_THINK}")
+            } else {
+                prompt.clone()
+            };
+            let tokens = llama.tokenize(&full).unwrap();
+            assert_eq!(&p.tokens[..p.n_prompt], tokens.as_slice(), "{}", l.line_id);
+            let line = llama.tokenize(&format!("{full}{}", l.assistant)).unwrap();
+            assert_eq!(p.tokens, line);
+            if think {
+                // Pooling starts at `</think>`, after vi chat's prompt.
+                assert_eq!(p.tokens[p.lead_in], think_end);
+                assert!(p.lead_in >= chat.len() && p.lead_in < p.n_prompt - 1);
+            } else {
+                assert_eq!(p.lead_in, p.n_prompt - 1);
+            }
+        }
+        // The persona is shared and comes first.
+        assert!(cap.prefix_tokens() > 10);
     }
-    // The persona is shared and comes first.
-    assert!(cap.prefix_tokens() > 10);
+}
+
+#[test]
+fn the_think_block_changes_what_is_pooled() {
+    let path = model("think", 4);
+    let lines = llm::selftest::messages();
+    let mut on = capturer_think(&path, "l_out", &lines, true);
+    let mut off = capturer_think(&path, "l_out", &lines, false);
+    let p_on = on.prepare(&lines).unwrap();
+    let p_off = off.prepare(&lines).unwrap();
+    let a = on.capture(&p_on[2], true).unwrap();
+    let b = off.capture(&p_off[2], true).unwrap();
+    assert_ne!(a.mean, b.mean);
+    // Her line's log-probability covers her tokens only, either way.
+    assert!(a.logprob.is_finite() && b.logprob.is_finite());
 }
 
 #[test]
