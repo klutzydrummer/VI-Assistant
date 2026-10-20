@@ -12,6 +12,8 @@
 //!   steering path.
 //! - `layers <method-folder> <scheme>` sets the layer scheme the chat check
 //!   settled (single layer or telescoping band).
+//! - `compare <a> <b>` compares two captures of the same lines (say with
+//!   and without persona reuse), or two fits' vectors.
 //! - `selftest` runs all of it on a tiny random model.
 
 use std::collections::BTreeMap;
@@ -33,10 +35,12 @@ pub const USAGE: &str = "  vi vectors fetch <model-id>
   vi vectors preflight <model-id> --messages <messages.jsonl> [--character <folder>] [--no-think]
   vi vectors capture <model-id> --messages <messages.jsonl> --store <folder> [--skip-preflight] [--no-reuse] [--no-think]
   vi vectors fit --store <folder> --labels <labels.jsonl> --pairs <pairs.jsonl> --out <folder> [--head]
-  vi vectors build <model-id> --messages <m.jsonl> --labels <l.jsonl> --pairs <p.jsonl> [--store <folder>] [--out <folder>] [--no-think]
+  vi vectors build <model-id> --messages <m.jsonl> --labels <l.jsonl> --pairs <p.jsonl> [--store <folder>] [--out <folder>]
+      [--no-think] [--skip-preflight] [--no-reuse]
   vi vectors check <model-id> --vectors <method-folder> --plan <plan.jsonl> --results <results.jsonl>
       [--thinking on|off] [--steer reply|all]
   vi vectors layers <method-folder> <single:L | band:A-B | band-k:A-B | band-sqrtk:A-B> [--only a,b]
+  vi vectors compare <store-a> <store-b> | <method-folder-a> <method-folder-b>
   vi vectors selftest [--dir <folder>]
   (model commands also take --models <folder> (default $VI_MODELS or models/), --registry <models.toml>,
    --gpu-layers N, --threads N; fit and build take --mem-mb N)";
@@ -104,6 +108,7 @@ pub fn run(args: &[String]) -> ExitCode {
             "build" => build_cmd(&a),
             "check" => check_cmd(&a),
             "layers" => layers_cmd(&a),
+            "compare" => compare_cmd(&a),
             "selftest" => selftest_cmd(&a),
             _ => Err(format!("usage:\n{USAGE}")),
         }
@@ -556,6 +561,44 @@ fn layers_cmd(a: &Args) -> Result<(), String> {
         .map(|s| s.split(',').map(str::to_string).collect());
     let done = fit::relayer(Path::new(dir), scheme, only.as_deref())?;
     println!("{} vectors now use {}", done.len(), scheme.name());
+    Ok(())
+}
+
+fn compare_cmd(a: &Args) -> Result<(), String> {
+    let (Some(x), Some(y)) = (a.pos.get(1), a.pos.get(2)) else {
+        return Err("needs two stores or two method folders".into());
+    };
+    let (x, y) = (Path::new(x), Path::new(y));
+    if x.join(llm::store::META).exists() {
+        let diffs = llm::compare::stores(&mut Store::open(x)?, &mut Store::open(y)?)?;
+        println!(
+            "line_mean, per layer: relative error per line (median, worst), worst cosine; \
+             the difference against the lines' spread around their mean, the part every line \
+             shares (about 1/sqrt(lines) for noise), and the spread ratio without that part"
+        );
+        for d in &diffs {
+            println!(
+                "  layer {:>3}: {:.2e} / {:.2e}, cos {:.6}; vs spread {:.2e}, shared {:.2}, noise vs spread {:.2e}",
+                d.layer, d.median_rel, d.worst_rel, d.min_cos, d.vs_spread, d.shared, d.noise_vs_spread
+            );
+        }
+        let worst = diffs.iter().map(|d| d.noise_vs_spread).fold(0.0, f64::max);
+        println!("worst noise vs spread: {worst:.2e}");
+    } else {
+        let diffs = llm::compare::vectors(x, y)?;
+        for d in &diffs {
+            println!(
+                "  {} layer {}: cosine {:.6}, norm ratio {:.4}",
+                d.vector, d.layer, d.cos, d.norm_ratio
+            );
+        }
+        if let Some(w) = diffs.iter().min_by(|p, q| p.cos.total_cmp(&q.cos)) {
+            println!(
+                "lowest cosine: {} layer {} at {:.6}",
+                w.vector, w.layer, w.cos
+            );
+        }
+    }
     Ok(())
 }
 

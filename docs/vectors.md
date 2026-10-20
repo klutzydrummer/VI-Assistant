@@ -13,6 +13,7 @@ vi vectors fit --store <folder> --labels l.jsonl --pairs p.jsonl --out <folder>
 vi vectors build <model-id> --messages m.jsonl --labels l.jsonl --pairs p.jsonl [--store <folder>]
 vi vectors check <model-id> --vectors <out>/joint --plan plan.jsonl --results results.jsonl [--thinking on|off] [--steer reply|all]
 vi vectors layers <out>/joint single:32 | band:24-40 [--only warmth,teasing]
+vi vectors compare <store-a> <store-b> | <out-a>/joint <out-b>/joint
 vi vectors selftest
 ```
 
@@ -45,6 +46,25 @@ under `nice -n 19` (plus `ionice -c3` on the game disk, `ionice -c2 -n7` on the 
   was never steered: its `outcome` is `truncated`. One in the `reply` scope that ends without ever
   saying `</think>` is `never_steered`. Neither is judged or counted as a steering result, and
   `check` prints their rate per mood after each run (raise `max_tokens` if it's common).
+
+## When the reuse test fails
+
+The reuse test compares each line captured with the decoded persona reused against the same line
+decoded whole, and wants a relative error under 1e-3. On quantized weights that can fail without
+anything being wrong: CPU matmuls on Q8_0 weights round the activations to 8 bits, so a last-bit
+difference in summation order (the persona's cache cells sit elsewhere in the two decodes) flips
+some roundings and spreads. On the tiny test model, Q8_0 weights turn a 2e-7 difference into 1.2e-3,
+while the vectors fit from the two captures still agree to a cosine above 0.9998 per layer.
+What matters is whether the difference moves the vectors. To find out on a model:
+
+1. Capture the same lines twice, once with `--no-reuse` (`--skip-preflight` on both).
+2. `vi vectors compare <store> <store-no-reuse>`: per layer, the difference against the lines' own
+   spread, and how much of it every line shares (a shared shift cancels in every contrast and in
+   the fit's intercept).
+3. Fit both and `vi vectors compare <out>/joint <out-no-reuse>/joint`: cosine and norm ratio per
+   vector and layer.
+
+`build` and `capture` both take `--no-reuse`.
 
 ## Swapping the model
 

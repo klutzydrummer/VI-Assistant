@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 pub mod capture;
 pub mod check;
+pub mod compare;
 pub mod f16;
 pub mod fit;
 pub mod gguf;

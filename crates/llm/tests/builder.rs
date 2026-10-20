@@ -127,3 +127,19 @@ fn the_capture_refuses_missing_layers_and_mixed_personas() {
         .unwrap_err()
         .contains("different persona"));
 }
+
+#[test]
+fn the_capture_runs_on_qwen35s_hybrid_layout() {
+    // Gated DeltaNet layers with every fourth layer full attention, as in
+    // Qwen3.5 and 3.8: the recurrent state is copied by `seq_cp` too.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen35.gguf");
+    testmodel::write_qwen35(&path, 5, 8).unwrap();
+    let lines = llm::selftest::messages();
+    let mut cap = capturer(&path, "l_out", &lines);
+    assert_eq!(cap.llama().architecture(), "qwen35");
+    assert_eq!(cap.layers, (1..=6).collect::<Vec<_>>());
+    let prepared = cap.prepare(&lines).unwrap();
+    let p = cap.preflight(&prepared).unwrap();
+    assert!(p.passed, "{p:#?}");
+}
