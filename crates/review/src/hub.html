@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>vi review</title>
+<link id="icon" rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --yes: #2e7d4f; --yes-soft: #dcefe3; --no: #b3392f; --warn: #b8701a; --warn-soft: #f7e7d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --yes: #6fc492; --yes-soft: #1f3327; --no: #e57b70; --warn: #e0a253; --warn-soft: #3d2f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 760px; margin: 0 auto; padding: 14px 16px 60px; }
+  header { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+  h1 { font-size: 19px; margin: 0; }
+  h2 { font-size: 13px; margin: 22px 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .count { display: inline-block; min-width: 22px; padding: 0 7px; border-radius: 999px; background: var(--warn); color: var(--panel); font-size: 13px; font-weight: 700; text-align: center; }
+  .count.zero { background: var(--yes); }
+  .card { display: block; background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--warn); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; color: inherit; text-decoration: none; }
+  a.card:active { opacity: .7; }
+  .card .top { display: flex; gap: 8px; align-items: baseline; }
+  .card .title { font-weight: 600; flex: 1; }
+  .card .about { font-size: 14px; color: var(--muted); margin: 3px 0 8px; }
+  .card .folder { font-size: 12px; color: var(--muted); word-break: break-all; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 6px 0 4px; }
+  .bar div { height: 100%; background: var(--warn); }
+  .new { background: var(--accent); color: var(--panel); border-radius: 999px; padding: 0 8px; font-size: 12px; font-weight: 600; }
+  .go { color: var(--accent); font-weight: 600; white-space: nowrap; }
+  .card.done { border-left-color: var(--yes); }
+  .card.done .title::before { content: "\2713  "; color: var(--yes); }
+  .card.fresh { background: var(--yes-soft); }
+  .empty { padding: 22px 14px; text-align: center; border: 1px dashed var(--line); border-radius: 12px; color: var(--muted); }
+  .empty b { color: var(--yes); display: block; font-size: 17px; margin-bottom: 2px; }
+  button { font: inherit; font-size: 14px; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 9px; padding: 7px 11px; cursor: pointer; touch-action: manipulation; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; max-height: 260px; overflow: auto; margin: 8px 0 0; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .problem { font-size: 13px; margin: 6px 0; }
+  .problem b { font-weight: 600; }
+  .err { color: var(--no); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Needs you</h1>
+    <span id="count" class="count"></span>
+    <span id="updated" class="small muted" style="flex:1;text-align:right"></span>
+  </header>
+  <div id="pending"></div>
+
+  <h2>Done</h2>
+  <div id="done"></div>
+
+  <details id="notready" style="margin-top:22px" class="hidden"><summary id="nrsum">Not ready yet</summary><div id="problems"></div></details>
+  <p class="small muted" style="margin-top:22px">Everything here is read from <span id="corpus"></span> on your PC. New listening sets and job reviews show up on their own.</p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function when(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return d.toDateString() === now.toDateString() ? `today ${time}` : `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
+}
+function load(key) { try { return JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { return null; } }
+function save(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) {} }
+
+function icon(n) {
+  const fill = n ? "#b8701a" : "#2e7d4f", text = n ? (n > 9 ? "9+" : String(n)) : "✓";
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="${fill}"/><text x="16" y="22" font-size="${n > 9 ? 14 : 18}" font-family="sans-serif" font-weight="700" text-anchor="middle" fill="#fff">${text}</text></svg>`;
+  $("icon").href = "data:image/svg+xml," + encodeURIComponent(svg);
+}
+
+let seen = new Set(load("hub-seen") || []), first = load("hub-seen") === null;
+
+function pendingCard(t) {
+  const pct = Math.round(100 * t.done / t.total);
+  const progress = t.kind === "note" ? "" :
+    `<div class="bar"><div style="width:${pct}%"></div></div><div class="small muted">${t.done} of ${t.total} ${esc(t.unit)}${t.done ? "" : " · not started"}</div>`;
+  const isNew = !first && !seen.has(t.id) ? `<span class="new">New</span>` : "";
+  const top = `<div class="top"><span class="title">${esc(t.title)}</span>${isNew}${t.url ? `<span class="go">Open &rsaquo;</span>` : ""}</div>`;
+  const body = `${top}<div class="about">${esc(t.about)}</div>${progress}<div class="folder">${esc(t.folder)}</div>`;
+  if (t.kind === "note") {
+    const link = t.url ? `<a class="go" href="${esc(t.url)}">Open &rsaquo;</a>` : "";
+    return `<div class="card">${body}<div class="row">${link}<button class="primary" data-mark="${esc(t.id)}" data-done="1">Mark done</button></div></div>`;
+  }
+  return `<a class="card" href="${esc(encodeURI(t.url))}">${body}</a>`;
+}
+
+function doneCard(t, now) {
+  const fresh = t.finished_at && now - t.finished_at < 6 * 3600 ? " fresh" : "";
+  const open = t.url ? `<a class="go" href="${esc(encodeURI(t.url))}">Open &rsaquo;</a>` : "";
+  const undo = t.kind === "note" ? `<button data-mark="${esc(t.id)}" data-done="0">Reopen</button>` : "";
+  return `<div class="card done${fresh}">
+    <div class="top"><span class="title">${esc(t.title)}</span>${open}</div>
+    <div class="small muted">Finished ${esc(when(t.finished_at))} · ${t.total} ${esc(t.unit)}</div>
+    <div class="folder">${esc(t.folder)}</div>
+    <details${fresh ? " open" : ""}><summary>Summary for Claude</summary>
+      <pre>${esc(t.report)}</pre>
+      <div class="row"><button class="primary" data-copy="${esc(t.id)}">Copy summary</button><span class="small muted">paste it into the thread that asked</span></div>
+    </details>
+    ${undo ? `<div class="row">${undo}</div>` : ""}
+  </div>`;
+}
+
+let view = null;
+async function refresh() {
+  try {
+    const r = await fetch("/api/tasks", { cache: "no-store" });
+    if (!r.ok) throw new Error(await r.text());
+    view = await r.json();
+  } catch (e) {
+    $("updated").innerHTML = `<span class="err">can't reach vi review</span>`;
+    return;
+  }
+  const n = view.pending.length;
+  document.title = n ? `(${n}) vi review` : "✓ vi review";
+  icon(n);
+  $("count").textContent = n;
+  $("count").className = "count" + (n ? "" : " zero");
+  $("pending").innerHTML = n ? view.pending.map(pendingCard).join("")
+    : `<div class="empty"><b>✓ All caught up</b>Nothing needs you right now.</div>`;
+  $("done").innerHTML = view.done.length ? view.done.map((t) => doneCard(t, view.now)).join("")
+    : `<div class="small muted">Nothing finished yet.</div>`;
+  $("corpus").textContent = view.corpus;
+  $("updated").textContent = "updated " + new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const nr = view.not_ready;
+  $("notready").classList.toggle("hidden", !nr.length);
+  $("notready").style.display = nr.length ? "" : "none";
+  $("nrsum").textContent = `Not ready yet (${nr.length})`;
+  $("problems").innerHTML = nr.map((p) => `<div class="problem"><b>${esc(p.task)}</b>: <span class="muted">${esc(p.why)}</span></div>`).join("");
+  // Remember what he has seen, so anything new later gets a badge.
+  for (const t of view.pending.concat(view.done)) seen.add(t.id);
+  save("hub-seen", [...seen]);
+  first = false;
+}
+
+document.addEventListener("click", async (ev) => {
+  const copy = ev.target.closest("[data-copy]"), mark = ev.target.closest("[data-mark]");
+  if (copy) {
+    const t = view.done.find((t) => t.id === copy.dataset.copy);
+    try { await navigator.clipboard.writeText(t.report); copy.textContent = "Copied ✓"; }
+    catch (e) {
+      const pre = copy.closest("details").querySelector("pre"), range = document.createRange();
+      range.selectNodeContents(pre); getSelection().removeAllRanges(); getSelection().addRange(range);
+      copy.textContent = "Selected: copy it";
+    }
+  } else if (mark) {
+    mark.disabled = true;
+    await fetch("/api/mark", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: mark.dataset.mark, done: mark.dataset.done === "1" }) });
+    refresh();
+  }
+});
+
+refresh();
+setInterval(refresh, 20000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+window.addEventListener("pageshow", (e) => { if (e.persisted) refresh(); });
+</script>
+</body>
+</html>

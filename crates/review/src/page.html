@@ -226,7 +226,7 @@ function renderAxes() {
 }
 
 async function show(id) {
-  current = await api('/api/clip/' + encodeURIComponent(id));
+  current = await api('api/clip/' + encodeURIComponent(id));
   const { line, clip, label, review, why } = current;
   values = {};
   for (const axis of axisIds()) {
@@ -257,7 +257,7 @@ async function show(id) {
   renderAxes();
 
   const audio = $('audio');
-  audio.src = '/audio/' + encodeURIComponent(line.id);
+  audio.src = 'audio/' + encodeURIComponent(line.id);
   audio.play().catch(() => {}); // autoplay may need one click first
   shownAt = performance.now();
   $('clip').hidden = false;
@@ -279,7 +279,7 @@ async function submit(verdict) {
   const body = { id: current.line.id, verdict, seconds };
   if (verdict === 'keep') body.scores = values;
   if (verdict === 'flag') body.flag = $('reason').value;
-  session = await api('/api/review', body);
+  session = await api('api/review', body);
   history.push(current.line.id);
   renderSession();
   await next();
@@ -321,7 +321,7 @@ $('flag').onclick = () => submit('flag');
 $('back').onclick = back;
 
 (async () => {
-  session = await api('/api/session');
+  session = await api('api/session');
   renderSession();
   await next();
 })();

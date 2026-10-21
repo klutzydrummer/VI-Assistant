@@ -158,7 +158,7 @@ function lines(list) {
 
 async function show(k) {
   n = Math.min(Math.max(1, k), session.count);
-  const item = await api(`/api/item?n=${n}`);
+  const item = await api(`api/item?n=${n}`);
   const line = item.line, label = item.label;
   $("tags").innerHTML = (line.scene ? line.scene.split(", ").map((t) => `<span class="tag">${esc(t)}</span>`).join("") : "") +
     (line.listener ? `<span class="tag">to ${esc(line.listener)}</span>` : "") +
@@ -168,7 +168,7 @@ async function show(k) {
   $("after").innerHTML = lines(line.after);
   const clip = $("clip");
   clip.pause();
-  if (line.audio) { clip.src = `/audio?n=${n}`; clip.classList.remove("hidden"); $("noclip").classList.add("hidden"); }
+  if (line.audio) { clip.src = `audio?n=${n}`; clip.classList.remove("hidden"); $("noclip").classList.add("hidden"); }
   else { clip.removeAttribute("src"); clip.load(); clip.classList.add("hidden"); $("noclip").classList.remove("hidden"); }
   heard = label ? !!label.heard : false;
   picked = new Set(label ? label.moods : []);
@@ -185,7 +185,7 @@ async function show(k) {
 async function save() {
   $("save").disabled = true; $("msg").textContent = "";
   try {
-    session = await api("/api/label", {
+    session = await api("api/label", {
       n, moods: [...picked], knobs, unsure, heard, notes: $("notes").value, seconds: (Date.now() - shownAt) / 1000,
     });
     const after = session.done.findIndex((d, i) => !d && i + 1 > n);
@@ -209,7 +209,7 @@ window.addEventListener("hashchange", () => {
 
 (async () => {
   try {
-    session = await api("/api/session");
+    session = await api("api/session");
     buildForm();
     const hash = parseInt(location.hash.slice(1), 10);
     await show(hash > 0 ? hash : session.next || 1);

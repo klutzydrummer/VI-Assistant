@@ -278,3 +278,61 @@ pub fn write_clusters(dir: &Path, classes: usize) -> std::io::Result<()> {
     write_jsonl(&embed.join("scores.jsonl"), &scores)?;
     write_jsonl(&embed.join("prosody.jsonl"), &prosody)
 }
+
+/// A blind listening set as voicearms writes it (under a voicearms stage
+/// output: `listen/<group>/NN.wav`, her example clip, `sheet.csv` and the
+/// hidden `key.json`), and a qtcheck folder under `analysis/`, for the
+/// hub's demo and tests. Conditions are told apart by pitch.
+pub fn write_listening(dir: &Path) -> std::io::Result<()> {
+    let root = stage(dir, "voicearms")?.join("listen");
+    let sentence = "I'm fine, really. Just tired.";
+    let groups: [(&str, &[(&str, f32)]); 2] = [
+        (
+            "warmth",
+            &[("A21@1", 330.0), ("neutral", 220.0), ("swap", 262.0)],
+        ),
+        ("warmth+amused", &[("neutral", 220.0), ("A21", 392.0)]),
+    ];
+    let mut rows = vec![["group", "clip", "sentence"]
+        .into_iter()
+        .chain(crate::listen::ANSWERS)
+        .map(str::to_string)
+        .collect::<Vec<_>>()];
+    let mut key = BTreeMap::new();
+    for (group, conds) in groups {
+        fs::create_dir_all(root.join(group))?;
+        for (n, (cond, hz)) in conds.iter().enumerate() {
+            let name = format!("{:02}", n + 1);
+            fs::write(root.join(group).join(format!("{name}.wav")), tone(*hz, 1.0))?;
+            key.insert(
+                format!("{group}/{name}"),
+                serde_json::json!({"condition": cond, "sentence": 0}),
+            );
+            rows.push(vec![
+                group.into(),
+                name,
+                sentence.into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]);
+        }
+    }
+    fs::write(root.join("warmth/her_example.wav"), tone(262.0, 1.0))?;
+    fs::write(
+        root.join(crate::listen::SHEET),
+        crate::listen::write_csv(&rows),
+    )?;
+    fs::write(
+        root.join(crate::listen::KEY),
+        serde_json::to_string_pretty(&key).expect("key serializes"),
+    )?;
+
+    let qt = dir.join("analysis/qtcheck");
+    fs::create_dir_all(qt.join("audio"))?;
+    fs::write(qt.join("report.json"), r#"{"verdict": "matches"}"#)?;
+    fs::write(qt.join("audio/freeman-0-qt.wav"), tone(200.0, 1.0))?;
+    fs::write(qt.join("audio/freeman-0-torch.wav"), tone(200.0, 1.0))?;
+    fs::write(qt.join("audio/freeman-1-qt.wav"), tone(240.0, 1.0))
+}

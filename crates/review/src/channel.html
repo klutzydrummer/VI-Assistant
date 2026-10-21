@@ -137,10 +137,10 @@ function paint() {
 
 async function show(k) {
   n = Math.min(Math.max(1, k), session.count);
-  const item = await api(`/api/item?n=${n}`);
+  const item = await api(`api/item?n=${n}`);
   const clip = $("clip");
   clip.pause();
-  clip.src = `/audio?n=${n}`;
+  clip.src = `audio?n=${n}`;
   $("say").innerHTML = `<b>Tali:</b> ${esc(item.clip.text)}`;
   choice = item.mark ? item.mark.channel : null;
   heard = !!item.mark;
@@ -155,7 +155,7 @@ async function show(k) {
 async function save() {
   $("save").disabled = true; $("msg").textContent = "";
   try {
-    session = await api("/api/mark", { n, channel: choice, heard, notes: $("notes").value, seconds: (Date.now() - shownAt) / 1000 });
+    session = await api("api/mark", { n, channel: choice, heard, notes: $("notes").value, seconds: (Date.now() - shownAt) / 1000 });
     const after = session.done.findIndex((d, i) => !d && i + 1 > n);
     const open = after >= 0 ? after + 1 : session.next;
     if (open) await show(open);
@@ -174,7 +174,7 @@ window.addEventListener("hashchange", () => {
 
 (async () => {
   try {
-    session = await api("/api/session");
+    session = await api("api/session");
     $("choices").innerHTML = session.choices.map((c) =>
       `<button type="button" class="choice" data-id="${esc(c)}">${esc(NAMES[c][0])}<span class="d">${esc(NAMES[c][1])}</span></button>`).join("");
     $("choices").onclick = (e) => { const b = e.target.closest(".choice"); if (b) { choice = b.dataset.id; paint(); } };

@@ -22,8 +22,10 @@ pub(crate) const USAGE: &str = "usage:
   vi harvest package <file.pcc>
   vi harvest tlk <file.tlk | LE1-file.pcc> [--id N]
   vi extract --character <character-folder> <LE-install-folder> [--out <folder>]
-  vi review <corpus-folder> [--port N]
+  vi review <corpus-folder> [--moods <moods.toml>] [--port N]   (the hub: every task in one place)
   vi review --demo <empty-folder> [--port N]
+  vi review --labels <corpus-folder> [--port N]
+  vi review --labels --demo <empty-folder> [--port N]
   vi review --purity <corpus-folder> [--port N]
   vi review --purity --demo <empty-folder> [--port N]
   vi review --gold <corpus-folder> [--moods <moods.toml>] [--port N]
@@ -172,8 +174,9 @@ fn pack_check(dir: PathBuf) -> ExitCode {
     }
 }
 
-/// Serve the label review page, with `--purity` the cluster purity review,
-/// with `--gold` the gold labelling page, or with `--channel` the channel
+/// Serve the hub (every page Brandon works in, with what needs him), or one
+/// page on its own: `--labels` the label review page, `--purity` the cluster
+/// purity review, `--gold` the gold labelling page, `--channel` the channel
 /// marks page (radio and other effects, by ear), for a corpus. On localhost
 /// unless `--host` names another address (a reverse proxy's bridge, say).
 fn review(args: &[&str]) -> ExitCode {
@@ -183,6 +186,7 @@ fn review(args: &[&str]) -> ExitCode {
     let mut purity = false;
     let mut gold = false;
     let mut channel = false;
+    let mut labels = false;
     let mut moods = None;
     let mut dir = None;
     let mut args = args.iter();
@@ -192,6 +196,7 @@ fn review(args: &[&str]) -> ExitCode {
             "--purity" => purity = true,
             "--gold" => gold = true,
             "--channel" => channel = true,
+            "--labels" => labels = true,
             "--moods" => match args.next() {
                 Some(m) => moods = Some(PathBuf::from(m)),
                 None => {
@@ -235,11 +240,14 @@ fn review(args: &[&str]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         let written = review::fixture::write(&dir, 120).and_then(|()| {
-            if purity {
-                review::fixture::write_clusters(&dir, 4)
-            } else {
-                Ok(())
+            let hub = !(purity || gold || channel || labels);
+            if purity || hub {
+                review::fixture::write_clusters(&dir, 4)?;
             }
+            if hub {
+                review::fixture::write_listening(&dir)?;
+            }
+            Ok(())
         });
         if let Err(e) = written {
             eprintln!("error: could not write demo corpus: {e}");
@@ -276,12 +284,41 @@ fn review(args: &[&str]) -> ExitCode {
         };
     }
 
+    // characters/<name>/moods.toml next to corpus/<name>, unless given.
+    let moods = moods.unwrap_or_else(|| {
+        let name = dir.file_name().unwrap_or_default();
+        dir.join("../../characters").join(name).join("moods.toml")
+    });
+
+    if !(purity || gold || channel || labels) {
+        let mut hub = match review::hub::Hub::load(&dir, &moods) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let view = hub.view();
+        let count = |k: &str| view[k].as_array().map_or(0, Vec::len);
+        println!(
+            "{} tasks need you, {} done, {} not ready",
+            count("pending"),
+            count("done"),
+            count("not_ready")
+        );
+        println!("review hub at http://{addr}/  (Ctrl+C to stop; every answer is saved as you go)");
+        return match review::server::serve_with(&addr, |post, url, body| {
+            review::hub::handle(&mut hub, post, url, body)
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if gold {
-        // characters/<name>/moods.toml next to corpus/<name>, unless given.
-        let moods = moods.unwrap_or_else(|| {
-            let name = dir.file_name().unwrap_or_default();
-            dir.join("../../characters").join(name).join("moods.toml")
-        });
         let mut g = match review::gold::Gold::load(&dir, &moods) {
             Ok(g) => g,
             Err(e) => {

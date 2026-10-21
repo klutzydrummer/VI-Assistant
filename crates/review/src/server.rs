@@ -24,6 +24,11 @@ pub const BUDGET_SECONDS: f32 = 3600.0;
 #[derive(Debug)]
 pub enum Reply {
     Page(&'static str),
+    /// A page put together at request time (the hub, or a page with the
+    /// hub's bar on it).
+    Html(String),
+    /// Send the browser on to another address.
+    Redirect(String),
     Json(Value),
     Audio(PathBuf),
     NotFound,
@@ -54,6 +59,16 @@ pub fn serve_with(
         let sent = match reply {
             Reply::Page(page) => request.respond(
                 Response::from_string(page).with_header(header("text/html; charset=utf-8")),
+            ),
+            Reply::Html(page) => request.respond(
+                Response::from_string(page)
+                    .with_header(header("text/html; charset=utf-8"))
+                    .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap()),
+            ),
+            Reply::Redirect(to) => request.respond(
+                Response::from_string("")
+                    .with_status_code(303)
+                    .with_header(Header::from_bytes("Location", to).unwrap()),
             ),
             Reply::Json(v) => request.respond(
                 Response::from_string(v.to_string()).with_header(header("application/json")),
@@ -282,6 +297,14 @@ fn byte_range(header: &str, len: usize) -> Option<(usize, usize)> {
         ),
     };
     (start <= end && end < len).then_some((start, end))
+}
+
+/// Seconds since 1970.
+pub(crate) fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Percent-decoding for ids in paths.
