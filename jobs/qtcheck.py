@@ -5,8 +5,9 @@ model voicearms uses? CPU for PyTorch, no rental, a few minutes.
     python3 jobs/qtcheck.py --qt <qwentts.cpp folder> --talker <gguf> [--device Vulkan0] --out <folder>
 
 Without qwen-tts importable, it re-runs itself in voicearms' virtualenv (~/.cache/vi/venv-...,
-built from requirements-steer.txt if the voicearms smoke hasn't already). Three runs answer the question: F32 on the CPU (is the port
-right?), Q8_0 on Vulkan0 (what the trials would use) and F32 on Vulkan0 if it fits in the card.
+built from requirements-steer.txt if the voicearms smoke hasn't already). Two runs answer the question: F32 on the CPU (is the port
+right?) and Q8_0 on Vulkan0 (what the trials would use). F32 on an 8 GB card spills into RAM and
+froze Brandon's PC, so a GPU device with an F32 talker is refused.
 
 Cases: the reference clip's own x-vector; that x-vector plus a random shift the size the token
 arms use (arms B, C and D change only this token); and the x-vector with arm A's steering, random
@@ -233,6 +234,8 @@ def main():
     ap.add_argument("--min-agree", type=float, default=0.95)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if (args.device or "").upper() != "CPU" and "F32" in Path(args.talker).name:
+        raise SystemExit("qtcheck: an F32 talker on the GPU overfills an 8 GB card; use Q8_0 there, F32 only with --device CPU")
     try:
         import qwen_tts  # noqa: F401
     except ImportError:
