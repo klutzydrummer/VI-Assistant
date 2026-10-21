@@ -1,0 +1,471 @@
+diff --git a/src/pipeline-tts.cpp b/src/pipeline-tts.cpp
+index 7e64d76..b655e65 100644
+--- a/src/pipeline-tts.cpp
++++ b/src/pipeline-tts.cpp
+@@ -513,6 +513,12 @@ struct TtsSlot {
+     std::vector<int32_t> talker_history;  // emitted c0, feeds repetition penalty
+     std::vector<int32_t> prev_ids;        // previous frame codes [num_code_groups]
+     const float *        prev_overlay;    // trailing text row or tts_pad row
++
++    // vi patch: residual steering of this request, [n_layers, hidden]
++    // rows weighted steer_decay^t at decode step t; empty when off.
++    std::vector<float> steer_add;
++    bool               steer_renorm;
++    float              steer_decay;
+     std::vector<float>   logits;          // pending c0 logits [vocab]
+     int                  pending_c0;      // c0 of the frame in flight
+     bool                 has_frame;       // slot emits a frame this engine step
+@@ -819,6 +825,9 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
+     s.step             = 0;
+     s.subseq_counter   = 0;
+     s.prev_overlay     = NULL;
++    s.steer_add.clear();
++    s.steer_renorm     = false;
++    s.steer_decay      = 1.0f;
+     s.pending_c0       = -1;
+     s.has_frame        = false;
+     s.streaming        = (params->on_chunk != NULL);
+@@ -870,9 +879,30 @@ bool tts_engine_admit(TtsEngine * e, TtsJob * job) {
+     // language id and the model infers it from the text.
+     const char * lang = params->lang ? params->lang : "auto";
+ 
++    // vi patch fields exist from ABI 7.
++    const bool v7          = params->abi_version >= 7;
++    const bool stream_text = v7 && params->stream_text != 0;
++    if (v7 && params->steer_add != NULL) {
++        const int n_layers = pt->talker.num_hidden_layers;
++        if (!pt->steering) {
++            qt_set_error("tts_engine_admit: steer_add needs a handle made with qt_init_params.steering");
++            e->slots.pop_back();
++            return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
++        }
++        if (params->steer_n_layers != n_layers) {
++            qt_set_error("tts_engine_admit: steer_n_layers %d, the talker has %d layers", params->steer_n_layers,
++                         n_layers);
++            e->slots.pop_back();
++            return tts_admit_fail(job, QT_STATUS_INVALID_PARAMS);
++        }
++        s.steer_add.assign(params->steer_add, params->steer_add + (size_t) n_layers * (size_t) pt->talker.hidden_size);
++        s.steer_renorm = params->steer_renorm != 0;
++        s.steer_decay  = params->steer_decay;
++    }
++
+     Timer t_build;
+     if (!prompt_builder_build(pt, e->tok, params->text, lang, instruct, speaker, ref_spk_emb_ptr, ref_text,
+-                              s.ref_codes_ptr, s.ref_codes_T, &s.prompt)) {
++                              s.ref_codes_ptr, s.ref_codes_T, stream_text, &s.prompt)) {
+         e->slots.pop_back();
+         return tts_admit_fail(job, QT_STATUS_GENERATE_FAILED);
+     }
+@@ -1097,11 +1127,38 @@ void tts_engine_step(TtsEngine * e, std::vector<TtsJob *> * retired) {
+             std::memcpy(overlays.data() + (size_t) i * (size_t) hidden, s.prev_overlay,
+                         (size_t) hidden * sizeof(float));
+         }
++        // vi patch: steering rows [n_layers][N_dec][hidden], each slot's
++        // add weighted decay^t, t its decode step (the first frame comes
++        // from the prefill, so this decode is step s.step - 1).
++        std::vector<float> steer, steer_mode;
++        if (pt->steering) {
++            const int n_layers = pt->talker.num_hidden_layers;
++            steer.assign((size_t) n_layers * (size_t) N_dec * (size_t) hidden, 0.0f);
++            steer_mode.assign((size_t) 2 * (size_t) N_dec, 0.0f);
++            for (int i = 0; i < N_dec; i++) {
++                TtsSlot & s       = e->slots[(size_t) i];
++                const bool renorm = !s.steer_add.empty() && s.steer_renorm;
++                steer_mode[(size_t) i]                   = renorm ? 1.0f : 0.0f;
++                steer_mode[(size_t) N_dec + (size_t) i]  = renorm ? 0.0f : 1.0f;
++                if (s.steer_add.empty()) {
++                    continue;
++                }
++                const float w = std::pow(s.steer_decay, (float) (s.step - 1));
++                for (int l = 0; l < n_layers; l++) {
++                    const float * src = s.steer_add.data() + (size_t) l * (size_t) hidden;
++                    float *       dst = steer.data() + ((size_t) l * (size_t) N_dec + (size_t) i) * (size_t) hidden;
++                    for (int j = 0; j < hidden; j++) {
++                        dst[j] = w * src[j];
++                    }
++                }
++            }
++        }
+         TalkerForwardOutput fw;
+         Timer               t_talker;
+         if (!talker_forward_decode(&pt->talker, &pt->talker_kv, pt->backend, pt->talker_decode_graphs,
+                                    pt->hidden_bridge, ids.data(), pt->code_predictor.codec_embedding.data(), n_acoustic,
+-                                   overlays.data(), N_dec, pt->use_flash_attn, pt->clamp_fp16, any_dump, &fw)) {
++                                   overlays.data(), N_dec, pt->use_flash_attn, pt->clamp_fp16, any_dump, &fw,
++                                   pt->steering ? steer.data() : nullptr, pt->steering ? steer_mode.data() : nullptr)) {
+             qt_set_error("tts_engine_step: talker decode failed");
+             for (TtsSlot & s : e->slots) {
+                 s.finished   = true;
+diff --git a/src/pipeline-tts.h b/src/pipeline-tts.h
+index b8ee5d9..66dc8f8 100644
+--- a/src/pipeline-tts.h
++++ b/src/pipeline-tts.h
+@@ -155,6 +155,10 @@ struct PipelineTTS {
+     bool use_flash_attn;
+     bool clamp_fp16;
+ 
++    // vi patch: the talker decode graph carries a steering input on
++    // every layer (qt_init_params.steering), so requests may steer.
++    bool steering;
++
+     // Persistent KV caches, one set per slot: the talker holds the LM
+     // contexts, the predictor holds one frame's 16 sub-steps per slot,
+     // rewritten every frame at baked rows.
+diff --git a/src/prompt-builder.h b/src/prompt-builder.h
+index b5380fc..a861539 100644
+--- a/src/prompt-builder.h
++++ b/src/prompt-builder.h
+@@ -373,6 +373,7 @@ static bool prompt_builder_build(PipelineTTS *         pt,
+                                  const std::string &   ref_text,
+                                  const int32_t *       ref_codes,
+                                  int                   ref_codes_T,
++                                 bool                  stream_text,
+                                  PromptBuilderOutput * out) {
+     const int hidden = pt->talker.hidden_size;
+ 
+@@ -573,8 +574,12 @@ static bool prompt_builder_build(PipelineTTS *         pt,
+     // Allocate the full output buffer.
+     // Standard layout    : N_instruct + 3 (role) + (n_pad_pre + 1) + N_text + 1 (eos) + 1 (final)
+     // ICL layout         : N_instruct + 3 (role) + (n_pad_pre + 1) + icl_T
+-    const int T_ctx =
+-        icl ? (N_instruct + 3 + (n_pad_pre + 1) + icl_T) : (N_instruct + 3 + (n_pad_pre + 1) + N_text + 1 + 1);
++    // Streaming text (vi patch, x-vector cloning): one row, the first text
++    // token + codec_bos; the rest of the text and tts_eos ride the overlay.
++    const bool stream = !icl && stream_text;
++    const int  T_ctx  = icl    ? (N_instruct + 3 + (n_pad_pre + 1) + icl_T) :
++                        stream ? (N_instruct + 3 + (n_pad_pre + 1) + 1) :
++                                 (N_instruct + 3 + (n_pad_pre + 1) + N_text + 1 + 1);
+     out->T_ctx  = T_ctx;
+     out->hidden = hidden;
+     out->input_embed.assign((size_t) T_ctx * (size_t) hidden, 0.0f);
+@@ -646,7 +651,21 @@ static bool prompt_builder_build(PipelineTTS *         pt,
+     // From here, two paths: standard (no ICL) builds the trailing
+     // utterance text + tts_eos + final_pad, ICL builds an aligned
+     // text/codec block that replaces those rows entirely.
+-    if (!icl) {
++    if (stream) {
++        // Upstream non_streaming_mode=False: text(input_id[3:4]) +
++        // codec_bos ends the prompt; trailing = text(input_id[4:-5]) +
++        // tts_eos, one row per decode step.
++        project_text_range(pt, ids.data(), 3, 4, row_ptr(row));
++        vec_add(row_ptr(row), codec_bos_emb.data(), hidden);
++        row++;
++        out->T_trailing = N_text;
++        out->trailing_text_hidden.assign((size_t) N_text * (size_t) hidden, 0.0f);
++        if (N_text > 1) {
++            project_text_range(pt, ids.data(), 4, 3 + N_text, out->trailing_text_hidden.data());
++        }
++        std::memcpy(out->trailing_text_hidden.data() + (size_t) (N_text - 1) * (size_t) hidden, tts_eos_emb.data(),
++                    (size_t) hidden * sizeof(float));
++    } else if (!icl) {
+         // Standard layout: trailing utterance text + tts_eos rows summed
+         // with codec_pad, then a final tts_pad + codec_bos row.
+         project_text_range(pt, ids.data(), 3, 3 + N_text, row_ptr(row));
+@@ -759,7 +778,7 @@ static bool prompt_builder_build(PipelineTTS *         pt,
+     //
+     // ICL mode populates out->trailing_text_hidden directly inside the
+     // ICL branch above, so we only set the default here for non ICL.
+-    if (!icl) {
++    if (!icl && !stream) {
+         out->T_trailing = 1;
+         out->trailing_text_hidden.assign((size_t) hidden, 0.0f);
+         std::memcpy(out->trailing_text_hidden.data(), tts_pad_emb.data(), (size_t) hidden * sizeof(float));
+diff --git a/src/qwen.cpp b/src/qwen.cpp
+index 0974624..7c4c99a 100644
+--- a/src/qwen.cpp
++++ b/src/qwen.cpp
+@@ -238,6 +238,7 @@ void qt_init_default_params(struct qt_init_params * p) {
+ 
+     p->codec_chunk_sec = QT_CODEC_CHUNK_SEC_DEFAULT;
+     p->device          = nullptr;
++    p->steering        = false;
+ }
+ 
+ void qt_tts_default_params(struct qt_tts_params * p) {
+@@ -267,6 +268,11 @@ void qt_tts_default_params(struct qt_tts_params * p) {
+     p->ref_spk_dim           = 0;
+     p->ref_codes             = nullptr;
+     p->ref_T                 = 0;
++    p->stream_text           = 0;
++    p->steer_add             = nullptr;
++    p->steer_n_layers        = 0;
++    p->steer_renorm          = 0;
++    p->steer_decay           = 1.0f;
+ }
+ 
+ int qt_num_codebooks(const struct qt_context * q) {
+@@ -466,6 +472,7 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
+             qt_throw("qt_init: backend_init failed (no GGML backend available)");
+         }
+ 
++        q->pt.steering = params->abi_version >= 7 && params->steering;  // vi patch, read by the decode graph
+         if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp, params->use_fa,
+                                params->clamp_fp16, max_batch, chunk_sec)) {
+             qt_throw("qt_init: pipeline_tts_load failed for '%s' / '%s'", params->talker_path, params->codec_path);
+diff --git a/src/qwen.h b/src/qwen.h
+index 8dce26d..50625cd 100644
+--- a/src/qwen.h
++++ b/src/qwen.h
+@@ -59,7 +59,7 @@ extern "C" {
+ // git short hash + commit date string returned by qt_version(); for
+ // binding compat checks, QT_ABI_VERSION is the only number that
+ // matters.
+-#define QT_ABI_VERSION 6
++#define QT_ABI_VERSION 7
+ 
+ // Oldest struct layout this build addresses. A v4 or older
+ // qt_tts_params places its trailing fields at offsets this build does
+@@ -161,6 +161,11 @@ struct qt_init_params {
+     // GGML device the handle runs on, by name (CUDA0, Vulkan0, MTL0,
+     // CPU...). NULL selects the best available device. Since ABI 6.
+     const char * device;
++
++    // ABI 7 (vi patch). Builds the talker decode graph with a steering
++    // input on every layer, so qt_tts_params.steer_add can take effect.
++    // false keeps the stock graph.
++    bool steering;
+ };
+ 
+ // Initialise to the standard defaults: both paths NULL (caller must set
+@@ -353,6 +358,25 @@ struct qt_tts_params {
+     int             ref_spk_dim;
+     const int32_t * ref_codes;
+     int             ref_T;
++
++    // ABI 7 (vi patch). stream_text selects the upstream
++    // non_streaming_mode=False layout for x-vector voice cloning (the
++    // default of upstream generate_voice_clone): only the first text
++    // token joins the prompt and the rest of the text plus tts_eos ride
++    // the per-frame overlay. 0 keeps the non-streaming layout. ICL is
++    // always streaming and ignores it.
++    int stream_text;
++
++    // ABI 7 (vi patch). Residual steering of the talker on decode steps
++    // (never the prompt), as a forward hook adding to each layer's output
++    // would: steer_add is [steer_n_layers, hidden] row-major (a row of
++    // zeros leaves that layer alone), weighted steer_decay^t at decode
++    // step t (1 = constant); steer_renorm rescales each steered row to
++    // its norm before the add. Needs qt_init_params.steering. NULL off.
++    const float * steer_add;
++    int           steer_n_layers;
++    int           steer_renorm;
++    float         steer_decay;
+ };
+ 
+ // Initialise to the standard defaults. Strings NULL, seed -1, sampling
+diff --git a/src/talker-decode-graph.h b/src/talker-decode-graph.h
+index bbcce4d..a9b982a 100644
+--- a/src/talker-decode-graph.h
++++ b/src/talker-decode-graph.h
+@@ -22,6 +22,9 @@ struct TalkerDecodeGraph {
+     struct ggml_tensor *     rows_in = nullptr;  // [1, 1, N] i64
+     struct ggml_tensor *     mask_in = nullptr;  // [n_kv_pad, 1, 1, N] f16
+     struct ggml_tensor *     logits  = nullptr;  // [vocab, N] f32
++    struct ggml_tensor *     steer   = nullptr;  // [hidden, N, n_layers] f32, vi patch, NULL without steering
++    struct ggml_tensor *     renorm  = nullptr;  // [1, N] f32: 1 rescales a steered row to its old norm
++    struct ggml_tensor *     keep    = nullptr;  // [1, N] f32: 1 - renorm
+     std::vector<ggml_fp16_t> mask;               // [n_kv_pad * N] f16
+     std::vector<int32_t>     pos_data;           // [N] host staging
+     std::vector<int64_t>     rows_data;          // [N] host staging
+@@ -45,6 +48,9 @@ static void talker_decode_graph_free(TalkerDecodeGraph * tg) {
+     tg->rows_in = nullptr;
+     tg->mask_in = nullptr;
+     tg->logits  = nullptr;
++    tg->steer   = nullptr;
++    tg->renorm  = nullptr;
++    tg->keep    = nullptr;
+     tg->mask.clear();
+     tg->pos_data.clear();
+     tg->rows_data.clear();
+diff --git a/src/talker-forward.h b/src/talker-forward.h
+index 6d487a1..b40f51a 100644
+--- a/src/talker-forward.h
++++ b/src/talker-forward.h
+@@ -85,7 +85,7 @@ static bool talker_is_bisect_layer(int l) {
+ // norm, codec_head and bisect dump branches. Sizes both the persistent
+ // arena in the pipeline and the graph allocated per forward.
+ static int talker_graph_max_nodes(int n_layers) {
+-    return 48 * n_layers + 256;
++    return 60 * n_layers + 256;  // + the vi steering chain (add, norms, rescale) per layer
+ }
+ 
+ // Manual F32 attention chain. Used when use_flash_attn is false: GQA
+@@ -631,6 +631,7 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
+                                       int                          N,
+                                       bool                         use_flash_attn,
+                                       bool                         clamp_fp16,
++                                      bool                         steering,
+                                       TalkerDecodeGraph *          tg) {
+     const int hidden   = tw->hidden_size;
+     const int n_layers = tw->num_hidden_layers;
+@@ -676,11 +677,41 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
+ 
+     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
+ 
++    // vi patch: residual steering. Each layer's output gets its row of
++    // steer added (zeros leave it alone), then, where renorm is 1, is
++    // rescaled to its norm before the add, as a forward hook on the
++    // PyTorch layer would do. keep = 1 - renorm passes the plain add.
++    struct ggml_tensor * steer_in  = nullptr;
++    struct ggml_tensor * renorm_in = nullptr;
++    struct ggml_tensor * keep_in   = nullptr;
++    if (steering) {
++        steer_in  = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hidden, N, n_layers);
++        renorm_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 1, N);
++        keep_in   = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 1, N);
++        ggml_set_name(steer_in, "steer_rows");
++        ggml_set_name(renorm_in, "steer_renorm");
++        ggml_set_name(keep_in, "steer_keep");
++        ggml_set_input(steer_in);
++        ggml_set_input(renorm_in);
++        ggml_set_input(keep_in);
++    }
++
+     struct ggml_tensor * h = x_in;
+     for (int l = 0; l < n_layers; l++) {
+         h = talker_layer_forward_batch(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, rows_in,
+                                        kv->k4[(size_t) l], kv->v4[(size_t) l], N, n_kv_pad, use_flash_attn, clamp_fp16,
+                                        gf);
++        if (steering) {
++            struct ggml_tensor * add =
++                ggml_view_2d(gctx, steer_in, hidden, N, steer_in->nb[1], (size_t) l * steer_in->nb[2]);
++            struct ggml_tensor * moved = ggml_add(gctx, h, add);
++            struct ggml_tensor * n_old = ggml_sqrt(gctx, ggml_sum_rows(gctx, ggml_sqr(gctx, h)));
++            struct ggml_tensor * n_new = ggml_sqrt(gctx, ggml_sum_rows(gctx, ggml_sqr(gctx, moved)));
++            n_new                      = ggml_clamp(gctx, n_new, 1e-6f, INFINITY);
++            struct ggml_tensor * scale =
++                ggml_add(gctx, ggml_mul(gctx, ggml_div(gctx, n_old, n_new), renorm_in), keep_in);
++            h = ggml_mul(gctx, moved, scale);
++        }
+     }
+ 
+     struct ggml_tensor * h_final = ggml_rms_norm(gctx, h, tw->rms_norm_eps);
+@@ -710,6 +741,9 @@ static bool talker_decode_graph_build(const TalkerWeights *        tw,
+     tg->rows_in = rows_in;
+     tg->mask_in = mask_in;
+     tg->logits  = logits;
++    tg->steer   = steer_in;
++    tg->renorm  = renorm_in;
++    tg->keep    = keep_in;
+     tg->mask.resize((size_t) n_kv_pad * (size_t) N);
+     tg->pos_data.resize((size_t) N);
+     tg->rows_data.resize((size_t) N);
+@@ -741,7 +775,12 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
+                                   bool                             use_flash_attn,
+                                   bool                             clamp_fp16,
+                                   bool                             read_hidden_host,
+-                                  TalkerForwardOutput *            out) {
++                                  TalkerForwardOutput *            out,
++                                  const float *                    steer      = nullptr,
++                                  const float *                    steer_mode = nullptr) {
++    // steer: [n_layers][N][hidden] rows (vi patch), steer_mode: [2][N],
++    // renorm then keep per slot. Both NULL without steering.
++    const bool steering = steer != nullptr;
+     int max_len = 0;
+     for (int i = 0; i < N; i++) {
+         const int len = kv->cur_len[(size_t) i] + 1;
+@@ -758,13 +797,19 @@ static bool talker_forward_decode(const TalkerWeights *            tw,
+     const int n_kv_pad   = kv_pad_raw < kv->max_seq_len ? kv_pad_raw : kv->max_seq_len;
+ 
+     TalkerDecodeGraph * tg = &graphs[(size_t) ((n_kv_pad + 255) / 256 - 1)];
+-    if (tg->ctx && tg->N != N) {
++    if (tg->ctx && (tg->N != N || (tg->steer != nullptr) != steering)) {
+         talker_decode_graph_free(tg);
+     }
+     if (!tg->ctx && !talker_decode_graph_build(tw, kv, backend, hidden_bridge, acoustic_embd, n_acoustic, n_kv_pad, N,
+-                                               use_flash_attn, clamp_fp16, tg)) {
++                                               use_flash_attn, clamp_fp16, steering, tg)) {
+         return false;
+     }
++    if (steering) {
++        ggml_backend_tensor_set(tg->steer, steer, 0,
++                                (size_t) tw->num_hidden_layers * (size_t) N * (size_t) tw->hidden_size * sizeof(float));
++        ggml_backend_tensor_set(tg->renorm, steer_mode, 0, (size_t) N * sizeof(float));
++        ggml_backend_tensor_set(tg->keep, steer_mode + N, 0, (size_t) N * sizeof(float));
++    }
+ 
+     ggml_backend_tensor_set(tg->ids_in, frame_ids, 0, (size_t) (1 + n_acoustic) * (size_t) N * sizeof(int32_t));
+     ggml_backend_tensor_set(tg->overlay, overlays, 0, (size_t) tw->hidden_size * (size_t) N * sizeof(float));
+diff --git a/tools/qwen-tts.cpp b/tools/qwen-tts.cpp
+index c8fd73f..13a1a31 100644
+--- a/tools/qwen-tts.cpp
++++ b/tools/qwen-tts.cpp
+@@ -58,7 +58,13 @@ static void print_usage(const char * prog) {
+             "  --ref-text <path>       Transcript file for the reference (enables ICL clone mode)\n"
+             "  --max-new <n>           Max new audio frames (default: %d)\n"
+             "  --codec-chunk-dur <f>   Codec decode chunk duration in seconds (default: 24.0)\n"
+-            "  --stream-by-line        Flush synthesis at each newline, one WAV header per line (-o '-')\n\n"
++            "  --stream-by-line        Flush synthesis at each newline, one WAV header per line (-o '-')\n"
++            "  --stream-text           Streaming text layout for x-vector cloning, the upstream\n"
++            "                          generate_voice_clone default (vi patch)\n"
++            "  --steer <path>          Residual steering, raw f32 [layers, hidden] rows added to each\n"
++            "                          talker layer's output on decode steps (vi patch)\n"
++            "  --steer-renorm          Rescale each steered row to its norm before the add\n"
++            "  --steer-decay <f>       Weight decay^t at decode step t (default: 1)\n\n"
+             "Sampling:\n"
+             "  --seed <int>            Sampling seed (default: -1 for random)\n"
+             "  --greedy                Argmax on both stacks (temperature 0)\n"
+@@ -95,6 +101,7 @@ struct Args {
+     bool         clamp_fp16;
+     bool         stream_by_line;
+     float        codec_chunk_sec;
++    const char * steer;  // vi patch
+ 
+     // Synthesis params seeded by qt_tts_default_params; sampling flags
+     // write straight into it, so only what the user sets deviates.
+@@ -244,6 +251,14 @@ static bool parse_args(int argc, char ** argv, Args & a) {
+             a.clamp_fp16 = true;
+         } else if (std::strcmp(arg, "--stream-by-line") == 0) {
+             a.stream_by_line = true;
++        } else if (std::strcmp(arg, "--stream-text") == 0) {
++            a.tts.stream_text = 1;
++        } else if (std::strcmp(arg, "--steer") == 0 && i + 1 < argc) {
++            a.steer = argv[++i];
++        } else if (std::strcmp(arg, "--steer-renorm") == 0) {
++            a.tts.steer_renorm = 1;
++        } else if (std::strcmp(arg, "--steer-decay") == 0 && i + 1 < argc) {
++            a.tts.steer_decay = (float) std::atof(argv[++i]);
+         } else if (std::strcmp(arg, "--codec-chunk-dur") == 0 && i + 1 < argc) {
+             a.codec_chunk_sec = (float) std::atof(argv[++i]);
+         } else if (std::strcmp(arg, "-o") == 0 && i + 1 < argc) {
+@@ -268,6 +283,7 @@ static int run(const Args & a) {
+     iparams.clamp_fp16      = a.clamp_fp16;
+     iparams.codec_chunk_sec = a.codec_chunk_sec;
+     iparams.device          = a.device;
++    iparams.steering        = a.steer != nullptr;
+ 
+     qt_context * q = qt_init(&iparams);
+     if (!q) {
+@@ -329,6 +345,20 @@ static int run(const Args & a) {
+         }
+         fprintf(stderr, "[CLI] Reference SPK: %s, %zu f32 values\n", a.ref_spk, ref_spk_emb.size());
+     }
++    std::vector<float> steer;  // vi patch: same raw f32 format as .spk, [layers * hidden]
++    if (a.steer) {
++        if (!read_spk_file(a.steer, steer)) {
++            qt_free(q);
++            return 1;
++        }
++        if (ref_spk_emb.empty() || steer.size() % ref_spk_emb.size() != 0) {
++            fprintf(stderr, "[CLI] ERROR: --steer needs --ref-spk, and a whole number of hidden-size rows\n");
++            qt_free(q);
++            return 1;
++        }
++        fprintf(stderr, "[CLI] Steering: %s, %zu rows, renorm %d, decay %g\n", a.steer,
++                steer.size() / ref_spk_emb.size(), a.tts.steer_renorm, (double) a.tts.steer_decay);
++    }
+     if (a.ref_rvq) {
+         const int K = qt_num_codebooks(q);
+         if (!rvq_read_file(a.ref_rvq, K, RVQ_CODE_BITS, ref_codes, &ref_T)) {
+@@ -384,6 +414,10 @@ static int run(const Args & a) {
+     params.ref_text      = ref_text;
+     params.ref_spk_emb   = ref_spk_emb.empty() ? NULL : ref_spk_emb.data();
+     params.ref_spk_dim   = (int) ref_spk_emb.size();
++    if (!steer.empty()) {
++        params.steer_add      = steer.data();
++        params.steer_n_layers = (int) (steer.size() / ref_spk_emb.size());
++    }
+     params.ref_codes     = ref_codes.empty() ? NULL : ref_codes.data();
+     params.ref_T         = ref_T;
+ 
