@@ -79,6 +79,23 @@ class FakeRunTest(unittest.TestCase):
             self.assertTrue((out / "tokens" / "warmth.json").exists())
             for name in ("report.json", "report.md", "listen.md"):
                 self.assertNotIn("Secret subtitle", (out / name).read_text(), name)
+            # The blind listening set: numbered clips per mood and blend, her example, the sheet and key.
+            listen = out / "listen"
+            key = json.loads((listen / "key.json").read_text())
+            warm = sorted(k for k in key if k.startswith("warmth/"))
+            conds = {key[k]["condition"] for k in warm}
+            self.assertTrue({"neutral", "swap", "A", "R", "B-icl", "C-xvec", "D-xvec", "Dpca4-icl"} <= conds, conds)
+            self.assertTrue(all((listen / f"{k}.wav").exists() for k in key))
+            self.assertTrue(any(listen.glob("warmth/her_example.*")))
+            self.assertTrue(any(k.startswith("warmth+teasing/") for k in key))
+            self.assertNotIn("condition", (listen / "sheet.csv").read_text())
+            rows = (listen / "sheet.csv").read_text().splitlines()
+            rows[1] = rows[1].replace(",,,,", ",y,2,y,nice")
+            (listen / "sheet.csv").write_text("\n".join(rows) + "\n")
+            voicearms.unblind(out)
+            first_group, first_clip = rows[1].split(",")[:2]
+            self.assertIn(f"| {first_group} | {key[first_group + '/' + first_clip]['condition']} | y | 2 | y | nice |",
+                          (listen / "results.md").read_text())
 
     def test_above_is_tried_only_when_full_strength_holds_without_lifting(self):
         with tempfile.TemporaryDirectory() as tmp:
