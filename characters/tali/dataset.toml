@@ -295,10 +295,11 @@ min_share = 0.75           # and on at least this share of the test sentences
 # GPU, manual: the steering protocol (/mnt/project-files/research/steering-qwen3-tts.md, section 5),
 # `vi dataset run characters/tali/dataset.toml voicearms`. Three arms on Qwen3-TTS, all from her
 # clips: A voicesteer's vectors at single late layers and a band (norm-preserving, plus decay,
-# x-vector-only mode and a random control), B her x-vector mood shift, C a fitted speaker token.
+# x-vector-only mode and a random control), B her x-vector mood shift, C a speaker token fitted to
+# her clips' audio, D a speaker token fitted to the residual-stream shift her clips share.
 # Before it: run voicesteer, then at home `python3 jobs/voicelayers.py <voicesteer out> --npz
 # corpus/tali/analysis/after_labels/voice_vectors.npz` (layer table, swap check, the vector bundle).
-# About 1.5-2 h on a 48 GB card for 7 moods and 2 blends. Needs Brandon's yes for the run.
+# About 2-2.5 h on a 48 GB card for 7 moods and 2 blends. Needs Brandon's yes for the run.
 [stage.voicearms]
 command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
            "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz",
@@ -323,9 +324,10 @@ above_tau = []      # the same for B and C; e.g. [1.5, 2.5] (the published x-vec
 decay = 0.985       # per frame, for the A-decay variant
 refs_per_side = 32  # pairs per mood to build tau and fit tokens from (held-out conversations excluded)
 held_max = 16       # held-out pairs scored for the likelihood check and early stopping
-fit_steps = 200
+fit_steps = 200     # C and D
 fit_lr = 0.002
 fit_l2 = 0.01
+match_layers = "7-26"   # D: the talker layers whose shared residual shift the token is fitted to
 max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
 max_wer = 0.15
 min_lift = 0.1

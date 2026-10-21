@@ -58,7 +58,7 @@ class FakeRunTest(unittest.TestCase):
             for m in ("warmth", "teasing"):
                 r = report["moods"][m]
                 # Fake similarity drops at strength 1, so every arm steps down once, to 0.5.
-                for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl"):
+                for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl"):
                     self.assertEqual(r["arms"][name]["strength"], 0.5, (m, name))
                 self.assertEqual([t["strength"] for t in r["A_layers"]["AL2"]["tried"]], [1.0, 0.5])
                 self.assertLess(r["arms"]["R"]["lift"], r["arms"]["A"]["lift"])
@@ -70,7 +70,8 @@ class FakeRunTest(unittest.TestCase):
             self.assertTrue(report["moods"]["teasing"]["borderline"])
             self.assertTrue((ck / "vectors" / "teasing.npy").exists())  # captured, not given
             self.assertFalse((ck / "vectors" / "warmth.npy").exists())  # given by voicesteer
-            self.assertEqual(set(report["blends"]["warmth+teasing"]), {"A", "B", "C"})
+            self.assertEqual(set(report["blends"]["warmth+teasing"]), {"A", "B", "C", "D"})
+            self.assertEqual(report["moods"]["warmth"]["match"]["fit"]["layers"], [1, 2, 3, 4])
             self.assertTrue((out / "tokens" / "warmth.json").exists())
             for name in ("report.json", "report.md", "listen.md"):
                 self.assertNotIn("Secret subtitle", (out / name).read_text(), name)
@@ -267,6 +268,27 @@ class TinyModelTest(unittest.TestCase):
         for a, b in zip(before, tts.m.parameters(), strict=True):
             self.assertTrue(torch.equal(a, b))
         self.assertLess(tts.nll(clips[0], start, {1: [0.0] * 64}) - tts.nll(clips[0], start), 1e-6)
+
+    def test_residual_match_fit_moves_the_residual_toward_the_shared_shift(self):
+        torch, tts = self.torch, self.tts
+        before = [p.clone() for p in tts.m.parameters()]
+        texts = ["We should reach the relay soon.", "I checked the coolant lines twice.", "The market closes at noon.",
+                 "Someone moved my notes."]
+        warm, plain = torch.randn(64), torch.randn(64)
+        pos, zero, px, zx = [], [], [], []
+        for i, text in enumerate(texts):
+            for group, ex_list, xs, centre in (("p", pos, px, warm), ("z", zero, zx, plain)):
+                x = (centre + 0.1 * torch.randn(64)).tolist()
+                codes, _ = self.greedy(text, x)
+                ex_list.append({"id": f"{group}{i}", "text": text, "codes": codes.tolist()})
+                xs.append(x)
+        init = torch.stack([torch.tensor(x) for x in zx]).mean(0).tolist()
+        fit = tts.fit_match(pos[:3], px[:3], zero[:3], zx[:3], zero[3:], zx[3:], init, [1, 2],
+                            {"fit_steps": 40, "fit_lr": 0.05, "fit_eval_every": 10, "fit_batch": 3})
+        self.assertLess(fit["held_loss"], fit["start_held_loss"])
+        self.assertEqual(set(fit["agreement"]), {"1", "2"})
+        for a, b in zip(before, tts.m.parameters(), strict=True):
+            self.assertTrue(torch.equal(a, b))
 
     def test_xvector_is_the_speaker_token_width(self):
         clip = mock.Mock()

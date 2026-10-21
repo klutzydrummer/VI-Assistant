@@ -16,6 +16,11 @@ sentences and seeds:
      by gradient to her positive clips (teacher-forced codec tokens, the talker's loss plus 0.3 x
      the code predictor's), and another to their matched zeros; delta = the difference, used as
      her neutral reference's x-vector + w * delta. Both modes.
+  D  residual-matched soft token (Brandon, 2026-10-21): the target is the per-layer residual shift her
+     positive clips share while the frozen model reproduces them (teacher-forced, each with its own
+     x-vector), minus the same for their matched zeros; one speaker token is fitted so that, on her
+     zero clips, it moves the residual by that shift. Used like C. The report says how shared the
+     shift is (each pair's shift against the target).
 Baselines: N (neutral reference, nothing changed, in each mode) and S (swap: her top positive clip
 as the reference, the positive control for the probe on generated speech). Controls: a random
 vector of the same size per layer for A, and a random token shift of the same size for B and C.
@@ -250,8 +255,29 @@ def main():
             if k is not None:
                 arms[f"C-{mode}"] = token_arm(f"C-{mode}", mode, delta, k)
         kept[mood]["C"] = c["xvec"]["strength"]
+
+        # --- D: residual-matched speaker token (Brandon, 2026-10-21). The target is the shift her positive
+        # clips share in the talker's residual stream while it reproduces them (each with its own x-vector),
+        # against their matched zeros; the token is fitted so that on her zero clips it moves the residual
+        # by that shift. delta_match = fitted token - the zeros' mean x-vector it starts from.
+        match_layers = parse_layers(s.get("match_layers", f"{tts.n_layers // 4}-{tts.n_layers - 2}"), tts.n_layers - 1)
+        held_n = int(s.get("held_max", 16))
+        fit_m = cached(keep / "fits" / f"{mood}.match.json", lambda: tts.fit_match(
+            examples(tts, keep, clips, [p for p, _ in train]), xp, examples(tts, keep, clips, [z for _, z in train]), xz,
+            examples(tts, keep, clips, [z for _, z in held[:held_n]]),
+            [cached(keep / "xvec" / f"{z}.json", lambda c=clips[z]: tts.xvector(c)) for _, z in held[:held_n]],
+            np.mean(xz, 0).tolist(), match_layers, s))
+        delta_m = (np.array(fit_m["token"]) - np.mean(xz, 0)).tolist()
+        d = {}
+        for mode in ("xvec", "icl"):
+            k, tried = ladder_run(f"D-{mode}", mode, lambda k, m=mode: token_spec(base[m], x_voice, delta_m, k), above_tau)
+            d[mode] = {"strength": k, "tried": tried}
+            if k is not None:
+                arms[f"D-{mode}"] = token_arm(f"D-{mode}", mode, delta_m, k)
+        kept[mood]["D"] = d["xvec"]["strength"]
         (keep / "tokens").mkdir(parents=True, exist_ok=True)
-        (keep / "tokens" / f"{mood}.json").write_text(json.dumps({"base": x_voice, "tau": tau, "delta": delta}))
+        (keep / "tokens" / f"{mood}.json").write_text(json.dumps(
+            {"base": x_voice, "tau": tau, "delta": delta, "delta_match": delta_m}))
 
         # --- held-out likelihood: does each setting favour her held-out positives over their zeros?
         scored_held = held[: int(s.get("held_max", 16))]
@@ -273,9 +299,10 @@ def main():
             settings_lik["B-icl"] = (shifted(x_voice, tau, b["icl"]["strength"]), None)
         if b["xvec"]["strength"] is not None:
             settings_lik["B-xvec"] = (shifted(x_voice, tau, b["xvec"]["strength"]), None)
-        for mode in ("xvec", "icl"):
-            if c[mode]["strength"] is not None:
-                settings_lik[f"C-{mode}"] = (shifted(x_voice, delta, c[mode]["strength"]), None)
+        for arm, res, dv in (("C", c, delta), ("D", d, delta_m)):
+            for mode in ("xvec", "icl"):
+                if res[mode]["strength"] is not None:
+                    settings_lik[f"{arm}-{mode}"] = (shifted(x_voice, dv, res[mode]["strength"]), None)
         for arm, (spk, add) in settings_lik.items():
             lik[arm] = gain(nll(arm, spk, add), n0, mood)
 
@@ -294,7 +321,7 @@ def main():
                 verdicts[arm] = "loses voice or words"
             else:
                 verdicts[arm] = "steers" if steers else "doesn't steer"
-        for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl"):
+        for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl"):
             if name not in arms:
                 verdicts[name] = "loses voice or words"
 
@@ -309,8 +336,11 @@ def main():
             "delta": {"norm_ratio": ratio(delta, x_voice), "cosine_with_tau": round(cos(delta, tau), 4),
                       "fit_pos": {k: v for k, v in fit_p.items() if k != "token"},
                       "fit_zero": {k: v for k, v in fit_z.items() if k != "token"}},
-            "B_tried": b, "C_tried": c, "arms": arms, "likelihood_gain": lik, "verdicts": verdicts,
-            "tokens": {"tau": tau, "delta": delta},
+            "match": {"norm_ratio": ratio(delta_m, x_voice), "cosine_with_tau": round(cos(delta_m, tau), 4),
+                      "cosine_with_delta": round(cos(delta_m, delta), 4),
+                      "fit": {k: v for k, v in fit_m.items() if k != "token"}},
+            "B_tried": b, "C_tried": c, "D_tried": d, "arms": arms, "likelihood_gain": lik, "verdicts": verdicts,
+            "tokens": {"tau": tau, "delta": delta, "delta_match": delta_m},
         }
         log(f"voicearms: {mood}: " + ", ".join(f"{a} {v}" for a, v in sorted(verdicts.items())))
 
@@ -324,7 +354,7 @@ def main():
             v1, v2 = load_vectors(files, keep, m1, tts, clips, [], fake), load_vectors(files, keep, m2, tts, clips, [], fake)
             mix = [[0.5 * k1 * a + 0.5 * k2 * b for a, b in zip(x, y, strict=True)] for x, y in zip(v1, v2, strict=True)]
             out_b["A"] = blend_scores(speak(name, "A", add_spec(base["icl"], mix, L, 1.0, True, 1.0), tests), m1, m2, neutral_rows["icl"])
-        for arm, key, mode in (("B", "tau", "icl"), ("C", "delta", "xvec")):
+        for arm, key, mode in (("B", "tau", "icl"), ("C", "delta", "xvec"), ("D", "delta_match", "xvec")):
             k1, k2 = kept.get(m1, {}).get(arm), kept.get(m2, {}).get(arm)
             if k1 is None or k2 is None:
                 continue
@@ -693,6 +723,70 @@ class ArmTTS(steer.TTS):
                 "curve": curve, "train_clips": len(train), "held_clips": len(held)}
 
 
+    def _states(self, ex, spk, layers):
+        """Each layer's output, averaged over the frame positions (where generation steers), teacher-forced."""
+        torch = self.torch
+        seq, p, _, cd = self._layout(ex["text"], ex["codes"], spk)
+        out = self.talker(inputs_embeds=seq, attention_mask=torch.ones(seq.shape[:2], device=self.dev, dtype=torch.long),
+                          output_hidden_states=True, use_cache=False)
+        hs = out.hidden_states[0]  # hs[i + 1] is layer i's output (the last one after the final norm)
+        n = cd.shape[0]
+        return torch.stack([hs[i + 1][0, p: p + n].float().mean(0) for i in layers])
+
+    def fit_match(self, pos, pos_x, zero, zero_x, held, held_x, init, layers, s):
+        """One speaker token fitted, with every weight frozen, so that on her zero clips it shifts each
+        layer's residual by the shift her positive clips share (mean over positives, each with its own
+        x-vector, minus the same over their zeros), each layer weighted by that shift's size."""
+        import random
+
+        torch = self.torch
+        dev = self.dev
+        steps, lr, l2 = int(s.get("fit_steps", 200)), float(s.get("fit_lr", 2e-3)), float(s.get("fit_l2", 1e-2))
+        every, batch = int(s.get("fit_eval_every", 25)), int(s.get("fit_batch", 8))
+        with torch.no_grad():
+            sp = [self._states(e, torch.tensor(x, device=dev), layers) for e, x in zip(pos, pos_x, strict=True)]
+            sz = [self._states(e, torch.tensor(x, device=dev), layers) for e, x in zip(zero, zero_x, strict=True)]
+            target = torch.stack(sp).mean(0) - torch.stack(sz).mean(0)  # layers x hidden
+            scale = target.norm(dim=-1).pow(2).clamp_min(1e-12)
+            pairs = torch.stack(sp) - torch.stack(sz)
+            agreement = self.F.cosine_similarity(pairs, target[None], dim=-1).mean(0)  # per layer
+            x0 = torch.tensor(init, device=dev, dtype=torch.float32)
+            base_train = [self._states(e, x0, layers) for e in zero]
+            base_held = [self._states(e, x0, layers) for e in held]
+
+        def loss_of(tok, ex, base):
+            got = self._states(ex, tok, layers) - base
+            return ((got - target).pow(2).sum(-1) / scale).mean()
+
+        tok = x0.clone().requires_grad_(True)
+        opt = torch.optim.AdamW([tok], lr=lr, weight_decay=0.0)
+        rng = random.Random(0)
+        carriers = list(zip(zero, base_train))
+
+        def held_loss():
+            with torch.no_grad():
+                return float(sum(loss_of(tok, e, b) for e, b in zip(held, base_held)) / len(held)) if held else None
+
+        best, best_loss, curve = tok.detach().clone(), held_loss(), []
+        curve.append({"step": 0, "held": best_loss})
+        for step in range(1, steps + 1):
+            opt.zero_grad()
+            pick = rng.sample(carriers, min(batch, len(carriers)))
+            loss = sum(loss_of(tok, e, b) for e, b in pick) / len(pick)
+            loss = loss + l2 * ((tok - x0).pow(2).sum() / x0.pow(2).sum())
+            loss.backward()
+            opt.step()
+            if step % every == 0 or step == steps:
+                h = held_loss()
+                curve.append({"step": step, "train": round(loss.item(), 5), "held": h})
+                if best_loss is None or (h is not None and h < best_loss):
+                    best, best_loss = tok.detach().clone(), h
+        return {"token": [float(x) for x in best.cpu()], "held_loss": best_loss, "start_held_loss": curve[0]["held"],
+                "curve": curve, "layers": layers, "agreement": {str(i): round(float(a), 4) for i, a in zip(layers, agreement)},
+                "target_norm": {str(i): round(float(v), 4) for i, v in zip(layers, scale.sqrt())},
+                "train_clips": len(zero), "held_clips": len(held)}
+
+
 class FakeArmTTS:
     """Deterministic stand-in for CI: 6 layers, 4 wide; mood settings lift the fake probe by strength."""
 
@@ -726,6 +820,11 @@ class FakeArmTTS:
         pull = sum(abs(x) for v in (add or {}).values() for x in v) + sum(spk)
         return round(2.0 + 0.1 * unit_hash("n", ex["id"]) - (0.01 * pull if "pos" in ex["id"] else 0.0), 5)
 
+    def fit_match(self, pos, pos_x, zero, zero_x, held, held_x, init, layers, s):
+        return {"token": [x + 0.3 for x in init], "held_loss": 0.4, "start_held_loss": 1.0, "curve": [], "layers": layers,
+                "agreement": {str(i): 0.5 for i in layers}, "target_norm": {str(i): 1.0 for i in layers},
+                "train_clips": len(zero), "held_clips": len(held)}
+
     def fit(self, train, held, init, s):
         bump = 0.5 if train and "pos" in train[0]["id"] else 0.0
         return {"token": [x + bump for x in init], "held_loss": 1.9, "start_held_loss": 2.0, "curve": [],
@@ -756,7 +855,7 @@ class FakeScorer:
 # --- report -----------------------------------------------------------------------
 
 
-ARMS = ["A", "A-decay", "A-xvec", "B-icl", "B-xvec", "C-xvec", "C-icl"]
+ARMS = ["A", "A-decay", "A-xvec", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl"]
 
 
 def render(r):
@@ -788,7 +887,10 @@ def render(r):
                      f"{x['natural_similarity_drop']} (allowance {x['similarity_allowance']}); tau/x {x['tau']['norm_ratio']}, "
                      f"split-half {x['tau']['split_half_cosine']}; delta/x {x['delta']['norm_ratio']}, cos(delta, tau) "
                      f"{x['delta']['cosine_with_tau']}; fit held-out loss {x['delta']['fit_pos']['start_held_loss']} -> "
-                     f"{x['delta']['fit_pos']['held_loss']}")
+                     f"{x['delta']['fit_pos']['held_loss']}; matched token: shift shared by her clips (mean cosine of each "
+                     f"pair's shift to the target) {x['match']['fit'].get('agreement')}, match loss "
+                     f"{x['match']['fit'].get('start_held_loss')} -> {x['match']['fit'].get('held_loss')}, "
+                     f"cos(delta_match, delta) {x['match']['cosine_with_delta']}")
     if r["blends"]:
         lines += ["", "Blends (half of each mood's kept setting; probe lift for each mood over neutral):", ""]
         for name, arms in r["blends"].items():
@@ -802,7 +904,8 @@ def listen(r):
     lines = ["# Listening", "", "audio/_neutral/N-icl/<n>.wav is her neutral voice (N-xvec: x-vector-only mode).",
              "audio/<mood>/S/<n>.wav swaps in her top clip for that mood. audio/<mood>/<arm>@<k>/<n>.wav is an arm at",
              "strength k: A<layers> activation steering (-decay, -xvec variants), R the random control, B-<mode> her",
-             "x-vector shift, C-<mode> her fitted token, R-B-<mode>/R-C-<mode> their random-shift controls.",
+             "x-vector shift, C-<mode> her fitted token, D-<mode> her residual-matched token, R-<arm> the token arms'",
+             "random-shift controls.",
              "audio/<a>+<b>/<arm>/ are blends. Sentence n:", ""]
     lines += [f"{n}. {t}" for n, t in enumerate(TEST)]
     lines += ["", "Kept settings per mood:", ""]
