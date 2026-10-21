@@ -4,11 +4,36 @@ Status: built (`crates/review`, `vi review`), tested on synthetic clips only. Re
 
 Stage 5 of [control-vector-datasets.md](control-vector-datasets.md). You listen to a clip, see the label stage's scores, and keep, nudge, flag or skip it. About an hour of your time should cover the clips that matter.
 
-## Running it
+## The hub
 
 ```
-vi review <corpus-folder>            # serves http://127.0.0.1:8737/
-vi review --demo <empty-folder>      # writes a synthetic corpus (harvest, clean, label) first
+vi review <corpus-folder>            # the hub, http://127.0.0.1:8737/ (phone: https://vi-review.home.internal)
+vi review --demo <empty-folder>      # a synthetic corpus with clusters, a listening set and a qtcheck folder
+vi review --labels <corpus-folder>   # the old label review page on its own
+```
+
+One address for every page where Brandon does something. The home page lists **Needs you** (count in the tab title and icon; anything new since his last visit says New) and **Done** (when each was finished, and a summary to copy into the thread that asked). Each task opens its page under its own path with a bar on top that links back to all tasks and turns green when the task is done. `--purity`, `--gold` and `--channel` still serve one page on its own.
+
+The hub finds tasks itself and rescans on every visit:
+- **Cluster purity**, **Gold labels**, **Radio and effect marks** when their inputs exist (otherwise listed under "Not ready yet" with the reason). Done when every cluster is decided, every line labelled, every clip marked.
+- **Blind listening sets**: any `listen/` folder with `sheet.csv` and `key.json` under a stage's current output or `analysis/` (voicearms writes them). Answers go straight into `sheet.csv` in voicearms' columns, so `voicearms.py --unblind` still works; the key is never served, and when every clip is answered the hub writes `listen/results.md` (the same table). A rerun that rewrites the sheet reopens the task.
+- **qtcheck**: any folder with `report.json` and `audio/*-qt.wav`. Ok / not ok and a note per file, in `heard.jsonl` beside the report.
+- **Anything else**: a job that needs Brandon writes `task.toml` beside its output; he marks it done on the hub (which writes `task.done` there).
+
+```toml
+title = "Read the steering report"     # required
+about = "Say which arm to keep."       # what to do
+asked_by = "TTS steering"              # the thread the summary goes to
+link = "/listen/..."                   # optional page to open
+```
+
+Finishing or reopening a task appends `{"task", "done", "at"}` to `<corpus>/hub.jsonl`.
+
+## Running the label review page
+
+```
+vi review --labels <corpus-folder>          # serves http://127.0.0.1:8737/
+vi review --labels --demo <empty-folder>    # writes a synthetic corpus (harvest, clean, label) first
 ```
 
 It binds to localhost only and the page loads nothing from the internet, so game audio stays on your machine. Every verdict is written as you go; stop with Ctrl+C and rerun to pick up where you left off.

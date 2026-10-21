@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vulkan voice check</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --yes: #2e7d4f; --no: #b3392f; --warn: #b8701a; --warn-soft: #f7e7d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --yes: #6fc492; --no: #e57b70; --warn: #e0a253; --warn-soft: #3d2f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 760px; margin: 0 auto; padding: 14px 16px 60px; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  h1 { font-size: 17px; margin: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .bar { flex: 1 1 120px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar div { height: 100%; background: var(--accent); width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--line); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .panel.ok { border-left-color: var(--yes); }
+  .panel.bad { border-left-color: var(--no); }
+  .name { font-weight: 600; font-size: 15px; word-break: break-all; }
+  .label { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 10px; padding: 9px 12px; cursor: pointer; touch-action: manipulation; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .row button { flex: 1 1 0; }
+  button.on.y { background: var(--yes); border-color: var(--yes); color: var(--panel); }
+  button.on.n { background: var(--no); border-color: var(--no); color: var(--panel); }
+  textarea { font: inherit; font-size: 14px; width: 100%; min-height: 38px; border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; background: var(--panel); color: var(--text); margin-top: 8px; }
+  audio { width: 100%; margin: 2px 0; }
+  .err { color: var(--no); }
+  .verdict { display: inline-block; border-radius: 999px; padding: 1px 9px; font-size: 12px; background: var(--accent-soft); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Vulkan voice check</h1>
+    <span id="progress" class="muted small"></span>
+    <div class="bar"><div id="barfill"></div></div>
+  </header>
+  <p class="small muted">Each clip is qwentts.cpp on the GPU. Does it sound like a normal, clean voice saying the words? Where PyTorch's version exists it plays underneath, and the two should sound alike. <span id="verdict"></span></p>
+  <p id="msg" class="small"></p>
+  <div id="files"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+let session = null;
+
+function render() {
+  $("progress").textContent = `${session.done} of ${session.total}`;
+  $("barfill").style.width = `${session.total ? 100 * session.done / session.total : 0}%`;
+  if (session.verdict) $("verdict").innerHTML = `The numbers said: <span class="verdict">${esc(session.verdict)}</span>`;
+  $("files").innerHTML = session.files.map((f) => {
+    const h = f.heard, cls = h ? (h.ok ? "ok" : "bad") : "";
+    const a = (file) => `<audio controls preload="none" src="audio?f=${encodeURIComponent(file)}"></audio>`;
+    return `<div class="panel ${cls}" data-f="${esc(f.file)}">
+      <div class="name">${esc(f.file.replace(/-qt\.wav$/, ""))}</div>
+      <div class="label">qwentts.cpp</div>${a(f.file)}
+      ${f.torch ? `<div class="label">PyTorch</div>${a(f.torch)}` : ""}
+      <div class="row"><button class="y ${h && h.ok ? "on" : ""}" data-ok="1">Sounds right</button><button class="n ${h && !h.ok ? "on" : ""}" data-ok="0">Something's off</button></div>
+      <textarea placeholder="What's off? (optional; saved when you tap a button)">${esc(h ? h.note : "")}</textarea>
+    </div>`;
+  }).join("");
+}
+
+$("files").onclick = async (e) => {
+  const b = e.target.closest("[data-ok]"); if (!b) return;
+  const card = b.closest("[data-f]");
+  try {
+    const r = await fetch("api/heard", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file: card.dataset.f, ok: b.dataset.ok === "1", note: card.querySelector("textarea").value }) });
+    if (!r.ok) throw new Error(await r.text());
+    session = await r.json();
+    $("msg").textContent = "";
+    render();
+  } catch (err) {
+    $("msg").innerHTML = `<span class="err">Not saved: ${esc(err.message)}</span>`;
+  }
+};
+
+(async () => {
+  try {
+    const r = await fetch("api/session", { cache: "no-store" });
+    if (!r.ok) throw new Error(await r.text());
+    session = await r.json();
+    render();
+  } catch (e) {
+    $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Blind listening</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --yes: #2e7d4f; --no: #b3392f; --warn: #b8701a; --warn-soft: #f7e7d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --yes: #6fc492; --no: #e57b70; --warn: #e0a253; --warn-soft: #3d2f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 760px; margin: 0 auto; padding: 14px 16px 120px; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  h1 { font-size: 17px; margin: 0; }
+  h2 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .bar { flex: 1 1 120px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar div { height: 100%; background: var(--accent); width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .say { font-size: 17px; margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 6px; }
+  button {
+    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    border-radius: 10px; padding: 10px 12px; cursor: pointer; touch-action: manipulation;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .q { margin: 12px 0 4px; font-weight: 600; font-size: 15px; }
+  .seg { display: flex; gap: 6px; flex-wrap: wrap; }
+  .seg button { flex: 1 1 0; min-width: 56px; }
+  .seg button.on { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+  .blend { margin: 6px 0; }
+  .blend .name { font-size: 14px; color: var(--muted); margin-bottom: 3px; }
+  textarea { font: inherit; width: 100%; min-height: 44px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--panel); color: var(--text); }
+  .dock {
+    position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line);
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  }
+  .dock .in { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; }
+  .dock button { padding: 12px; }
+  .dock .save { flex: 1; background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+  .err { color: var(--no); }
+  .hidden { display: none; }
+  audio { width: 100%; margin: 4px 0 6px; }
+  .dots { display: flex; gap: 4px; flex-wrap: wrap; margin: 6px 0 0; }
+  .dot { width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); font-size: 11px; display: grid; place-items: center; cursor: pointer; background: var(--panel); }
+  .dot.done { background: var(--yes); border-color: var(--yes); color: var(--panel); }
+  .dot.here { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .example { border-left: 3px solid var(--warn); padding-left: 10px; }
+  .finished { text-align: center; padding: 26px 16px; }
+  .finished b { color: var(--yes); font-size: 19px; display: block; margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Blind listening</h1>
+    <span id="progress" class="muted small"></span>
+    <div class="bar"><div id="barfill"></div></div>
+  </header>
+  <p id="msg" class="small muted"></p>
+
+  <div id="finished" class="panel finished hidden">
+    <b>&check; All clips answered</b>
+    <span class="muted">Your answers are in sheet.csv, and the unblinded results in results.md. You can still change any answer.</span>
+    <details style="margin-top:12px;text-align:left"><summary>Show what each clip was</summary><div id="results"></div></details>
+  </div>
+
+  <div id="card" class="panel hidden">
+    <div class="small muted" id="where"></div>
+    <h2 id="group" style="margin-top:4px"></h2>
+    <div id="exwrap" class="example hidden">
+      <div class="small muted">Her real clip in this mood, for comparison</div>
+      <audio id="example" controls preload="none"></audio>
+    </div>
+    <div class="say" id="sentence"></div>
+    <audio id="clip" controls preload="auto"></audio>
+
+    <div class="q">Still her voice?</div>
+    <div class="seg" id="voice"></div>
+    <div class="q" id="moodq">How much of the mood do you hear?</div>
+    <div id="mood"></div>
+    <div class="q">Words clear?</div>
+    <div class="seg" id="clear"></div>
+    <div class="q">Notes</div>
+    <textarea id="notes" placeholder="Optional"></textarea>
+    <div class="dots" id="dots"></div>
+  </div>
+
+  <details><summary>How this works</summary>
+    <p class="small">Each mood folder plays the same sentence spoken several ways (neutral, her swapped-in clip, each steering method) in a shuffled order, so you can't tell which is which. Answer three questions per clip; notes are optional. For a blend, rate each mood on its own. Every save goes straight into sheet.csv. The answer key stays hidden until every clip is answered.</p>
+  </details>
+</main>
+
+<div class="dock">
+  <div class="in">
+    <button id="prev" type="button" aria-label="Previous clip">&lsaquo;</button>
+    <button id="save" class="save" type="button">Save &amp; next</button>
+    <button id="next" type="button" aria-label="Next clip without saving">&rsaquo;</button>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+let session = null, items = [], i = 0, answer = {};
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : { cache: "no-store" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function seg(el, options, value, set) {
+  el.innerHTML = options.map(([v, label]) => `<button type="button" data-v="${v}" class="${v === value ? "on" : ""}">${label}</button>`).join("");
+  el.onclick = (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    set(b.dataset.v === value ? "" : b.dataset.v);
+  };
+}
+
+// A blend's mood answer is "a:2 b:1"; a single mood's is "0".."3".
+function blendParts(s) {
+  const out = {};
+  for (const p of String(s || "").split(/\s+/)) { const [k, v] = p.split(":"); if (k && v !== undefined) out[k] = v; }
+  return out;
+}
+
+function answered(c) { return c.voice && c.mood && c.clear; }
+
+function render() {
+  const total = items.length, done = items.filter((x) => answered(x.clip)).length;
+  $("progress").textContent = `${done} of ${total}`;
+  $("barfill").style.width = `${total ? 100 * done / total : 0}%`;
+  $("finished").classList.toggle("hidden", !(total && done === total));
+  if (session.results) {
+    const rows = session.results.split("\n").filter((l) => l.startsWith("| ") && !l.startsWith("| group"));
+    $("results").innerHTML = `<table><tr><th>group</th><th>was</th><th>voice</th><th>mood</th><th>clear</th><th>notes</th></tr>${rows.map((l) => "<tr>" + l.split("|").slice(1, -1).map((c) => `<td>${esc(c.trim())}</td>`).join("") + "</tr>").join("")}</table>`;
+  }
+  if (!total) { $("msg").textContent = "This set has no clips."; return; }
+  $("card").classList.remove("hidden");
+  const { group, clip } = items[i];
+  const g = session.groups.find((x) => x.group === group);
+  $("where").textContent = `Clip ${i + 1} of ${total}`;
+  $("group").textContent = g.moods.length > 1 ? `Blend: ${g.moods.join(" + ")}` : `Mood: ${group}`;
+  $("exwrap").classList.toggle("hidden", !g.example);
+  const ex = `audio?g=${encodeURIComponent(group)}&c=her_example`;
+  if (g.example && $("example").getAttribute("src") !== ex) $("example").setAttribute("src", ex);
+  $("sentence").textContent = clip.sentence;
+  const src = `audio?g=${encodeURIComponent(group)}&c=${encodeURIComponent(clip.clip)}`;
+  if ($("clip").getAttribute("src") !== src) $("clip").setAttribute("src", src);
+  seg($("voice"), [["y", "Yes"], ["n", "No"]], answer.voice, (v) => { answer.voice = v; render(); });
+  seg($("clear"), [["y", "Yes"], ["n", "No"]], answer.clear, (v) => { answer.clear = v; render(); });
+  const scale = [["0", "0 none"], ["1", "1"], ["2", "2"], ["3", "3 clearly"]];
+  if (g.moods.length > 1) {
+    $("moodq").textContent = "How much of each mood do you hear?";
+    const parts = blendParts(answer.mood);
+    $("mood").innerHTML = g.moods.map((m) => `<div class="blend"><div class="name">${esc(m)}</div><div class="seg" data-m="${esc(m)}"></div></div>`).join("");
+    for (const el of $("mood").querySelectorAll("[data-m]")) {
+      const m = el.dataset.m;
+      seg(el, scale, parts[m], (v) => {
+        const p = blendParts(answer.mood); if (v) p[m] = v; else delete p[m];
+        // Only counts as answered once every mood has a level.
+        answer.mood = g.moods.filter((x) => p[x]).map((x) => `${x}:${p[x]}`).join(" ");
+        answer.partial = g.moods.some((x) => !p[x]);
+        render();
+      });
+    }
+  } else {
+    $("moodq").textContent = "How much of the mood do you hear?";
+    $("mood").innerHTML = `<div class="seg" id="moodseg"></div>`;
+    seg($("moodseg"), scale, answer.mood, (v) => { answer.mood = v; render(); });
+  }
+  if (document.activeElement !== $("notes")) $("notes").value = answer.notes || "";
+  $("dots").innerHTML = items.map((x, k) => `<span class="dot ${answered(x.clip) ? "done" : ""} ${k === i ? "here" : ""}" data-k="${k}">${k + 1}</span>`).join("");
+  $("prev").disabled = i === 0;
+  $("next").disabled = i === total - 1;
+}
+
+function go(k) {
+  i = Math.max(0, Math.min(items.length - 1, k));
+  const c = items[i].clip;
+  answer = { voice: c.voice, mood: c.mood, clear: c.clear, notes: c.notes, partial: false };
+  render();
+  window.scrollTo({ top: 0 });
+}
+
+function firstOpen() {
+  const k = items.findIndex((x) => !answered(x.clip));
+  return k < 0 ? 0 : k;
+}
+
+function flatten() {
+  items = session.groups.flatMap((g) => g.clips.map((clip) => ({ group: g.group, clip })));
+}
+
+$("notes").oninput = () => { answer.notes = $("notes").value; };
+$("dots").onclick = (e) => { const d = e.target.closest("[data-k]"); if (d) go(+d.dataset.k); };
+$("prev").onclick = () => go(i - 1);
+$("next").onclick = () => go(i + 1);
+$("save").onclick = async () => {
+  const { group, clip } = items[i];
+  const mood = answer.partial ? "" : (answer.mood || "");
+  if (answer.partial) $("msg").textContent = "Rate every mood in the blend for it to count.";
+  try {
+    $("save").disabled = true;
+    session = await api("api/answer", { group, clip: clip.clip, voice: answer.voice || "", mood, clear: answer.clear || "", notes: answer.notes || "" });
+    flatten();
+    $("msg").textContent = "";
+    const open = items.findIndex((x, k) => k > i && !answered(x.clip));
+    go(open >= 0 ? open : firstOpen());
+  } catch (e) {
+    $("msg").innerHTML = `<span class="err">Not saved: ${esc(e.message)}</span>`;
+  } finally {
+    $("save").disabled = false;
+  }
+};
+
+(async () => {
+  try {
+    session = await api("api/session");
+    flatten();
+    if (items.length) go(firstOpen()); else render();
+  } catch (e) {
+    $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+})();
+</script>
+</body>
+</html>
