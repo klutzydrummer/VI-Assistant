@@ -292,6 +292,70 @@ max_wer = 0.15             # words: Whisper's word error rate at most this
 min_lift = 0.1             # the probe must rise this much over neutral on average
 min_share = 0.75           # and on at least this share of the test sentences
 
+# GPU, manual: the steering protocol (/mnt/project-files/research/steering-qwen3-tts.md, section 5),
+# `vi dataset run characters/tali/dataset.toml voicearms`. Three arms on Qwen3-TTS, all from her
+# clips: A voicesteer's vectors at single late layers and a band (norm-preserving, plus decay,
+# x-vector-only mode and a random control), B her x-vector mood shift, C a fitted speaker token.
+# Before it: run voicesteer, then at home `python3 jobs/voicelayers.py <voicesteer out> --npz
+# corpus/tali/analysis/after_labels/voice_vectors.npz` (layer table, swap check, the vector bundle).
+# About 1.5-2 h on a 48 GB card for 7 moods and 2 blends. Needs Brandon's yes for the run.
+[stage.voicearms]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_vectors.npz", "python3", "jobs/voicearms.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/voicearms.py", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
+         "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt",
+         "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz",
+         "corpus:analysis/after_labels/voice_vectors.npz"]
+manual = true
+
+[stage.voicearms.settings]
+model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+# Picked from voicesteer's results before the run: about half that steered and half that didn't, at
+# least two of the borderline four, one high- and one low-arousal mood. Blends name two of these.
+moods = ["warmth", "sadness", "alarm", "matter_of_fact", "indignation", "playful", "teasing"]
+blends = [["warmth", "playful"], ["alarm", "indignation"]]
+layer_sets = ["14", "18", "21", "24", "21-25"]   # talker layers (of 28); voicesteer used 9-17
+ladder = [1.0, 0.5, 0.25, 0.1, 0.05]   # full strength first, down only if her voice or the words go
+above = []          # strengths over 1 for A, only if 1 holds without lifting; e.g. [2.0, 4.0] on Brandon's yes
+above_tau = []      # the same for B and C; e.g. [1.5, 2.5] (the published x-vector range) on his yes
+decay = 0.985       # per frame, for the A-decay variant
+refs_per_side = 32  # pairs per mood to build tau and fit tokens from (held-out conversations excluded)
+held_max = 16       # held-out pairs scored for the likelihood check and early stopping
+fit_steps = 200
+fit_lr = 0.002
+fit_l2 = 0.01
+max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
+max_wer = 0.15
+min_lift = 0.1
+min_share = 0.75
+
+# Home smoke for voicearms on CPU, real models, tiny settings (no rental):
+# `VI_WORKER_HOST=local nice -n 19 vi dataset run characters/tali/dataset.toml voicearms_smoke`.
+# It captures its one mood's vector itself, so it doesn't need voice_vectors.npz.
+[stage.voicearms_smoke]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/voicearms.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/voicearms.py", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
+         "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt",
+         "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.voicearms_smoke.settings]
+device = "cpu"
+asr = "openai/whisper-tiny"
+moods = ["warmth"]
+test_sentences = 2
+layer_sets = ["21"]
+ladder = [1.0]
+refs_per_side = 2
+held_max = 1
+fit_steps = 2
+fit_eval_every = 1
+fit_batch = 1
+
 # GPU, manual: step 5's one rental, `vi dataset run characters/tali/dataset.toml rental5`
 # (docs/design/step5-rental-plan.md). jobs/rental5.sh takes every pre-decided branch itself and
 # logs each choice to decisions.md: preflight on Qwen3.8-27B decides persona reuse, then build,
