@@ -79,7 +79,7 @@ for round in 1 2 3; do
 done
 
 # 4. Voice vectors and test D (voicesteer reads its settings from VI_SETTINGS).
-VI_FILES=$PWD/$f python3 jobs/voicesteer.py >"$VI_OUT/voicesteer.log" 2>&1
+VI_FILES=$PWD/$f VI_CHECKPOINT=$ck/voice python3 jobs/voicesteer.py >"$VI_OUT/voicesteer.log" 2>&1   # its own checkpoint folder
 note "voice: $(grep -o '"verdict": "[^"]*"' "$VI_OUT/report.json" 2>/dev/null | sort | uniq -c | tr '\n' ' ')"
 
 cp -r "$ck/vectors" "$VI_OUT/chat_vectors"   # voicesteer writes its own vectors/
