@@ -38,6 +38,11 @@ pub struct Meta {
     pub architecture: String,
     /// The llama.cpp the capture ran on.
     pub llama_cpp: String,
+    /// Where it ran ([`crate::llama::Llama::backend`]). GPU and CPU sums
+    /// differ by rounding, so a store doesn't resume on another backend.
+    /// Stores from before this field were all captured on the CPU.
+    #[serde(default = "cpu")]
+    pub backend: String,
     pub n_embd: usize,
     pub n_layer: usize,
     /// Captured layers, in store order: `1..=n_layer-2`.
@@ -60,6 +65,10 @@ pub struct Meta {
     /// Preflight results on this model, when it ran first.
     #[serde(default)]
     pub preflight: Option<serde_json::Value>,
+}
+
+fn cpu() -> String {
+    "cpu".into()
 }
 
 impl Meta {
@@ -147,6 +156,20 @@ impl StoreWriter {
                 &fs::read_to_string(&meta_path).map_err(|e| io(&meta_path, e))?,
             )
             .map_err(|e| format!("{}: {e}", meta_path.display()))?;
+            if old.backend != meta.backend
+                && old.same_capture(&Meta {
+                    backend: old.backend.clone(),
+                    ..meta.clone()
+                })
+            {
+                return Err(format!(
+                    "{} was captured on {}, this run is on {}; resume it there (--gpu-layers 0 for the CPU) \
+                     or choose another --store",
+                    dir.display(),
+                    old.backend,
+                    meta.backend
+                ));
+            }
             if !old.same_capture(&meta) {
                 return Err(format!(
                     "{} holds a capture of another model, layer set or message file; \
@@ -417,6 +440,7 @@ mod tests {
             model_sha256: "ab".into(),
             architecture: "llama".into(),
             llama_cpp: "test".into(),
+            backend: "cpu".into(),
             n_embd: 3,
             n_layer: 4,
             layers: vec![1, 2],
@@ -487,5 +511,17 @@ mod tests {
         let mut other = meta(3);
         other.model_sha256 = "cd".into();
         assert!(StoreWriter::open(dir.path(), other).is_err());
+        let mut gpu = meta(3);
+        gpu.backend = "Vulkan0 (test)".into();
+        let err = StoreWriter::open(dir.path(), gpu).err().unwrap();
+        assert!(err.contains("captured on cpu"), "{err}");
+    }
+
+    #[test]
+    fn stores_from_before_the_backend_field_were_cpu() {
+        let mut v = serde_json::to_value(meta(3)).unwrap();
+        v.as_object_mut().unwrap().remove("backend");
+        let m: Meta = serde_json::from_value(v).unwrap();
+        assert_eq!(m.backend, "cpu");
     }
 }

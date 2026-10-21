@@ -18,7 +18,8 @@ vi vectors selftest
 ```
 
 Model commands also take `--models <folder>` (default `$VI_MODELS`, else `models/`),
-`--gpu-layers N` and `--threads N`. `build` writes the store to
+`--gpu-layers N` and `--threads N` (a Vulkan or CUDA build offloads every layer unless told
+`--gpu-layers 0`; see the README's Vulkan notes). `build` writes the store to
 `vectors/<name>/llm/<model-sha256>/capture/` and the vectors next to it unless `--store`/`--out`
 say otherwise (`--name`, default `tali`). At home, put the store on a disk with 6 GB free and run
 under `nice -n 19` (plus `ionice -c3` on the game disk, `ionice -c2 -n7` on the system disk).

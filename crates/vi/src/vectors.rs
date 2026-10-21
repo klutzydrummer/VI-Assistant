@@ -721,13 +721,14 @@ fn selftest_cmd(a: &Args) -> Result<(), String> {
     print_preflight(&r.preflight);
     print_fit_check(&r.fit_check);
     println!(
-        "  GPU offload {}; capture with --gpu-layers {gpu} against CPU: worst cosine {:.6}, \
+        "  GPU offload {}; capture with --gpu-layers {gpu} on {} against CPU: worst cosine {:.6}, \
          worst relative error {:.2e} -> {}",
         if r.gpu_offload_supported {
             "built in"
         } else {
             "not built in (CPU build)"
         },
+        r.backend,
         r.gpu_vs_cpu.0,
         r.gpu_vs_cpu.1,
         if r.gpu_vs_cpu_ok { "ok" } else { "FAILED" }
