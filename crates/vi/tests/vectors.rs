@@ -124,6 +124,23 @@ fn builds_checks_and_relayers_vectors() {
                            "steer": {"loud": 1.0}, "max_tokens": 8, "thinking": "off"}),
         serde_json::json!({"id": "loud-all", "messages": [{"role": "user", "content": "Hi"}],
                            "steer": {"loud": 1.0}, "max_tokens": 8, "scope": "all"}),
+        // Above full strength with a scheme, against a random control,
+        // judged pairwise both ways.
+        serde_json::json!({"id": "loud-x4-pair", "messages": [{"role": "user", "content": "Hi"}],
+                           "steer": {"loud": 4.0}, "scheme": "single:2", "max_tokens": 8,
+                           "thinking": "off",
+                           "judge": [{"role": "user", "content": "1: {reply} 2: {baseline}"}],
+                           "judge_max_tokens": 4}),
+        serde_json::json!({"id": "random-pair", "messages": [{"role": "user", "content": "Hi"}],
+                           "steer": {"random:loud": 4.0}, "scheme": "single:2", "max_tokens": 8,
+                           "thinking": "off",
+                           "judge": [{"role": "user", "content": "1: {reply} 2: {baseline}"}],
+                           "judge_max_tokens": 4}),
+        // The judge's positive control: two of her lines, nothing generated.
+        serde_json::json!({"id": "given", "messages": [{"role": "user", "content": "Hi"}],
+                           "given_reply": "Keelah se'lai!", "given_baseline": "Okay.",
+                           "judge": [{"role": "user", "content": "1: {reply} 2: {baseline}"}],
+                           "judge_max_tokens": 4}),
     ];
     jsonl!(&d.join("plan.jsonl"), &plan);
     vi(
@@ -152,7 +169,18 @@ fn builds_checks_and_relayers_vectors() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(results.len(), 5);
+    assert_eq!(results.len(), 8);
+    assert_eq!(results[5]["applied"]["loud"], 4.0);
+    assert!(results[5]["baseline"].is_string());
+    assert!(results[5]["judge"].is_string() && results[5]["judge_swapped"].is_string());
+    // The same prompt and seed share one baseline.
+    assert_eq!(results[5]["baseline"], results[6]["baseline"]);
+    assert_eq!(results[6]["applied"]["random:loud"], 4.0);
+    assert_ne!(results[5]["reply"], serde_json::Value::Null);
+    assert_eq!(results[7]["outcome"], "given");
+    assert_eq!(results[7]["reply"], "Keelah se'lai!");
+    assert_eq!(results[7]["baseline"], "Okay.");
+    assert!(results[7]["judge_swapped"].is_string());
     // Thinking on, reply scope: the random model never closes its thinking,
     // so nothing was steered.
     assert_eq!(results[2]["think"], "on");
@@ -189,6 +217,45 @@ fn builds_checks_and_relayers_vectors() {
         ],
     );
     assert!(rerun.contains("0 trials run"), "{rerun}");
+
+    // Over vectors.toml's cap with no scheme: refused before anything runs.
+    let over = [
+        serde_json::json!({"id": "fine", "messages": [{"role": "user", "content": "Hi"}],
+                           "max_tokens": 4}),
+        serde_json::json!({"id": "capped", "messages": [{"role": "user", "content": "Hi"}],
+                           "steer": {"loud": 2.0}, "max_tokens": 4}),
+    ];
+    jsonl!(&d.join("over.jsonl"), &over);
+    let out = Command::new(env!("CARGO_BIN_EXE_vi"))
+        .current_dir(d)
+        .args([
+            "vectors",
+            "check",
+            "tiny",
+            "--registry",
+            "models.toml",
+            "--vectors",
+            "built/joint",
+            "--plan",
+            "over.jsonl",
+            "--results",
+            "over-results.jsonl",
+            "--threads",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("over its cap"),
+        "{err}"
+    );
+    assert!(
+        !d.join("over-results.jsonl").exists()
+            || fs::read_to_string(d.join("over-results.jsonl"))
+                .unwrap()
+                .is_empty()
+    );
 
     let l = vi(d, &["layers", "built/joint", "band:2-4", "--only", "loud"]);
     assert!(l.contains("1 vectors now use band:2-4"), "{l}");

@@ -43,6 +43,14 @@
 //! other reason is `never_steered`, also unjudged. Neither counts as a
 //! steering result; [`summarize`] gives their rate per mood. Results are
 //! appended as JSON lines, and a rerun skips ids already there.
+//!
+//! For the steering sweep (2026-10-21): a judge with `{baseline}` is
+//! pairwise (the unsteered reply to the same prompt and seed, judged in
+//! both orders); `random:<mood>` steers with a random direction of the
+//! mood's length per layer; `given_reply`/`given_baseline` judge her own
+//! lines without generating; and every pending trial's strengths are
+//! checked against `vectors.toml`'s caps before any runs (a `scheme` has
+//! no cap).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -148,6 +156,14 @@ pub struct Trial {
     /// Whether the judge thinks first; off by default.
     #[serde(default)]
     pub judge_thinking: Option<Thinking>,
+    /// Judge this text instead of generating a reply (the judge's positive
+    /// control: one of her own lines).
+    #[serde(default)]
+    pub given_reply: Option<String>,
+    /// With `{baseline}` in the judge: this text instead of the unsteered
+    /// reply.
+    #[serde(default)]
+    pub given_baseline: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +201,14 @@ pub struct TrialResult {
     pub outcome: String,
     #[serde(default)]
     pub judge_think: String,
+    /// Pairwise trials (`{baseline}` in the judge): the unsteered reply to
+    /// the same prompt, thinking setting and seed, or `given_baseline`.
+    #[serde(default)]
+    pub baseline: Option<String>,
+    /// Pairwise trials: the judge's answer with `{reply}` and `{baseline}`
+    /// swapped, so its prompt's first and second reply trade places.
+    #[serde(default)]
+    pub judge_swapped: Option<String>,
 }
 
 pub struct Checker {
@@ -193,7 +217,14 @@ pub struct Checker {
     natural: BTreeMap<String, BTreeMap<u32, Vec<f32>>>,
     banks: HashMap<String, VectorBank>,
     defaults: CheckDefaults,
+    /// Unsteered replies by prompt and sampling, so pairwise trials that
+    /// share a prompt generate their baseline once.
+    baselines: HashMap<String, Option<String>>,
 }
+
+/// Steering with `random:<mood>` uses a random direction as long as the
+/// mood's own at every layer.
+pub const RANDOM_PREFIX: &str = "random:";
 
 fn file_model_sha(g: &Gguf) -> Option<String> {
     g.metadata
@@ -241,6 +272,7 @@ impl Checker {
             natural,
             banks: HashMap::new(),
             defaults,
+            baselines: HashMap::new(),
         })
     }
 
@@ -273,9 +305,44 @@ impl Checker {
         Ok(&self.banks[&key])
     }
 
+    /// The trial's blend: adds any `random:` controls it asks for, and
+    /// refuses a strength the folder's `vectors.toml` would cap (with no
+    /// `scheme`, as `vi chat` loads it) instead of quietly lowering it.
+    fn blend(&mut self, t: &Trial) -> Result<crate::vectors::Blend, String> {
+        let scheme = t.scheme.as_deref();
+        self.bank(scheme)?;
+        let bank = self
+            .banks
+            .get_mut(scheme.unwrap_or("vectors.toml"))
+            .expect("bank was just loaded");
+        for (name, &s) in &t.steer {
+            if let Some(src) = name.strip_prefix(RANDOM_PREFIX) {
+                if bank.get(name).is_none() {
+                    bank.insert_random_like(name, src, seed_for(name))?;
+                }
+            }
+            if let Some(v) = bank.get(name) {
+                let want = s * v.limits.scale;
+                if v.effective(s) != want {
+                    return Err(format!(
+                        "{name} at {s} is over its cap of {} in vectors.toml; give the trial a \
+                         `scheme` to check strengths above the cap",
+                        v.limits.cap
+                    ));
+                }
+            }
+        }
+        Ok(bank.blend(&t.steer))
+    }
+
+    /// Check a trial's vectors, scheme and strengths without running it.
+    pub fn validate(&mut self, t: &Trial) -> Result<(), String> {
+        self.blend(t).map(|_| ())
+    }
+
     pub fn run(&mut self, t: &Trial) -> Result<TrialResult, String> {
         let start = Instant::now();
-        let blend = self.bank(t.scheme.as_deref())?.blend(&t.steer);
+        let blend = self.blend(t)?;
         let messages: Vec<(&str, &str)> = t
             .messages
             .iter()
@@ -297,41 +364,73 @@ impl Checker {
             },
             _ => Sampling::greedy(max),
         };
-        let g =
-            self.llama
-                .generate_scoped(&prompt, blend.data.as_deref(), scope, &sampling, |_| true)?;
-        let (thinking, reply) = split_thinking(&g.text);
-        let open_thinking =
-            g.text.trim_start().starts_with("<think>") && !g.text.contains("</think>");
-        let outcome = if open_thinking && g.stop == Stop::MaxTokens {
-            "truncated"
-        } else if scope == Scope::Reply && g.steer_start == SteerStart::Never {
-            if g.stop == Stop::MaxTokens {
-                "truncated"
-            } else {
-                "never_steered"
-            }
-        } else {
-            "reply"
-        };
         let judge_think = t.judge_thinking.unwrap_or(Thinking::Off);
-        let judge = match &t.judge {
-            Some(_) if outcome != "reply" => None,
-            None => None,
-            Some(js) => {
-                let filled: Vec<(String, String)> = js
-                    .iter()
-                    .map(|m| (m.role.clone(), m.content.replace("{reply}", &reply)))
-                    .collect();
-                let refs: Vec<(&str, &str)> = filled
-                    .iter()
-                    .map(|(r, c)| (r.as_str(), c.as_str()))
-                    .collect();
-                let jp = with_thinking(self.llama.format_chat(&refs)?, judge_think);
-                let sampling = Sampling::greedy(t.judge_max_tokens.unwrap_or(max));
-                let text = self.llama.generate(&jp, None, &sampling, |_| true)?.text;
-                Some(split_thinking(&text).1)
+        let (g, thinking, reply, mut outcome) = match &t.given_reply {
+            Some(text) => (None, None, text.clone(), "given"),
+            None => {
+                let g = self.llama.generate_scoped(
+                    &prompt,
+                    blend.data.as_deref(),
+                    scope,
+                    &sampling,
+                    |_| true,
+                )?;
+                let (thinking, reply) = split_thinking(&g.text);
+                let open_thinking =
+                    g.text.trim_start().starts_with("<think>") && !g.text.contains("</think>");
+                let outcome = if open_thinking && g.stop == Stop::MaxTokens {
+                    "truncated"
+                } else if scope == Scope::Reply && g.steer_start == SteerStart::Never {
+                    if g.stop == Stop::MaxTokens {
+                        "truncated"
+                    } else {
+                        "never_steered"
+                    }
+                } else {
+                    "reply"
+                };
+                (Some(g), thinking, reply, outcome)
             }
+        };
+        let judged = matches!(outcome, "reply" | "given");
+        let pairwise = t
+            .judge
+            .as_ref()
+            .is_some_and(|js| js.iter().any(|m| m.content.contains("{baseline}")));
+        let baseline = match (&t.given_baseline, pairwise && judged) {
+            (_, false) => None,
+            (Some(b), true) => Some(b.clone()),
+            (None, true) => {
+                let key = format!(
+                    "{prompt}\u{0}{max}\u{0}{:?}\u{0}{:?}",
+                    t.temperature, t.seed
+                );
+                if !self.baselines.contains_key(&key) {
+                    let b = self.llama.generate(&prompt, None, &sampling, |_| true)?;
+                    let (_, reply) = split_thinking(&b.text);
+                    let closed =
+                        !b.text.trim_start().starts_with("<think>") || b.text.contains("</think>");
+                    self.baselines.insert(key.clone(), closed.then_some(reply));
+                }
+                self.baselines[&key].clone()
+            }
+        };
+        if pairwise && judged && baseline.is_none() {
+            outcome = "baseline_truncated";
+        }
+        let jmax = t.judge_max_tokens.unwrap_or(max);
+        let (judge, judge_swapped) = match &t.judge {
+            Some(js) if matches!(outcome, "reply" | "given") => {
+                let b = baseline.as_deref().unwrap_or("");
+                let first = self.judge(js, &reply, b, judge_think, jmax)?;
+                let swapped = if pairwise {
+                    Some(self.judge(js, b, &reply, judge_think, jmax)?)
+                } else {
+                    None
+                };
+                (Some(first), swapped)
+            }
+            _ => (None, None),
         };
         Ok(TrialResult {
             id: t.id.clone(),
@@ -340,31 +439,87 @@ impl Checker {
             missing: blend.missing,
             reply,
             thinking,
-            reply_tokens: g.tokens.len(),
-            stopped: match g.stop {
-                Stop::EndOfTurn => "end_of_turn",
-                Stop::MaxTokens => "max_tokens",
-                Stop::Cancelled => "cancelled",
+            reply_tokens: g.as_ref().map_or(0, |g| g.tokens.len()),
+            stopped: match g.as_ref().map(|g| g.stop) {
+                None => "given",
+                Some(Stop::EndOfTurn) => "end_of_turn",
+                Some(Stop::MaxTokens) => "max_tokens",
+                Some(Stop::Cancelled) => "cancelled",
             }
             .into(),
             judge,
             seconds: start.elapsed().as_secs_f64(),
             think: think.name().into(),
             scope: scope.name().into(),
-            steer_start: match g.steer_start {
+            steer_start: match g.as_ref().map_or(SteerStart::Never, |g| g.steer_start) {
                 SteerStart::Prompt(_) => "prompt",
                 SteerStart::Reply(_) => "reply",
                 SteerStart::Never => "never",
             }
             .into(),
-            steer_start_token: match g.steer_start {
+            steer_start_token: match g.as_ref().map_or(SteerStart::Never, |g| g.steer_start) {
                 SteerStart::Prompt(i) | SteerStart::Reply(i) => Some(i),
                 SteerStart::Never => None,
             },
             outcome: outcome.into(),
             judge_think: judge_think.name().into(),
+            baseline,
+            judge_swapped,
         })
     }
+
+    /// The same model, unsteered, answering the judge prompt `js` with
+    /// `{reply}` and `{baseline}` filled in; only its text after `</think>`.
+    fn judge(
+        &mut self,
+        js: &[ChatMessage],
+        reply: &str,
+        baseline: &str,
+        think: Thinking,
+        max_tokens: usize,
+    ) -> Result<String, String> {
+        let filled: Vec<(String, String)> = js
+            .iter()
+            .map(|m| (m.role.clone(), fill(&m.content, reply, baseline)))
+            .collect();
+        let refs: Vec<(&str, &str)> = filled
+            .iter()
+            .map(|(r, c)| (r.as_str(), c.as_str()))
+            .collect();
+        let jp = with_thinking(self.llama.format_chat(&refs)?, think);
+        let text = self
+            .llama
+            .generate(&jp, None, &Sampling::greedy(max_tokens), |_| true)?
+            .text;
+        Ok(split_thinking(&text).1)
+    }
+}
+
+/// `{reply}` and `{baseline}` in a judge message, filled in one pass so a
+/// reply that happens to contain either placeholder stays as it is.
+fn fill(template: &str, reply: &str, baseline: &str) -> String {
+    let mut out = String::with_capacity(template.len() + reply.len() + baseline.len());
+    let mut rest = template;
+    loop {
+        let next = [("{reply}", reply), ("{baseline}", baseline)]
+            .into_iter()
+            .filter_map(|(p, v)| rest.find(p).map(|i| (i, p, v)))
+            .min_by_key(|&(i, _, _)| i);
+        let Some((i, p, v)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str(v);
+        rest = &rest[i + p.len()..];
+    }
+}
+
+/// A fixed seed per control name, so reruns steer with the same vector.
+fn seed_for(name: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(name.as_bytes());
+    u64::from_le_bytes(h[..8].try_into().unwrap())
 }
 
 fn with_thinking(prompt: String, thinking: Thinking) -> String {
@@ -449,6 +604,13 @@ pub fn run_plan(
         .append(true)
         .open(out)
         .map_err(|e| format!("{}: {e}", out.display()))?;
+    // Every pending trial's vectors and strengths are checked before any
+    // runs, so a plan mistake shows up before the GPU time is spent.
+    for t in trials.iter().filter(|t| !done.contains(&t.id)) {
+        checker
+            .validate(t)
+            .map_err(|e| format!("trial {}: {e}", t.id))?;
+    }
     let mut n = 0;
     for t in trials.iter().filter(|t| !done.contains(&t.id)) {
         let r = checker.run(t).map_err(|e| format!("trial {}: {e}", t.id))?;
@@ -465,7 +627,20 @@ pub fn run_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::{split_thinking, Thinking, Trial};
+    use super::{fill, split_thinking, Thinking, Trial};
+
+    #[test]
+    fn fills_reply_and_baseline_in_one_pass() {
+        assert_eq!(
+            fill(
+                "1: {reply}\n2: {baseline}\n{reply}",
+                "warm {baseline}",
+                "plain"
+            ),
+            "1: warm {baseline}\n2: plain\nwarm {baseline}"
+        );
+        assert_eq!(fill("Rate: {reply}", "Hi", ""), "Rate: Hi");
+    }
 
     #[test]
     fn reads_step_5s_field_names() {
