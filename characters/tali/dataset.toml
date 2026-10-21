@@ -313,10 +313,10 @@ manual = true
 
 [stage.voicearms.settings]
 model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-# Picked from voicesteer's results before the run: about half that steered and half that didn't, at
-# least two of the borderline four, one high- and one low-arousal mood. Blends name two of these.
-moods = ["warmth", "sadness", "alarm", "matter_of_fact", "indignation", "playful", "teasing"]
-blends = [["warmth", "playful"], ["alarm", "indignation"]]
+# Pilot (Brandon 2026-10-21: 7 easily recognisable moods). Happy ~ warmth and amused, sad = sadness,
+# angry = indignation, afraid = alarm; playful and amused are two of the borderline four.
+moods = ["warmth", "amused", "sadness", "indignation", "alarm", "urgency", "playful"]
+blends = [["warmth", "amused"], ["alarm", "indignation"]]
 layer_sets = ["14", "18", "21", "24", "21-25"]   # talker layers (of 28); voicesteer used 9-17
 ladder = [1.0, 0.5, 0.25, 0.1, 0.05]   # full strength first, down only if her voice or the words go
 above = []          # strengths over 1 for A, only if 1 holds without lifting; e.g. [2.0, 4.0] on Brandon's yes
