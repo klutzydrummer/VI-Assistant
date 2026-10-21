@@ -291,3 +291,47 @@ max_similarity_drop = 0.05 # voice: ECAPA cosine to her neutral clips may fall t
 max_wer = 0.15             # words: Whisper's word error rate at most this
 min_lift = 0.1             # the probe must rise this much over neutral on average
 min_share = 0.75           # and on at least this share of the test sentences
+
+# GPU, manual: step 5's one rental, `vi dataset run characters/tali/dataset.toml rental5`
+# (docs/design/step5-rental-plan.md). jobs/rental5.sh takes every pre-decided branch itself and
+# logs each choice to decisions.md: preflight on Qwen3.8-27B decides persona reuse, then build,
+# the chat check (thinking on; reply-only and all-token steering; lowered only if a vector goes
+# off), then voicesteer. Its inputs:
+#   vi                 the CUDA build from .github/workflows/cuda-build.yml, downloaded with
+#                      `gh run download <run> --dir ...` and copied to target/vi-cuda/vi (its commit
+#                      in target/vi-cuda/COMMIT)
+#   builder/*.jsonl    corpus/tali/analysis/after_labels/builder_inputs.py (vi chat's system prompt,
+#                      byte-checked by `vi vectors preflight --character` at home)
+#   check_plan.*       corpus/tali/analysis/after_labels/check_plan.py
+#   voice_*            corpus/tali/analysis/after_labels/voice_probe.py
+# Smoke-tested end to end at home on qwen3.5-0.8b-q8 (2026-10-21). About 5-6 h on a 48 GB arch 86/89 card.
+[stage.rental5]
+command = ["../../jobs/on-worker.sh",
+           "--put", "../../target/vi-cuda/vi", "--put", "../../models.toml",
+           "--put", "../../corpus/tali/analysis/after_labels/builder/messages.jsonl",
+           "--put", "../../corpus/tali/analysis/after_labels/builder/labels.jsonl",
+           "--put", "../../corpus/tali/analysis/after_labels/builder/pairs.jsonl",
+           "--put", "../../corpus/tali/analysis/after_labels/check_plan.jsonl",
+           "--put", "../../corpus/tali/analysis/after_labels/check_plan.py",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz",
+           "bash", "jobs/rental5.sh"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/rental5.sh", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
+         "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt",
+         "../../models.toml", "corpus:analysis/after_labels/builder/messages.jsonl",
+         "corpus:analysis/after_labels/builder/labels.jsonl", "corpus:analysis/after_labels/builder/pairs.jsonl",
+         "corpus:analysis/after_labels/check_plan.jsonl", "corpus:analysis/after_labels/check_plan.py",
+         "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.rental5.settings]
+# voicesteer's, as in [stage.voicesteer.settings]
+model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+refs_per_side = 32
+capture_sentences = 2
+lower = [0.5, 0.25]
+max_similarity_drop = 0.05
+max_wer = 0.15
+min_lift = 0.1
+min_share = 0.75
