@@ -112,6 +112,24 @@ folder's own `vectors.toml`. `thinking` (`"on"`/`"off"` or `true`/`false`) and `
 `scope`: `"reply"`/`"all"`) override the run's `--thinking`/`--steer` for one trial;
 `judge_thinking` (default off) lets the judge think first. `{reply}` in the judge messages is replaced by the steered reply; the
 judge is the same model, unsteered. Reruns skip ids already in the results.
+
+Added 2026-10-21 for the steering sweep (Brandon's yes; research in
+`/mnt/project-files/research/steering-qwen38-27b.md`):
+- **Strengths above 1.0.** With a `scheme`, any strength is applied as given (`{"warmth": 4.0}` is
+  4x the natural gap; the vectors themselves keep their natural size). Without a `scheme` the
+  folder's `vectors.toml` caps apply as in `vi chat`, and a trial asking for more than a cap is
+  refused when the plan is read, before any trial runs, instead of being quietly lowered.
+- **Pairwise judging.** Put `{baseline}` in the judge messages next to `{reply}`: the check also
+  generates the unsteered reply to the same prompt, thinking setting, `max_tokens` and seed (once per
+  prompt, shared by every trial that uses it) and asks the judge twice, as written and with the two
+  swapped (`judge` and `judge_swapped`; in the swapped answer the prompt's first reply is the
+  unsteered one). The result keeps the `baseline` text. If the baseline's thinking runs out of
+  tokens the trial's `outcome` is `baseline_truncated` and it isn't judged.
+- **Random-vector control.** `"steer": {"random:warmth": 4.0}` steers with a random direction as long
+  as warmth's own at every layer of the scheme, fixed per name so reruns match.
+- **Judge-only trials.** `given_reply` (and, for pairwise, `given_baseline`) judge that text instead
+  of generating anything, `outcome` `given`: the judge's positive control on her own score-3 and
+  score-0 lines.
 ```json
 {"id": "warmth-single32-1", "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}],
  "steer": {"warmth": 1.0}, "scheme": "single:32", "max_tokens": 1000, "thinking": true, "steer_scope": "reply",

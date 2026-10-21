@@ -234,6 +234,41 @@ impl VectorBank {
         self.vectors.get(name)
     }
 
+    /// Add `name`: vector `src` with each layer's direction swapped for a
+    /// random one of the same length, the same on every run for a `seed`.
+    /// A control for the chat check: a push this size in no particular
+    /// direction.
+    pub fn insert_random_like(&mut self, name: &str, src: &str, seed: u64) -> Result<(), String> {
+        let v = self
+            .vectors
+            .get(src)
+            .ok_or_else(|| format!("{name}: there's no vector {src:?} to match"))?;
+        let mut rng = SplitMix(seed);
+        let mut data = vec![0.0f32; v.data.len()];
+        for (from, to) in v.data.chunks(self.n_embd).zip(data.chunks_mut(self.n_embd)) {
+            let norm = from
+                .iter()
+                .map(|&x| f64::from(x).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if norm == 0.0 {
+                continue;
+            }
+            let g: Vec<f64> = (0..self.n_embd).map(|_| rng.gaussian()).collect();
+            let gn = g.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for (d, x) in to.iter_mut().zip(&g) {
+                *d = (x * norm / gn) as f32;
+            }
+        }
+        let random = Vector {
+            data,
+            limits: v.limits.clone(),
+            hash: String::new(),
+        };
+        self.vectors.insert(name.to_string(), random);
+        Ok(())
+    }
+
     pub fn blend(&self, strengths: &BTreeMap<String, f32>) -> Blend {
         let mut blend = Blend::default();
         let mut data = vec![0.0f32; self.n_embd * (self.n_layer - 1)];
@@ -257,6 +292,29 @@ impl VectorBank {
             blend.data = Some(data);
         }
         blend
+    }
+}
+
+/// SplitMix64, enough randomness for a control vector without a crate.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in (0, 1].
+    fn unit(&mut self) -> f64 {
+        ((self.next() >> 11) + 1) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Standard normal (Box-Muller).
+    fn gaussian(&mut self) -> f64 {
+        (-2.0 * self.unit().ln()).sqrt() * (std::f64::consts::TAU * self.unit()).cos()
     }
 }
 
@@ -485,6 +543,28 @@ mod tests {
 
         let b = bank().blend(&strengths(&[("sad", 0.9)]));
         assert_eq!(b.applied["sad"], 0.5);
+    }
+
+    #[test]
+    fn random_controls_match_each_layers_length() {
+        let mut b = VectorBank::empty(8, 4);
+        let dirs: BTreeMap<u32, Vec<f32>> = [(1, vec![3.0; 8]), (3, vec![0.5; 8])].into();
+        let v = Vector::from_gguf(&vector_gguf(&dirs, 4, "", &[]), 8, 4, Limits::default());
+        b.insert("warmth", v.unwrap()).unwrap();
+        b.insert_random_like("random:warmth", "warmth", 7).unwrap();
+        let w = b.get("warmth").unwrap().data.clone();
+        let r = b.get("random:warmth").unwrap().data.clone();
+        let norm = |x: &[f32]| x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for (a, c) in w.chunks(8).zip(r.chunks(8)) {
+            assert!((norm(a) - norm(c)).abs() < 1e-4, "{a:?} vs {c:?}");
+        }
+        // Layer 2 had no direction and stays empty; the others point elsewhere.
+        assert_eq!(norm(&r[8..16]), 0.0);
+        assert!(r[..8].iter().zip(&w[..8]).any(|(x, y)| (x - y).abs() > 0.1));
+        // The same seed gives the same vector.
+        b.insert_random_like("again", "warmth", 7).unwrap();
+        assert_eq!(b.get("again").unwrap().data, r);
+        assert!(b.insert_random_like("random:nope", "nope", 7).is_err());
     }
 
     #[test]
