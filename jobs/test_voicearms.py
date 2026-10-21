@@ -58,7 +58,7 @@ class FakeRunTest(unittest.TestCase):
             for m in ("warmth", "teasing"):
                 r = report["moods"][m]
                 # Fake similarity drops at strength 1, so every arm steps down once, to 0.5.
-                for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl"):
+                for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl", "Dpca1-xvec", "Dpca4-icl"):
                     self.assertEqual(r["arms"][name]["strength"], 0.5, (m, name))
                 self.assertEqual([t["strength"] for t in r["A_layers"]["AL2"]["tried"]], [1.0, 0.5])
                 self.assertLess(r["arms"]["R"]["lift"], r["arms"]["A"]["lift"])
@@ -70,8 +70,12 @@ class FakeRunTest(unittest.TestCase):
             self.assertTrue(report["moods"]["teasing"]["borderline"])
             self.assertTrue((ck / "vectors" / "teasing.npy").exists())  # captured, not given
             self.assertFalse((ck / "vectors" / "warmth.npy").exists())  # given by voicesteer
-            self.assertEqual(set(report["blends"]["warmth+teasing"]), {"A", "B", "C", "D"})
-            self.assertEqual(report["moods"]["warmth"]["match"]["fit"]["layers"], [1, 2, 3, 4])
+            self.assertEqual(set(report["blends"]["warmth+teasing"]), {"A", "B", "C", "D", "Dpca1", "Dpca4"})
+            self.assertEqual(report["settings"]["match_targets"], ["mean", "pca:1", "pca:4"])
+            match = report["moods"]["warmth"]["match"]
+            self.assertEqual(set(match), {"mean", "pca:1", "pca:4"})
+            self.assertEqual(match["mean"]["fit"]["layers"], [1, 2, 3, 4])
+            self.assertIn("Dpca4-icl", (out / "report.md").read_text())
             self.assertTrue((out / "tokens" / "warmth.json").exists())
             for name in ("report.json", "report.md", "listen.md"):
                 self.assertNotIn("Secret subtitle", (out / name).read_text(), name)
@@ -136,6 +140,40 @@ class LayersTest(unittest.TestCase):
             self.assertLess(rows["layers"][2]["cross_mood_cosine"], rows["layers"][0]["cross_mood_cosine"])
             self.assertAlmostEqual(rows["swap"]["warmth"]["swap_lift"], 0.3)
             self.assertIn("Most distinct layers: 2", (tmp / "layers.md").read_text())
+
+
+class SharedTargetTest(unittest.TestCase):
+    """D's target types on made-up shifts: one shared direction plus one loud odd pair."""
+
+    def setUp(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch isn't installed")
+        self.torch = torch
+
+    def test_pca_keeps_the_shared_direction_and_drops_what_one_pair_carries(self):
+        torch = self.torch
+        g = torch.Generator().manual_seed(0)
+        shared = torch.zeros(2, 16)
+        shared[:, 0] = 3.0
+        pairs = shared.expand(10, 2, 16).clone() + 0.1 * torch.randn(10, 2, 16, generator=g)
+        pairs[0, :, 5] += 20.0  # one odd, loud pair
+        mean, energy = voicearms.shared_target(pairs, "mean")
+        self.assertIsNone(energy)
+        self.assertTrue(torch.allclose(mean, pairs.mean(0)))
+        one, energy = voicearms.shared_target(pairs, "pca:1")
+        self.assertEqual(one.shape, (2, 16))
+        self.assertGreater(float(one[0, 0]), 2.5)  # sign and size of the mean kept along the shared axis
+        self.assertLess(abs(float(one[0, 5])), abs(float(mean[0, 5])) / 4)  # the odd pair mostly gone
+        _, e2 = voicearms.shared_target(pairs, "pca:2")
+        self.assertGreater(float(e2[0]), float(energy[0]))
+        self.assertLessEqual(float(one[0].norm()), float(mean[0].norm()) + 1e-5)
+
+    def test_targets_are_checked(self):
+        self.assertEqual(voicearms.match_targets({}), ["mean", "pca:1", "pca:4"])
+        with self.assertRaises(SystemExit):
+            voicearms.match_targets({"match_targets": ["median"]})
 
 
 class HookTest(unittest.TestCase):
@@ -287,6 +325,10 @@ class TinyModelTest(unittest.TestCase):
                             {"fit_steps": 40, "fit_lr": 0.05, "fit_eval_every": 10, "fit_batch": 3})
         self.assertLess(fit["held_loss"], fit["start_held_loss"])
         self.assertEqual(set(fit["agreement"]), {"1", "2"})
+        pca = tts.fit_match(pos[:3], px[:3], zero[:3], zx[:3], zero[3:], zx[3:], init, [1, 2],
+                            {"fit_steps": 20, "fit_lr": 0.05, "fit_eval_every": 10, "fit_batch": 3}, "pca:1")
+        self.assertLess(pca["held_loss"], pca["start_held_loss"])
+        self.assertTrue(all(0 < v <= 1.0001 for v in pca["mean_kept"].values()))
         for a, b in zip(before, tts.m.parameters(), strict=True):
             self.assertTrue(torch.equal(a, b))
 

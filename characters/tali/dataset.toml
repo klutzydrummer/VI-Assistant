@@ -299,7 +299,7 @@ min_share = 0.75           # and on at least this share of the test sentences
 # her clips' audio, D a speaker token fitted to the residual-stream shift her clips share.
 # Before it: run voicesteer, then at home `python3 jobs/voicelayers.py <voicesteer out> --npz
 # corpus/tali/analysis/after_labels/voice_vectors.npz` (layer table, swap check, the vector bundle).
-# About 2-2.5 h on a 48 GB card for 7 moods and 2 blends. Needs Brandon's yes for the run.
+# About 3.5-4 h on a 48 GB card for 7 moods and 2 blends (D runs three target types). Needs Brandon's yes for the run.
 [stage.voicearms]
 command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
            "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz",
@@ -328,6 +328,7 @@ fit_steps = 200     # C and D
 fit_lr = 0.002
 fit_l2 = 0.01
 match_layers = "7-26"   # D: the talker layers whose shared residual shift the token is fitted to
+match_targets = ["mean", "pca:1", "pca:4"]   # D: one token per target (mean shift; PCA-cleaned mean)
 max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
 max_wer = 0.15
 min_lift = 0.1
@@ -357,6 +358,7 @@ held_max = 1
 fit_steps = 2
 fit_eval_every = 1
 fit_batch = 1
+match_targets = ["mean", "pca:1"]
 
 # GPU, manual: step 5's one rental, `vi dataset run characters/tali/dataset.toml rental5`
 # (docs/design/step5-rental-plan.md). jobs/rental5.sh takes every pre-decided branch itself and

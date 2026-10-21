@@ -20,7 +20,10 @@ sentences and seeds:
      positive clips share while the frozen model reproduces them (teacher-forced, each with its own
      x-vector), minus the same for their matched zeros; one speaker token is fitted so that, on her
      zero clips, it moves the residual by that shift. Used like C. The report says how shared the
-     shift is (each pair's shift against the target).
+     shift is (each pair's shift against the target). One token per target type (`match_targets`,
+     Brandon 2026-10-21: try them all): "mean" (the mean pair shift; arms D-<mode>), "pca:k" (the
+     mean projected onto the top k principal directions of the pair shifts, which drops what only a
+     few pairs carry; arms Dpcak-<mode>). "pca:1" is the single dominant shared direction.
 Baselines: N (neutral reference, nothing changed, in each mode) and S (swap: her top positive clip
 as the reference, the positive control for the probe on generated speech). Controls: a random
 vector of the same size per layer for A, and a random token shift of the same size for B and C.
@@ -80,6 +83,7 @@ def main():
     max_drop = float(s.get("max_similarity_drop", 0.05))
     max_wer = float(s.get("max_wer", 0.15))
     min_lift, min_share = float(s.get("min_lift", 0.1)), float(s.get("min_share", 0.75))
+    targets = match_targets(s)
     n_refs = int(s.get("refs_per_side", 32))
     decay = float(s.get("decay", 0.985))
     for b in blends:
@@ -134,7 +138,7 @@ def main():
               "settings": {"layer_sets": [f"{a[0]}-{a[-1]}" if len(a) > 1 else str(a[0]) for a in layer_sets],
                            "ladder": ladder, "above": above, "above_tau": above_tau, "decay": decay,
                            "max_similarity_drop": max_drop, "max_wer": max_wer, "min_lift": min_lift,
-                           "min_share": min_share, "pick": pick, "confirm": confirm},
+                           "min_share": min_share, "pick": pick, "confirm": confirm, "match_targets": targets},
               "residual_norms": norms, "moods": {}, "blends": {}}
     kept = {}
 
@@ -259,25 +263,31 @@ def main():
         # --- D: residual-matched speaker token (Brandon, 2026-10-21). The target is the shift her positive
         # clips share in the talker's residual stream while it reproduces them (each with its own x-vector),
         # against their matched zeros; the token is fitted so that on her zero clips it moves the residual
-        # by that shift. delta_match = fitted token - the zeros' mean x-vector it starts from.
+        # by that shift. delta_match = fitted token - the zeros' mean x-vector it starts from. One per target type.
         match_layers = parse_layers(s.get("match_layers", f"{tts.n_layers // 4}-{tts.n_layers - 2}"), tts.n_layers - 1)
         held_n = int(s.get("held_max", 16))
-        fit_m = cached(keep / "fits" / f"{mood}.match.json", lambda: tts.fit_match(
-            examples(tts, keep, clips, [p for p, _ in train]), xp, examples(tts, keep, clips, [z for _, z in train]), xz,
-            examples(tts, keep, clips, [z for _, z in held[:held_n]]),
-            [cached(keep / "xvec" / f"{z}.json", lambda c=clips[z]: tts.xvector(c)) for _, z in held[:held_n]],
-            np.mean(xz, 0).tolist(), match_layers, s))
-        delta_m = (np.array(fit_m["token"]) - np.mean(xz, 0)).tolist()
-        d = {}
-        for mode in ("xvec", "icl"):
-            k, tried = ladder_run(f"D-{mode}", mode, lambda k, m=mode: token_spec(base[m], x_voice, delta_m, k), above_tau)
-            d[mode] = {"strength": k, "tried": tried}
-            if k is not None:
-                arms[f"D-{mode}"] = token_arm(f"D-{mode}", mode, delta_m, k)
-        kept[mood]["D"] = d["xvec"]["strength"]
+        fits_m, deltas_m, d = {}, {}, {}
+        for target in targets:
+            tag = target_tag(target)
+            fit_m = cached(keep / "fits" / f"{mood}.match{'.' + tag if tag else ''}.json", lambda tg=target: tts.fit_match(
+                examples(tts, keep, clips, [p for p, _ in train]), xp, examples(tts, keep, clips, [z for _, z in train]), xz,
+                examples(tts, keep, clips, [z for _, z in held[:held_n]]),
+                [cached(keep / "xvec" / f"{z}.json", lambda c=clips[z]: tts.xvector(c)) for _, z in held[:held_n]],
+                np.mean(xz, 0).tolist(), match_layers, s, tg))
+            fits_m[target] = fit_m
+            deltas_m[target] = (np.array(fit_m["token"]) - np.mean(xz, 0)).tolist()
+            for mode in ("xvec", "icl"):
+                name = f"D{tag}-{mode}"
+                k, tried = ladder_run(name, mode, lambda k, m=mode, dv=deltas_m[target]: token_spec(base[m], x_voice, dv, k),
+                                      above_tau)
+                d[name] = {"strength": k, "tried": tried}
+                if k is not None:
+                    arms[name] = token_arm(name, mode, deltas_m[target], k)
+            kept[mood][f"D{tag}"] = d[f"D{tag}-xvec"]["strength"]
+        delta_m = deltas_m[targets[0]]
         (keep / "tokens").mkdir(parents=True, exist_ok=True)
         (keep / "tokens" / f"{mood}.json").write_text(json.dumps(
-            {"base": x_voice, "tau": tau, "delta": delta, "delta_match": delta_m}))
+            {"base": x_voice, "tau": tau, "delta": delta, **{f"delta_match{target_tag(g)}": v for g, v in deltas_m.items()}}))
 
         # --- held-out likelihood: does each setting favour her held-out positives over their zeros?
         scored_held = held[: int(s.get("held_max", 16))]
@@ -299,10 +309,13 @@ def main():
             settings_lik["B-icl"] = (shifted(x_voice, tau, b["icl"]["strength"]), None)
         if b["xvec"]["strength"] is not None:
             settings_lik["B-xvec"] = (shifted(x_voice, tau, b["xvec"]["strength"]), None)
-        for arm, res, dv in (("C", c, delta), ("D", d, delta_m)):
-            for mode in ("xvec", "icl"):
-                if res[mode]["strength"] is not None:
-                    settings_lik[f"{arm}-{mode}"] = (shifted(x_voice, dv, res[mode]["strength"]), None)
+        for mode in ("xvec", "icl"):
+            if c[mode]["strength"] is not None:
+                settings_lik[f"C-{mode}"] = (shifted(x_voice, delta, c[mode]["strength"]), None)
+            for target, dv in deltas_m.items():
+                name = f"D{target_tag(target)}-{mode}"
+                if d[name]["strength"] is not None:
+                    settings_lik[name] = (shifted(x_voice, dv, d[name]["strength"]), None)
         for arm, (spk, add) in settings_lik.items():
             lik[arm] = gain(nll(arm, spk, add), n0, mood)
 
@@ -321,8 +334,8 @@ def main():
                 verdicts[arm] = "loses voice or words"
             else:
                 verdicts[arm] = "steers" if steers else "doesn't steer"
-        for name in ("A", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl"):
-            if name not in arms:
+        for name in arm_names(targets):
+            if name not in arms and name not in ("A-decay", "A-xvec"):
                 verdicts[name] = "loses voice or words"
 
         report["moods"][mood] = {
@@ -336,11 +349,13 @@ def main():
             "delta": {"norm_ratio": ratio(delta, x_voice), "cosine_with_tau": round(cos(delta, tau), 4),
                       "fit_pos": {k: v for k, v in fit_p.items() if k != "token"},
                       "fit_zero": {k: v for k, v in fit_z.items() if k != "token"}},
-            "match": {"norm_ratio": ratio(delta_m, x_voice), "cosine_with_tau": round(cos(delta_m, tau), 4),
-                      "cosine_with_delta": round(cos(delta_m, delta), 4),
-                      "fit": {k: v for k, v in fit_m.items() if k != "token"}},
+            "match": {target: {"norm_ratio": ratio(dv, x_voice), "cosine_with_tau": round(cos(dv, tau), 4),
+                               "cosine_with_delta": round(cos(dv, delta), 4),
+                               "cosine_with_first_target": round(cos(dv, delta_m), 4),
+                               "fit": {k: v for k, v in fits_m[target].items() if k != "token"}}
+                      for target, dv in deltas_m.items()},
             "B_tried": b, "C_tried": c, "D_tried": d, "arms": arms, "likelihood_gain": lik, "verdicts": verdicts,
-            "tokens": {"tau": tau, "delta": delta, "delta_match": delta_m},
+            "tokens": {"tau": tau, "delta": delta, **{f"delta_match{target_tag(g)}": v for g, v in deltas_m.items()}},
         }
         log(f"voicearms: {mood}: " + ", ".join(f"{a} {v}" for a, v in sorted(verdicts.items())))
 
@@ -354,7 +369,9 @@ def main():
             v1, v2 = load_vectors(files, keep, m1, tts, clips, [], fake), load_vectors(files, keep, m2, tts, clips, [], fake)
             mix = [[0.5 * k1 * a + 0.5 * k2 * b for a, b in zip(x, y, strict=True)] for x, y in zip(v1, v2, strict=True)]
             out_b["A"] = blend_scores(speak(name, "A", add_spec(base["icl"], mix, L, 1.0, True, 1.0), tests), m1, m2, neutral_rows["icl"])
-        for arm, key, mode in (("B", "tau", "icl"), ("C", "delta", "xvec"), ("D", "delta_match", "xvec")):
+        token_arms = [("B", "tau", "icl"), ("C", "delta", "xvec")]
+        token_arms += [(f"D{target_tag(g)}", f"delta_match{target_tag(g)}", "xvec") for g in targets]
+        for arm, key, mode in token_arms:
             k1, k2 = kept.get(m1, {}).get(arm), kept.get(m2, {}).get(arm)
             if k1 is None or k2 is None:
                 continue
@@ -384,6 +401,47 @@ def parse_layers(spec, n_layers):
     if not layers or layers[-1] >= n_layers:
         raise SystemExit(f"voicearms: layer set {spec} is outside the talker's {n_layers} layers")
     return layers
+
+
+def match_targets(s):
+    """D's target types, in order; the first is the one the report compares the others with."""
+    out = [str(x) for x in s.get("match_targets", ["mean", "pca:1", "pca:4"])]
+    for x in out:
+        kind, _, k = x.partition(":")
+        if not (x == "mean" or (kind == "pca" and k.isdigit() and int(k) > 0)):
+            raise SystemExit(f"voicearms: match target {x!r} is not mean or pca:<k>")
+    return out
+
+
+def target_tag(target):
+    return "" if target == "mean" else target.replace(":", "")
+
+
+def arm_names(targets):
+    return ["A", "A-decay", "A-xvec", "B-icl", "B-xvec", "C-xvec", "C-icl"] + [
+        f"D{target_tag(g)}-{m}" for g in targets for m in ("xvec", "icl")]
+
+
+def shared_target(pairs, target):
+    """pairs: (pairs, layers, hidden) residual shifts, positive minus its zero. "mean": their mean.
+    "pca:k": per layer, the mean projected onto the top k principal directions of the shifts (uncentred,
+    so the first is the dominant shared direction), keeping the mean's sign and size along them. Each
+    shift is scaled to unit length for the directions, so every pair gets one vote and one loud clip
+    can't take the first direction. Also returns, per layer, the share of those unit shifts' energy
+    in the k directions."""
+    import torch
+
+    mean = pairs.mean(0)
+    if target == "mean":
+        return mean, None
+    k = int(target.split(":")[1])
+    unit = pairs.transpose(0, 1).float()  # layers x pairs x hidden
+    unit = unit / unit.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    _, sv, vh = torch.linalg.svd(unit, full_matrices=False)
+    basis = vh[:, :k]  # layers x k x hidden
+    proj = torch.einsum("lkh,lh->lk", basis, mean.float())
+    energy = sv[:, :k].pow(2).sum(-1) / sv.pow(2).sum(-1).clamp_min(1e-12)
+    return torch.einsum("lkh,lk->lh", basis, proj).to(mean.dtype), energy
 
 
 def label(layers):
@@ -733,7 +791,7 @@ class ArmTTS(steer.TTS):
         n = cd.shape[0]
         return torch.stack([hs[i + 1][0, p: p + n].float().mean(0) for i in layers])
 
-    def fit_match(self, pos, pos_x, zero, zero_x, held, held_x, init, layers, s):
+    def fit_match(self, pos, pos_x, zero, zero_x, held, held_x, init, layers, s, target="mean"):
         """One speaker token fitted, with every weight frozen, so that on her zero clips it shifts each
         layer's residual by the shift her positive clips share (mean over positives, each with its own
         x-vector, minus the same over their zeros), each layer weighted by that shift's size."""
@@ -746,9 +804,10 @@ class ArmTTS(steer.TTS):
         with torch.no_grad():
             sp = [self._states(e, torch.tensor(x, device=dev), layers) for e, x in zip(pos, pos_x, strict=True)]
             sz = [self._states(e, torch.tensor(x, device=dev), layers) for e, x in zip(zero, zero_x, strict=True)]
-            target = torch.stack(sp).mean(0) - torch.stack(sz).mean(0)  # layers x hidden
+            pairs = torch.stack(sp) - torch.stack(sz)  # pairs x layers x hidden
+            target, energy = shared_target(pairs, target)
             scale = target.norm(dim=-1).pow(2).clamp_min(1e-12)
-            pairs = torch.stack(sp) - torch.stack(sz)
+            kept_of_mean = target.norm(dim=-1) / pairs.mean(0).norm(dim=-1).clamp_min(1e-12)
             agreement = self.F.cosine_similarity(pairs, target[None], dim=-1).mean(0)  # per layer
             x0 = torch.tensor(init, device=dev, dtype=torch.float32)
             base_train = [self._states(e, x0, layers) for e in zero]
@@ -784,6 +843,8 @@ class ArmTTS(steer.TTS):
         return {"token": [float(x) for x in best.cpu()], "held_loss": best_loss, "start_held_loss": curve[0]["held"],
                 "curve": curve, "layers": layers, "agreement": {str(i): round(float(a), 4) for i, a in zip(layers, agreement)},
                 "target_norm": {str(i): round(float(v), 4) for i, v in zip(layers, scale.sqrt())},
+                "mean_kept": {str(i): round(float(v), 4) for i, v in zip(layers, kept_of_mean)},
+                "pc_energy": None if energy is None else {str(i): round(float(v), 4) for i, v in zip(layers, energy)},
                 "train_clips": len(zero), "held_clips": len(held)}
 
 
@@ -820,8 +881,9 @@ class FakeArmTTS:
         pull = sum(abs(x) for v in (add or {}).values() for x in v) + sum(spk)
         return round(2.0 + 0.1 * unit_hash("n", ex["id"]) - (0.01 * pull if "pos" in ex["id"] else 0.0), 5)
 
-    def fit_match(self, pos, pos_x, zero, zero_x, held, held_x, init, layers, s):
-        return {"token": [x + 0.3 for x in init], "held_loss": 0.4, "start_held_loss": 1.0, "curve": [], "layers": layers,
+    def fit_match(self, pos, pos_x, zero, zero_x, held, held_x, init, layers, s, target="mean"):
+        bump = 0.3 if target == "mean" else 0.2 + 0.01 * int(target.split(":")[1])
+        return {"token": [x + bump for x in init], "held_loss": 0.4, "start_held_loss": 1.0, "curve": [], "layers": layers,
                 "agreement": {str(i): 0.5 for i in layers}, "target_norm": {str(i): 1.0 for i in layers},
                 "train_clips": len(zero), "held_clips": len(held)}
 
@@ -855,10 +917,8 @@ class FakeScorer:
 # --- report -----------------------------------------------------------------------
 
 
-ARMS = ["A", "A-decay", "A-xvec", "B-icl", "B-xvec", "C-xvec", "C-icl", "D-xvec", "D-icl"]
-
-
 def render(r):
+    ARMS = arm_names(r["settings"].get("match_targets", ["mean"]))
     lines = ["# Steering Qwen3-TTS: three arms (voicearms)", "",
              f"Model {r['model']}, {r['layers']} talker layers, speaking from {r['voice']}. Strength picked on sentences "
              f"{r['settings']['pick']}, verdicts on {r['settings']['confirm']}.", "",
@@ -887,10 +947,13 @@ def render(r):
                      f"{x['natural_similarity_drop']} (allowance {x['similarity_allowance']}); tau/x {x['tau']['norm_ratio']}, "
                      f"split-half {x['tau']['split_half_cosine']}; delta/x {x['delta']['norm_ratio']}, cos(delta, tau) "
                      f"{x['delta']['cosine_with_tau']}; fit held-out loss {x['delta']['fit_pos']['start_held_loss']} -> "
-                     f"{x['delta']['fit_pos']['held_loss']}; matched token: shift shared by her clips (mean cosine of each "
-                     f"pair's shift to the target) {x['match']['fit'].get('agreement')}, match loss "
-                     f"{x['match']['fit'].get('start_held_loss')} -> {x['match']['fit'].get('held_loss')}, "
-                     f"cos(delta_match, delta) {x['match']['cosine_with_delta']}")
+                     f"{x['delta']['fit_pos']['held_loss']}")
+        for g, mt in x["match"].items():
+            f = mt["fit"]
+            lines.append(f"  - matched token, target {g}: shift shared by her clips (mean cosine of each pair's shift to "
+                         f"the target) {f.get('agreement')}, share of the mean kept {f.get('mean_kept')}, energy in those "
+                         f"directions {f.get('pc_energy')}, match loss {f.get('start_held_loss')} -> {f.get('held_loss')}, "
+                         f"cos with delta {mt['cosine_with_delta']}, with the first target's token {mt['cosine_with_first_target']}")
     if r["blends"]:
         lines += ["", "Blends (half of each mood's kept setting; probe lift for each mood over neutral):", ""]
         for name, arms in r["blends"].items():
@@ -904,7 +967,8 @@ def listen(r):
     lines = ["# Listening", "", "audio/_neutral/N-icl/<n>.wav is her neutral voice (N-xvec: x-vector-only mode).",
              "audio/<mood>/S/<n>.wav swaps in her top clip for that mood. audio/<mood>/<arm>@<k>/<n>.wav is an arm at",
              "strength k: A<layers> activation steering (-decay, -xvec variants), R the random control, B-<mode> her",
-             "x-vector shift, C-<mode> her fitted token, D-<mode> her residual-matched token, R-<arm> the token arms'",
+             "x-vector shift, C-<mode> her fitted token, D-<mode> her residual-matched token (Dpcak-<mode> with the",
+             "PCA-cleaned target), R-<arm> the token arms'",
              "random-shift controls.",
              "audio/<a>+<b>/<arm>/ are blends. Sentence n:", ""]
     lines += [f"{n}. {t}" for n, t in enumerate(TEST)]
