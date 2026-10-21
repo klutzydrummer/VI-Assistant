@@ -66,6 +66,18 @@ def shifted(x, seed=0, share=0.5):
     return (np.asarray(x) + share * np.linalg.norm(x) * d / np.linalg.norm(d)).tolist()
 
 
+def free_memory():
+    """Hand freed model memory back to the system before the next big model loads."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+
+
 class Clip:
     def __init__(self, path):
         self.audio, self.id, self.text = Path(path), Path(path).stem, None
@@ -232,26 +244,47 @@ def main():
 
     import voicearms
 
-    tts = voicearms.ArmTTS(args.model, "cpu")
+    # One big model in memory at a time (PyTorch F32 and the F32 GGUF together swapped a 32 GB PC): PyTorch
+    # makes the speakers and steering, is freed, qwentts.cpp runs every case, then PyTorch comes back to compare.
     ref = Clip(args.ref or qt / "examples" / "freeman.wav")
-    x = tts.xvector(ref)
+    prep, key = out / "prep.json", [args.model, str(ref.audio)]
+    p = json.loads(prep.read_text()) if prep.exists() else {}
+    if p.get("key") != key:
+        tts = voicearms.ArmTTS(args.model, "cpu")
+        x = tts.xvector(ref)
+        p = {"key": key, "x": list(map(float, x)), "steered": steering(tts, x, TEST[0], True, 0.985),
+             "steered-plain": steering(tts, x, TEST[0], False, 1.0)}
+        for k in ("steered", "steered-plain"):
+            p[k]["rows"] = p[k]["rows"].tolist()
+        prep.write_text(json.dumps(p))
+        del tts
+        free_memory()
+    x = p["x"]
+    for k in ("steered", "steered-plain"):
+        p[k]["add"] = {int(i): row for i, row in p[k]["add"].items()}
+    plan = [(who, spk, st, n) for who, spk, st in (("voice", x, None), ("shifted", shifted(x), None),
+                                                   ("steered", x, p["steered"]), ("steered-plain", x, p["steered-plain"]))
+            for n in range(args.sentences)]
+    runs = {}
+    for who, spk, st, n in plan:
+        dump = out / "dumps" / f"{who}-{n}"
+        runs[who, n] = run_qt(qt, args, spk, TEST[n], dump, out / "audio" / f"{who}-{n}-qt.wav", st)
+        print(f"qtcheck: qwen-tts {who} {n}: {len(runs[who, n][0])} frames in {runs[who, n][1]:.1f} s")
+
+    tts = voicearms.ArmTTS(args.model, "cpu")
     cases = []
-    steer_rn = steering(tts, x, TEST[0], True, 0.985)
-    steer_plain = steering(tts, x, TEST[0], False, 1.0)
-    for who, spk, st in (("voice", x, None), ("shifted", shifted(x), None), ("steered", x, steer_rn),
-                         ("steered-plain", x, steer_plain)):
-        for n in range(args.sentences):
-            dump = out / "dumps" / f"{who}-{n}"
-            codes, qt_s = run_qt(qt, args, spk, TEST[n], dump, out / "audio" / f"{who}-{n}-qt.wav", st)
-            stopped = len(codes) < args.max_new
-            stages, a0, asub = compare(tts, TEST[n], spk, codes, dump, stopped, st)
-            torch_s = None  # PyTorch on the CPU is slow: its audio (and the timing) for the first sentence only
-            if n == 0:
-                torch_s = speak_torch(tts, ref, spk, TEST[n], args.max_new, out / "audio" / f"{who}-{n}-torch.wav", st)
-            cases.append({"speaker": who, "sentence": n, "frames": len(codes), "stopped": stopped, "stages": stages,
-                          "agree_c0": a0, "agree_sub": asub, "qt_seconds": qt_s, "torch_seconds": torch_s})
-            print(f"qtcheck: {who} {n}: {len(codes)} frames, agree {a0}/{asub}, "
-                  + ", ".join(f"{k} {v.get('cos')}" for k, v in stages.items()))
+    for who, spk, st, n in plan:
+        dump = out / "dumps" / f"{who}-{n}"
+        codes, qt_s = runs[who, n]
+        stopped = len(codes) < args.max_new
+        stages, a0, asub = compare(tts, TEST[n], spk, codes, dump, stopped, st)
+        torch_s = None  # PyTorch on the CPU is slow: its audio (and the timing) for the first sentence only
+        if n == 0:
+            torch_s = speak_torch(tts, ref, spk, TEST[n], args.max_new, out / "audio" / f"{who}-{n}-torch.wav", st)
+        cases.append({"speaker": who, "sentence": n, "frames": len(codes), "stopped": stopped, "stages": stages,
+                      "agree_c0": a0, "agree_sub": asub, "qt_seconds": qt_s, "torch_seconds": torch_s})
+        print(f"qtcheck: {who} {n}: {len(codes)} frames, agree {a0}/{asub}, "
+              + ", ".join(f"{k} {v.get('cos')}" for k, v in stages.items()))
     a0 = round(float(np.mean([c["agree_c0"] for c in cases])), 4)
     asub = round(float(np.mean([c["agree_sub"] for c in cases])), 4)
     ok = all(v.get("cos") is not None and v["cos"] >= args.min_cos for c in cases for v in c["stages"].values()) and min(
