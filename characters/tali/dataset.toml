@@ -329,6 +329,7 @@ fit_lr = 0.002
 fit_l2 = 0.01
 match_layers = "7-26"   # D: the talker layers whose shared residual shift the token is fitted to
 match_targets = ["mean", "pca:1", "pca:4"]   # D: one token per target (mean shift; PCA-cleaned mean)
+listen_sentences = 1   # blind listening set for Brandon (listen/), sentences per condition
 max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
 max_wer = 0.15
 min_lift = 0.1

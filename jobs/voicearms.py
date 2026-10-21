@@ -40,6 +40,12 @@ Verdict per mood and arm: "steers" if the lift and share rules pass on the confi
 and words hold, it beats the random vector, and the likelihood gain's 95% interval is above 0.
 If S itself doesn't lift the probe, the mood is "probe can't hear it" and Brandon's ears decide.
 
+For his ears (Brandon, 2026-10-21): listen/ holds a short blind set, per mood one confirm-half
+sentence for neutral, swap, the random control and every arm at its kept strength (and each blend),
+renamed to numbers in a shuffled order, with her real example clip beside them and sheet.csv to fill
+in. `python3 jobs/voicearms.py --unblind <out folder>` joins his sheet to the hidden key and writes
+listen/results.md.
+
 Inputs (VI_FILES): voice_sets.json and voice_probe.npz as voicesteer's, and voicesteer's vectors
 bundled by `voicelayers.py --npz` as voice_vectors.npz (or vectors/<mood>.npy); a mood without one
 is captured here the way voicesteer does. Outputs: report.json, report.md, listen.md,
@@ -194,7 +200,7 @@ def main():
             ok, sim, w = holds(rows, mode)
             lift, share = lifted(rows, mode, confirm)
             return {"strength": k, "lift": lift, "share": share, "similarity": sim, "wer": w, "holds": ok,
-                    "probe": mean([r["probe"][mood] for r in rows])}
+                    "probe": mean([r["probe"][mood] for r in rows]), "audio": f"{arm}@{k:g}"}
 
         def token_arm(name, mode, d, k):
             """A token arm on the confirm half, with its own control: a random shift of the same size."""
@@ -342,7 +348,7 @@ def main():
             "route": mset.get("route"), "borderline": mset.get("borderline", False),
             "pairs": {"train": len(train), "held_out": len(held)},
             "natural_similarity_drop": natural, "similarity_allowance": round(allow, 4),
-            "swap": {"lift": swap_lift, "share": swap_share},
+            "swap": {"lift": swap_lift, "share": swap_share, "clip": swap_ref.id},
             "A_layers": {n: {k: v for k, v in r.items() if k != "layers"} for n, r in a_res.items()},
             "A_norm_fraction": norm_fraction(vec, a_res[a_best]["layers"], a_res[a_best]["strength"], norms) if a_best else None,
             "tau": {"norm_ratio": ratio(tau, x_voice), "split_half_cosine": tau_split},
@@ -382,6 +388,7 @@ def main():
 
     tts.close()
     shutil.copytree(keep / "audio", out / "audio", dirs_exist_ok=True)
+    listening_set(report, out, clips, confirm[: int(s.get("listen_sentences", 1))])
     if (keep / "tokens").exists():
         shutil.copytree(keep / "tokens", out / "tokens", dirs_exist_ok=True)
     for r in report["moods"].values():
@@ -963,6 +970,69 @@ def render(r):
     return "\n".join(lines) + "\n"
 
 
+def listening_set(r, out, clips, sentences):
+    """listen/<group>/<nn>.wav, blind and shuffled, plus her real example clip, sheet.csv and the hidden key."""
+    import csv
+
+    root = out / "listen"
+    shutil.rmtree(root, ignore_errors=True)
+    key, rows = {}, []
+    groups = [(m, [("neutral", "_neutral", "N-icl"), ("swap", m, "S")] +
+               [(a, m, v["audio"]) for a, v in x["arms"].items() if "audio" in v])
+              for m, x in sorted(r["moods"].items())]
+    groups += [(b, [("neutral", "_neutral", "N-icl")] + [(a, b, a) for a in arms])
+               for b, arms in sorted(r["blends"].items())]
+    for group, conds in groups:
+        (root / group).mkdir(parents=True)
+        items = [(cond, out / "audio" / d / a, n) for cond, d, a in conds for n in sentences]
+        items.sort(key=lambda i: unit_hash("listen", group, i[0], str(i[2])))
+        for num, (cond, src, n) in enumerate(items, 1):
+            wav = src / f"{n}.wav"
+            if not wav.exists():
+                continue
+            name = f"{num:02d}"
+            shutil.copy(wav, root / group / f"{name}.wav")
+            key[f"{group}/{name}"] = {"condition": cond, "sentence": n}
+            rows.append([group, name, TEST[n], "", "", "", ""])
+        if group in r["moods"]:
+            clip = clips.get(r["moods"][group]["swap"].get("clip"))
+            if clip is not None:
+                shutil.copy(clip.audio, root / group / f"her_example{Path(clip.audio).suffix}")
+    with open(root / "sheet.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["group", "clip", "sentence", "still_her_voice_y_n", "mood_heard_0_3", "words_clear_y_n", "notes"])
+        w.writerows(rows)
+    (root / "key.json").write_text(json.dumps(key, indent=1, sort_keys=True) + "\n")
+    (root / "README.md").write_text(
+        "# Blind listening set\n\nEach folder is a mood (or a blend, a+b). The numbered clips are the same sentence\n"
+        "spoken different ways (neutral, her swapped-in mood clip, and each steering method), in a shuffled order.\n"
+        "her_example is one of her real game clips in that mood. In sheet.csv, per clip: is it still her voice (y/n),\n"
+        "how much of the folder's mood you hear (0 none - 3 clearly; for a blend, name which moods), are the\n"
+        "words clear (y/n), and any notes. Don't open key.json until you're done.\n")
+
+
+def unblind(folder):
+    """His filled-in sheet.csv joined to key.json: listen/results.md."""
+    import csv
+
+    root = Path(folder) / "listen"
+    key = json.loads((root / "key.json").read_text())
+    by = {}
+    with open(root / "sheet.csv", newline="") as f:
+        for row in csv.DictReader(f):
+            k = key.get(f"{row['group']}/{row['clip']}")
+            if k:
+                by.setdefault(row["group"], []).append((k["condition"], row))
+    lines = ["# What Brandon heard", "", "| group | condition | her voice | mood heard | words clear | notes |",
+             "|---|---|---|---|---|---|"]
+    for group, items in sorted(by.items()):
+        for cond, row in sorted(items, key=lambda i: i[0]):
+            lines.append(f"| {group} | {cond} | {row['still_her_voice_y_n']} | {row['mood_heard_0_3']} | "
+                         f"{row['words_clear_y_n']} | {row['notes']} |")
+    (root / "results.md").write_text("\n".join(lines) + "\n")
+    print(f"wrote {root / 'results.md'}")
+
+
 def listen(r):
     lines = ["# Listening", "", "audio/_neutral/N-icl/<n>.wav is her neutral voice (N-xvec: x-vector-only mode).",
              "audio/<mood>/S/<n>.wav swaps in her top clip for that mood. audio/<mood>/<arm>@<k>/<n>.wav is an arm at",
@@ -983,4 +1053,9 @@ def fmt(x):
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--unblind":
+        unblind(sys.argv[2])
+    else:
+        main()
