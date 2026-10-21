@@ -1,0 +1,54 @@
+name: Vulkan build
+
+# Builds `vi --features vulkan` (Brandon's RX 480 at home) and runs the
+# builder's tests on it, separately from CI (it takes a while, and CI must
+# not need a GPU). There is no GPU here either: Mesa's software Vulkan
+# driver, lavapipe, runs the same llama.cpp Vulkan code on the CPU. ggml
+# skips CPU-type Vulkan devices unless they're named, hence
+# GGML_VK_VISIBLE_DEVICES.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/llm/**"
+      - "crates/vi/**"
+      - "Cargo.lock"
+      - ".github/workflows/vulkan.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/llm/**"
+      - "crates/vi/**"
+      - "Cargo.lock"
+      - ".github/workflows/vulkan.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+  GGML_VK_VISIBLE_DEVICES: "0"
+
+jobs:
+  lavapipe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vulkan headers, shader compiler and software driver
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            glslc libvulkan-dev spirv-headers mesa-vulkan-drivers vulkan-tools libclang-dev
+          vulkaninfo --summary | grep -E 'deviceName|driverName'
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vulkan
+      - name: Build vi with Vulkan
+        run: cargo build --release -p vi --features vulkan
+      - name: Selftest, capture on Vulkan against CPU
+        run: |
+          target/release/vi vectors selftest --dir /tmp/selftest | tee selftest.log
+          grep -q 'on Vulkan0' selftest.log || { echo "the capture didn't run on Vulkan" >&2; exit 1; }
+          grep '"backend"' /tmp/selftest/store/capture.json
+      - name: Builder tests on Vulkan (in parallel, as cargo runs them)
+        run: cargo test --release -p llm --features vulkan --test builder

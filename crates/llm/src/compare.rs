@@ -219,6 +219,7 @@ mod tests {
             model_sha256: "s".into(),
             architecture: "a".into(),
             llama_cpp: "l".into(),
+            backend: "cpu".into(),
             n_embd: 4,
             n_layer: 3,
             layers: vec![1],

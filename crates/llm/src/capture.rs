@@ -1023,6 +1023,7 @@ pub fn capture_all(
         model_sha256: run.model_sha256.to_string(),
         architecture: llama.architecture(),
         llama_cpp: LLAMA_CPP.to_string(),
+        backend: llama.backend().to_string(),
         n_embd: llama.n_embd(),
         n_layer: llama.n_layer(),
         layers: cap.layers.clone(),

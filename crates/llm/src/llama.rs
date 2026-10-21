@@ -11,7 +11,7 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use llama_cpp_sys_2 as sys;
 use sys::llama_token;
@@ -145,6 +145,7 @@ pub struct Llama {
     n_ctx: usize,
     n_batch: usize,
     template: Option<CString>,
+    backend: String,
     /// Tokens whose KV entries are in the cache, all decoded unsteered.
     cached: Vec<llama_token>,
 }
@@ -155,6 +156,7 @@ unsafe impl Send for Llama {}
 
 impl Drop for Llama {
     fn drop(&mut self) {
+        let _guard = SETUP.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             sys::llama_free(self.ctx);
             sys::llama_model_free(self.model);
@@ -164,11 +166,49 @@ impl Drop for Llama {
 
 static INIT: Once = Once::new();
 
+/// Held while a model and context are made or freed. The Vulkan backend's
+/// device setup isn't thread-safe: two contexts made at once in different
+/// threads crash in `ggml_vk_init`.
+static SETUP: Mutex<()> = Mutex::new(());
+
 fn init_backend() {
     INIT.call_once(|| unsafe {
         sys::llama_log_set(Some(log), ptr::null_mut());
         sys::llama_backend_init();
     });
+}
+
+/// [`Llama::backend`]: the first GPU device llama.cpp offloads to.
+fn backend_name(n_gpu_layers: i32, n_layer: i32) -> String {
+    if n_gpu_layers == 0 {
+        return "cpu".into();
+    }
+    unsafe {
+        for i in 0..sys::ggml_backend_dev_count() {
+            let dev = sys::ggml_backend_dev_get(i);
+            let ty = sys::ggml_backend_dev_type(dev);
+            if ty != sys::GGML_BACKEND_DEVICE_TYPE_GPU && ty != sys::GGML_BACKEND_DEVICE_TYPE_IGPU {
+                continue;
+            }
+            let text = |p: *const c_char| {
+                if p.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            let mut name = format!(
+                "{} ({})",
+                text(sys::ggml_backend_dev_name(dev)),
+                text(sys::ggml_backend_dev_description(dev))
+            );
+            if n_gpu_layers > 0 && n_gpu_layers < n_layer {
+                name += &format!(", {n_gpu_layers} of {n_layer} layers");
+            }
+            return name;
+        }
+    }
+    "cpu".into()
 }
 
 /// Pass llama.cpp's warnings and errors through, or everything with
@@ -194,6 +234,7 @@ impl Llama {
     ) -> Result<Self, String> {
         init_backend();
         let path = path_cstring(&config.path)?;
+        let _guard = SETUP.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut mp = sys::llama_model_default_params();
             mp.n_gpu_layers = config.n_gpu_layers;
@@ -225,6 +266,7 @@ impl Llama {
                 n_ctx: sys::llama_n_ctx(ctx) as usize,
                 n_batch: sys::llama_n_batch(ctx) as usize,
                 template,
+                backend: backend_name(config.n_gpu_layers, sys::llama_model_n_layer(model)),
                 cached: Vec::new(),
             })
         }
@@ -232,6 +274,13 @@ impl Llama {
 
     pub fn n_embd(&self) -> usize {
         self.n_embd
+    }
+
+    /// Where the layers run: `cpu`, or the GPU device, e.g.
+    /// `Vulkan0 (AMD Radeon RX 480 Graphics (RADV POLARIS10))`, with the
+    /// offloaded layer count when only some are.
+    pub fn backend(&self) -> &str {
+        &self.backend
     }
 
     pub fn n_layer(&self) -> usize {

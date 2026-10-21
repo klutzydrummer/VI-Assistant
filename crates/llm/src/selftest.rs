@@ -22,6 +22,8 @@ pub const LINES: usize = 60;
 #[derive(Debug, Clone, Serialize)]
 pub struct SelfTest {
     pub gpu_offload_supported: bool,
+    /// Where the first capture ran ([`Llama::backend`]).
+    pub backend: String,
     pub preflight: Preflight,
     pub fit_check: capture::FitCheck,
     /// Worst cosine and relative error, capture on `gpu_layers` against CPU.
@@ -108,6 +110,7 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
 
     log("preflight: layer, copy and reuse tests");
     let mut cap = load(&model, gpu_layers, &msgs)?;
+    let backend = cap.llama().backend().to_string();
     let prepared = cap.prepare(&msgs)?;
     let preflight = cap.preflight(&prepared)?;
     log("fit-level reuse check");
@@ -219,6 +222,7 @@ pub fn run(dir: &Path, gpu_layers: i32, mut log: impl FnMut(&str)) -> Result<Sel
     let passed = preflight.passed && fit_check.passed && gpu_vs_cpu_ok && steered_differs;
     Ok(SelfTest {
         gpu_offload_supported: unsafe { llama_cpp_sys_2::llama_supports_gpu_offload() },
+        backend,
         preflight,
         fit_check,
         gpu_vs_cpu: (min_cos, max_rel),

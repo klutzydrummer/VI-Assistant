@@ -32,6 +32,23 @@ Or with a real dialogue model: any chat GGUF, run in-process by llama.cpp and st
 
 Building needs cmake and a C++ compiler, since llama.cpp is compiled from source. It runs on the CPU by default; add `--features cuda` (rented GPU) or `--features vulkan` (RX 480) for a GPU backend.
 
+### Vulkan (RX 480 at home)
+A Vulkan build also needs `glslc` and the Vulkan and SPIR-V headers. On NixOS, from the repo:
+
+    nice -n 19 nix-shell -p cargo rustc gcc pkg-config openssl cmake clang llvmPackages.libclang vulkan-headers vulkan-loader shaderc.bin spirv-headers --run 'export LIBCLANG_PATH=$(dirname $(find $(nix-build --no-out-link "<nixpkgs>" -A llvmPackages.libclang.lib) -name "libclang.so*" | head -1)); nice -n 19 cargo build --release -p vi --features vulkan'
+
+- Every build at home must pass `--features vulkan`, `cargo run` included. A build without it quietly
+  replaces `target/release/vi` with a CPU-only one (and recompiles llama.cpp, about 8 minutes).
+- A GPU build offloads every layer by default; `--gpu-layers 0` runs on the CPU, `--gpu-layers N`
+  offloads N layers. 8 GB holds models up to about 8B at Q4; Qwen3.8-27B doesn't fit.
+- `vi vectors selftest` captures on the GPU and checks it against the CPU (the RX 480 passed on
+  2026-10-21, worst relative error 2.1e-4). A capture store records where it ran (`backend` in
+  `capture.json`) and won't resume on another backend.
+- Only llama.cpp uses the GPU. The Python models (Qwen3-TTS, emotion2vec, Whisper) have no Vulkan
+  path on the RX 480 and stay on the CPU or the rental.
+- `.github/workflows/vulkan.yml` builds it and runs the selftest and builder tests on Mesa's software
+  Vulkan driver, without a GPU.
+
 ## Cloud worker
 Heavy models and dataset jobs run on a rented Vast.ai GPU that releases itself when idle:
 
