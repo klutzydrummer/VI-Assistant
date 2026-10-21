@@ -382,6 +382,12 @@ fn print_fit_check(f: &capture::FitCheck) {
         f.worst_norm * 100.0,
         if f.passed { "ok" } else { "FAILED" }
     );
+    if !f.skipped.is_empty() {
+        println!(
+            "    {} other vectors not gated (not among the checked sets)",
+            f.skipped.len()
+        );
+    }
 }
 
 /// The fit-level reuse gate, on the lines of the first contrast sets.

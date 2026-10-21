@@ -145,3 +145,45 @@ fn the_capture_runs_on_qwen35s_hybrid_layout() {
     let p = cap.preflight(&prepared).unwrap();
     assert!(p.passed, "{p:#?}");
 }
+
+#[test]
+fn the_fit_check_gates_only_the_sets_it_captured() {
+    // Only one set's lines: every other set's mean_diff has no pairs and
+    // other moods may not vary, so their vectors are zero on both sides.
+    let dir = tempfile::tempdir().unwrap();
+    let path = model("fitcheck", 6);
+    let lines = llm::selftest::messages();
+    let mut cap = capturer(&path, "l_out", &lines);
+    let prepared = cap.prepare(&lines).unwrap();
+    let pairs = llm::selftest::pairs();
+    let want = vec!["loud".to_string()];
+    let (sets, subset) = capture::fit_check_lines(&prepared, &pairs, Some(&want));
+    assert_eq!(sets, want);
+    // A mood no line has: its joint vector is zero on both sides.
+    let mut labels = llm::selftest::labels();
+    for r in &mut labels {
+        r.scores.insert("never".into(), 0.0);
+    }
+    let range = capture::default_check_range(&cap.layers, cap.llama().n_layer());
+    let f = capture::reuse_fit_check(
+        &mut cap,
+        &subset,
+        sets,
+        &labels,
+        &pairs,
+        range,
+        dir.path(),
+        |_| {},
+    )
+    .unwrap();
+    assert!(f.passed, "{f:#?}");
+    assert!(f.worst_cos > 0.999, "{f:#?}");
+    assert!(
+        f.skipped.iter().any(|s| s.starts_with("joint:never")),
+        "{f:#?}"
+    );
+    assert!(
+        f.vectors.iter().all(|d| d.vector.ends_with(":loud")),
+        "{f:#?}"
+    );
+}

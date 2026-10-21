@@ -23,6 +23,7 @@
 //!   comparison) the lead-in is the last prompt token, as the `all` scope
 //!   steers.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 use std::fs;
 use std::path::Path;
@@ -867,8 +868,12 @@ pub struct FitCheck {
     pub sets: Vec<String>,
     /// Layers gated (inclusive); every layer is reported.
     pub layers: (u32, u32),
-    /// Joint and mean_diff, prefixed `joint:` and `mean_diff:`.
+    /// Joint and mean_diff, prefixed `joint:` and `mean_diff:`: the
+    /// checked sets' vectors, which the gate covers.
     pub vectors: Vec<crate::compare::VectorDiff>,
+    /// Vectors left out of the gate and why: other sets' (no pairs or no
+    /// variation among these lines, so zero or noise on both sides).
+    pub skipped: Vec<String>,
     pub worst_cos: f64,
     pub worst_norm: f64,
     pub passed: bool,
@@ -950,12 +955,24 @@ pub fn reuse_fit_check(
             |_| {},
         )?);
     }
+    // Only the checked sets' vectors: the lines were chosen for them, and
+    // any other vector has no pairs or no variation among these lines.
     let mut vectors = Vec::new();
+    let mut skipped = Vec::new();
     for (method, a, b) in [
         ("joint", &fits[0].joint, &fits[1].joint),
         ("mean_diff", &fits[0].mean_diff, &fits[1].mean_diff),
     ] {
-        for mut d in crate::compare::vector_maps(a, b)? {
+        for name in a.keys().filter(|n| !sets.contains(n)) {
+            skipped.push(format!("{method}:{name} (not a checked set)"));
+        }
+        let pick = |m: &BTreeMap<String, BTreeMap<u32, Vec<f32>>>| {
+            m.iter()
+                .filter(|(n, _)| sets.contains(n))
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        for mut d in crate::compare::vector_maps(&pick(a), &pick(b))? {
             d.vector = format!("{method}:{}", d.vector);
             vectors.push(d);
         }
@@ -975,6 +992,7 @@ pub fn reuse_fit_check(
         sets,
         layers: range,
         vectors,
+        skipped,
         worst_cos,
         worst_norm,
         passed,
