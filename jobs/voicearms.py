@@ -259,6 +259,9 @@ def main():
                        lambda: tts.fit(examples(tts, keep, clips, [z for _, z in train]),
                                        examples(tts, keep, clips, [z for _, z in held[: int(s.get("held_max", 16))]]), np.mean(xz, 0).tolist(), s))
         delta = (np.array(fit_p["token"]) - np.array(fit_z["token"])).tolist()
+        # Brandon, 2026-10-26: is a fitted token on its own her voice, where her plain x-vector loses the accent and
+        # suit? The token fitted to this mood's zero clips speaks x-vector-only with no mood added.
+        fitted_rows = speak(mood, "F-xvec", {**base["xvec"], "xvec": fit_z["token"]}, tests)
         c = {}
         for mode in ("xvec", "icl"):
             k, tried = ladder_run(f"C-{mode}", mode, lambda k, m=mode: token_spec(base[m], x_voice, delta, k), above_tau)
@@ -350,6 +353,7 @@ def main():
             "pairs": {"train": len(train), "held_out": len(held)},
             "natural_similarity_drop": natural, "similarity_allowance": round(allow, 4),
             "swap": {"lift": swap_lift, "share": swap_share, "clip": swap_ref.id, "seconds": swap_ref.duration_s},
+            "fitted_voice": {"similarity": mean([r["similarity"] for r in fitted_rows]), "audio": "F-xvec"},
             "A_layers": {n: {k: v for k, v in r.items() if k != "layers"} for n, r in a_res.items()},
             "A_norm_fraction": norm_fraction(vec, a_res[a_best]["layers"], a_res[a_best]["strength"], norms) if a_best else None,
             "tau": {"norm_ratio": ratio(tau, x_voice), "split_half_cosine": tau_split},
@@ -989,6 +993,7 @@ def listening_set(r, out, clips, sentences):
     shutil.rmtree(root, ignore_errors=True)
     key, rows = {}, []
     groups = [(m, [("neutral", "_neutral", "N-icl"), ("swap", m, "S")] +
+               ([("fitted", m, x["fitted_voice"]["audio"])] if "fitted_voice" in x else []) +
                [(a, m, v["audio"]) for a, v in x["arms"].items() if "audio" in v])
               for m, x in sorted(r["moods"].items())]
     groups += [(b, [("neutral", "_neutral", "N-icl")] + [(a, b, a) for a in arms])
@@ -1050,7 +1055,8 @@ def listen(r):
              "strength k: A<layers> activation steering (-decay, -xvec variants), R the random control, B-<mode> her",
              "x-vector shift, C-<mode> her fitted token, D-<mode> her residual-matched token (Dpcak-<mode> with the",
              "PCA-cleaned target), R-<arm> the token arms'",
-             "random-shift controls.",
+             "random-shift controls. audio/<mood>/F-xvec/<n>.wav is the token fitted to that mood's zero clips on",
+             "its own (x-vector-only, no mood): does a fitted token keep her voice?",
              "audio/<a>+<b>/<arm>/ are blends. Sentence n:", ""]
     lines += [f"{n}. {t}" for n, t in enumerate(TEST)]
     lines += ["", "Kept settings per mood:", ""]

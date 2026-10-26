@@ -84,7 +84,7 @@ class FakeRunTest(unittest.TestCase):
             key = json.loads((listen / "key.json").read_text())
             warm = sorted(k for k in key if k.startswith("warmth/"))
             conds = {key[k]["condition"] for k in warm}
-            self.assertTrue({"neutral", "swap", "A", "R", "B-icl", "C-xvec", "D-xvec", "Dpca4-icl"} <= conds, conds)
+            self.assertTrue({"neutral", "swap", "fitted", "A", "R", "B-icl", "C-xvec", "D-xvec", "Dpca4-icl"} <= conds, conds)
             self.assertTrue(all((listen / f"{k}.wav").exists() for k in key))
             self.assertTrue(any(listen.glob("warmth/her_example.*")))
             self.assertTrue(any(k.startswith("warmth+teasing/") for k in key))
