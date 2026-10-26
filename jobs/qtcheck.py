@@ -204,7 +204,7 @@ def stage_cosines(ours, dump):
 def icl_prefill(tts):
     """Hooks that keep what the talker's first (prefill) pass of a generate() sees: input embeddings, the
     layer outputs qwentts.cpp dumps, the final norm and the last position's logits. Returns (states, remove)."""
-    torch, model, got = tts.torch, tts.talker.model, {}
+    model, got = tts.talker.model, {}
 
     def first(name, value):
         if name not in got and value.shape[1] > 1:
