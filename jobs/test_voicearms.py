@@ -159,6 +159,15 @@ class LayersTest(unittest.TestCase):
             self.assertIn("Most distinct layers: 2", (tmp / "layers.md").read_text())
 
 
+class ReferenceTest(unittest.TestCase):
+    def test_first_in_window_else_longest(self):
+        from types import SimpleNamespace as C
+
+        short, ok, long_ = C(id="a", duration_s=1.2), C(id="b", duration_s=5.0), C(id="c", duration_s=20.0)
+        self.assertEqual(voicearms.reference([short, ok, long_], (3, 15)).id, "b")
+        self.assertEqual(voicearms.reference([short, long_], (3, 15)).id, "c")
+
+
 class SharedTargetTest(unittest.TestCase):
     """D's target types on made-up shifts: one shared direction plus one loud odd pair."""
 

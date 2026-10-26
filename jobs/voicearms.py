@@ -101,11 +101,12 @@ def main():
     neutral = [clips[i] for i in sets["neutral"] if i in clips]
     if not neutral:
         raise SystemExit("voicearms: none of the neutral clips are in harvest")
-    voice = neutral[0]
+    ref_len = (float(s.get("ref_min_s", 3.0)), float(s.get("ref_max_s", 15.0)))
+    voice = reference(neutral, ref_len)
     tests = list(range(int(s.get("test_sentences", len(TEST)))))
     half = len(tests) // 2
     pick, confirm = tests[:half], tests[half:]
-    log(f"voicearms: {len(moods)} moods, {len(blends)} blends, speaking from {voice.id}")
+    log(f"voicearms: {len(moods)} moods, {len(blends)} blends, speaking from {voice.id} ({voice.duration_s:.1f} s)")
 
     tts = FakeArmTTS() if fake else ArmTTS(s.get("model", MODEL), s.get("device", "cuda:0"))
     scorer = FakeScorer() if fake else voicesteer.Scorer(s)
@@ -140,7 +141,7 @@ def main():
     base_sim = {m: mean([r["similarity"] for r in rows]) for m, rows in neutral_rows.items()}
     x_voice = cached(keep / "xvec" / f"{voice.id}.json", lambda: tts.xvector(voice))
 
-    report = {"model": s.get("model", MODEL), "voice": voice.id, "layers": tts.n_layers,
+    report = {"model": s.get("model", MODEL), "voice": voice.id, "voice_seconds": voice.duration_s, "layers": tts.n_layers,
               "settings": {"layer_sets": [f"{a[0]}-{a[-1]}" if len(a) > 1 else str(a[0]) for a in layer_sets],
                            "ladder": ladder, "above": above, "above_tau": above_tau, "decay": decay,
                            "max_similarity_drop": max_drop, "max_wer": max_wer, "min_lift": min_lift,
@@ -210,7 +211,7 @@ def main():
             return r
 
         # Swap: her top positive clip as the reference (does the probe hear mood in generated speech?).
-        swap_ref = clips[train[0][0]] if train else clips[pairs[0][0]]
+        swap_ref = reference([clips[p] for p, _ in (train or pairs)], ref_len)
         swap_rows = speak(mood, "S", {"ref": swap_ref, "mode": "icl"}, tests)
         swap_lift, swap_share = lifted(swap_rows, "icl", tests)
 
@@ -348,7 +349,7 @@ def main():
             "route": mset.get("route"), "borderline": mset.get("borderline", False),
             "pairs": {"train": len(train), "held_out": len(held)},
             "natural_similarity_drop": natural, "similarity_allowance": round(allow, 4),
-            "swap": {"lift": swap_lift, "share": swap_share, "clip": swap_ref.id},
+            "swap": {"lift": swap_lift, "share": swap_share, "clip": swap_ref.id, "seconds": swap_ref.duration_s},
             "A_layers": {n: {k: v for k, v in r.items() if k != "layers"} for n, r in a_res.items()},
             "A_norm_fraction": norm_fraction(vec, a_res[a_best]["layers"], a_res[a_best]["strength"], norms) if a_best else None,
             "tau": {"norm_ratio": ratio(tau, x_voice), "split_half_cosine": tau_split},
@@ -453,6 +454,16 @@ def shared_target(pairs, target):
 
 def label(layers):
     return f"L{layers[0]}-{layers[-1]}" if len(layers) > 1 else f"L{layers[0]}"
+
+
+def reference(cands, length):
+    """The first clip (candidates come best first) whose length is in [lo, hi] seconds, else the longest:
+    a clip of a second or two gives the speaker encoder and the in-context prompt too little of her."""
+    lo, hi = length
+    for c in cands:
+        if lo <= c.duration_s <= hi:
+            return c
+    return max(cands, key=lambda c: c.duration_s)
 
 
 def held_out(clip):
