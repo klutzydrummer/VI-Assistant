@@ -84,7 +84,7 @@ class FakeRunTest(unittest.TestCase):
             key = json.loads((listen / "key.json").read_text())
             warm = sorted(k for k in key if k.startswith("warmth/"))
             conds = {key[k]["condition"] for k in warm}
-            self.assertTrue({"neutral", "swap", "A", "R", "B-icl", "C-xvec", "D-xvec", "Dpca4-icl"} <= conds, conds)
+            self.assertTrue({"neutral", "swap", "fitted", "A", "R", "B-icl", "C-xvec", "D-xvec", "Dpca4-icl"} <= conds, conds)
             self.assertTrue(all((listen / f"{k}.wav").exists() for k in key))
             self.assertTrue(any(listen.glob("warmth/her_example.*")))
             self.assertTrue(any(k.startswith("warmth+teasing/") for k in key))
@@ -157,6 +157,15 @@ class LayersTest(unittest.TestCase):
             self.assertLess(rows["layers"][2]["cross_mood_cosine"], rows["layers"][0]["cross_mood_cosine"])
             self.assertAlmostEqual(rows["swap"]["warmth"]["swap_lift"], 0.3)
             self.assertIn("Most distinct layers: 2", (tmp / "layers.md").read_text())
+
+
+class ReferenceTest(unittest.TestCase):
+    def test_first_in_window_else_longest(self):
+        from types import SimpleNamespace as C
+
+        short, ok, long_ = C(id="a", duration_s=1.2), C(id="b", duration_s=5.0), C(id="c", duration_s=20.0)
+        self.assertEqual(voicearms.reference([short, ok, long_], (3, 15)).id, "b")
+        self.assertEqual(voicearms.reference([short, long_], (3, 15)).id, "c")
 
 
 class SharedTargetTest(unittest.TestCase):
