@@ -100,6 +100,38 @@ class FakeRunTest(unittest.TestCase):
             self.assertIn(f"| {first_group} | {key[first_group + '/' + first_clip]['condition']} | y | 2 | y | nice |",
                           (listen / "results.md").read_text())
 
+    def test_weak_probe_still_judges_every_arm_and_voice_is_the_neutral_mean(self):
+        class WeakSwap(voicearms.FakeScorer):
+            def __call__(self, path, sentence, mood, probe, her):
+                r = super().__call__(path, sentence, mood, probe, her)
+                if Path(path).parent.name == "S":  # her own clip doesn't lift the probe
+                    r["probe"] = {m: 0.3 for m in r["probe"]}
+                return r
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            harvest, files = corpus(tmp)
+            out, ck = tmp / "out", tmp / "ck"
+            (tmp / "settings.json").write_text(json.dumps({
+                "backend": "fake", "layer_sets": ["2"], "moods": ["warmth"], "ladder": [1.0, 0.5], "test_sentences": 16}))
+            env = {"VI_SETTINGS": str(tmp / "settings.json"), "VI_OUT": str(out), "VI_CHECKPOINT": str(ck),
+                   "VI_INPUT_HARVEST": str(harvest), "VI_FILES": str(files)}  # fmt: skip
+            with mock.patch.dict(os.environ, env), mock.patch.object(voicearms, "FakeScorer", WeakSwap):
+                voicearms.main()
+            report = json.loads((out / "report.json").read_text())
+            r = report["moods"]["warmth"]
+            self.assertTrue(r["probe_weak"])
+            self.assertEqual(r["verdicts"]["A"], "steers (probe weak)")  # judged as usual, then marked
+            self.assertIn("(probe weak)", (out / "report.md").read_text())
+            self.assertEqual(len(report["settings"]["pick"]), 8)
+            self.assertEqual(len(report["settings"]["confirm"]), 8)
+            self.assertEqual(report["voice_xvec"], "mean of 2 neutral clips")
+            # The base token: the neutral clips' mean x-vector at their average norm.
+            xs = np.array([json.loads((ck / "xvec" / f"{i}.json").read_text()) for i in ("le3.z21_f", "le3.z23_f")])
+            want = xs.mean(0) * np.linalg.norm(xs, axis=1).mean() / np.linalg.norm(xs.mean(0))
+            base = json.loads((out / "tokens" / "warmth.json").read_text())["base"]
+            np.testing.assert_allclose(base, want, rtol=1e-9)
+
     def test_above_is_tried_only_when_full_strength_holds_without_lifting(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
