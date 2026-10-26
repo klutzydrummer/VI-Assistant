@@ -305,7 +305,7 @@ command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after
            "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz",
            "--put", "../../corpus/tali/analysis/after_labels/voice_vectors.npz", "python3", "jobs/voicearms.py"]
 inputs = ["harvest", "clean"]
-files = ["../../jobs/voicearms.py", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
+files = ["../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
          "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt",
          "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz",
          "corpus:analysis/after_labels/voice_vectors.npz"]
@@ -342,7 +342,7 @@ min_share = 0.75
 command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
            "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/voicearms.py"]
 inputs = ["harvest", "clean"]
-files = ["../../jobs/voicearms.py", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
+files = ["../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py", "../../jobs/steer.py", "../../jobs/clean.py",
          "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py", "../../jobs/requirements-steer.txt",
          "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz"]
 manual = true

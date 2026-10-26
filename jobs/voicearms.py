@@ -129,9 +129,14 @@ def main():
             if not path.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tts.speak(spec, TEST[n], seed(n), path)
-            rows.append(cached(keep / "scores" / mood / cond / f"{n}.json",
-                               lambda p=path, n=n: scorer(p, TEST[n], mood, probe, her)))
+            row = cached(keep / "scores" / mood / cond / f"{n}.json", lambda p=path, n=n: scorer(p, TEST[n], mood, probe, her))
+            rows.append({**row, "suit": cached(keep / "suit" / mood / cond / f"{n}.json", lambda p=path: suit_curve(p))})
         return rows
+
+    def suit_ref(ids):
+        """Her real clips' average spectrum shape: the suit's EQ is in it (filter_probe)."""
+        curves = [cached(keep / "suit" / "clips" / f"{i}.json", lambda c=clips[i]: suit_curve(c.audio)) for i in ids[:n_refs]]
+        return np.mean([c for c in curves if c], 0).tolist()
 
     base = {"icl": {"ref": voice, "mode": "icl"}, "xvec": {"ref": voice, "mode": "xvec"}}
     tts.measure = True  # residual norms per layer, read while the baselines speak
@@ -139,9 +144,11 @@ def main():
     tts.measure = False
     norms = cached(keep / "residual_norms.json", tts.residual_norms)
     base_sim = {m: mean([r["similarity"] for r in rows]) for m, rows in neutral_rows.items()}
+    suit_neutral = suit_ref([c.id for c in neutral])
+    base_suit = {m: suit_gap(rows, suit_neutral) for m, rows in neutral_rows.items()}
     x_voice = cached(keep / "xvec" / f"{voice.id}.json", lambda: tts.xvector(voice))
 
-    report = {"model": s.get("model", MODEL), "voice": voice.id, "voice_seconds": voice.duration_s, "layers": tts.n_layers,
+    report = {"suit_gap_db_neutral": base_suit, "model": s.get("model", MODEL), "voice": voice.id, "voice_seconds": voice.duration_s, "layers": tts.n_layers,
               "settings": {"layer_sets": [f"{a[0]}-{a[-1]}" if len(a) > 1 else str(a[0]) for a in layer_sets],
                            "ladder": ladder, "above": above, "above_tau": above_tau, "decay": decay,
                            "max_similarity_drop": max_drop, "max_wer": max_wer, "min_lift": min_lift,
@@ -200,7 +207,9 @@ def main():
             rows = speak(mood, f"{arm}@{k:g}", spec, confirm)
             ok, sim, w = holds(rows, mode)
             lift, share = lifted(rows, mode, confirm)
+            gap = suit_gap(rows, suit_mood)
             return {"strength": k, "lift": lift, "share": share, "similarity": sim, "wer": w, "holds": ok,
+                    "suit_gap_db": gap, "suit_lost": None if gap is None or base_suit[mode] is None else gap - base_suit[mode] > SUIT_FLAG_DB,
                     "probe": mean([r["probe"][mood] for r in rows]), "audio": f"{arm}@{k:g}"}
 
         def token_arm(name, mode, d, k):
@@ -211,6 +220,7 @@ def main():
             return r
 
         # Swap: her top positive clip as the reference (does the probe hear mood in generated speech?).
+        suit_mood = suit_ref([p for p, _ in train or pairs])  # mood-matched: a shout is brighter for real reasons
         swap_ref = reference([clips[p] for p, _ in (train or pairs)], ref_len)
         swap_rows = speak(mood, "S", {"ref": swap_ref, "mode": "icl"}, tests)
         swap_lift, swap_share = lifted(swap_rows, "icl", tests)
@@ -358,12 +368,11 @@ def main():
             "A_norm_fraction": norm_fraction(vec, a_res[a_best]["layers"], a_res[a_best]["strength"], norms) if a_best else None,
             "tau": {"norm_ratio": ratio(tau, x_voice), "split_half_cosine": tau_split},
             "delta": {"norm_ratio": ratio(delta, x_voice), "cosine_with_tau": round(cos(delta, tau), 4),
-                      "fit_pos": {k: v for k, v in fit_p.items() if k != "token"},
-                      "fit_zero": {k: v for k, v in fit_z.items() if k != "token"}},
+                      "fit_pos": fit_state(fit_p), "fit_zero": fit_state(fit_z)},
             "match": {target: {"norm_ratio": ratio(dv, x_voice), "cosine_with_tau": round(cos(dv, tau), 4),
                                "cosine_with_delta": round(cos(dv, delta), 4),
                                "cosine_with_first_target": round(cos(dv, delta_m), 4),
-                               "fit": {k: v for k, v in fits_m[target].items() if k != "token"}}
+                               "fit": fit_state(fits_m[target])}
                       for target, dv in deltas_m.items()},
             "B_tried": b, "C_tried": c, "D_tried": d, "arms": arms, "likelihood_gain": lik, "verdicts": verdicts,
             "tokens": {"tau": tau, "delta": delta, **{f"delta_match{target_tag(g)}": v for g, v in deltas_m.items()}},
@@ -458,6 +467,49 @@ def shared_target(pairs, target):
 
 def label(layers):
     return f"L{layers[0]}-{layers[-1]}" if len(layers) > 1 else f"L{layers[0]}"
+
+
+SUIT_FLAG_DB = 1.5  # a flag, not a gate: a method that loses the suit can have it put back by an effects chain
+
+
+def suit_curve(path):
+    """Long-term spectrum shape, third octaves 100 Hz-9 kHz in dB with the mean removed. Her suit is mostly an EQ
+    (a dip near 800 Hz, thin 2.5-4 kHz, a hissy top: filter_probe), so it shows here."""
+    import numpy as np
+    import soundfile as sf
+
+    import filter_probe as fp
+
+    x, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    x = x.mean(1)
+    n = round(sr / fp.GRID_HZ)
+    spec = fp.clip_spectrum(np.pad(x, (0, max(0, n - len(x)))), sr)  # silence adds no power: shape unchanged
+    if spec is None:
+        return None
+    g = fp.grid()
+    db = fp.smooth_octave(g, 10 * np.log10(spec + 1e-20))
+    v = np.interp([t for t in fp.THIRDS if 100 <= t <= 9000], g, db)
+    return (v - np.nanmean(v)).round(2).tolist()
+
+
+def suit_gap(rows, ref):
+    """Mean RMS dB between the generated clips' spectrum shapes and her real clips' (lower: closer to her suit)."""
+    import numpy as np
+
+    gaps = [float(np.sqrt(np.nanmean((np.array(r["suit"]) - np.array(ref)) ** 2))) for r in rows if r.get("suit")]
+    return round(mean(gaps), 2) if gaps else None
+
+
+def fit_state(f):
+    """A fit's numbers without its token, plus whether its held-out loss was still falling at the end."""
+    out = {k: v for k, v in f.items() if k != "token"}
+    held = [c for c in f.get("curve", []) if c.get("held") is not None]
+    if len(held) >= 3:
+        best = min(held, key=lambda c: c["held"])
+        tail = held[-max(2, len(held) // 4)]
+        out["best_step"] = best["step"]
+        out["still_improving"] = best is held[-1] and held[-1]["held"] < tail["held"] * 0.99
+    return out
 
 
 def reference(cands, length):
@@ -956,11 +1008,13 @@ def render(r):
                 cells.append(v or "-")
                 continue
             lk_s = f" [{lk['low']:+.3f}, {lk['high']:+.3f}]" if lk else ""
-            cells.append(f"{v} x{arm['strength']:g} {fmt(arm['lift'])}{lk_s}")
+            cells.append(f"{v} x{arm['strength']:g} {fmt(arm['lift'])}{lk_s}{' suit?' if arm.get('suit_lost') else ''}")
         rl = x["arms"].get("R", {}).get("lift")
         lines.append(f"| {m}{' (borderline)' if x['borderline'] else ''} | {fmt(x['swap']['lift'])} | " + " | ".join(cells)
                      + f" | {fmt(rl)} |")
-    lines += ["", "Per mood: A's layer settings (kept strength, pick-half lift), the push as a share of the residual, "
+    lines += ["", (f"suit? marks an arm whose spectrum is more than {SUIT_FLAG_DB} dB further from her real clips' than "
+                   f"neutral's ({r.get('suit_gap_db_neutral')}): it may have lost the suit effect. A flag only; an effects "
+                   "chain can put the suit back on the best method."), "", "Per mood: A's layer settings (kept strength, pick-half lift), the push as a share of the residual, "
               "and her own x-vector and fitted-token shifts:", ""]
     for m, x in sorted(r["moods"].items()):
         a = ", ".join(f"{n} x{v['strength']}{' ' + fmt(v.get('lift')) if v.get('lift') is not None else ''}"
@@ -969,12 +1023,12 @@ def render(r):
                      f"{x['natural_similarity_drop']} (allowance {x['similarity_allowance']}); tau/x {x['tau']['norm_ratio']}, "
                      f"split-half {x['tau']['split_half_cosine']}; delta/x {x['delta']['norm_ratio']}, cos(delta, tau) "
                      f"{x['delta']['cosine_with_tau']}; fit held-out loss {x['delta']['fit_pos']['start_held_loss']} -> "
-                     f"{x['delta']['fit_pos']['held_loss']}")
+                     f"{x['delta']['fit_pos']['held_loss']}{still(x['delta']['fit_pos'])}")
         for g, mt in x["match"].items():
             f = mt["fit"]
             lines.append(f"  - matched token, target {g}: shift shared by her clips (mean cosine of each pair's shift to "
                          f"the target) {f.get('agreement')}, share of the mean kept {f.get('mean_kept')}, energy in those "
-                         f"directions {f.get('pc_energy')}, match loss {f.get('start_held_loss')} -> {f.get('held_loss')}, "
+                         f"directions {f.get('pc_energy')}, match loss {f.get('start_held_loss')} -> {f.get('held_loss')}{still(f)}, "
                          f"cos with delta {mt['cosine_with_delta']}, with the first target's token {mt['cosine_with_first_target']}")
     if r["blends"]:
         lines += ["", "Blends (half of each mood's kept setting; probe lift for each mood over neutral):", ""]
@@ -1063,6 +1117,10 @@ def listen(r):
     for m, x in sorted(r["moods"].items()):
         lines.append(f"- {m}: " + ", ".join(f"{a} x{v['strength']:g}" for a, v in x["arms"].items()))
     return "\n".join(lines) + "\n"
+
+
+def still(fit):
+    return " (still improving at the last step: more steps may help)" if fit.get("still_improving") else ""
 
 
 def fmt(x):

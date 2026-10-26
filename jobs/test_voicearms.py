@@ -84,6 +84,9 @@ class FakeRunTest(unittest.TestCase):
             key = json.loads((listen / "key.json").read_text())
             warm = sorted(k for k in key if k.startswith("warmth/"))
             conds = {key[k]["condition"] for k in warm}
+            rep = json.loads((out / "report.json").read_text())
+            self.assertIn("suit_gap_db", rep["moods"]["warmth"]["arms"]["A"])
+            self.assertIn("suit_gap_db_neutral", rep)
             self.assertTrue({"neutral", "swap", "fitted", "A", "R", "B-icl", "C-xvec", "D-xvec", "Dpca4-icl"} <= conds, conds)
             self.assertTrue(all((listen / f"{k}.wav").exists() for k in key))
             self.assertTrue(any(listen.glob("warmth/her_example.*")))
@@ -157,6 +160,32 @@ class LayersTest(unittest.TestCase):
             self.assertLess(rows["layers"][2]["cross_mood_cosine"], rows["layers"][0]["cross_mood_cosine"])
             self.assertAlmostEqual(rows["swap"]["warmth"]["swap_lift"], 0.3)
             self.assertIn("Most distinct layers: 2", (tmp / "layers.md").read_text())
+
+
+class SuitTest(unittest.TestCase):
+    def test_eq_change_shows_in_the_gap(self):
+        import soundfile as sf
+        from scipy import signal
+
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal(24000 * 2).astype(np.float32) * 0.1
+        b, a = signal.butter(2, [600, 1000], btype="bandstop", fs=24000)  # a dip like the suit's near 800 Hz
+        with tempfile.TemporaryDirectory() as d:
+            sf.write(f"{d}/plain.wav", x, 24000)
+            sf.write(f"{d}/dip.wav", signal.lfilter(b, a, x).astype(np.float32), 24000)
+            sf.write(f"{d}/short.wav", x[:2400], 24000)
+            plain, dip = voicearms.suit_curve(f"{d}/plain.wav"), voicearms.suit_curve(f"{d}/dip.wav")
+            self.assertIsNotNone(voicearms.suit_curve(f"{d}/short.wav"))
+        self.assertEqual(voicearms.suit_gap([{"suit": plain}], plain), 0.0)
+        self.assertGreater(voicearms.suit_gap([{"suit": dip}], plain), voicearms.SUIT_FLAG_DB)
+
+    def test_fit_state_flags_a_fit_still_falling(self):
+        falling = {"token": [0.0], "curve": [{"step": i, "held": 1.0 - 0.1 * i} for i in range(5)]}
+        flat = {"token": [0.0], "curve": [{"step": i, "held": h} for i, h in enumerate([1.0, 0.5, 0.4, 0.4, 0.41])]}
+        self.assertTrue(voicearms.fit_state(falling)["still_improving"])
+        self.assertNotIn("token", voicearms.fit_state(falling))
+        self.assertFalse(voicearms.fit_state(flat)["still_improving"])
+        self.assertEqual(voicearms.fit_state(flat)["best_step"], 2)
 
 
 class ReferenceTest(unittest.TestCase):
