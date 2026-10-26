@@ -334,5 +334,23 @@ pub fn write_listening(dir: &Path) -> std::io::Result<()> {
     fs::write(qt.join("report.json"), r#"{"verdict": "matches"}"#)?;
     fs::write(qt.join("audio/freeman-0-qt.wav"), tone(200.0, 1.0))?;
     fs::write(qt.join("audio/freeman-0-torch.wav"), tone(200.0, 1.0))?;
-    fs::write(qt.join("audio/freeman-1-qt.wav"), tone(240.0, 1.0))
+    fs::write(qt.join("audio/freeman-1-qt.wav"), tone(240.0, 1.0))?;
+
+    // A clip list a thread might write: three of her lines by id.
+    let harvest = dir.join("stages/harvest/synthetic/out");
+    let ids: Vec<String> = fs::read_to_string(harvest.join(LINES))?
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| Some(v["id"].as_str()?.to_string()))
+        .take(3)
+        .collect();
+    let list = dir.join("analysis/clips-demo");
+    fs::create_dir_all(&list)?;
+    let mut toml = String::from(
+        "title = \"Which of these sound warm?\"\nquestion = \"Is she warm here?\"\nanswers = [\"warm\", \"not warm\", \"unsure\"]\nasked_by = \"Steering research for Qwen3-TTS\"\n",
+    );
+    for (n, id) in ids.iter().enumerate() {
+        toml += &format!("\n[[clip]]\nid = \"{id}\"\nlabel = \"pick {}\"\n", n + 1);
+    }
+    fs::write(list.join(crate::clips::CLIPS), toml)
 }

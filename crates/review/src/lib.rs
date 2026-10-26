@@ -9,6 +9,7 @@
 //! effect on top of the suit filter.
 
 pub mod channel;
+pub mod clips;
 pub mod corpus;
 pub mod fixture;
 pub mod gold;

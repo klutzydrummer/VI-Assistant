@@ -7,8 +7,9 @@
 //! Tasks are found, not registered: purity, gold and channel when their
 //! inputs exist, every blind listening set (`listen/sheet.csv` with its
 //! `key.json`) and qtcheck folder under a stage's current output or
-//! `analysis/`, and any `task.toml` a job leaves beside its output for a
-//! review the hub doesn't know yet. The home page rescans on every visit.
+//! `analysis/`, any `clips.toml` (a quick clip list a job or a Claude
+//! thread writes to play him some clips), and any `task.toml` a job leaves
+//! beside its output for a review the hub doesn't know yet. The home page rescans on every visit.
 //!
 //! When a task's state changes (finished, or reopened by new data) the
 //! hub appends it to `hub.jsonl`, so Done shows when it was finished.
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::channel::{self, Channel};
+use crate::clips::{self, Clips, Index};
 use crate::corpus::current_out;
 use crate::gold::{self, Gold};
 use crate::listen::{self, Listen, QtCheck};
@@ -108,6 +110,9 @@ pub struct Hub {
     listens: BTreeMap<String, Listen>,
     checks: BTreeMap<String, QtCheck>,
     notes: BTreeMap<String, Note>,
+    lists: BTreeMap<String, Clips>,
+    /// Her lines' audio, read when the first clip list needs it.
+    index: Option<Index>,
     /// Problems found while scanning, shown under "Not ready".
     problems: BTreeMap<String, String>,
     log: Vec<Event>,
@@ -146,6 +151,8 @@ impl Hub {
             listens: BTreeMap::new(),
             checks: BTreeMap::new(),
             notes: BTreeMap::new(),
+            lists: BTreeMap::new(),
+            index: None,
             problems: BTreeMap::new(),
             log,
             root,
@@ -225,6 +232,22 @@ impl Hub {
                     }
                     Err(e) => {
                         self.problems.insert(format!("qtcheck:{rel}"), e);
+                    }
+                }
+            }
+        }
+        let lists: BTreeSet<String> = found.lists.iter().map(|d| self.rel(d)).collect();
+        self.lists.retain(|k, c| lists.contains(k) && !c.stale());
+        for dir in &found.lists {
+            let rel = self.rel(dir);
+            if let Entry::Vacant(slot) = self.lists.entry(rel.clone()) {
+                let index = self.index.get_or_insert_with(|| Index::load(&self.root));
+                match Clips::load(&self.root, dir, index) {
+                    Ok(c) => {
+                        slot.insert(c);
+                    }
+                    Err(e) => {
+                        self.problems.insert(format!("clips:{rel}"), e);
                     }
                 }
             }
@@ -394,6 +417,31 @@ impl Hub {
                 &|| format!("qtcheck listening for {root}/{rel} is done:\n{}", q.report()),
             );
         }
+        for (rel, c) in &self.lists {
+            let asked = if c.file.asked_by.is_empty() {
+                String::new()
+            } else {
+                format!(" (for \"{}\")", c.file.asked_by)
+            };
+            push(
+                format!("clips:{rel}"),
+                "clips",
+                c.file.title.clone(),
+                c.file.question.clone(),
+                rel.clone(),
+                Some(format!("/clips/{}/", slug(rel))),
+                (c.done(), c.total()),
+                "clips answered",
+                &|| {
+                    format!(
+                        "Clips \"{}\"{asked} are done ({root}/{rel}/{}):\n{}",
+                        c.file.title,
+                        clips::ANSWERS,
+                        c.report()
+                    )
+                },
+            );
+        }
         for (rel, n) in &self.notes {
             let done = n.dir.join(TASK_DONE).is_file();
             let asked = (!n.asked_by.is_empty()).then(|| format!(" (for \"{}\")", n.asked_by));
@@ -524,6 +572,7 @@ struct Found {
     listens: Vec<PathBuf>,
     checks: Vec<PathBuf>,
     notes: Vec<PathBuf>,
+    lists: Vec<PathBuf>,
 }
 
 fn walk(dir: &Path, depth: usize, found: &mut Found) {
@@ -536,6 +585,9 @@ fn walk(dir: &Path, depth: usize, found: &mut Found) {
     }
     if dir.join(TASK).is_file() {
         found.notes.push(dir.to_path_buf());
+    }
+    if dir.join(clips::CLIPS).is_file() {
+        found.lists.push(dir.to_path_buf());
     }
     if depth == 0 {
         return;
@@ -625,6 +677,15 @@ pub fn handle(h: &mut Hub, post: bool, url: &str, body: &str) -> Reply {
             listen::handle_listen(l, post, &rest, body),
             &format!("listen:{rel}"),
         );
+    }
+    if let Some(rest) = url.strip_prefix("/clips/") {
+        let Some((rel, rest)) = split_seg(rest).map(|(s, r)| (s.replace('~', "/"), r)) else {
+            return Reply::Redirect(format!("{url}/"));
+        };
+        let Some(c) = h.lists.get_mut(&rel) else {
+            return Reply::NotFound;
+        };
+        return barred(clips::handle(c, post, &rest, body), &format!("clips:{rel}"));
     }
     if let Some(rest) = url.strip_prefix("/qtcheck/") {
         let Some((rel, rest)) = split_seg(rest).map(|(s, r)| (s.replace('~', "/"), r)) else {
@@ -1016,6 +1077,102 @@ mod tests {
             "{}",
             t["report"]
         );
+    }
+
+    #[test]
+    fn a_clip_list_plays_ids_and_paths_and_hides_labels_when_blind() {
+        let (dir, mut hub) = demo();
+        let corpus = crate::Corpus::load(dir.path()).unwrap();
+        let line = &corpus.lines[0];
+        let at = dir.path().join("analysis/steering/round1");
+        fs::create_dir_all(at.join("wav")).unwrap();
+        fs::write(at.join("wav/a.wav"), b"RIFF").unwrap();
+        let toml = format!(
+            "title = \"Fitted tokens\"\nquestion = \"Warm?\"\nanswers = [\"warm\", \"not\"]\nblind = true\nasked_by = \"TTS steering\"\n\
+             [[clip]]\nid = \"{}\"\nlabel = \"her real clip\"\n\
+             [[clip]]\npath = \"wav/a.wav\"\nlabel = \"C-mean\"\n\
+             [[clip]]\npath = \"corpus:analysis/steering/round1/wav/a.wav\"\ntext = \"same file, from the corpus root\"\n\
+             [[clip]]\npath = \"wav/missing.wav\"\n",
+            line.id
+        );
+        fs::write(at.join(clips::CLIPS), toml).unwrap();
+        let id = "clips:analysis/steering/round1".to_string();
+        assert!(ids(&hub.view(), "pending").contains(&id));
+
+        let base = "/clips/analysis~steering~round1";
+        let s = json(handle(&mut hub, false, &format!("{base}/api/session"), ""));
+        assert_eq!(s["total"], 4);
+        assert!(s["clips"][0]["label"].is_null(), "blind hides labels");
+        assert_eq!(s["clips"][0]["text"], line.text.as_str());
+        assert_eq!(s["clips"][3]["audio"], false);
+        assert!(
+            matches!(handle(&mut hub, false, &format!("{base}/audio?n=0"), ""), Reply::Audio(p) if p.exists())
+        );
+        assert!(
+            matches!(handle(&mut hub, false, &format!("{base}/audio?n=2"), ""), Reply::Audio(p) if p.ends_with("wav/a.wav"))
+        );
+        assert!(matches!(
+            handle(&mut hub, false, &format!("{base}/audio?n=3"), ""),
+            Reply::NotFound
+        ));
+        assert!(
+            matches!(handle(&mut hub, false, &format!("{base}/"), ""), Reply::Html(p) if p.contains("hubbar"))
+        );
+
+        let answer = |hub: &mut Hub, n: usize, a: &str| {
+            handle(
+                hub,
+                true,
+                &format!("{base}/api/answer"),
+                &json!({"n": n, "answer": a, "note": "bit flat"}).to_string(),
+            )
+        };
+        assert!(
+            matches!(answer(&mut hub, 0, "yes"), Reply::Bad(_)),
+            "only its own answers"
+        );
+        assert!(matches!(answer(&mut hub, 9, "warm"), Reply::Bad(_)));
+        for n in 0..3 {
+            json(answer(&mut hub, n, "warm"));
+        }
+        let s = json(answer(&mut hub, 3, "not"));
+        assert_eq!(
+            s["clips"][1]["label"], "C-mean",
+            "labels show once all are answered"
+        );
+        let t = json(handle(&mut hub, false, &format!("/api/task?id={id}"), ""));
+        let report = t["report"].as_str().unwrap();
+        assert!(report.contains("(for \"TTS steering\")"), "{report}");
+        assert!(
+            report.contains("- C-mean (wav/a.wav): warm: bit flat"),
+            "{report}"
+        );
+
+        // Answers live beside the list and survive a restart.
+        let again = Hub::load(dir.path(), dir.path().join("no-moods.toml")).unwrap();
+        assert_eq!(again.lists["analysis/steering/round1"].done(), 4);
+
+        for bad in [
+            "path = \"../x.wav\"",
+            "path = \"/etc/passwd\"",
+            "id = \"a\"\npath = \"b\"",
+            "nope = 1",
+        ] {
+            fs::write(
+                at.join(clips::CLIPS),
+                format!("title = \"t\"\n[[clip]]\n{bad}\n"),
+            )
+            .unwrap();
+            let file = fs::File::options()
+                .append(true)
+                .open(at.join(clips::CLIPS))
+                .unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(9))
+                .unwrap();
+            let v = hub.view();
+            assert!(v["not_ready"].to_string().contains("clips.toml"), "{bad}");
+            assert!(!ids(&v, "pending").contains(&id), "{bad}");
+        }
     }
 
     #[test]

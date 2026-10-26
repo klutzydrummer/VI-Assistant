@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clips</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #fff; --text: #1d1d1b; --muted: #6b6a65;
+    --line: #e2e0da; --accent: #2f6fb3; --accent-soft: #dbe7f5;
+    --yes: #2e7d4f; --no: #b3392f; --warn: #b8701a; --warn-soft: #f7e7d1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #201f1d; --text: #ecebe6; --muted: #9b998f;
+      --line: #34322e; --accent: #7fb0e6; --accent-soft: #23344a;
+      --yes: #6fc492; --no: #e57b70; --warn: #e0a253; --warn-soft: #3d2f1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 760px; margin: 0 auto; padding: 14px 16px 60px; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  h1 { font-size: 17px; margin: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .bar { flex: 1 1 120px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar div { height: 100%; background: var(--accent); width: 0; }
+  .question { font-size: 16px; margin: 6px 0 12px; padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 6px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--line); border-radius: 12px; padding: 10px 14px; margin-bottom: 10px; }
+  .panel.answered { border-left-color: var(--yes); }
+  .top { display: flex; gap: 8px; align-items: baseline; }
+  .num { font-weight: 600; }
+  .label { font-weight: 600; }
+  .say { color: var(--muted); font-size: 14px; margin: 2px 0; }
+  audio { width: 100%; margin: 4px 0; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+  .row button { flex: 1 1 0; min-width: 70px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 10px; padding: 9px 10px; cursor: pointer; touch-action: manipulation; }
+  button.on { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+  textarea { font: inherit; font-size: 14px; width: 100%; min-height: 36px; border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; background: var(--panel); color: var(--text); margin-top: 6px; }
+  .missing { color: var(--no); font-size: 13px; }
+  .err { color: var(--no); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">Clips</h1>
+    <span id="progress" class="muted small"></span>
+    <div class="bar"><div id="barfill"></div></div>
+  </header>
+  <div id="question" class="question" hidden></div>
+  <p id="msg" class="small"></p>
+  <div id="clips"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+let s = null;
+
+function card(c) {
+  const a = c.answer;
+  return `<div class="panel ${a ? "answered" : ""}" id="c${c.n}" data-n="${c.n}">
+    <div class="top"><span class="num">${c.n + 1}</span>${c.label ? `<span class="label">${esc(c.label)}</span>` : ""}</div>
+    ${c.text ? `<div class="say">${esc(c.text)}</div>` : ""}
+    ${c.audio ? `<audio controls preload="none" src="audio?n=${c.n}"></audio>` : `<div class="missing">Audio not found on this PC.</div>`}
+    <div class="row">${s.choices.map((ch) => `<button type="button" data-a="${esc(ch)}" class="${a && a.answer === ch ? "on" : ""}">${esc(ch)}</button>`).join("")}</div>
+    <textarea placeholder="Note (optional)">${esc(a ? a.note : "")}</textarea>
+  </div>`;
+}
+
+function render() {
+  $("title").textContent = s.title;
+  document.title = s.title;
+  $("question").hidden = !s.question;
+  $("question").textContent = s.question;
+  $("progress").textContent = `${s.done} of ${s.total}` + (s.blind && s.done < s.total ? " · labels show when all are answered" : "");
+  $("barfill").style.width = `${s.total ? 100 * s.done / s.total : 0}%`;
+  $("clips").innerHTML = s.clips.map(card).join("");
+}
+
+async function send(n, answer, note) {
+  try {
+    const r = await fetch("api/answer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ n, answer, note }) });
+    if (!r.ok) throw new Error(await r.text());
+    const y = window.scrollY;
+    s = await r.json();
+    $("msg").textContent = "";
+    render();
+    window.scrollTo(0, y);
+    return true;
+  } catch (e) {
+    $("msg").innerHTML = `<span class="err">Not saved: ${esc(e.message)}</span>`;
+  }
+}
+
+$("clips").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-a]"); if (!b) return;
+  const p = b.closest("[data-n]"), n = +p.dataset.n;
+  if (await send(n, b.dataset.a, p.querySelector("textarea").value)) {
+    const next = s.clips.find((c) => c.n > n && !c.answer);
+    if (next) $("c" + next.n).scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+});
+// A note changed after answering is saved when the box loses focus.
+$("clips").addEventListener("focusout", (e) => {
+  if (e.target.tagName !== "TEXTAREA") return;
+  const n = +e.target.closest("[data-n]").dataset.n, a = s.clips[n].answer;
+  if (a && a.note !== e.target.value) send(n, a.answer, e.target.value);
+});
+
+(async () => {
+  try {
+    const r = await fetch("api/session", { cache: "no-store" });
+    if (!r.ok) throw new Error(await r.text());
+    s = await r.json();
+    render();
+  } catch (e) {
+    $("msg").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+})();
+</script>
+</body>
+</html>
