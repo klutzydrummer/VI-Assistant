@@ -18,6 +18,7 @@ The hub finds tasks itself and rescans on every visit:
 - **Cluster purity**, **Gold labels**, **Radio and effect marks** when their inputs exist (otherwise listed under "Not ready yet" with the reason). Done when every cluster is decided, every line labelled, every clip marked.
 - **Blind listening sets**: any `listen/` folder with `sheet.csv` and `key.json` under a stage's current output or `analysis/` (voicearms writes them). Answers go straight into `sheet.csv` in voicearms' columns, so `voicearms.py --unblind` still works; the key is never served, and when every clip is answered the hub writes `listen/results.md` (the same table). A rerun that rewrites the sheet reopens the task.
 - **qtcheck**: any folder with `report.json` and `audio/*-qt.wav`. Ok / not ok and a note per file, in `heard.jsonl` beside the report.
+- **Clip lists**: any `clips.toml` (below).
 - **Anything else**: a job that needs Brandon writes `task.toml` beside its output; he marks it done on the hub (which writes `task.done` there).
 
 ```toml
@@ -26,6 +27,29 @@ about = "Say which arm to keep."       # what to do
 asked_by = "TTS steering"              # the thread the summary goes to
 link = "/listen/..."                   # optional page to open
 ```
+
+### Clip lists
+
+The quickest way for a job or a Claude thread to play Brandon some clips: write a `clips.toml` in its own folder under `analysis/` (or a stage's output). The hub shows it under Needs you, plays each clip with her subtitle, and saves his taps to `answers.jsonl` beside it (last answer per clip wins). The Done card's summary is one line per clip, ready to paste back.
+
+```toml
+title = "Fitted tokens, round 1"          # required
+question = "Is she warm here?"             # shown above the clips
+answers = ["warm", "not warm", "unsure"]   # buttons; default yes / no / unsure
+blind = true                               # hide labels until every clip is answered
+asked_by = "Steering research for Qwen3-TTS"
+
+[[clip]]
+id = "le2.s348112_f"        # a corpus line: her cleaned clip (harvest's if clean hasn't run), subtitle shown
+label = "her real clip"
+
+[[clip]]
+path = "wav/C-mean-0.wav"   # relative to this folder; "corpus:stages/..." for relative to the corpus folder
+label = "C-mean"
+text = "I'm fine, really."  # optional line under the clip
+```
+
+Each clip has an `id` or a `path`, never both, and paths can't leave their folder. A new question goes in a new folder; rewriting `clips.toml` reloads it but keeps answers by id or path.
 
 Finishing or reopening a task appends `{"task", "done", "at"}` to `<corpus>/hub.jsonl`.
 
