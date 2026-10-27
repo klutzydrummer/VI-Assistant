@@ -93,11 +93,12 @@ class FakeRunTest(unittest.TestCase):
             self.assertTrue(any(k.startswith("warmth+teasing/") for k in key))
             self.assertNotIn("condition", (listen / "sheet.csv").read_text())
             rows = (listen / "sheet.csv").read_text().splitlines()
-            rows[1] = rows[1].replace(",,,,", ",y,2,y,nice")
+            rows[1] = rows[1].replace(",,,,,,,,", ",y,2,y,nice,full,partial,mimic,lower")
             (listen / "sheet.csv").write_text("\n".join(rows) + "\n")
             voicearms.unblind(out)
             first_group, first_clip = rows[1].split(",")[:2]
-            self.assertIn(f"| {first_group} | {key[first_group + '/' + first_clip]['condition']} | y | 2 | y | nice |",
+            self.assertIn(f"| {first_group} | {key[first_group + '/' + first_clip]['condition']} | y | 2 | y | full | partial | "
+                          "mimic | lower | nice |",
                           (listen / "results.md").read_text())
 
     def test_weak_probe_still_judges_every_arm_and_voice_is_the_neutral_mean(self):
