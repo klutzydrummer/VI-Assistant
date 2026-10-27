@@ -393,7 +393,7 @@ impl Hub {
                 format!("listen:{rel}"),
                 "listen",
                 format!("Blind listening set ({from})"),
-                "For each clip: is it still her voice, how much of the mood do you hear, are the words clear. Her real example clip is beside each set.".into(),
+                "For each clip: is it still her voice, how much of the mood do you hear, are the words clear; optionally accent, suit effect, right mood and pitch. Her real example clip is beside each set.".into(),
                 rel.clone(),
                 Some(format!("/listen/{}/", slug(rel))),
                 (l.done(), l.total()),
@@ -727,7 +727,7 @@ pub fn handle(h: &mut Hub, post: bool, url: &str, body: &str) -> Reply {
 mod tests {
     use super::*;
     use crate::fixture;
-    use crate::listen::{parse_csv, write_csv};
+    use crate::listen::{parse_csv, write_csv, ANSWERS};
 
     fn demo() -> (tempfile::TempDir, Hub) {
         let dir = tempfile::tempdir().unwrap();
@@ -857,6 +857,48 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn listening_sheet_gains_the_optional_questions() {
+        let (dir, mut hub) = demo();
+        let url = format!("/listen/{}/api/answer", slug(SET));
+        let body = |pitch: &str| {
+            json!({"group": "warmth", "clip": "01", "voice": "y", "mood": "2", "clear": "y",
+                   "accent": "partial", "suit": "full", "mood_right": "mimic", "pitch": pitch})
+            .to_string()
+        };
+        assert!(matches!(
+            handle(&mut hub, true, &url, &body("flat")),
+            Reply::Bad(_)
+        ));
+        let s = json(handle(&mut hub, true, &url, &body("lower")));
+        let clip = &s["groups"][0]["clips"][0];
+        assert_eq!(
+            (
+                &clip["accent"],
+                &clip["suit"],
+                &clip["mood_right"],
+                &clip["pitch"]
+            ),
+            (
+                &json!("partial"),
+                &json!("full"),
+                &json!("mimic"),
+                &json!("lower")
+            )
+        );
+        // An older sheet keeps its columns where they were and gains the new
+        // ones at the end, so --unblind and earlier answers still line up.
+        let rows = parse_csv(&fs::read_to_string(dir.path().join(SET).join("sheet.csv")).unwrap());
+        assert_eq!(rows[0][3..7], ANSWERS.map(String::from));
+        assert_eq!(
+            rows[0][7..],
+            ["accent", "suit_effect", "mood_right", "pitch"]
+        );
+        assert_eq!(rows[1][7..], ["partial", "full", "mimic", "lower"]);
+        // The optional questions don't count toward a clip being answered.
+        assert_eq!(s["done"].as_u64(), Some(1));
     }
 
     #[test]

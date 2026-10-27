@@ -1092,14 +1092,15 @@ def listening_set(r, out, clips, sentences):
             name = f"{num:02d}"
             shutil.copy(wav, root / group / f"{name}.wav")
             key[f"{group}/{name}"] = {"condition": cond, "sentence": n}
-            rows.append([group, name, TEST[n], "", "", "", ""])
+            rows.append([group, name, TEST[n], "", "", "", "", "", "", "", ""])
         if group in r["moods"]:
             clip = clips.get(r["moods"][group]["swap"].get("clip"))
             if clip is not None:
                 shutil.copy(clip.audio, root / group / f"her_example{Path(clip.audio).suffix}")
     with open(root / "sheet.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["group", "clip", "sentence", "still_her_voice_y_n", "mood_heard_0_3", "words_clear_y_n", "notes"])
+        w.writerow(["group", "clip", "sentence", "still_her_voice_y_n", "mood_heard_0_3", "words_clear_y_n", "notes",
+                    "accent", "suit_effect", "mood_right", "pitch"])
         w.writerows(rows)
     (root / "key.json").write_text(json.dumps(key, indent=1, sort_keys=True) + "\n")
     (root / "README.md").write_text(
@@ -1107,7 +1108,9 @@ def listening_set(r, out, clips, sentences):
         "spoken different ways (neutral, her swapped-in mood clip, and each steering method), in a shuffled order.\n"
         "her_example is one of her real game clips in that mood. In sheet.csv, per clip: is it still her voice (y/n),\n"
         "how much of the folder's mood you hear (0 none - 3 clearly; for a blend, name which moods), are the\n"
-        "words clear (y/n), and any notes. Don't open key.json until you're done.\n")
+        "words clear (y/n), and any notes. Optional: accent and suit_effect (missing/partial/full), mood_right\n"
+        "(y; mimic = sounds like her example but not the mood; n) and pitch (lower/correct/higher).\n"
+        "Don't open key.json until you're done.\n")
 
 
 def unblind(folder):
@@ -1122,12 +1125,14 @@ def unblind(folder):
             k = key.get(f"{row['group']}/{row['clip']}")
             if k:
                 by.setdefault(row["group"], []).append((k["condition"], row))
-    lines = ["# What Brandon heard", "", "| group | condition | her voice | mood heard | words clear | notes |",
-             "|---|---|---|---|---|---|"]
+    lines = ["# What Brandon heard", "",
+             "| group | condition | her voice | mood heard | words clear | accent | suit effect | mood right | pitch | notes |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for group, items in sorted(by.items()):
         for cond, row in sorted(items, key=lambda i: i[0]):
+            extra = " | ".join(row.get(c) or "" for c in ("accent", "suit_effect", "mood_right", "pitch"))
             lines.append(f"| {group} | {cond} | {row['still_her_voice_y_n']} | {row['mood_heard_0_3']} | "
-                         f"{row['words_clear_y_n']} | {row['notes']} |")
+                         f"{row['words_clear_y_n']} | {extra} | {row['notes']} |")
     (root / "results.md").write_text("\n".join(lines) + "\n")
     print(f"wrote {root / 'results.md'}")
 

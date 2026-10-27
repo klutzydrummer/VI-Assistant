@@ -95,13 +95,22 @@
     <div id="mood"></div>
     <div class="q">Words clear?</div>
     <div class="seg" id="clear"></div>
+    <div class="q">Accent present?</div>
+    <div class="seg" id="accent"></div>
+    <div class="q">Suit effect present?</div>
+    <div class="seg" id="suit"></div>
+    <div class="q" id="rightq">Right mood?</div>
+    <div class="small muted">"Copies the example" is for a clip that sounds like her example clip in pitch, inflection or timbre but doesn't carry the mood.</div>
+    <div class="seg" id="right"></div>
+    <div class="q">Pitch?</div>
+    <div class="seg" id="pitch"></div>
     <div class="q">Notes</div>
     <textarea id="notes" placeholder="Optional"></textarea>
     <div class="dots" id="dots"></div>
   </div>
 
   <details><summary>How this works</summary>
-    <p class="small">Each mood folder plays the same sentence spoken several ways (neutral, her swapped-in clip, each steering method) in a shuffled order, so you can't tell which is which. Answer three questions per clip; notes are optional. For a blend, rate each mood on its own. Every save goes straight into sheet.csv. The answer key stays hidden until every clip is answered.</p>
+    <p class="small">Each mood folder plays the same sentence spoken several ways (neutral, her swapped-in clip, each steering method) in a shuffled order, so you can't tell which is which. Three questions count a clip as answered: her voice, how much mood, words clear. Accent, suit effect, right mood and pitch are optional but help, and notes are optional too. For a blend, rate each mood on its own. Every save goes straight into sheet.csv. The answer key stays hidden until every clip is answered.</p>
   </details>
 </main>
 
@@ -148,7 +157,7 @@ function render() {
   $("finished").classList.toggle("hidden", !(total && done === total));
   if (session.results) {
     const rows = session.results.split("\n").filter((l) => l.startsWith("| ") && !l.startsWith("| group"));
-    $("results").innerHTML = `<table><tr><th>group</th><th>was</th><th>voice</th><th>mood</th><th>clear</th><th>notes</th></tr>${rows.map((l) => "<tr>" + l.split("|").slice(1, -1).map((c) => `<td>${esc(c.trim())}</td>`).join("") + "</tr>").join("")}</table>`;
+    $("results").innerHTML = `<table><tr><th>group</th><th>was</th><th>voice</th><th>mood</th><th>clear</th><th>accent</th><th>suit</th><th>right mood</th><th>pitch</th><th>notes</th></tr>${rows.map((l) => "<tr>" + l.split("|").slice(1, -1).map((c) => `<td>${esc(c.trim())}</td>`).join("") + "</tr>").join("")}</table>`;
   }
   if (!total) { $("msg").textContent = "This set has no clips."; return; }
   $("card").classList.remove("hidden");
@@ -164,6 +173,12 @@ function render() {
   if ($("clip").getAttribute("src") !== src) $("clip").setAttribute("src", src);
   seg($("voice"), [["y", "Yes"], ["n", "No"]], answer.voice, (v) => { answer.voice = v; render(); });
   seg($("clear"), [["y", "Yes"], ["n", "No"]], answer.clear, (v) => { answer.clear = v; render(); });
+  const level = [["missing", "Missing"], ["partial", "Partly"], ["full", "Fully"]];
+  seg($("accent"), level, answer.accent, (v) => { answer.accent = v; render(); });
+  seg($("suit"), level, answer.suit, (v) => { answer.suit = v; render(); });
+  $("rightq").textContent = g.moods.length > 1 ? `Right mood for ${g.moods.join(" + ")}?` : `Right mood for ${group}?`;
+  seg($("right"), [["y", "Yes"], ["mimic", "Copies the example"], ["n", "No"]], answer.mood_right, (v) => { answer.mood_right = v; render(); });
+  seg($("pitch"), [["lower", "Lower"], ["correct", "Correct"], ["higher", "Higher"]], answer.pitch, (v) => { answer.pitch = v; render(); });
   const scale = [["0", "0 none"], ["1", "1"], ["2", "2"], ["3", "3 clearly"]];
   if (g.moods.length > 1) {
     $("moodq").textContent = "How much of each mood do you hear?";
@@ -193,7 +208,7 @@ function render() {
 function go(k) {
   i = Math.max(0, Math.min(items.length - 1, k));
   const c = items[i].clip;
-  answer = { voice: c.voice, mood: c.mood, clear: c.clear, notes: c.notes, partial: false };
+  answer = { voice: c.voice, mood: c.mood, clear: c.clear, notes: c.notes, accent: c.accent, suit: c.suit, mood_right: c.mood_right, pitch: c.pitch, partial: false };
   render();
   window.scrollTo({ top: 0 });
 }
@@ -217,7 +232,7 @@ $("save").onclick = async () => {
   if (answer.partial) $("msg").textContent = "Rate every mood in the blend for it to count.";
   try {
     $("save").disabled = true;
-    session = await api("api/answer", { group, clip: clip.clip, voice: answer.voice || "", mood, clear: answer.clear || "", notes: answer.notes || "" });
+    session = await api("api/answer", { group, clip: clip.clip, voice: answer.voice || "", mood, clear: answer.clear || "", notes: answer.notes || "", accent: answer.accent || "", suit: answer.suit || "", mood_right: answer.mood_right || "", pitch: answer.pitch || "" });
     flatten();
     $("msg").textContent = "";
     const open = items.findIndex((x, k) => k > i && !answered(x.clip));

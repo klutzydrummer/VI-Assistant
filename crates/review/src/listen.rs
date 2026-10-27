@@ -27,6 +27,15 @@ pub const ANSWERS: [&str; 4] = [
     "words_clear_y_n",
     "notes",
 ];
+/// Optional answer columns (Brandon, 2026-10-27), added to the end of an
+/// older sheet on load so `--unblind` and earlier answers keep working. They
+/// don't count toward a clip being answered. Each is (column, allowed values).
+pub const EXTRA: [(&str, &[&str]); 4] = [
+    ("accent", &["missing", "partial", "full"]),
+    ("suit_effect", &["missing", "partial", "full"]),
+    ("mood_right", &["y", "mimic", "n"]),
+    ("pitch", &["lower", "correct", "higher"]),
+];
 /// Where qtcheck answers go, beside its report.
 pub const HEARD: &str = "heard.jsonl";
 
@@ -109,9 +118,14 @@ impl Listen {
         let text = fs::read_to_string(&path)
             .map_err(|e| format!("could not read {}: {e}", path.display()))?;
         let mut rows = parse_csv(&text).into_iter();
-        let header = rows.next().unwrap_or_default();
+        let mut header = rows.next().unwrap_or_default();
         if header.len() < 3 + ANSWERS.len() || header[..3] != ["group", "clip", "sentence"] {
             return Err(format!("{}: not a listening sheet", path.display()));
+        }
+        for (c, _) in EXTRA {
+            if !header.iter().any(|h| h == c) {
+                header.push(c.to_string());
+            }
         }
         let width = header.len();
         let rows = rows
@@ -185,6 +199,10 @@ impl Listen {
                 "mood": r[self.col(ANSWERS[1])],
                 "clear": r[self.col(ANSWERS[2])],
                 "notes": r[self.col(ANSWERS[3])],
+                "accent": r[self.col(EXTRA[0].0)],
+                "suit": r[self.col(EXTRA[1].0)],
+                "mood_right": r[self.col(EXTRA[2].0)],
+                "pitch": r[self.col(EXTRA[3].0)],
             });
             match groups.last_mut() {
                 Some((g, clips)) if *g == r[0] => clips.push(clip),
@@ -215,6 +233,10 @@ impl Listen {
         };
         check(&a.voice, &["y", "n"], "voice")?;
         check(&a.clear, &["y", "n"], "clear")?;
+        let extra = [a.accent, a.suit, a.mood_right, a.pitch];
+        for ((c, ok), v) in EXTRA.iter().zip(&extra) {
+            check(v, ok, c)?;
+        }
         let blend = a.group.contains('+');
         if !blend {
             check(&a.mood, &["0", "1", "2", "3"], "mood")?;
@@ -226,8 +248,12 @@ impl Listen {
             .row(&a.group, &a.clip)
             .ok_or_else(|| format!("no clip {}/{}", a.group, a.clip))?;
         let cols = ANSWERS.map(|c| self.col(c));
+        let extra_cols = EXTRA.map(|(c, _)| self.col(c));
         let row = &mut self.rows[i];
         for (c, v) in cols.into_iter().zip([a.voice, a.mood, a.clear, a.notes]) {
+            row[c] = v;
+        }
+        for (c, v) in extra_cols.into_iter().zip(extra) {
             row[c] = v;
         }
         self.save()?;
@@ -266,13 +292,16 @@ impl Listen {
             }
         }
         let mut out = String::from(
-            "# What Brandon heard\n\n| group | condition | her voice | mood heard | words clear | notes |\n|---|---|---|---|---|---|\n",
+            "# What Brandon heard\n\n| group | condition | her voice | mood heard | words clear | accent | suit effect | mood right | pitch | notes |\n|---|---|---|---|---|---|---|---|---|---|\n",
         );
         for (group, mut items) in by {
             items.sort_by(|a, b| a.0.cmp(&b.0));
             for (cond, r) in items {
                 let [v, m, c, n] = ANSWERS.map(|a| r[self.col(a)].as_str());
-                out.push_str(&format!("| {group} | {cond} | {v} | {m} | {c} | {n} |\n"));
+                let [ac, su, mr, pi] = EXTRA.map(|(a, _)| r[self.col(a)].as_str());
+                out.push_str(&format!(
+                    "| {group} | {cond} | {v} | {m} | {c} | {ac} | {su} | {mr} | {pi} | {n} |\n"
+                ));
             }
         }
         Ok(out)
@@ -291,6 +320,14 @@ pub struct Answer {
     pub clear: String,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub accent: String,
+    #[serde(default)]
+    pub suit: String,
+    #[serde(default)]
+    pub mood_right: String,
+    #[serde(default)]
+    pub pitch: String,
 }
 
 fn query(url: &str, name: &str) -> Option<String> {
