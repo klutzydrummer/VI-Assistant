@@ -38,7 +38,11 @@ allowance is max(max_similarity_drop, how far her own real mood clips sit from h
 positive clips over their zeros than N does (pairs held out by conversation).
 Verdict per mood and arm: "steers" if the lift and share rules pass on the confirm half, voice
 and words hold, it beats the random vector, and the likelihood gain's 95% interval is above 0.
-If S itself doesn't lift the probe, the mood is "probe can't hear it" and Brandon's ears decide.
+If S itself doesn't lift the probe, every arm still gets its verdict, marked "(probe weak)": the probe
+can't hear that mood in generated speech, so its lifts are no evidence either way and Brandon's ears decide.
+Her voice in every condition but S: the one reference clip (3-15 s) for the ICL prompt's audio and
+transcript, with its speaker token replaced by the mean x-vector of all her neutral clips, rescaled to
+their average norm; B, C and D shift that mean token.
 
 For his ears (Brandon, 2026-10-21): listen/ holds a short blind set, per mood one confirm-half
 sentence for neutral, swap, the random control and every arm at its kept strength (and each blend),
@@ -60,7 +64,7 @@ from pathlib import Path
 
 import steer
 import voicesteer
-from steer import TEST, seed, write_wav
+from steer import TEST as TEST_8, seed, write_wav
 from voicesteer import Probe, mean
 from vi_job import ensure_venv, fake_models, load_clips, log, out_dir, settings, unit_hash
 
@@ -138,7 +142,13 @@ def main():
         curves = [cached(keep / "suit" / "clips" / f"{i}.json", lambda c=clips[i]: suit_curve(c.audio)) for i in ids[:n_refs]]
         return np.mean([c for c in curves if c], 0).tolist()
 
-    base = {"icl": {"ref": voice, "mode": "icl"}, "xvec": {"ref": voice, "mode": "xvec"}}
+    # Her voice for every condition (Brandon, 2026-10-26): the mean of all her neutral clips' x-vectors,
+    # rescaled to their average norm (a mean of vectors is shorter than they are). The ICL prompt's audio and
+    # transcript are still the one reference clip; only its speaker token is replaced.
+    xn = np.array([cached(keep / "xvec" / f"{c.id}.json", lambda c=c: tts.xvector(c)) for c in neutral])
+    x_mean = xn.mean(0)
+    x_voice = (x_mean * np.linalg.norm(xn, axis=1).mean() / max(np.linalg.norm(x_mean), 1e-12)).tolist()
+    base = {"icl": {"ref": voice, "mode": "icl", "xvec": x_voice}, "xvec": {"ref": voice, "mode": "xvec", "xvec": x_voice}}
     tts.measure = True  # residual norms per layer, read while the baselines speak
     neutral_rows = {m: speak("_neutral", f"N-{m}", base[m], tests) for m in base}
     tts.measure = False
@@ -146,9 +156,8 @@ def main():
     base_sim = {m: mean([r["similarity"] for r in rows]) for m, rows in neutral_rows.items()}
     suit_neutral = suit_ref([c.id for c in neutral])
     base_suit = {m: suit_gap(rows, suit_neutral) for m, rows in neutral_rows.items()}
-    x_voice = cached(keep / "xvec" / f"{voice.id}.json", lambda: tts.xvector(voice))
-
-    report = {"suit_gap_db_neutral": base_suit, "model": s.get("model", MODEL), "voice": voice.id, "voice_seconds": voice.duration_s, "layers": tts.n_layers,
+    report = {"suit_gap_db_neutral": base_suit, "model": s.get("model", MODEL), "voice": voice.id, "voice_seconds": voice.duration_s,
+              "voice_xvec": f"mean of {len(neutral)} neutral clips", "voice_xvec_norm_shrink": round(float(np.linalg.norm(x_mean) / np.linalg.norm(xn, axis=1).mean()), 4), "layers": tts.n_layers,
               "settings": {"layer_sets": [f"{a[0]}-{a[-1]}" if len(a) > 1 else str(a[0]) for a in layer_sets],
                            "ladder": ladder, "above": above, "above_tau": above_tau, "decay": decay,
                            "max_similarity_drop": max_drop, "max_wer": max_wer, "min_lift": min_lift,
@@ -339,6 +348,9 @@ def main():
         for arm, (spk, add) in settings_lik.items():
             lik[arm] = gain(nll(arm, spk, add), n0, mood)
 
+        # Probe weak (Brandon, 2026-10-26): when the swap doesn't lift the probe, every arm still runs and gets
+        # its verdict, marked: its lift is no evidence either way and his ears decide.
+        weak = swap_lift is None or swap_lift < min_lift
         verdicts = {}
         r_lift = arms["R"]["lift"] if "R" in arms else None
         for arm, r in arms.items():
@@ -348,18 +360,18 @@ def main():
             control = r.get("random_lift", r_lift)  # token arms: a random token shift; A: the random vector
             steers = (r["holds"] and r["lift"] is not None and r["lift"] >= min_lift and r["share"] >= min_share
                       and (control is None or r["lift"] > control) and lk is not None and lk["low"] > 0)
-            if swap_lift is None or swap_lift < min_lift:
-                verdicts[arm] = "probe can't hear it"
-            elif not r["holds"]:
+            if not r["holds"]:
                 verdicts[arm] = "loses voice or words"
             else:
                 verdicts[arm] = "steers" if steers else "doesn't steer"
         for name in arm_names(targets):
             if name not in arms and name not in ("A-decay", "A-xvec"):
                 verdicts[name] = "loses voice or words"
+        if weak:
+            verdicts = {a: f"{v} (probe weak)" for a, v in verdicts.items()}
 
         report["moods"][mood] = {
-            "route": mset.get("route"), "borderline": mset.get("borderline", False),
+            "route": mset.get("route"), "borderline": mset.get("borderline", False), "probe_weak": weak,
             "pairs": {"train": len(train), "held_out": len(held)},
             "natural_similarity_drop": natural, "similarity_allowance": round(allow, 4),
             "swap": {"lift": swap_lift, "share": swap_share, "clip": swap_ref.id, "seconds": swap_ref.duration_s},
@@ -413,6 +425,19 @@ def main():
 
 
 # --- helpers ----------------------------------------------------------------------
+
+# steer's eight plus eight more in the same plain style (Brandon, 2026-10-26: 16 sentences, 8 to pick
+# the strength and 8 to confirm). The first eight are unchanged, so a run on 8 matches the old ones.
+TEST = TEST_8 + [
+    "The supply shuttle is due back at the docking bay tomorrow.",
+    "I put the spare filters in the locker beside the airlock.",
+    "The navigation charts for this sector are on the main screen.",
+    "Our fuel should last until we reach the next relay.",
+    "I checked the cargo manifest twice before we left the station.",
+    "The lights in the forward corridor are on a timer now.",
+    "There is a small leak in the coolant line under the floor.",
+    "I will send you the repair schedule when I get back.",
+]
 
 
 def parse_layers(spec, n_layers):
@@ -994,7 +1019,8 @@ class FakeScorer:
 def render(r):
     ARMS = arm_names(r["settings"].get("match_targets", ["mean"]))
     lines = ["# Steering Qwen3-TTS: three arms (voicearms)", "",
-             f"Model {r['model']}, {r['layers']} talker layers, speaking from {r['voice']}. Strength picked on sentences "
+             f"Model {r['model']}, {r['layers']} talker layers, speaking from {r['voice']} (speaker token: "
+             f"{r.get('voice_xvec', 'its own x-vector')}). Strength picked on sentences "
              f"{r['settings']['pick']}, verdicts on {r['settings']['confirm']}.", "",
              "Verdict per mood and arm (strength kept; probe lift on the confirm half; likelihood gain [95%]):", "",
              "| mood | swap lift | " + " | ".join(ARMS) + " | random lift |", "|---" * (len(ARMS) + 3) + "|"]
@@ -1010,8 +1036,11 @@ def render(r):
             lk_s = f" [{lk['low']:+.3f}, {lk['high']:+.3f}]" if lk else ""
             cells.append(f"{v} x{arm['strength']:g} {fmt(arm['lift'])}{lk_s}{' suit?' if arm.get('suit_lost') else ''}")
         rl = x["arms"].get("R", {}).get("lift")
-        lines.append(f"| {m}{' (borderline)' if x['borderline'] else ''} | {fmt(x['swap']['lift'])} | " + " | ".join(cells)
+        lines.append(f"| {m}{' (borderline)' if x['borderline'] else ''}{' (probe weak)' if x.get('probe_weak') else ''} | {fmt(x['swap']['lift'])} | " + " | ".join(cells)
                      + f" | {fmt(rl)} |")
+    lines += ["", f"(probe weak) marks a mood whose swap (her own clip as the reference) didn't lift the probe by "
+              f"{r['settings']['min_lift']}: the probe can't hear that mood in generated speech, so its lifts are no "
+              "evidence either way, and Brandon's ears in listen/ decide."]
     lines += ["", (f"suit? marks an arm whose spectrum is more than {SUIT_FLAG_DB} dB further from her real clips' than "
                    f"neutral's ({r.get('suit_gap_db_neutral')}): it may have lost the suit effect. A flag only; an effects "
                    "chain can put the suit back on the best method."), "", "Per mood: A's layer settings (kept strength, pick-half lift), the push as a share of the residual, "

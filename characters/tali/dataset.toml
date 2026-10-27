@@ -319,8 +319,9 @@ moods = ["warmth", "amused", "sadness", "indignation", "alarm", "urgency", "play
 blends = [["warmth", "amused"], ["alarm", "indignation"]]
 layer_sets = ["14", "18", "21", "24", "21-25"]   # talker layers (of 28); voicesteer used 9-17
 ladder = [1.0, 0.5, 0.25, 0.1, 0.05]   # full strength first, down only if her voice or the words go
-above = []          # strengths over 1 for A, only if 1 holds without lifting; e.g. [2.0, 4.0] on Brandon's yes
-above_tau = []      # the same for B and C; e.g. [1.5, 2.5] (the published x-vector range) on his yes
+above = [2.0, 4.0]       # strengths over 1 for A, only if 1 holds without lifting (Brandon's yes, 2026-10-26)
+above_tau = [1.5, 2.5]   # the same for B, C and D (the published x-vector range; his yes, 2026-10-26)
+test_sentences = 16      # 8 pick the strength, 8 confirm (Brandon, 2026-10-26; was steer's 8)
 decay = 0.985       # per frame, for the A-decay variant
 refs_per_side = 32  # pairs per mood to build tau and fit tokens from (held-out conversations excluded)
 held_max = 16       # held-out pairs scored for the likelihood check and early stopping
@@ -329,14 +330,15 @@ fit_lr = 0.002
 fit_l2 = 0.01
 match_layers = "7-26"   # D: the talker layers whose shared residual shift the token is fitted to
 match_targets = ["mean", "pca:1", "pca:4"]   # D: one token per target (mean shift; PCA-cleaned mean)
-listen_sentences = 1   # blind listening set for Brandon (listen/), sentences per condition
+listen_sentences = 2   # blind listening set for Brandon (listen/), sentences per condition
 max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
 max_wer = 0.15
 min_lift = 0.1
 min_share = 0.75
 
-# Home smoke for voicearms on CPU, real models, tiny settings (no rental):
-# `VI_WORKER_HOST=local nice -n 19 vi dataset run characters/tali/dataset.toml voicearms_smoke`.
+# Smoke for voicearms, real models, tiny settings: on the rented worker's GPU first (Brandon, 2026-10-26),
+# `vi dataset run characters/tali/dataset.toml voicearms_smoke` after `vi cloud up`; at home on the CPU
+# with `VI_WORKER_HOST=local nice -n 19 ...` and device = "cpu".
 # It captures its one mood's vector itself, so it doesn't need voice_vectors.npz.
 [stage.voicearms_smoke]
 command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
@@ -348,12 +350,14 @@ files = ["../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/vo
 manual = true
 
 [stage.voicearms_smoke.settings]
-device = "cpu"
+device = "cuda:0"
 asr = "openai/whisper-tiny"
 moods = ["warmth"]
 test_sentences = 2
 layer_sets = ["21"]
 ladder = [1.0]
+above = [2.0]       # the strengths-over-1 path, if x1 holds without lifting
+above_tau = [1.5]
 refs_per_side = 2
 held_max = 1
 fit_steps = 2
