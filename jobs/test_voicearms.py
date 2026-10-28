@@ -149,6 +149,60 @@ class FakeRunTest(unittest.TestCase):
             self.assertEqual([t["strength"] for t in r["A_layers"]["AL2"]["tried"]], [1.0])
 
 
+    def test_a_run_can_keep_only_some_arms_and_modes(self):
+        # Brandon, 2026-10-28: A and D with her clip only; the likelihood only guards.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            harvest, files = corpus(tmp)
+            out = tmp / "out"
+            (tmp / "settings.json").write_text(json.dumps({
+                "backend": "fake", "layer_sets": ["2"], "blends": [["warmth", "teasing"]], "ladder": [1.0, 0.5],
+                "arms": ["A", "D"], "modes": ["icl"], "match_targets": ["mean", "pca:4"], "likelihood": "guard",
+                "fit_patience": 2, "fit_min_steps": 2, "fit_max_steps": 50, "listen_sentences": 2}))
+            env = {"VI_SETTINGS": str(tmp / "settings.json"), "VI_OUT": str(out),
+                   "VI_INPUT_HARVEST": str(harvest), "VI_FILES": str(files)}  # fmt: skip
+            with mock.patch.dict(os.environ, env):
+                voicearms.main()
+            report = json.loads((out / "report.json").read_text())
+            for m in ("warmth", "teasing"):
+                r = report["moods"][m]
+                self.assertEqual(set(r["arms"]), {"A", "A-decay", "R", "D-icl", "Dpca4-icl"}, m)
+                self.assertEqual(set(r["verdicts"]), {"A", "A-decay", "D-icl", "Dpca4-icl"}, m)
+                self.assertIsNone(r["delta"])
+                self.assertNotIn("fitted_voice", r)
+                self.assertEqual(r["B_tried"], {})
+            self.assertEqual(set(report["blends"]["warmth+teasing"]), {"A", "D", "Dpca4"})
+            md = (out / "report.md").read_text()
+            self.assertIn("Dpca4-icl", md)
+            self.assertNotIn("C-icl", md)
+            self.assertNotIn("delta", json.loads((out / "tokens" / "warmth.json").read_text()))
+            key = json.loads((out / "listen" / "key.json").read_text())
+            conds = {v["condition"] for v in key.values()}
+            self.assertEqual(conds, {"neutral", "swap", "A", "A-decay", "R", "D-icl", "Dpca4-icl", "D", "Dpca4"})
+            # By ear: a method heard above neutral and random with her voice counts; one below doesn't.
+            listen = out / "listen"
+            rows = (listen / "sheet.csv").read_text().splitlines()
+            filled = [rows[0]]
+            for line in rows[1:]:
+                group, clip = line.split(",")[:2]
+                cond = key[f"{group}/{clip}"]["condition"]
+                mood = {"A": "3", "neutral": "1", "R": "0"}.get(cond, "1")
+                filled.append(line.replace(",,,,,,,,", f",y,{mood},y,,,,{'y' if cond == 'A' else 'n'},"))
+            (listen / "sheet.csv").write_text("\n".join(filled) + "\n")
+            voicearms.unblind(out)
+            res = (listen / "results.md").read_text()
+            self.assertIn("# By ear, per method", res)
+            self.assertRegex(res, r"\| A \| 4 \| 4 \| 3.00 \| 4 \| 0 \| heard \|")
+            self.assertRegex(res, r"\| D-icl \| 4 \| 4 \| 1.00 \| 0 \| 0 \|  \|")
+            self.assertRegex(res, r"\| neutral \| 4 \| 4 \| 1.00 \| 0 \| 0 \|  \|")
+
+    def test_arms_and_modes_are_checked(self):
+        with self.assertRaises(SystemExit):
+            voicearms.arms_on({"arms": ["A", "E"]})
+        self.assertEqual(voicearms.arm_names(["mean"], ["A", "D"], ["icl"]), ["A", "A-decay", "D-icl"])
+        self.assertEqual(len(voicearms.arm_names(["mean", "pca:1", "pca:4"])), 13)  # every arm, both modes
+
+
 class HelperTest(unittest.TestCase):
     def test_layer_sets(self):
         self.assertEqual(voicearms.parse_layers("21-25", 28), [21, 22, 23, 24, 25])
@@ -394,6 +448,36 @@ class TinyModelTest(unittest.TestCase):
         for a, b in zip(before, tts.m.parameters(), strict=True):
             self.assertTrue(torch.equal(a, b))
         self.assertLess(tts.nll(clips[0], start, {1: [0.0] * 64}) - tts.nll(clips[0], start), 1e-6)
+
+    def test_fit_stops_once_the_held_out_loss_stops_improving_and_skips_bad_steps(self):
+        torch = self.torch
+        tok = torch.zeros(2, requires_grad=True)
+        opt = torch.optim.SGD([tok], lr=0.5)
+        calls = {"n": 0}
+
+        def step_loss():  # a bowl at (1, 1), with one step that blows up
+            calls["n"] += 1
+            if calls["n"] == 3:
+                return torch.tensor(float("nan"))
+            return (tok - 1).pow(2).sum()
+
+        def held_loss():
+            return float((tok.detach() - 1).pow(2).sum())
+
+        s = {"fit_patience": 2, "fit_min_steps": 10, "fit_max_steps": 500, "fit_eval_every": 5}
+        best, curve, stop = voicearms.run_fit(torch, tok, opt, step_loss, held_loss, s)
+        self.assertEqual(stop["why"], "held-out loss stopped improving")
+        self.assertLess(stop["step"], 500)
+        self.assertGreaterEqual(stop["step"], 10)
+        self.assertEqual(stop["skipped_steps"], 1)
+        self.assertLess(stop["best_held"], 1e-3)
+        self.assertTrue(torch.isfinite(best).all())
+        # Without patience it runs exactly fit_steps, as before.
+        tok2 = torch.zeros(2, requires_grad=True)
+        _, curve2, stop2 = voicearms.run_fit(torch, tok2, torch.optim.SGD([tok2], lr=0.5),
+                                             lambda: (tok2 - 1).pow(2).sum(), lambda: float((tok2.detach() - 1).pow(2).sum()),
+                                             {"fit_steps": 30, "fit_eval_every": 10})
+        self.assertEqual((stop2["step"], stop2["why"], [c["step"] for c in curve2]), (30, "max steps", [0, 10, 20, 30]))
 
     def test_residual_match_fit_moves_the_residual_toward_the_shared_shift(self):
         torch, tts = self.torch, self.tts

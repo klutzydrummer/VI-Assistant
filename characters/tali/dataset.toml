@@ -299,7 +299,7 @@ min_share = 0.75           # and on at least this share of the test sentences
 # her clips' audio, D a speaker token fitted to the residual-stream shift her clips share.
 # Before it: run voicesteer, then at home `python3 jobs/voicelayers.py <voicesteer out> --npz
 # corpus/tali/analysis/after_labels/voice_vectors.npz` (layer table, swap check, the vector bundle).
-# About 3.5-4 h on a 48 GB card for 7 moods and 2 blends (D runs three target types). Needs Brandon's yes for the run.
+# With A and D (mean, pca:4) in ICL mode only, fewer conditions than the 10-26 run but longer D fits. Needs Brandon's yes for the run.
 [stage.voicearms]
 command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
            "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz",
@@ -325,11 +325,22 @@ test_sentences = 16      # 8 pick the strength, 8 confirm (Brandon, 2026-10-26; 
 decay = 0.985       # per frame, for the A-decay variant
 refs_per_side = 32  # pairs per mood to build tau and fit tokens from (held-out conversations excluded)
 held_max = 16       # held-out pairs scored for the likelihood check and early stopping
-fit_steps = 200     # C and D
+# Brandon, 2026-10-28, after his blind listening set: only ICL mode kept her voice, C and B-icl carried
+# little mood, and A, D and Dpca4 (all with her clip) carried the most. So this run keeps those.
+arms = ["A", "D"]        # A brings its decay variant and random control
+modes = ["icl"]          # x-vector-only mode lost her voice for every method
+likelihood = "guard"     # held-out likelihood only blocks an arm whose 95% interval is wholly below 0
+# Fits stop on the held-out loss, not a fixed count (Brandon, 2026-10-28): once 4 checks in a row
+# (100 steps) fail to beat the best by 0.5%, after at least 200 steps and at most 1500.
+fit_min_steps = 200
+fit_max_steps = 1500
+fit_patience = 4
+fit_min_gain = 0.005
+fit_grad_clip = 1.0
 fit_lr = 0.002
 fit_l2 = 0.01
 match_layers = "7-26"   # D: the talker layers whose shared residual shift the token is fitted to
-match_targets = ["mean", "pca:1", "pca:4"]   # D: one token per target (mean shift; PCA-cleaned mean)
+match_targets = ["mean", "pca:4"]   # D: one token per target (mean shift; PCA-cleaned mean); pca:1 dropped 10-28
 listen_sentences = 2   # blind listening set for Brandon (listen/), sentences per condition
 max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
 max_wer = 0.15
@@ -361,9 +372,14 @@ above_tau = [1.5]
 refs_per_side = 2
 held_max = 1
 fit_steps = 2
+fit_patience = 1    # the stop-on-loss path, on real torch: at most 4 steps
+fit_min_steps = 1
+fit_max_steps = 4
 fit_eval_every = 1
 fit_batch = 1
 match_targets = ["mean", "pca:1"]
+arms = ["A", "D"]
+modes = ["icl"]
 
 # GPU, manual: step 5's one rental, `vi dataset run characters/tali/dataset.toml rental5`
 # (docs/design/step5-rental-plan.md). jobs/rental5.sh takes every pre-decided branch itself and
