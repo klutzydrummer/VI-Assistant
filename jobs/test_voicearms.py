@@ -158,7 +158,7 @@ class FakeRunTest(unittest.TestCase):
             (tmp / "settings.json").write_text(json.dumps({
                 "backend": "fake", "layer_sets": ["2"], "blends": [["warmth", "teasing"]], "ladder": [1.0, 0.5],
                 "arms": ["A", "D"], "modes": ["icl"], "match_targets": ["mean", "pca:4"], "likelihood": "guard",
-                "fit_patience": 2, "fit_min_steps": 2, "fit_max_steps": 50, "listen_sentences": 2}))
+                "fit_patience": 2, "fit_min_steps": 2, "fit_max_steps": 50, "listen_sentences": 2, "example_trials": 3}))
             env = {"VI_SETTINGS": str(tmp / "settings.json"), "VI_OUT": str(out),
                    "VI_INPUT_HARVEST": str(harvest), "VI_FILES": str(files)}  # fmt: skip
             with mock.patch.dict(os.environ, env):
@@ -178,7 +178,12 @@ class FakeRunTest(unittest.TestCase):
             self.assertNotIn("delta", json.loads((out / "tokens" / "warmth.json").read_text()))
             key = json.loads((out / "listen" / "key.json").read_text())
             conds = {v["condition"] for v in key.values()}
-            self.assertEqual(conds, {"neutral", "swap", "A", "A-decay", "R", "D-icl", "Dpca4-icl", "D", "Dpca4"})
+            self.assertEqual(conds - {"example E1 (le3.z23_f)"}, {"neutral", "swap", "A", "A-decay", "R", "D-icl", "Dpca4-icl", "D", "Dpca4"})
+            # Example clips: her neutral voice from her other neutral clip (the corpus has two; one is the reference).
+            self.assertEqual(list(report["example_trials"]), ["E1"])
+            self.assertEqual(report["example_trials"]["E1"]["clip"], "le3.z23_f")
+            ex = {v["condition"] for k, v in key.items() if k.startswith(voicearms.EXAMPLES + "/")}
+            self.assertEqual(ex, {"neutral", "example E1 (le3.z23_f)"})
             # By ear: a method heard above neutral and random with her voice counts; one below doesn't.
             listen = out / "listen"
             rows = (listen / "sheet.csv").read_text().splitlines()
