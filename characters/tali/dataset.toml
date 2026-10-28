@@ -342,6 +342,7 @@ fit_l2 = 0.01
 match_layers = "7-26"   # D: the talker layers whose shared residual shift the token is fitted to
 match_targets = ["mean", "pca:4"]   # D: one token per target (mean shift; PCA-cleaned mean); pca:1 dropped 10-28
 listen_sentences = 2   # blind listening set for Brandon (listen/), sentences per condition
+example_trials = 6     # her neutral voice from 6 other neutral clips as the ICL example (suit, accent; 2026-10-28)
 max_similarity_drop = 0.05   # widened per mood to her own real clips' drop + 0.02
 max_wer = 0.15
 min_lift = 0.1
@@ -380,6 +381,7 @@ fit_batch = 1
 match_targets = ["mean", "pca:1"]
 arms = ["A", "D"]
 modes = ["icl"]
+example_trials = 1
 
 # GPU, manual: step 5's one rental, `vi dataset run characters/tali/dataset.toml rental5`
 # (docs/design/step5-rental-plan.md). jobs/rental5.sh takes every pre-decided branch itself and

@@ -179,6 +179,19 @@ def main():
                            "min_share": min_share, "pick": pick, "confirm": confirm, "match_targets": targets,
                            "arms": on, "modes": modes, "likelihood": guard},
               "residual_norms": norms, "moods": {}, "blends": {}}
+    # Example clips (Brandon, 2026-10-28): her plain neutral already loses most of the suit and accent, and the
+    # x-vector carries little of either, so does the ICL example clip bring them back? Her neutral voice spoken
+    # from other neutral clips as the example, the speaker token unchanged; his ears judge in listen/.
+    n_refs_try = int(s.get("example_trials", 0))
+    listen_n = confirm[: int(s.get("listen_sentences", 1))]
+    trials = [c for c in neutral if c.id != voice.id and ref_len[0] <= c.duration_s <= ref_len[1]]
+    trials.sort(key=lambda c: (-c.duration_s, c.id))
+    report["example_trials"] = {}
+    for j, c in enumerate(trials[:n_refs_try], 1):
+        rows = speak(EXAMPLES, f"E{j}", {**base["icl"], "ref": c}, listen_n)
+        report["example_trials"][f"E{j}"] = {"clip": c.id, "seconds": c.duration_s, "audio": f"E{j}",
+                                             "similarity": mean([x["similarity"] for x in rows]),
+                                             "suit_gap_db": suit_gap(rows, suit_neutral)}
     kept = {}
 
     for mood in moods:
@@ -493,6 +506,9 @@ def arm_names(targets, on="ABCD", modes=("icl", "xvec")):
     if "D" in on:
         out += [f"D{target_tag(g)}-{m}" for g in targets for m in modes]
     return out
+
+
+EXAMPLES = "example_clips"
 
 
 def arms_on(s):
@@ -1127,6 +1143,11 @@ def render(r):
                          f"the target) {f.get('agreement')}, share of the mean kept {f.get('mean_kept')}, energy in those "
                          f"directions {f.get('pc_energy')}, match loss {f.get('start_held_loss')} -> {f.get('held_loss')}{still(f)}, "
                          f"cos with delta {mt['cosine_with_delta']}, with the first target's token {mt['cosine_with_first_target']}")
+    if r.get("example_trials"):
+        lines += ["", f"Example clips (her neutral voice with another neutral clip as the ICL example; listen/{EXAMPLES}/; "
+                  f"neutral's suit gap {r.get('suit_gap_db_neutral', {}).get('icl')} dB):", ""]
+        lines += [f"- {e}: {x['clip']} ({x['seconds']:.1f} s), similarity {x['similarity']}, suit gap {x['suit_gap_db']} dB"
+                  for e, x in sorted(r["example_trials"].items())]
     if r["blends"]:
         lines += ["", "Blends (half of each mood's kept setting; probe lift for each mood over neutral):", ""]
         for name, arms in r["blends"].items():
@@ -1149,6 +1170,9 @@ def listening_set(r, out, clips, sentences):
               for m, x in sorted(r["moods"].items())]
     groups += [(b, [("neutral", "_neutral", "N-icl")] + [(a, b, a) for a in arms])
                for b, arms in sorted(r["blends"].items())]
+    if r.get("example_trials"):
+        groups.append((EXAMPLES, [("neutral", "_neutral", "N-icl")] +
+                       [(f"example {e} ({x['clip']})", EXAMPLES, x["audio"]) for e, x in sorted(r["example_trials"].items())]))
     for group, conds in groups:
         (root / group).mkdir(parents=True)
         items = [(cond, out / "audio" / d / a, n) for cond, d, a in conds for n in sentences]
@@ -1178,6 +1202,8 @@ def listening_set(r, out, clips, sentences):
         "how much of the folder's mood you hear (0 none - 3 clearly; for a blend, name which moods), are the\n"
         "words clear (y/n), and any notes. Optional: accent and suit_effect (missing/partial/full), mood_right\n"
         "(y; mimic = sounds like her example but not the mood; n) and pitch (lower/correct/higher).\n"
+        f"The {EXAMPLES} folder is her neutral voice spoken from different example clips: there, accent and suit\n"
+        "effect are the questions that matter, and mood heard is 0.\n"
         "Don't open key.json until you're done.\n")
 
 
@@ -1217,8 +1243,8 @@ def by_ear(by):
 
     tally = {}
     for group, items in by.items():
-        if "+" in group:
-            continue  # a blend's mood answer names several moods
+        if "+" in group or group == EXAMPLES:
+            continue  # a blend's mood answer names several moods; example clips have no mood
         for cond, row in items:
             t = tally.setdefault(cond, {"n": 0, "voice": 0, "mood": [], "right": 0, "mimic": 0})
             t["n"] += 1
