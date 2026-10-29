@@ -374,6 +374,13 @@ refs_per_side = 32       # pairs for the similarity allowance and the mood's sui
 max_similarity_drop = 0.05
 max_wer = 0.15
 min_lift = 0.1
+# Not normal talking, so never a reference (Brandon, 2026-10-29; listed from the subtitles, and none of
+# them is in voice_sets' neutral): a scream, two burning-pain lines, two shouted combat callouts.
+exclude = ["le2.s266782_m",   # "Aaah!" (alarm)
+           "le2.s318068_m",   # "It's too hot. I'm burning up. Hurry -- open the valve!" (urgency)
+           "le2.s318075_m",   # "Feels like I'm on fire! You gotta find that valve, Shepard!" (urgency)
+           "le3.s567099_m",   # "Spiders spiders spiders spiders!" (alarm)
+           "le2.s318566_m"]   # "Look at that! Whatever it is, don't get too close!" (alarm, urgency; combat)
 
 [stage.refscreen_smoke]
 command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
