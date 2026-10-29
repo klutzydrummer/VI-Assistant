@@ -395,6 +395,23 @@ max_candidates = 2
 shortlist = 1
 controls = 1
 
+# Home CPU, manual: her real clips through Qwen3-TTS's speech codec alone, to hear whether the codec
+# itself loses the suit effect (Brandon, 2026-10-29). Writes a blind hub list, original beside round trip.
+# `VI_WORKER_HOST=local nice -n 19 vi dataset run characters/tali/dataset.toml codectrip`
+[stage.codectrip]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "python3", "jobs/codectrip.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/codectrip.py", "../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py",
+         "../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py",
+         "../../jobs/requirements-steer.txt", "corpus:analysis/after_labels/voice_sets.json"]
+manual = true
+
+[stage.codectrip.settings]
+tokenizer = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+clips = 8       # her clips with the strongest suit colouring
+per_game = 3    # so every game's suit is heard
+
 # Smoke for voicearms, real models, tiny settings: on the rented worker's GPU first (Brandon, 2026-10-26),
 # `vi dataset run characters/tali/dataset.toml voicearms_smoke` after `vi cloud up`; at home on the CPU
 # with `VI_WORKER_HOST=local nice -n 19 ...` and device = "cpu".
