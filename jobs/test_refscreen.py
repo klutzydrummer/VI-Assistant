@@ -19,7 +19,8 @@ class FakeRunTest(unittest.TestCase):
             harvest, files = corpus(tmp)
             out, ck = tmp / "out", tmp / "ck"
             (tmp / "settings.json").write_text(json.dumps({
-                "backend": "fake", "moods": ["warmth", "teasing"], "shortlist": 2, "shortlist_weak": 3, "controls": 1}))
+                "backend": "fake", "moods": ["warmth", "teasing"], "shortlist": 2, "shortlist_weak": 3, "controls": 1,
+                "exclude": ["le3.pos0_f"]}))
             env = {"VI_SETTINGS": str(tmp / "settings.json"), "VI_OUT": str(out), "VI_CHECKPOINT": str(ck),
                    "VI_INPUT_HARVEST": str(harvest), "VI_FILES": str(files)}  # fmt: skip
             with mock.patch.dict(os.environ, env):
@@ -40,6 +41,7 @@ class FakeRunTest(unittest.TestCase):
                     self.assertTrue((out / "audio" / mood / c["clip"] / "3.wav").exists())
                     # her pairs' positives only, outside the held-out conversations
                     self.assertIn("pos", c["clip"])
+                    self.assertNotEqual(c["clip"], "le3.pos0_f")  # excluded
                 d = out / "shortlist" / mood
                 f = tomllib.loads((d / "clips.toml").read_text())
                 self.assertTrue(f["blind"])

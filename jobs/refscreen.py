@@ -4,7 +4,8 @@ carried the mood as well as any steering arm, but voicearms only ever tried one 
 
 Candidates per mood: every positive of the mood's pairs in voice_sets.json (her trusted clips, effect
 clips already out) that is 3-15 s long and not in a held-out conversation (voicearms' split, so its
-fits stay honest). Each speaks the first `screen_sentences` test sentences as the ICL example with its
+fits stay honest). `exclude` (clip ids) drops lines that aren't normal talking, such as screams, pain
+or combat callouts, from the candidates and from her neutral clips. Each speaks the first `screen_sentences` test sentences as the ICL example with its
 own x-vector, exactly voicearms' swap; her neutral voice (voicearms' N-icl: the reference clip with the
 mean neutral x-vector) speaks the same sentences as the baseline.
 
@@ -58,9 +59,10 @@ def main():
     min_lift = float(s.get("min_lift", 0.1))
     n_refs = int(s.get("refs_per_side", 32))
     max_cands = int(s.get("max_candidates", 0)) or None
+    excluded = set(s.get("exclude", []))
 
     clips = {c.id: c for c in load_clips()}
-    neutral = [clips[i] for i in sets["neutral"] if i in clips]
+    neutral = [clips[i] for i in sets["neutral"] if i in clips and i not in excluded]
     if not neutral:
         raise SystemExit("refscreen: none of the neutral clips are in harvest")
     voice = voicearms.reference(neutral, ref_len)
@@ -105,7 +107,7 @@ def main():
     for mood in moods:
         pairs = [p for p in sets["moods"][mood]["pairs"] if p[0] in clips and p[1] in clips]
         train = [p for p in pairs if not voicearms.held_out(clips[p[0]])]
-        cands = [p for p, _ in train if ref_len[0] <= clips[p].duration_s <= ref_len[1]][:max_cands]
+        cands = [p for p, _ in train if ref_len[0] <= clips[p].duration_s <= ref_len[1] and p not in excluded][:max_cands]
         # voicearms' similarity allowance: her own real mood clips' drop from her neutral voice, + 0.02
         sim_p = [cached(keep / "simclip" / f"{p}.json", lambda c=clips[p]: voicearms.voicesteer_cos(scorer, c, her)) for p, _ in train[:n_refs]]
         sim_z = [cached(keep / "simclip" / f"{z}.json", lambda c=clips[z]: voicearms.voicesteer_cos(scorer, c, her)) for _, z in train[:n_refs]]
