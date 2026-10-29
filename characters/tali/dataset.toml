@@ -348,6 +348,54 @@ max_wer = 0.15
 min_lift = 0.1
 min_share = 0.75
 
+# Reference screening (Brandon, 2026-10-29): every 3-15 s clip of hers in each mood speaks 4 test
+# sentences as the voice-clone example (voicearms' swap), scored and ranked; shortlist/<mood>/ goes to
+# the review hub for his ears and sub-mood tags. GPU, manual: `vi dataset run characters/tali/dataset.toml
+# refscreen` after `vi cloud up`, after refscreen_smoke. About 350 candidates, ~1,400 clips.
+[stage.refscreen]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/refscreen.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/refscreen.py", "../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py",
+         "../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py",
+         "../../jobs/requirements-steer.txt",
+         "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.refscreen.settings]
+model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+moods = ["warmth", "amused", "sadness", "indignation", "alarm", "urgency", "playful"]
+screen_sentences = 4     # test sentences each candidate speaks
+listen_sentences = 2     # of those, on the hub per shortlisted candidate
+shortlist = 5            # top holding candidates per mood for his ears
+shortlist_weak = 8       # where even the best doesn't lift the probe by min_lift (the ranking means little)
+controls = 2             # low-ranked holding candidates, a check that the ranking means anything
+refs_per_side = 32       # pairs for the similarity allowance and the mood's suit spectrum, as voicearms
+max_similarity_drop = 0.05
+max_wer = 0.15
+min_lift = 0.1
+
+[stage.refscreen_smoke]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/refscreen.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/refscreen.py", "../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py",
+         "../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py",
+         "../../jobs/requirements-steer.txt",
+         "corpus:analysis/after_labels/voice_sets.json", "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.refscreen_smoke.settings]
+device = "cuda:0"
+asr = "openai/whisper-tiny"
+moods = ["warmth"]
+screen_sentences = 2
+listen_sentences = 1
+max_candidates = 3
+refs_per_side = 2
+shortlist = 1
+controls = 1
+
 # Smoke for voicearms, real models, tiny settings: on the rented worker's GPU first (Brandon, 2026-10-26),
 # `vi dataset run characters/tali/dataset.toml voicearms_smoke` after `vi cloud up`; at home on the CPU
 # with `VI_WORKER_HOST=local nice -n 19 ...` and device = "cpu".
