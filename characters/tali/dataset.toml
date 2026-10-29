@@ -348,6 +348,53 @@ max_wer = 0.15
 min_lift = 0.1
 min_share = 0.75
 
+# GPU, manual: rank every usable clip of hers per mood as the ICL example by what it generates (Brandon,
+# 2026-10-29, voice-steering-contingencies.md section 6). Writes ranking.md and two hub clip lists: a
+# blind shortlist of generated lines and her real top clips to tag sub-moods.
+# `vi dataset run characters/tali/dataset.toml refrank`. Needs Brandon's yes for the run.
+[stage.refrank]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/refrank.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/refrank.py", "../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py",
+         "../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py",
+         "../../jobs/requirements-steer.txt", "corpus:analysis/after_labels/voice_sets.json",
+         "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.refrank.settings]
+model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+moods = ["warmth", "amused", "sadness", "indignation", "alarm", "urgency", "playful"]
+rank_sentences = 4      # the first 4 test sentences (voicearms' pick half)
+max_candidates = 100    # per mood: every usable positive up to this
+example_xvec = "own"    # each example keeps its own speaker token, as voicearms' swap did
+shortlist = 5           # top clips per mood for his ears
+shortlist_weak = 8      # for a mood the probe can't hear
+controls = 2            # low-ranked clips mixed in, to check the ranking means anything
+max_similarity_drop = 0.05
+max_wer = 0.15
+min_lift = 0.1
+
+# Smoke for refrank on the rented worker's GPU first.
+[stage.refrank_smoke]
+command = ["../../jobs/on-worker.sh", "--put", "../../corpus/tali/analysis/after_labels/voice_sets.json",
+           "--put", "../../corpus/tali/analysis/after_labels/voice_probe.npz", "python3", "jobs/refrank.py"]
+inputs = ["harvest", "clean"]
+files = ["../../jobs/refrank.py", "../../jobs/voicearms.py", "../../jobs/filter_probe.py", "../../jobs/voicesteer.py",
+         "../../jobs/steer.py", "../../jobs/clean.py", "../../jobs/models.py", "../../jobs/vi_job.py", "../../jobs/fusion.py",
+         "../../jobs/requirements-steer.txt", "corpus:analysis/after_labels/voice_sets.json",
+         "corpus:analysis/after_labels/voice_probe.npz"]
+manual = true
+
+[stage.refrank_smoke.settings]
+device = "cuda:0"
+asr = "openai/whisper-tiny"
+moods = ["warmth"]
+rank_sentences = 1
+max_candidates = 2
+shortlist = 1
+controls = 1
+
 # Smoke for voicearms, real models, tiny settings: on the rented worker's GPU first (Brandon, 2026-10-26),
 # `vi dataset run characters/tali/dataset.toml voicearms_smoke` after `vi cloud up`; at home on the CPU
 # with `VI_WORKER_HOST=local nice -n 19 ...` and device = "cpu".
