@@ -7,7 +7,7 @@ import numpy as np
 import voicetune
 
 
-class VoiceLoraTest(unittest.TestCase):
+class VoiceTuneTest(unittest.TestCase):
     def test_validate_flags_missing_fields_duplicates_and_sample_rate(self):
         rows = [
             {"id": "a", "audio": "a.wav", "text": "Keelah se'lai.", "ref_audio": "r.wav"},
@@ -59,6 +59,20 @@ class VoiceLoraTest(unittest.TestCase):
         mask = torch.tensor([[True, False]])
         self.assertAlmostEqual(float(voicetune.kl_to_base(base, base.clone(), mask)), 0.0, places=6)
         self.assertGreater(float(voicetune.kl_to_base(base, base.flip(-1), mask)), 0.1)
+
+    def test_style_encoder_starts_at_her_mean_voice_and_pads(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        mels, n = voicetune.pad_mels([torch.ones(40, 128), torch.ones(25, 128)])
+        self.assertEqual(tuple(mels.shape), (2, 40, 128))
+        self.assertEqual(n.tolist(), [40, 25])
+        self.assertEqual(float(mels[1, 30:].abs().sum()), 0.0)
+        enc = voicetune.style_encoder(16)
+        self.assertEqual(tuple(enc.code(mels, n).shape), (2, 16))
+        self.assertEqual(float(enc(mels, n).abs().sum()), 0.0)  # zero offset until trained
+
 
 if __name__ == "__main__":
     unittest.main()
