@@ -476,22 +476,27 @@ def cmd_train(a):
         p.requires_grad_(True)
     her_t = torch.tensor(her, dtype=torch.float32, device=model.device)
     enc = game_emb = game_head = pros_head = None
+    fresh = []  # new, randomly started parts: they get their own, much higher learning rate
     if style:
         enc = style_encoder(a.style_dim).to(model.device)
         game_emb = torch.nn.Embedding(len(games), her_t.shape[0]).to(model.device)
         torch.nn.init.zeros_(game_emb.weight)
-        params += list(enc.parameters()) + list(game_emb.parameters())
+        fresh = list(enc.parameters()) + list(game_emb.parameters())
         if a.game_adv:
             game_head = torch.nn.Sequential(torch.nn.Linear(a.style_dim, 64), torch.nn.GELU(),
                                             torch.nn.Linear(64, len(games))).to(model.device)
-            params += list(game_head.parameters())
+            fresh += list(game_head.parameters())
         if a.prosody_aux:
             pros_head = torch.nn.Linear(a.style_dim, 4).to(model.device)
-            params += list(pros_head.parameters())
+            fresh += list(pros_head.parameters())
         (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games}))
     shuffle_gen = torch.Generator().manual_seed(a.seed + 7)
     chunk_frames = int(round(a.style_shuffle * SR / 256))  # mel hop 256
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.01)
+    # At the talker's 2e-6, a network that starts from scratch barely moves in ~500 steps (Adam moves each
+    # weight about lr per step), so the style code would stay near zero and the slot would not steer.
+    groups = [{"params": params, "lr": a.lr}] + ([{"params": fresh, "lr": a.style_lr}] if fresh else [])
+    params = params + fresh
+    opt = torch.optim.AdamW(groups, weight_decay=0.01)
     train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning, style, games)
     val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games) if val else None
     replay_it = itertools.cycle(loader(replay, tts, config, a.batch, True, a.seed + 1, xvec, a.qwen_finetuning)) if a.kl else None
@@ -571,7 +576,7 @@ def cmd_train(a):
             save_file({**{f"enc.{k}": v.detach().cpu().contiguous() for k, v in enc.state_dict().items()},
                        "game": game_emb.weight.detach().cpu().contiguous()}, str(ep / "style.safetensors"))
         (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
-                                                  "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
+                                                  "style_lr": a.style_lr if style else None, "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
                                                   "prosody_aux": a.prosody_aux, "style_dropout": a.style_dropout}))
         log.write(json.dumps(rec) + "\n")
         log.flush()
@@ -725,6 +730,8 @@ def main(argv=None):
     t.add_argument("--kl", type=float, default=0.0, help="weight of the KL-to-Base term on replay lines")
     t.add_argument("--speaker", choices=["clip", "mean", "style"], default="clip")
     t.add_argument("--style-dim", type=int, default=16, help="--speaker style: numbers per clip's delivery")
+    t.add_argument("--style-lr", type=float, default=1e-4,
+                   help="--speaker style: learning rate of the style encoder, game vectors and helper heads")
     t.add_argument("--style-shuffle", type=float, default=0.0, help="--speaker style: shuffle the encoder's input in chunks of this many seconds")
     t.add_argument("--game-adv", type=float, default=0.0, help="--speaker style: weight of the gradient-reversed game classifier on the code")
     t.add_argument("--prosody-aux", type=float, default=0.0, help="--speaker style: weight of the pitch/loudness/pace head on the code")
