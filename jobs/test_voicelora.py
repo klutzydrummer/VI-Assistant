@@ -50,6 +50,12 @@ class VoiceLoraTest(unittest.TestCase):
         b = voicelora.length_bands([{"duration_s": 1.5}, {"duration_s": 3}, {"duration_s": 12}])
         self.assertEqual([b[k]["clips"] for k in b], [1, 1, 0, 1])
 
+    def test_blend_scales_the_weight_change(self):
+        base = {"w": np.array([1.0, 2.0])}
+        tuned = {"w": np.array([3.0, 2.0])}
+        self.assertEqual(list(voicelora.blend(base, tuned, 0.5)["w"]), [2.0, 2.0])
+        self.assertEqual(list(voicelora.blend(base, tuned, 1.0)["w"]), [3.0, 2.0])
+
     def test_set_scale_is_relative_to_trained_scaling(self):
         class Lora:
             def __init__(self):

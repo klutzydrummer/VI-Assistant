@@ -33,6 +33,7 @@ A full fine-tune of 1.7B in bf16 with AdamW needs about 14 GB for weights, gradi
 
 ## Recommended shape
 
-- **A LoRA, rank 16, on the official loop.** Apply the label fix, use sdpa, store the averaged x-vector, lr 2e-6, about 10 epochs, and save a checkpoint each epoch.
+- **Train both a LoRA and a full fine-tune on the same rental** (Brandon asked 2026-10-30 whether full beats LoRA). The full one has more room for her accent and suit and is the official path; it needs a 48 GB card and its strength knob scales the weight change from Base. `jobs/voicelora.py train --full` does it. Judge both blind.
+- **The LoRA: rank 16, on the official loop.** Apply the label fix, use sdpa, store the averaged x-vector, lr 2e-6, about 10 epochs, and save a checkpoint each epoch.
 - **First pass mood-blind,** on her effect-free LE2/LE3 clips, with screams and pain lines excluded and the refscreen conversations held out. LE1 waits for our RVC.
 - **Judge** without a reference clip, at scales 0.3, 0.5 and 1.0, on long and short lines, against the interim voice (her clip plus Collige01).

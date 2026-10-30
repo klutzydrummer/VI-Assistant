@@ -15,19 +15,22 @@ research/qwen3tts-finetune-guide.md), with its known problems fixed:
   - speaker: her MEAN x-vector over many clips (rescaled to their average norm, as voicearms does)
     sits in the speaker slot for every line and becomes the saved speaker, not whichever clip the
     first shuffled batch held.
-  - a LoRA (rank 16) instead of the full fine-tune, so the strength can be turned down at inference
-    (others found scale 0.3-0.4 best); lr 2e-6 (2e-5 gives noise and endless output).
+  - a LoRA (rank 16) by default, so the strength can be turned down at inference (others found
+    scale 0.3-0.4 best); `--full` trains every talker weight instead, as the official recipe does
+    (more room for her accent and suit), and its strength knob scales the weight change from Base
+    (base + s * (tuned - base)). Both are one voice model for every mood. lr 2e-6 (2e-5 gives
+    noise and endless output).
 
     python3 jobs/voicelora.py check   --out <folder>
     python3 jobs/voicelora.py prepare --raw train_raw.jsonl --out <folder> [--device cpu]
     python3 jobs/voicelora.py train   --data <folder>/train_with_codes.jsonl --out <folder>
-                                      [--val val_with_codes.jsonl] [--epochs 10] [--max-steps N]
+                                      [--val val_with_codes.jsonl] [--epochs 10] [--max-steps N] [--full]
     python3 jobs/voicelora.py speak   --run <folder> --sentences s.txt [--epoch K] [--scales 0.3,0.5,1.0]
 
 train_raw.jsonl (built at home): one line per clip, {"id", "audio" (24 kHz mono wav), "text",
 "ref_audio" (any of her clips; only used for the mean x-vector), "game", optional "language"}.
 `prepare` adds the codec codes (it fits the home CPU: one ~0.7 GB tokenizer). `train` writes
-epoch-<k>/adapter.safetensors, voice.json (her mean x-vector) and train_log.jsonl (loss and peak
+epoch-<k>/adapter.safetensors (with --full: epoch-<k>/talker.safetensors, ~3.4 GB each), voice.json (her mean x-vector) and train_log.jsonl (loss and peak
 GPU memory). `speak` builds a no-reference voice from Base + her x-vector + the adapter and writes
 a blind hub list (clips.toml) of every sentence at every scale, plus the Base model's ICL clone
 for comparison when --icl-ref is given. Needs qwen-tts==0.1.1 and peft (requirements-lora.txt).
@@ -109,6 +112,11 @@ def length_bands(rows, key="duration_s"):
         bands[b] += 1
         hours[b] += d / 3600
     return {b: {"clips": bands[b], "hours": round(hours[b], 3)} for b in bands}
+
+
+def blend(base, tuned, scale):
+    """The full fine-tune's strength knob: base + scale * (tuned - base), per tensor."""
+    return {k: base[k] + (tuned[k] - base[k]) * scale for k in tuned}
 
 
 def set_scale(module, scale):
@@ -297,7 +305,14 @@ def cmd_train(a):
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "voice.json").write_text(json.dumps({"speaker": SPEAKER, "refs": n_refs, "xvector": vec.tolist()}))
 
-    params = add_lora(model.talker, a.rank, a.alpha)
+    if a.full:
+        for p in model.parameters():
+            p.requires_grad_(False)
+        params = list(model.talker.parameters())
+        for p in params:
+            p.requires_grad_(True)
+    else:
+        params = add_lora(model.talker, a.rank, a.alpha)
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.01)
     train_dl = batches(TTSDataset(rows, tts.processor, config), a.batch, True, a.seed)
     val_dl = batches(TTSDataset(val, tts.processor, config), a.batch, False, a.seed) if val else None
@@ -333,9 +348,15 @@ def cmd_train(a):
             rec["val_loss"] = round(sum(vl) / len(vl), 4)
         ep = a.out / f"epoch-{epoch}"
         ep.mkdir(exist_ok=True)
-        state = {k: v.detach().cpu().contiguous() for k, v in get_peft_model_state_dict(model.talker).items()}
-        save_file(state, str(ep / "adapter.safetensors"))
-        (ep / "lora.json").write_text(json.dumps({"rank": a.rank, "alpha": a.alpha, "targets": LORA_TARGETS, "base": a.base}))
+        if a.full:
+            state = {k: v.detach().cpu().contiguous() for k, v in model.talker.state_dict().items()}
+            save_file(state, str(ep / "talker.safetensors"))
+            (ep / "lora.json").write_text(json.dumps({"kind": "full", "base": a.base}))
+        else:
+            state = {k: v.detach().cpu().contiguous() for k, v in get_peft_model_state_dict(model.talker).items()}
+            save_file(state, str(ep / "adapter.safetensors"))
+            (ep / "lora.json").write_text(json.dumps({"kind": "lora", "rank": a.rank, "alpha": a.alpha,
+                                                      "targets": LORA_TARGETS, "base": a.base}))
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
@@ -380,7 +401,7 @@ def cmd_speak(a):
 
     run = a.run
     voice = json.loads((run / "voice.json").read_text())
-    epochs = sorted(int(p.name.split("-")[1]) for p in run.glob("epoch-*") if (p / "adapter.safetensors").exists())
+    epochs = sorted(int(p.name.split("-")[1]) for p in run.glob("epoch-*") if (p / "lora.json").exists())
     if not epochs:
         sys.exit("speak: no adapters in the run")
     epoch = a.epoch if a.epoch is not None else epochs[-1]
@@ -389,24 +410,36 @@ def cmd_speak(a):
     sentences = [x.strip() for x in Path(a.sentences).read_text().splitlines() if x.strip()]
     vd = voice_dir(lora["base"], voice["xvector"], run / "voice-model")
     tts = load_tts(str(vd), a.device)
-    add_lora(tts.model.talker, lora["rank"], lora["alpha"])
-    set_peft_model_state_dict(tts.model.talker, load_file(str(ep / "adapter.safetensors")))
+    full = lora.get("kind") == "full"
+    if full:
+        talker = tts.model.talker
+        base_w = {k: v.detach().clone() for k, v in talker.state_dict().items()}
+        tuned_w = {k: v.to(base_w[k].device, base_w[k].dtype) for k, v in load_file(str(ep / "talker.safetensors")).items()}
+    else:
+        add_lora(tts.model.talker, lora["rank"], lora["alpha"])
+        set_peft_model_state_dict(tts.model.talker, load_file(str(ep / "adapter.safetensors")))
     tts.model.eval()
+    kind = "full fine-tune" if full else "LoRA"
     out = a.out or (run / f"speak-epoch-{epoch}")
     (out / "wav").mkdir(parents=True, exist_ok=True)
     clips = []
     timing = []
     for scale in [float(s) for s in a.scales.split(",")]:
-        set_scale(tts.model.talker, scale)
+        if full:
+            tts.model.talker.load_state_dict(blend(base_w, tuned_w, scale), strict=False)
+        else:
+            set_scale(tts.model.talker, scale)
         for n, text in enumerate(sentences):
             t0 = time.time()
             wavs, sr = tts.generate_custom_voice(text=text, speaker=SPEAKER)
-            p = out / "wav" / f"lora{scale:g}--{n:02d}.wav"
+            p = out / "wav" / f"{'full' if full else 'lora'}{scale:g}--{n:02d}.wav"
             sf.write(p, wavs[0], sr)
             timing.append({"scale": scale, "n": n, "s": round(time.time() - t0, 2), "audio_s": round(len(wavs[0]) / sr, 2)})
-            clips.append((f"LoRA epoch {epoch} x{scale:g}, no reference | sentence {n}: {text}", p))
+            clips.append((f"{kind} epoch {epoch} x{scale:g}, no reference | sentence {n}: {text}", p))
     if a.icl_ref:
         del tts  # one big model at a time
+        if full:
+            del base_w, tuned_w
         base = load_tts(lora["base"], a.device)
         for n, text in enumerate(sentences):
             wavs, sr = base.generate_voice_clone(text=text, ref_audio=a.icl_ref, ref_text=a.icl_ref_text)
@@ -447,6 +480,7 @@ def main(argv=None):
     t.add_argument("--base", default=BASE)
     t.add_argument("--qwen-finetuning", type=Path, default=Path("Qwen3-TTS/finetuning"),
                    help="the official finetuning/ folder (for dataset.py), pinned commit 022e286b")
+    t.add_argument("--full", action="store_true", help="train every talker weight instead of a LoRA")
     t.add_argument("--rank", type=int, default=16)
     t.add_argument("--alpha", type=int, default=32)
     t.add_argument("--lr", type=float, default=2e-6)
