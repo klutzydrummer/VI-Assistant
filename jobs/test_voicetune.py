@@ -50,6 +50,50 @@ class VoiceTuneTest(unittest.TestCase):
         b = voicetune.length_bands([{"duration_s": 1.5}, {"duration_s": 3}, {"duration_s": 12}])
         self.assertEqual([b[k]["clips"] for k in b], [1, 1, 0, 1])
 
+    def test_shuffle_chunks_keeps_frames_and_padding(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        mel = torch.arange(10, dtype=torch.float32).repeat(2, 1).T.contiguous()  # [10, 2], frame i = (i, i)
+        out = voicetune.shuffle_chunks(mel, 8, 3, torch.Generator().manual_seed(1))
+        self.assertEqual(sorted(out[:8, 0].tolist()), list(range(8)))  # same frames, reordered
+        self.assertEqual(out[8:, 0].tolist(), [8.0, 9.0])  # padding untouched
+        rows = out[:8, 0].tolist()
+        starts = [rows.index(c) for c in (0.0, 3.0, 6.0)]
+        self.assertEqual(rows[starts[0]:starts[0] + 3], [0.0, 1.0, 2.0])  # chunks stay whole
+        self.assertTrue(torch.equal(voicetune.shuffle_chunks(mel, 8, 0), mel))
+        self.assertTrue(torch.equal(voicetune.shuffle_chunks(mel, 3, 5), mel))
+
+    def test_grad_reverse_flips_the_gradient(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        x = torch.tensor([1.0, -2.0], requires_grad=True)
+        y = voicetune.grad_reverse(x, 0.5)
+        self.assertEqual(y.tolist(), [1.0, -2.0])
+        (y * torch.tensor([3.0, 4.0])).sum().backward()
+        self.assertEqual(x.grad.tolist(), [-1.5, -2.0])
+
+    def test_prosody_targets_on_a_steady_tone(self):
+        try:
+            import soundfile as sf
+            import librosa  # noqa: F401
+        except ImportError:
+            self.skipTest("no librosa")
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "tone.wav"
+            t = np.arange(24000 * 2) / 24000
+            sf.write(p, 0.3 * np.sin(2 * np.pi * 220 * t), 24000)
+            f0_range, loud, spread, pace = voicetune.prosody_targets(str(p), "one two three four")
+        self.assertLess(f0_range, 1.0)  # a steady pitch has almost no range
+        self.assertAlmostEqual(pace, 2.0, places=1)  # 4 words in 2 s
+        self.assertLess(spread, 3.0)
+
     def test_kl_to_base_is_zero_for_the_same_model_and_positive_otherwise(self):
         try:
             import torch
