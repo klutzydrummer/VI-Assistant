@@ -23,6 +23,14 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     style tokens / reference encoder, Wang et al. 2018). No labels anywhere: the state space comes
     from her clips, to be clustered and named by ear afterwards. The game goes in as its own
     learned vector, so the style numbers needn't carry each game's suit; `speak --game` picks it.
+  - style extras (Brandon 2026-10-30: reward the delivery we want, penalise the rest; each off at 0):
+    `--style-shuffle S` hands the encoder the clip cut into S-second chunks in a random order, so it can
+    hear delivery but not read the words back (content leakage); chunks of ~1 s keep local rhythm.
+    `--game-adv W` adds a game classifier on the style code behind gradient reversal, so the code
+    can't carry which game (suit) a clip is from; small W, since game and mood overlap (drunk is LE3).
+    `--prosody-aux W` adds a head that predicts the clip's measured pitch range, loudness and pace
+    from the code, so the code can't be ignored. `--style-dropout P` zeroes the code for a share P
+    of lines, so her mean voice stays a good default. None of these exist at inference.
   - forgetting: `--kl` adds a KL-to-Base term on replay lines, i.e. lines Base itself spoke in
     OTHER voices (`replay`). Teacher-forcing on the frozen model's own samples estimates the KL to
     it (Context-Free Synthetic Data, arXiv 2505.13811), so this keeps reading skill and expressive
@@ -132,6 +140,54 @@ def pad_mels(mels):
     for i, m in enumerate(mels):
         out[i, : m.shape[0]] = m
     return out, n
+
+
+def shuffle_chunks(mel, length, chunk, gen=None):
+    """mel [T, d] (first `length` frames real) cut into `chunk`-frame pieces, put back in a random order (torch)."""
+    import torch
+
+    n = int(length)
+    if chunk <= 0 or n <= chunk:
+        return mel
+    pieces = list(mel[:n].split(chunk))
+    order = torch.randperm(len(pieces), generator=gen).tolist()
+    out = mel.clone()
+    out[:n] = torch.cat([pieces[i] for i in order])
+    return out
+
+
+def grad_reverse(x, scale=1.0):
+    """Identity forward, gradient times -scale backward (torch)."""
+    import torch
+
+    class _Rev(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, t):
+            return t.view_as(t)
+
+        @staticmethod
+        def backward(ctx, g):
+            return -scale * g
+
+    return _Rev.apply(x)
+
+
+def prosody_targets(path, text):
+    """[f0 range in semitones (10-90th pct), mean loudness dB, loudness spread dB, words per second] of a clip."""
+    import librosa
+    import numpy as np
+
+    wav, sr = librosa.load(path, sr=16000, mono=True)
+    rms = librosa.feature.rms(y=wav, frame_length=1024, hop_length=320)[0]
+    voiced = rms > max(1e-4, 0.1 * float(rms.max(initial=0)))
+    f0 = librosa.yin(wav, fmin=75, fmax=600, sr=sr, frame_length=1024, hop_length=320)
+    k = min(len(f0), len(voiced))
+    f0 = f0[:k][voiced[:k]]
+    semis = 12 * np.log2(f0 / 100.0) if len(f0) else np.array([0.0])
+    db = 20 * np.log10(rms + 1e-9)
+    dur = max(len(wav) / sr, 1e-3)
+    return [float(np.percentile(semis, 90) - np.percentile(semis, 10)), float(db.mean()), float(db.std()),
+            len(text.split()) / dur]
 
 
 def kl_to_base(base_logits, logits, mask):
@@ -322,6 +378,7 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
             if style:
                 item["style_mel"] = mel(row["audio"])[0]
                 item["game"] = games.get(row.get("game", ""), 0)
+                item["audio_path"] = row["audio"]
             return item
 
         def collate_fn(self, batch):
@@ -330,6 +387,7 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
             if style:
                 out["style_mel"], out["style_len"] = pad_mels([b["style_mel"] for b in batch])
                 out["game"] = torch.tensor([b["game"] for b in batch])
+                out["audio_path"] = [b["audio_path"] for b in batch]
             return out
 
     data = [{**r, "_ref": r["ref_audio"], "ref_audio": fixed} for r in rows]
@@ -390,6 +448,20 @@ def cmd_train(a):
             xvec[r["ref_audio"]] = her.tolist()
     style = a.speaker == "style"
     games = {g: i for i, g in enumerate(sorted({r.get("game", "") for r in rows + val}))}
+    extras = any([a.style_shuffle, a.game_adv, a.prosody_aux, a.style_dropout])
+    if extras and not style:
+        sys.exit("train: --style-shuffle/--game-adv/--prosody-aux/--style-dropout need --speaker style")
+    pros = {}
+    if a.prosody_aux:
+        cache = a.out / "prosody.json"
+        pros = json.loads(cache.read_text()) if cache.exists() else {}
+        for r in rows + val:
+            if r["audio"] not in pros:
+                pros[r["audio"]] = prosody_targets(r["audio"], r["text"])
+        cache.write_text(json.dumps(pros))
+        pv = np.array([pros[r["audio"]] for r in rows])
+        pm, ps = pv.mean(0), pv.std(0) + 1e-6
+        pros = {k: ((np.array(v) - pm) / ps).tolist() for k, v in pros.items()}
 
     base = None
     if a.kl:
@@ -403,28 +475,51 @@ def cmd_train(a):
     for p in params:
         p.requires_grad_(True)
     her_t = torch.tensor(her, dtype=torch.float32, device=model.device)
-    enc = game_emb = None
+    enc = game_emb = game_head = pros_head = None
     if style:
         enc = style_encoder(a.style_dim).to(model.device)
         game_emb = torch.nn.Embedding(len(games), her_t.shape[0]).to(model.device)
         torch.nn.init.zeros_(game_emb.weight)
         params += list(enc.parameters()) + list(game_emb.parameters())
+        if a.game_adv:
+            game_head = torch.nn.Sequential(torch.nn.Linear(a.style_dim, 64), torch.nn.GELU(),
+                                            torch.nn.Linear(64, len(games))).to(model.device)
+            params += list(game_head.parameters())
+        if a.prosody_aux:
+            pros_head = torch.nn.Linear(a.style_dim, 4).to(model.device)
+            params += list(pros_head.parameters())
         (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games}))
+    shuffle_gen = torch.Generator().manual_seed(a.seed + 7)
+    chunk_frames = int(round(a.style_shuffle * SR / 256))  # mel hop 256
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.01)
     train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning, style, games)
     val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games) if val else None
     replay_it = itertools.cycle(loader(replay, tts, config, a.batch, True, a.seed + 1, xvec, a.qwen_finetuning)) if a.kl else None
 
-    def slot(batch):
+    def slot(batch, training=True):
+        """The speaker slot for her lines, and the style extras' loss (0 when off or not training)."""
         if not style:
-            return batch["xvec"]
+            return batch["xvec"], torch.zeros((), device=model.device)
         dev = model.device
-        off = enc(batch["style_mel"].to(dev), batch["style_len"].to(dev)) + game_emb(batch["game"].to(dev))
-        return her_t + off
+        mels, lens = batch["style_mel"], batch["style_len"]
+        if training and chunk_frames:
+            mels = torch.stack([shuffle_chunks(m, n, chunk_frames, shuffle_gen) for m, n in zip(mels, lens)])
+        code = enc.code(mels.to(dev), lens.to(dev))
+        aux = torch.zeros((), device=dev)
+        if training and game_head is not None:
+            aux = aux + a.game_adv * torch.nn.functional.cross_entropy(game_head(grad_reverse(code)).float(), batch["game"].to(dev))
+        if training and pros_head is not None:
+            tgt = torch.tensor([pros[p] for p in batch["audio_path"]], device=dev)
+            aux = aux + a.prosody_aux * torch.nn.functional.mse_loss(pros_head(code).float(), tgt)
+        if training and a.style_dropout:
+            keep = (torch.rand(code.shape[0], 1, device=dev) >= a.style_dropout).to(code.dtype)
+            code = code * keep
+        return her_t + enc.up(code) + game_emb(batch["game"].to(dev)), aux
 
-    def her_loss(batch):
-        out, sub = forward(model, batch, slot(batch))
-        return out.loss + 0.3 * sub
+    def her_loss(batch, training=True):
+        voice, aux = slot(batch, training)
+        out, sub = forward(model, batch, voice)
+        return out.loss + 0.3 * sub, aux
 
     def replay_kl(batch):
         out, _ = forward(model, batch, batch["xvec"])
@@ -441,16 +536,16 @@ def cmd_train(a):
         opt.zero_grad()
         for k, batch in enumerate(train_dl):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss = her_loss(batch)
+                loss, aux = her_loss(batch)
                 kl = replay_kl(next(replay_it)) if a.kl else torch.zeros((), device=model.device)
-                total = (loss + a.kl * kl) / a.accum
+                total = (loss + aux + a.kl * kl) / a.accum
             total.backward()
             if (k + 1) % a.accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 opt.step()
                 opt.zero_grad()
                 step += 1
-                rec = {"epoch": epoch, "step": step, "loss": round(loss.item(), 4), "kl": round(kl.item(), 5),
+                rec = {"epoch": epoch, "step": step, "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "aux": round(aux.item(), 5),
                        "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2), "s": round(time.time() - t0)}
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
@@ -464,7 +559,7 @@ def cmd_train(a):
             if enc is not None:
                 enc.eval()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                rec["val_loss"] = round(float(np.mean([her_loss(b).item() for b in val_dl])), 4)
+                rec["val_loss"] = round(float(np.mean([her_loss(b, training=False)[0].item() for b in val_dl])), 4)
             model.train()
             if enc is not None:
                 enc.train()
@@ -475,7 +570,9 @@ def cmd_train(a):
         if style:
             save_file({**{f"enc.{k}": v.detach().cpu().contiguous() for k, v in enc.state_dict().items()},
                        "game": game_emb.weight.detach().cpu().contiguous()}, str(ep / "style.safetensors"))
-        (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker}))
+        (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
+                                                  "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
+                                                  "prosody_aux": a.prosody_aux, "style_dropout": a.style_dropout}))
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
@@ -628,6 +725,10 @@ def main(argv=None):
     t.add_argument("--kl", type=float, default=0.0, help="weight of the KL-to-Base term on replay lines")
     t.add_argument("--speaker", choices=["clip", "mean", "style"], default="clip")
     t.add_argument("--style-dim", type=int, default=16, help="--speaker style: numbers per clip's delivery")
+    t.add_argument("--style-shuffle", type=float, default=0.0, help="--speaker style: shuffle the encoder's input in chunks of this many seconds")
+    t.add_argument("--game-adv", type=float, default=0.0, help="--speaker style: weight of the gradient-reversed game classifier on the code")
+    t.add_argument("--prosody-aux", type=float, default=0.0, help="--speaker style: weight of the pitch/loudness/pace head on the code")
+    t.add_argument("--style-dropout", type=float, default=0.0, help="--speaker style: share of lines trained with the code zeroed")
     t.add_argument("--out", type=Path, required=True)
     t.add_argument("--base", default=BASE)
     t.add_argument("--qwen-finetuning", type=Path, default=Path("Qwen3-TTS/finetuning"),
