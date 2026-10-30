@@ -17,6 +17,12 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     to ignore the slot the projector needs. The saved speaker `tali` is her mean x-vector
     (rescaled to the clips' average norm, as voicearms does). `--speaker mean` puts the mean in for
     every line instead.
+  - label-less style (`--speaker style`, Brandon 2026-10-30: "what if the labels are not
+    accurate?"): a small style encoder hears each clip's own audio and squeezes its delivery into
+    `--style-dim` numbers, added to her mean x-vector in the slot, trained with the model (global
+    style tokens / reference encoder, Wang et al. 2018). No labels anywhere: the state space comes
+    from her clips, to be clustered and named by ear afterwards. The game goes in as its own
+    learned vector, so the style numbers needn't carry each game's suit; `speak --game` picks it.
   - forgetting: `--kl` adds a KL-to-Base term on replay lines, i.e. lines Base itself spoke in
     OTHER voices (`replay`). Teacher-forcing on the frozen model's own samples estimates the KL to
     it (Context-Free Synthetic Data, arXiv 2505.13811), so this keeps reading skill and expressive
@@ -29,6 +35,7 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     python3 jobs/voicetune.py train   --data train_with_codes.jsonl --val val_with_codes.jsonl --out <folder>
                                       [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N]
     python3 jobs/voicetune.py speak   --run <folder> --sentences s.txt [--epoch K] [--icl-ref clip.wav]
+                                      [--style-from her_clip.wav ...] [--game le3]
 
 train_raw.jsonl (built at home): one line per clip, {"id", "audio" (24 kHz mono wav), "text",
 "ref_audio" (the clip itself, for its own x-vector), "game", optional "language"}. `prepare` adds
@@ -116,6 +123,17 @@ def length_bands(rows, key="duration_s"):
     return {b: {"clips": bands[b], "hours": round(hours[b], 3)} for b in bands}
 
 
+def pad_mels(mels):
+    """[T_i, 128] mels -> ([b, T, 128] zero-padded, [b] lengths) (torch)."""
+    import torch
+
+    n = torch.tensor([m.shape[0] for m in mels])
+    out = torch.zeros(len(mels), int(n.max()), mels[0].shape[1])
+    for i, m in enumerate(mels):
+        out[i, : m.shape[0]] = m
+    return out, n
+
+
 def kl_to_base(base_logits, logits, mask):
     """Mean KL(base || tuned) over the masked positions, from raw logits [b, t, v] (torch)."""
     import torch.nn.functional as F
@@ -146,6 +164,37 @@ def mel(path):
         raise SystemExit(f"{path}: {sr} Hz, needs {SR}")
     return mel_spectrogram(torch.from_numpy(wav).unsqueeze(0), n_fft=1024, num_mels=128, sampling_rate=SR,
                            hop_size=256, win_size=1024, fmin=0, fmax=12000).transpose(1, 2)
+
+
+def style_encoder(dim, width=256, out=2048):
+    """Reference encoder: mel [b, T, 128] + lengths -> a dim-number bottleneck -> a slot offset [b, out]."""
+    import torch
+    from torch import nn
+
+    class StyleEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv1d(128, width, 5, stride=2, padding=2), nn.GELU(),
+                nn.Conv1d(width, width, 5, stride=2, padding=2), nn.GELU(),
+                nn.Conv1d(width, width, 5, stride=2, padding=2), nn.GELU())
+            self.gru = nn.GRU(width, width, batch_first=True)
+            self.bottleneck = nn.Linear(width, dim)
+            self.up = nn.Linear(dim, out)
+            nn.init.zeros_(self.up.weight)  # starts as "no offset": her mean voice
+            nn.init.zeros_(self.up.bias)
+
+        def code(self, mels, lengths):
+            h = self.conv(mels.transpose(1, 2)).transpose(1, 2)
+            n = torch.clamp((lengths + 7) // 8, min=1, max=h.shape[1]).cpu()
+            packed = nn.utils.rnn.pack_padded_sequence(h, n, batch_first=True, enforce_sorted=False)
+            _, last = self.gru(packed)
+            return torch.tanh(self.bottleneck(last[-1]))
+
+        def forward(self, mels, lengths):
+            return self.up(self.code(mels, lengths))
+
+    return StyleEncoder()
 
 
 def xvectors(model, paths, cache):
@@ -253,7 +302,7 @@ def cmd_prepare(a):
     print(f"prepare: {dst}")
 
 
-def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning):
+def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=False, games=None):
     """The official dataset/collate, plus each line's own x-vector. The official collate stacks every
     line's reference mel, which only works when all lines share one ref_audio, so it is handed one
     fixed clip and the x-vectors travel separately."""
@@ -268,12 +317,19 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning):
     class WithVoice(TTSDataset):
         def __getitem__(self, idx):
             item = super().__getitem__(idx)
-            item["xvec"] = torch.tensor(xvec[self.data_list[idx]["_ref"]])
+            row = self.data_list[idx]
+            item["xvec"] = torch.tensor(xvec[row["_ref"]])
+            if style:
+                item["style_mel"] = mel(row["audio"])[0]
+                item["game"] = games.get(row.get("game", ""), 0)
             return item
 
         def collate_fn(self, batch):
             out = super().collate_fn(batch)
             out["xvec"] = torch.stack([b["xvec"] for b in batch])
+            if style:
+                out["style_mel"], out["style_len"] = pad_mels([b["style_mel"] for b in batch])
+                out["game"] = torch.tensor([b["game"] for b in batch])
             return out
 
     data = [{**r, "_ref": r["ref_audio"], "ref_audio": fixed} for r in rows]
@@ -332,6 +388,8 @@ def cmd_train(a):
     if a.speaker == "mean":
         for r in rows + val:
             xvec[r["ref_audio"]] = her.tolist()
+    style = a.speaker == "style"
+    games = {g: i for i, g in enumerate(sorted({r.get("game", "") for r in rows + val}))}
 
     base = None
     if a.kl:
@@ -344,13 +402,28 @@ def cmd_train(a):
     params = list(model.talker.parameters())
     for p in params:
         p.requires_grad_(True)
+    her_t = torch.tensor(her, dtype=torch.float32, device=model.device)
+    enc = game_emb = None
+    if style:
+        enc = style_encoder(a.style_dim).to(model.device)
+        game_emb = torch.nn.Embedding(len(games), her_t.shape[0]).to(model.device)
+        torch.nn.init.zeros_(game_emb.weight)
+        params += list(enc.parameters()) + list(game_emb.parameters())
+        (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games}))
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.01)
-    train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning)
-    val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning) if val else None
+    train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning, style, games)
+    val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games) if val else None
     replay_it = itertools.cycle(loader(replay, tts, config, a.batch, True, a.seed + 1, xvec, a.qwen_finetuning)) if a.kl else None
 
+    def slot(batch):
+        if not style:
+            return batch["xvec"]
+        dev = model.device
+        off = enc(batch["style_mel"].to(dev), batch["style_len"].to(dev)) + game_emb(batch["game"].to(dev))
+        return her_t + off
+
     def her_loss(batch):
-        out, sub = forward(model, batch, batch["xvec"])
+        out, sub = forward(model, batch, slot(batch))
         return out.loss + 0.3 * sub
 
     def replay_kl(batch):
@@ -388,13 +461,20 @@ def cmd_train(a):
         rec = {"epoch": epoch, "end": True}
         if val_dl is not None:
             model.eval()
+            if enc is not None:
+                enc.eval()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 rec["val_loss"] = round(float(np.mean([her_loss(b).item() for b in val_dl])), 4)
             model.train()
+            if enc is not None:
+                enc.train()
         ep = a.out / f"epoch-{epoch}"
         ep.mkdir(exist_ok=True)
         save_file({k: v.detach().cpu().contiguous() for k, v in model.talker.state_dict().items()},
                   str(ep / "talker.safetensors"))
+        if style:
+            save_file({**{f"enc.{k}": v.detach().cpu().contiguous() for k, v in enc.state_dict().items()},
+                       "game": game_emb.weight.detach().cpu().contiguous()}, str(ep / "style.safetensors"))
         (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker}))
         log.write(json.dumps(rec) + "\n")
         log.flush()
@@ -429,10 +509,52 @@ def voice_model(base, vec, talker_file, dst):
     return dst
 
 
+def speak_slots(a, tune, voice, ep):
+    """What goes in the speaker slot for each listening condition. Her mean voice always; with
+    --style-from, the delivery of each given clip of hers, so the list shows whether the slot still
+    steers her delivery (her x-vector of that clip, or the style encoder's reading of it)."""
+    import numpy as np
+    import torch
+    from safetensors.torch import load_file
+
+    her = np.asarray(voice["xvector"], dtype=np.float64)
+    style = tune.get("speaker") == "style"
+    game_vec = np.zeros_like(her)
+    enc = None
+    if style:
+        info = json.loads((ep.parent / "style.json").read_text())
+        st = load_file(str(ep / "style.safetensors"))
+        enc = style_encoder(info["dim"])
+        enc.load_state_dict({k[4:]: v for k, v in st.items() if k.startswith("enc.")})
+        enc.eval()
+        g = info["games"].get(a.game)
+        if g is None:
+            sys.exit(f"speak: game {a.game!r} not in {sorted(info['games'])}")
+        game_vec = st["game"][g].float().numpy()
+    out = [(f"her mean voice{f', {a.game} suit' if style else ''}", (her + game_vec).tolist())]
+    if not a.style_from:
+        return out
+    if style:
+        with torch.no_grad():
+            for w in a.style_from:
+                m = mel(w)
+                off = enc(m, torch.tensor([m.shape[1]]))[0].numpy()
+                out.append((f"delivery of {Path(w).stem}", (her + game_vec + off).tolist()))
+    else:
+        base = load_tts(tune["base"], a.device).model  # only for its speaker encoder
+        with torch.no_grad():
+            for w in a.style_from:
+                m = mel(w).to(base.device).to(base.dtype)
+                out.append((f"delivery of {Path(w).stem}", base.speaker_encoder(m)[0].float().cpu().tolist()))
+        del base
+    return out
+
+
 def cmd_speak(a):
     import hashlib
 
     import soundfile as sf
+    import torch
 
     run = a.run
     voice = json.loads((run / "voice.json").read_text())
@@ -443,18 +565,23 @@ def cmd_speak(a):
     ep = run / f"epoch-{epoch}"
     tune = json.loads((ep / "tune.json").read_text())
     sentences = [x.strip() for x in Path(a.sentences).read_text().splitlines() if x.strip()]
+    slots = speak_slots(a, tune, voice, ep)  # [(label, vector)]: her voice, plus one per --style-from clip
     vm = voice_model(tune["base"], voice["xvector"], ep / "talker.safetensors", run / f"voice-epoch-{epoch}")
     tts = load_tts(str(vm), a.device)
+    row = tts.model.talker.model.codec_embedding.weight
     out = a.out or (run / f"speak-epoch-{epoch}")
     (out / "wav").mkdir(parents=True, exist_ok=True)
     clips, timing = [], []
-    for n, text in enumerate(sentences):
-        t0 = time.time()
-        wavs, sr = tts.generate_custom_voice(text=text, speaker=SPEAKER)
-        p = out / "wav" / f"tuned--{n:02d}.wav"
-        sf.write(p, wavs[0], sr)
-        timing.append({"n": n, "s": round(time.time() - t0, 2), "audio_s": round(len(wavs[0]) / sr, 2)})
-        clips.append((f"fine-tuned epoch {epoch}, no reference | sentence {n}: {text}", p))
+    for j, (slot_label, vec) in enumerate(slots):
+        with torch.no_grad():
+            row[SPEAKER_ID] = torch.tensor(vec, dtype=row.dtype, device=row.device)
+        for n, text in enumerate(sentences):
+            t0 = time.time()
+            wavs, sr = tts.generate_custom_voice(text=text, speaker=SPEAKER)
+            p = out / "wav" / f"tuned-{j:02d}--{n:02d}.wav"
+            sf.write(p, wavs[0], sr)
+            timing.append({"slot": slot_label, "n": n, "s": round(time.time() - t0, 2), "audio_s": round(len(wavs[0]) / sr, 2)})
+            clips.append((f"fine-tuned epoch {epoch}, no reference, {slot_label} | sentence {n}: {text}", p))
     if a.icl_ref:
         del tts  # one big model at a time
         base = load_tts(tune["base"], a.device)
@@ -499,7 +626,8 @@ def main(argv=None):
     t.add_argument("--val", type=Path)
     t.add_argument("--replay", type=Path, help="replay_with_codes.jsonl, for --kl")
     t.add_argument("--kl", type=float, default=0.0, help="weight of the KL-to-Base term on replay lines")
-    t.add_argument("--speaker", choices=["clip", "mean"], default="clip")
+    t.add_argument("--speaker", choices=["clip", "mean", "style"], default="clip")
+    t.add_argument("--style-dim", type=int, default=16, help="--speaker style: numbers per clip's delivery")
     t.add_argument("--out", type=Path, required=True)
     t.add_argument("--base", default=BASE)
     t.add_argument("--qwen-finetuning", type=Path, default=Path("Qwen3-TTS/finetuning"),
@@ -517,6 +645,8 @@ def main(argv=None):
     s.add_argument("--device", default="cuda:0")
     s.add_argument("--out", type=Path)
     s.add_argument("--icl-ref", help="her clip, for a Base-model ICL comparison")
+    s.add_argument("--style-from", action="append", default=[], help="her clip whose delivery goes in the slot")
+    s.add_argument("--game", default="le3", help="--speaker style runs: which game's suit")
     s.add_argument("--icl-ref-text", default="")
     a = ap.parse_args(argv)
     cmds = {"check": cmd_check, "replay": cmd_replay, "prepare": cmd_prepare, "train": cmd_train, "speak": cmd_speak}
