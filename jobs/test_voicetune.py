@@ -21,42 +21,6 @@ class VoiceTuneTest(unittest.TestCase):
         self.assertIn("missing text", bad[2])
         self.assertEqual(voicetune.validate(rows[:1], lambda p: 24000), [])
 
-    def test_chunk_order_keeps_pieces_whole_and_shuffles_them(self):
-        import random
-
-        order = voicetune.chunk_order(10, 3, random.Random(1))
-        self.assertEqual(sorted(order), list(range(10)))
-        pieces, cur = [], [order[0]]
-        for f in order[1:]:  # split wherever the order jumps
-            if f == cur[-1] + 1 and f % 3:
-                cur.append(f)
-            else:
-                pieces.append(cur)
-                cur = [f]
-        pieces.append(cur)
-        self.assertEqual(sorted(pieces), [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]])  # pieces stay whole
-        self.assertNotEqual(order, list(range(10)))
-        self.assertEqual(voicetune.chunk_order(5, 0, random.Random(1)), list(range(5)))
-        self.assertEqual(voicetune.chunk_order(5, 8, random.Random(1)), list(range(5)))
-
-    def test_delivery_numbers(self):
-        hop = 0.016
-        f0 = np.r_[np.full(10, 100.0), np.full(10, 200.0), np.full(10, np.nan)]
-        voiced = np.r_[np.ones(20, bool), np.zeros(10, bool)]
-        rms_db = np.r_[np.full(20, -20.0), np.full(10, -70.0)]  # last 10 frames are silence
-        pitch, loud, pace = voicetune.delivery_numbers(f0, voiced, rms_db, 32, hop)
-        self.assertAlmostEqual(pitch, 12.0, places=5)  # 100 -> 200 Hz is one octave
-        self.assertEqual(loud, -20.0)
-        self.assertAlmostEqual(pace, 32 / (20 * hop))
-        self.assertEqual(voicetune.delivery_numbers(np.full(3, 100.0), np.ones(3, bool), np.zeros(3), 5, hop)[0], 0.0)
-
-    def test_zscore(self):
-        z, norm = voicetune.zscore({"a": [1.0, 10.0], "b": [3.0, 10.0]})
-        self.assertEqual(z["a"][0], -1.0)
-        self.assertEqual(z["b"][0], 1.0)
-        self.assertEqual(z["a"][1], 0.0)  # a constant column stays finite
-        self.assertEqual(norm["mean"], [2.0, 10.0])
-
     def test_alignment_matches_generation(self):
         # A sequence laid out like the official collate: prompt, codec bos at 3, frames 0..2 at 4..6, eos at 7.
         frames = [10, 11, 12]

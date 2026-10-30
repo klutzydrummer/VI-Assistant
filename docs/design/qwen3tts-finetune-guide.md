@@ -57,19 +57,6 @@ What helps, and how it applies here:
    - Weight interpolation after training (WiSE-FT, arXiv 2109.01903): that's a strength knob by another name. It stays a fallback only if the tuned model forgets and the KL can't fix it.
    - Partial fine-tuning of selected layers (CSP-FT, arXiv 2501.14273): the fallback if a full fine-tune forgets too much.
 
-## Style encoder guards (Brandon said yes, 2026-10-30 21:41)
-
-The style encoder can fail three ways: ignore the code, carry words or timing instead of delivery, or learn the recording instead of the mood. Three cheap guards are in `voicetune.py train --speaker style`, on by default, and all thrown away after training:
-- **`--style-chunk 1.0`:** in training the encoder hears its clip in shuffled pieces of about 1 s. That scrambles words and timing across the line but keeps the shape inside each piece (a rise, a pause, a sigh). `speak --style-from` hears the clip in order.
-- **`--style-dropout 0.1`:** one line in ten trains with the code off, so "her plain voice" stays a real default.
-- **`--style-aux 0.1`:** a small helper predicts each clip's measured pitch range, loudness and pace from the code. The values are measured from the audio (librosa pyin, cached in delivery.json), never labelled. It's kept light so loud moods don't crowd out subtle ones.
-
-Left out on purpose:
-- **Volume and EQ augmentation:** loudness and effort are part of her moods.
-- **Adversaries (game, words, length):** game and mood are tangled in her data (most drunk lines are LE3 parties), and strong adversaries weaken mood transfer (Daft-Exprt).
-- **DPO (SpeechAlign, arXiv 2404.05600):** later, only for a specific fault, with his ears judging.
-- **WiSE blending:** a strength knob.
-
 ## Plan for the runs
 
 - **Smoke test (one 48 GB rental, pennies):** `check`, then about 50 clips for 200 steps, once without KL and once with `--kl 0.1`. That proves both paths and measures memory and time. A few no-reference lines go on the hub.

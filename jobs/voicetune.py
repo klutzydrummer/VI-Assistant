@@ -23,17 +23,6 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     style tokens / reference encoder, Wang et al. 2018). No labels anywhere: the state space comes
     from her clips, to be clustered and named by ear afterwards. The game goes in as its own
     learned vector, so the style numbers needn't carry each game's suit; `speak --game` picks it.
-    Three guards against the encoder going wrong (Brandon 2026-10-30, "Yes" to them; volume/EQ
-    augmentation left out because loudness and effort are part of her moods):
-      * `--style-chunk 1.0`: in training the encoder hears its clip cut into ~1 s pieces in shuffled
-        order, so the code can't carry the words or exact timing, but keeps the shape inside each
-        piece (a rise, a pause, a sigh). `speak --style-from` hears the clip in order.
-      * `--style-dropout 0.1`: one line in ten trains with the code switched off (her mean voice plus
-        the game's), so "her plain voice" stays a real default and the code means a change from it.
-      * `--style-aux 0.1`: a small helper must predict the clip's measured pitch range, loudness and
-        pace from the 16 numbers, a light push against the model ignoring the code. Measured from
-        the audio, never labelled; kept light so loud moods don't crowd out subtle ones. Thrown
-        away after training.
   - forgetting: `--kl` adds a KL-to-Base term on replay lines, i.e. lines Base itself spoke in
     OTHER voices (`replay`). Teacher-forcing on the frozen model's own samples estimates the KL to
     it (Context-Free Synthetic Data, arXiv 2505.13811), so this keeps reading skill and expressive
@@ -45,7 +34,6 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     python3 jobs/voicetune.py prepare --raw train_raw.jsonl --out <folder> [--device cpu]
     python3 jobs/voicetune.py train   --data train_with_codes.jsonl --val val_with_codes.jsonl --out <folder>
                                       [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N]
-                                      [--speaker style [--style-chunk 1.0] [--style-dropout 0.1] [--style-aux 0.1]]
     python3 jobs/voicetune.py speak   --run <folder> --sentences s.txt [--epoch K] [--icl-ref clip.wav]
                                       [--style-from her_clip.wav ...] [--game le3]
 
@@ -112,43 +100,6 @@ def predictor_hidden_mask(codec_mask):
     """Which hidden states (of inputs_embeds[:, :-1]) feed the code predictor, one per audio frame:
     the position just before each frame, whose output predicted that frame's first code."""
     return codec_mask[:, 1:]
-
-
-def chunk_order(n, chunk, rng):
-    """Frame order for a style mel of n frames cut into chunk-frame pieces and shuffled: delivery
-    inside each piece survives, the words and timing across pieces don't. rng: random.Random."""
-    if chunk <= 0 or n <= chunk:
-        return list(range(n))
-    pieces = [list(range(i, min(i + chunk, n))) for i in range(0, n, chunk)]
-    rng.shuffle(pieces)
-    return [f for piece in pieces for f in piece]
-
-
-def delivery_numbers(f0, voiced, rms_db, n_chars, hop_s):
-    """[pitch range in semitones (10th to 90th percentile of voiced f0), loudness (median dB of active
-    frames), pace (characters per active second)] for the style helper. Active = within 35 dB of
-    the clip's loudest frame."""
-    import numpy as np
-
-    f0 = np.asarray(f0, dtype=np.float64)
-    rms_db = np.asarray(rms_db, dtype=np.float64)
-    n = min(len(f0), len(rms_db))
-    f0, rms_db, voiced = f0[:n], rms_db[:n], np.asarray(voiced, dtype=bool)[:n]
-    active = rms_db > rms_db.max() - 35 if n else np.zeros(0, dtype=bool)
-    v = f0[voiced & active & np.isfinite(f0) & (f0 > 0)]
-    pitch = 12 * np.log2(np.percentile(v, 90) / np.percentile(v, 10)) if len(v) >= 5 else 0.0
-    loud = float(np.median(rms_db[active])) if active.any() else -80.0
-    pace = n_chars / max(active.sum() * hop_s, 0.25)
-    return [float(pitch), loud, float(pace)]
-
-
-def zscore(table):
-    """{id: [numbers]} -> ({id: standardised numbers}, {"mean", "std"}), so each helper target weighs the same."""
-    import numpy as np
-
-    x = np.asarray(list(table.values()), dtype=np.float64)
-    mu, sd = x.mean(0), np.maximum(x.std(0), 1e-6)
-    return {k: ((np.asarray(v) - mu) / sd).tolist() for k, v in table.items()}, {"mean": mu.tolist(), "std": sd.tolist()}
 
 
 def mean_voice(vectors):
@@ -246,37 +197,6 @@ def style_encoder(dim, width=256, out=2048):
     return StyleEncoder()
 
 
-def measure_delivery(job):
-    """(path, text) -> delivery_numbers, from the audio (librosa pyin; CPU, runs in a pool)."""
-    import librosa
-    import numpy as np
-
-    path, text = job
-    wav, sr = librosa.load(path, sr=16000, mono=True)
-    hop = 256
-    f0, voiced, _ = librosa.pyin(wav, fmin=70, fmax=600, sr=sr, frame_length=1024, hop_length=hop)
-    rms = librosa.feature.rms(y=wav, frame_length=1024, hop_length=hop)[0]
-    return delivery_numbers(f0, voiced, 20 * np.log10(np.maximum(rms, 1e-5)), len(text.strip()), hop / sr)
-
-
-def deliveries(rows, cache):
-    """Measured delivery numbers per clip id, cached in a JSON file (all CPU cores)."""
-    import multiprocessing
-    import os
-
-    got = json.loads(cache.read_text()) if cache.exists() else {}
-    todo = [r for r in rows if r["id"] not in got]
-    if todo:
-        t0 = time.time()
-        # spawn, not fork: the parent already holds CUDA
-        with multiprocessing.get_context("spawn").Pool(max(1, (os.cpu_count() or 2) - 1)) as pool:
-            for r, d in zip(todo, pool.imap(measure_delivery, [(r["audio"], r["text"]) for r in todo], chunksize=8)):
-                got[r["id"]] = d
-        cache.write_text(json.dumps(got))
-        print(f"train: measured delivery of {len(todo)} clips in {time.time() - t0:.0f} s", flush=True)
-    return got
-
-
 def xvectors(model, paths, cache):
     """One x-vector per ref clip, cached in a JSON file keyed by path."""
     import torch
@@ -311,18 +231,6 @@ def cmd_check(a):
             out[mod] = getattr(m, "__version__", "ok")
         except Exception as e:  # noqa: BLE001
             out[f"{mod}_error"] = repr(e)
-    if "librosa_error" not in out:
-        try:
-            import numpy as np
-            import soundfile as sf
-
-            a.out.mkdir(parents=True, exist_ok=True)
-            t = np.arange(SR) / SR
-            tone = a.out / "check_tone.wav"
-            sf.write(tone, (0.3 * np.sin(2 * np.pi * (150 + 50 * t) * t)).astype(np.float32), SR)
-            out["delivery_tone"] = [round(x, 2) for x in measure_delivery((str(tone), "keelah"))]
-        except Exception as e:  # noqa: BLE001
-            out["delivery_error"] = repr(e)
     if out.get("transformers") and out["transformers"] != "4.57.3":
         out["transformers_warning"] = "qwen-tts 0.1.1 pins 4.57.3"
     if out.get("vram_gb") is not None and out["vram_gb"] < 40:
@@ -394,14 +302,10 @@ def cmd_prepare(a):
     print(f"prepare: {dst}")
 
 
-def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=False, games=None,
-           style_chunk=0, delivery=None):
+def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=False, games=None):
     """The official dataset/collate, plus each line's own x-vector. The official collate stacks every
     line's reference mel, which only works when all lines share one ref_audio, so it is handed one
-    fixed clip and the x-vectors travel separately. style_chunk: frames per shuffled piece of the
-    style encoder's input (0 = in order); delivery: {id: helper targets}."""
-    import random
-
+    fixed clip and the x-vectors travel separately."""
     import torch
     from torch.utils.data import DataLoader
 
@@ -409,7 +313,6 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
     from dataset import TTSDataset
 
     fixed = rows[0]["ref_audio"]
-    rng = random.Random(seed)
 
     class WithVoice(TTSDataset):
         def __getitem__(self, idx):
@@ -417,11 +320,8 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
             row = self.data_list[idx]
             item["xvec"] = torch.tensor(xvec[row["_ref"]])
             if style:
-                m = mel(row["audio"])[0]
-                item["style_mel"] = m[chunk_order(m.shape[0], style_chunk, rng)]
+                item["style_mel"] = mel(row["audio"])[0]
                 item["game"] = games.get(row.get("game", ""), 0)
-                if delivery is not None:
-                    item["delivery"] = torch.tensor(delivery[row["id"]], dtype=torch.float32)
             return item
 
         def collate_fn(self, batch):
@@ -430,8 +330,6 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
             if style:
                 out["style_mel"], out["style_len"] = pad_mels([b["style_mel"] for b in batch])
                 out["game"] = torch.tensor([b["game"] for b in batch])
-                if delivery is not None:
-                    out["delivery"] = torch.stack([b["delivery"] for b in batch])
             return out
 
     data = [{**r, "_ref": r["ref_audio"], "ref_audio": fixed} for r in rows]
@@ -505,45 +403,28 @@ def cmd_train(a):
     for p in params:
         p.requires_grad_(True)
     her_t = torch.tensor(her, dtype=torch.float32, device=model.device)
-    enc = game_emb = aux_head = delivery = None
-    chunk = round(a.style_chunk * SR / 256) if style else 0  # mel frames per shuffled piece
+    enc = game_emb = None
     if style:
         enc = style_encoder(a.style_dim).to(model.device)
         game_emb = torch.nn.Embedding(len(games), her_t.shape[0]).to(model.device)
         torch.nn.init.zeros_(game_emb.weight)
         params += list(enc.parameters()) + list(game_emb.parameters())
-        info = {"dim": a.style_dim, "games": games, "chunk_s": a.style_chunk, "dropout": a.style_dropout,
-                "aux": a.style_aux}
-        if a.style_aux:
-            delivery, info["delivery_norm"] = zscore(deliveries(rows + val, a.out / "delivery.json"))
-            aux_head = torch.nn.Linear(a.style_dim, 3).to(model.device)  # pitch range, loudness, pace
-            params += list(aux_head.parameters())
-        (a.out / "style.json").write_text(json.dumps(info))
+        (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games}))
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.01)
-    train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning, style, games, chunk, delivery)
-    val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games, 0,
-                    delivery) if val else None
+    train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning, style, games)
+    val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games) if val else None
     replay_it = itertools.cycle(loader(replay, tts, config, a.batch, True, a.seed + 1, xvec, a.qwen_finetuning)) if a.kl else None
 
-    def slot(batch, training):
-        """(speaker-slot vectors, style codes or None)."""
+    def slot(batch):
         if not style:
-            return batch["xvec"], None
+            return batch["xvec"]
         dev = model.device
-        code = enc.code(batch["style_mel"].to(dev), batch["style_len"].to(dev))
-        off = enc.up(code)
-        if training and a.style_dropout:
-            off = off * (torch.rand(off.shape[0], 1, device=dev) >= a.style_dropout).to(off.dtype)
-        return her_t + off + game_emb(batch["game"].to(dev)), code
+        off = enc(batch["style_mel"].to(dev), batch["style_len"].to(dev)) + game_emb(batch["game"].to(dev))
+        return her_t + off
 
-    def her_loss(batch, training=True):
-        """(voice loss, style helper loss)."""
-        vec, code = slot(batch, training)
-        out, sub = forward(model, batch, vec)
-        aux = torch.zeros((), device=model.device)
-        if aux_head is not None:
-            aux = torch.nn.functional.mse_loss(aux_head(code.float()), batch["delivery"].to(model.device))
-        return out.loss + 0.3 * sub, aux
+    def her_loss(batch):
+        out, sub = forward(model, batch, slot(batch))
+        return out.loss + 0.3 * sub
 
     def replay_kl(batch):
         out, _ = forward(model, batch, batch["xvec"])
@@ -560,16 +441,16 @@ def cmd_train(a):
         opt.zero_grad()
         for k, batch in enumerate(train_dl):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, aux = her_loss(batch)
+                loss = her_loss(batch)
                 kl = replay_kl(next(replay_it)) if a.kl else torch.zeros((), device=model.device)
-                total = (loss + a.style_aux * aux + a.kl * kl) / a.accum
+                total = (loss + a.kl * kl) / a.accum
             total.backward()
             if (k + 1) % a.accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 opt.step()
                 opt.zero_grad()
                 step += 1
-                rec = {"epoch": epoch, "step": step, "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "aux": round(aux.item(), 4),
+                rec = {"epoch": epoch, "step": step, "loss": round(loss.item(), 4), "kl": round(kl.item(), 5),
                        "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2), "s": round(time.time() - t0)}
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
@@ -582,15 +463,11 @@ def cmd_train(a):
             model.eval()
             if enc is not None:
                 enc.eval()
-                if aux_head is not None:
-                    aux_head.eval()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                rec["val_loss"] = round(float(np.mean([her_loss(b, False)[0].item() for b in val_dl])), 4)
+                rec["val_loss"] = round(float(np.mean([her_loss(b).item() for b in val_dl])), 4)
             model.train()
             if enc is not None:
                 enc.train()
-                if aux_head is not None:
-                    aux_head.train()
         ep = a.out / f"epoch-{epoch}"
         ep.mkdir(exist_ok=True)
         save_file({k: v.detach().cpu().contiguous() for k, v in model.talker.state_dict().items()},
@@ -598,9 +475,7 @@ def cmd_train(a):
         if style:
             save_file({**{f"enc.{k}": v.detach().cpu().contiguous() for k, v in enc.state_dict().items()},
                        "game": game_emb.weight.detach().cpu().contiguous()}, str(ep / "style.safetensors"))
-        (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
-                                                      **({"style_chunk_s": a.style_chunk, "style_dropout": a.style_dropout,
-                                                          "style_aux": a.style_aux} if style else {})}))
+        (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker}))
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
@@ -753,11 +628,6 @@ def main(argv=None):
     t.add_argument("--kl", type=float, default=0.0, help="weight of the KL-to-Base term on replay lines")
     t.add_argument("--speaker", choices=["clip", "mean", "style"], default="clip")
     t.add_argument("--style-dim", type=int, default=16, help="--speaker style: numbers per clip's delivery")
-    t.add_argument("--style-chunk", type=float, default=1.0,
-                   help="--speaker style: seconds per shuffled piece of the encoder's input in training (0 = in order)")
-    t.add_argument("--style-dropout", type=float, default=0.1, help="--speaker style: share of lines trained with the code off")
-    t.add_argument("--style-aux", type=float, default=0.1,
-                   help="--speaker style: weight of the helper predicting measured pitch range, loudness and pace (0 = off)")
     t.add_argument("--out", type=Path, required=True)
     t.add_argument("--base", default=BASE)
     t.add_argument("--qwen-finetuning", type=Path, default=Path("Qwen3-TTS/finetuning"),
