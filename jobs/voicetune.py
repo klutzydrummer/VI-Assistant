@@ -41,7 +41,7 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     python3 jobs/voicetune.py replay  --sentences s.txt --voices <dir of 24 kHz wavs> --out <folder>
     python3 jobs/voicetune.py prepare --raw train_raw.jsonl --out <folder> [--device cpu]
     python3 jobs/voicetune.py train   --data train_with_codes.jsonl --val val_with_codes.jsonl --out <folder>
-                                      [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N]
+                                      [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N] [--resume]
     python3 jobs/voicetune.py speak   --run <folder> --sentences s.txt [--epoch K] [--icl-ref clip.wav]
                                       [--style-from her_clip.wav ...] [--game le3]
 
@@ -418,6 +418,43 @@ def forward(model, batch, voice):
     return out, sub_loss
 
 
+def save_resume(out, epoch, step, heads, opt, gen):
+    """What `train --resume` needs beyond epoch-<k>/ (talker, style): optimizer state, helper heads, step
+    and the shuffle generator. One file, replaced atomically after each epoch (~8 bytes per talker
+    parameter, so about 12 GB)."""
+    import torch
+
+    tmp = out / "resume.pt.tmp"
+    torch.save({"epoch": epoch, "step": step, "opt": opt.state_dict(), "gen": gen.get_state(),
+                "heads": {k: h.state_dict() for k, h in heads.items() if h is not None}}, tmp)
+    tmp.replace(out / "resume.pt")
+
+
+def resume_state(out, model, enc, game_emb, heads, opt, gen):
+    """Load the last finished epoch back in (see save_resume); returns (step, first epoch to run).
+    A stop loses at most the epoch in progress. The data order of later epochs differs from an
+    unbroken run's, which doesn't matter for training."""
+    import torch
+    from safetensors.torch import load_file
+
+    f = out / "resume.pt"
+    if not f.exists():
+        sys.exit(f"train --resume: no {f} (no epoch finished yet: start again without --resume)")
+    r = torch.load(f, map_location="cpu", weights_only=False)
+    ep = out / f"epoch-{r['epoch']}"
+    model.talker.load_state_dict(load_file(str(ep / "talker.safetensors")))
+    if enc is not None:
+        st = load_file(str(ep / "style.safetensors"))
+        enc.load_state_dict({k[4:]: v for k, v in st.items() if k.startswith("enc.")})
+        game_emb.weight.data.copy_(st["game"].to(game_emb.weight.device))
+    for k, h in heads.items():
+        if h is not None:
+            h.load_state_dict(r["heads"][k])
+    opt.load_state_dict(r["opt"])
+    gen.set_state(r["gen"])
+    return r["step"], r["epoch"] + 1
+
+
 def cmd_train(a):
     import itertools
 
@@ -533,11 +570,15 @@ def cmd_train(a):
         mask = train_labels(batch["codec_0_labels"]).to(model.device) != -100
         return kl_to_base(ref.logits, out.logits, mask)
 
+    step, first = 0, 0
+    if a.resume:
+        step, first = resume_state(a.out, model, enc, game_emb, {"game_head": game_head, "pros_head": pros_head}, opt,
+                                   shuffle_gen)
+        print(f"train: resuming after epoch {first - 1} (step {step})", flush=True)
     log = open(a.out / "train_log.jsonl", "a")
     model.train()
-    step = 0
     t0 = time.time()
-    for epoch in range(a.epochs):
+    for epoch in range(first, a.epochs):
         opt.zero_grad()
         for k, batch in enumerate(train_dl):
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -578,6 +619,7 @@ def cmd_train(a):
         (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
                                                   "style_lr": a.style_lr if style else None, "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
                                                   "prosody_aux": a.prosody_aux, "style_dropout": a.style_dropout}))
+        save_resume(a.out, epoch, step, {"game_head": game_head, "pros_head": pros_head}, opt, shuffle_gen)
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
@@ -746,6 +788,8 @@ def main(argv=None):
     t.add_argument("--accum", type=int, default=4)
     t.add_argument("--max-steps", type=int, default=0, help="stop early (smoke)")
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--resume", action="store_true",
+                   help="carry on after the last finished epoch in --out (same flags as the stopped run)")
     s = sub.add_parser("speak")
     s.add_argument("--run", type=Path, required=True)
     s.add_argument("--sentences", type=Path, required=True)
