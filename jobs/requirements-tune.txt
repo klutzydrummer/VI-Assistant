@@ -1,0 +1,6 @@
+# What voicetune.py needs on the worker, in its own virtualenv on top of the image's PyTorch
+# (qwen-tts pins transformers 4.57.3 and accelerate 1.12.0). No flash-attn: voicetune uses sdpa.
+qwen-tts==0.1.1
+librosa
+soundfile
+huggingface_hub
