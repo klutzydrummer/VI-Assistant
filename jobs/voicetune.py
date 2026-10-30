@@ -41,7 +41,7 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     python3 jobs/voicetune.py replay  --sentences s.txt --voices <dir of 24 kHz wavs> --out <folder>
     python3 jobs/voicetune.py prepare --raw train_raw.jsonl --out <folder> [--device cpu]
     python3 jobs/voicetune.py train   --data train_with_codes.jsonl --val val_with_codes.jsonl --out <folder>
-                                      [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N]
+                                      [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N] [--resume]
     python3 jobs/voicetune.py speak   --run <folder> --sentences s.txt [--epoch K] [--icl-ref clip.wav]
                                       [--style-from her_clip.wav ...] [--game le3]
 
@@ -418,6 +418,43 @@ def forward(model, batch, voice):
     return out, sub_loss
 
 
+def save_resume(out, epoch, step, heads, opt, gen):
+    """What `train --resume` needs beyond epoch-<k>/ (talker, style): optimizer state, helper heads, step
+    and the shuffle generator. One file, replaced atomically after each epoch (~8 bytes per talker
+    parameter, so about 12 GB)."""
+    import torch
+
+    tmp = out / "resume.pt.tmp"
+    torch.save({"epoch": epoch, "step": step, "opt": opt.state_dict(), "gen": gen.get_state(),
+                "heads": {k: h.state_dict() for k, h in heads.items() if h is not None}}, tmp)
+    tmp.replace(out / "resume.pt")
+
+
+def resume_state(out, model, enc, game_emb, heads, opt, gen):
+    """Load the last finished epoch back in (see save_resume); returns (step, first epoch to run).
+    A stop loses at most the epoch in progress. The data order of later epochs differs from an
+    unbroken run's, which doesn't matter for training."""
+    import torch
+    from safetensors.torch import load_file
+
+    f = out / "resume.pt"
+    if not f.exists():
+        sys.exit(f"train --resume: no {f} (no epoch finished yet: start again without --resume)")
+    r = torch.load(f, map_location="cpu", weights_only=False)
+    ep = out / f"epoch-{r['epoch']}"
+    model.talker.load_state_dict(load_file(str(ep / "talker.safetensors")))
+    if enc is not None:
+        st = load_file(str(ep / "style.safetensors"))
+        enc.load_state_dict({k[4:]: v for k, v in st.items() if k.startswith("enc.")})
+        game_emb.weight.data.copy_(st["game"].to(game_emb.weight.device))
+    for k, h in heads.items():
+        if h is not None:
+            h.load_state_dict(r["heads"][k])
+    opt.load_state_dict(r["opt"])
+    gen.set_state(r["gen"])
+    return r["step"], r["epoch"] + 1
+
+
 def cmd_train(a):
     import itertools
 
@@ -476,22 +513,27 @@ def cmd_train(a):
         p.requires_grad_(True)
     her_t = torch.tensor(her, dtype=torch.float32, device=model.device)
     enc = game_emb = game_head = pros_head = None
+    fresh = []  # new, randomly started parts: they get their own, much higher learning rate
     if style:
         enc = style_encoder(a.style_dim).to(model.device)
         game_emb = torch.nn.Embedding(len(games), her_t.shape[0]).to(model.device)
         torch.nn.init.zeros_(game_emb.weight)
-        params += list(enc.parameters()) + list(game_emb.parameters())
+        fresh = list(enc.parameters()) + list(game_emb.parameters())
         if a.game_adv:
             game_head = torch.nn.Sequential(torch.nn.Linear(a.style_dim, 64), torch.nn.GELU(),
                                             torch.nn.Linear(64, len(games))).to(model.device)
-            params += list(game_head.parameters())
+            fresh += list(game_head.parameters())
         if a.prosody_aux:
             pros_head = torch.nn.Linear(a.style_dim, 4).to(model.device)
-            params += list(pros_head.parameters())
+            fresh += list(pros_head.parameters())
         (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games}))
     shuffle_gen = torch.Generator().manual_seed(a.seed + 7)
     chunk_frames = int(round(a.style_shuffle * SR / 256))  # mel hop 256
-    opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.01)
+    # At the talker's 2e-6, a network that starts from scratch barely moves in ~500 steps (Adam moves each
+    # weight about lr per step), so the style code would stay near zero and the slot would not steer.
+    groups = [{"params": params, "lr": a.lr}] + ([{"params": fresh, "lr": a.style_lr}] if fresh else [])
+    params = params + fresh
+    opt = torch.optim.AdamW(groups, weight_decay=0.01)
     train_dl = loader(rows, tts, config, a.batch, True, a.seed, xvec, a.qwen_finetuning, style, games)
     val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games) if val else None
     replay_it = itertools.cycle(loader(replay, tts, config, a.batch, True, a.seed + 1, xvec, a.qwen_finetuning)) if a.kl else None
@@ -528,11 +570,15 @@ def cmd_train(a):
         mask = train_labels(batch["codec_0_labels"]).to(model.device) != -100
         return kl_to_base(ref.logits, out.logits, mask)
 
+    step, first = 0, 0
+    if a.resume:
+        step, first = resume_state(a.out, model, enc, game_emb, {"game_head": game_head, "pros_head": pros_head}, opt,
+                                   shuffle_gen)
+        print(f"train: resuming after epoch {first - 1} (step {step})", flush=True)
     log = open(a.out / "train_log.jsonl", "a")
     model.train()
-    step = 0
     t0 = time.time()
-    for epoch in range(a.epochs):
+    for epoch in range(first, a.epochs):
         opt.zero_grad()
         for k, batch in enumerate(train_dl):
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -571,8 +617,9 @@ def cmd_train(a):
             save_file({**{f"enc.{k}": v.detach().cpu().contiguous() for k, v in enc.state_dict().items()},
                        "game": game_emb.weight.detach().cpu().contiguous()}, str(ep / "style.safetensors"))
         (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
-                                                  "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
+                                                  "style_lr": a.style_lr if style else None, "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
                                                   "prosody_aux": a.prosody_aux, "style_dropout": a.style_dropout}))
+        save_resume(a.out, epoch, step, {"game_head": game_head, "pros_head": pros_head}, opt, shuffle_gen)
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
@@ -725,6 +772,8 @@ def main(argv=None):
     t.add_argument("--kl", type=float, default=0.0, help="weight of the KL-to-Base term on replay lines")
     t.add_argument("--speaker", choices=["clip", "mean", "style"], default="clip")
     t.add_argument("--style-dim", type=int, default=16, help="--speaker style: numbers per clip's delivery")
+    t.add_argument("--style-lr", type=float, default=1e-4,
+                   help="--speaker style: learning rate of the style encoder, game vectors and helper heads")
     t.add_argument("--style-shuffle", type=float, default=0.0, help="--speaker style: shuffle the encoder's input in chunks of this many seconds")
     t.add_argument("--game-adv", type=float, default=0.0, help="--speaker style: weight of the gradient-reversed game classifier on the code")
     t.add_argument("--prosody-aux", type=float, default=0.0, help="--speaker style: weight of the pitch/loudness/pace head on the code")
@@ -739,6 +788,8 @@ def main(argv=None):
     t.add_argument("--accum", type=int, default=4)
     t.add_argument("--max-steps", type=int, default=0, help="stop early (smoke)")
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--resume", action="store_true",
+                   help="carry on after the last finished epoch in --out (same flags as the stopped run)")
     s = sub.add_parser("speak")
     s.add_argument("--run", type=Path, required=True)
     s.add_argument("--sentences", type=Path, required=True)
