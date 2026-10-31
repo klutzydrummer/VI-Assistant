@@ -55,6 +55,7 @@ given. Needs qwen-tts==0.1.1 (requirements-tune.txt) and, for training, a 48 GB 
 """
 
 import argparse
+import functools
 import json
 import sys
 import time
@@ -210,6 +211,7 @@ def load_tts(path=BASE, device="cuda:0"):
     return Qwen3TTSModel.from_pretrained(path, device_map=device, dtype=dtype, attn_implementation="sdpa")
 
 
+@functools.lru_cache(maxsize=None)  # each clip's mel is read every epoch for the style encoder: decode it once
 def mel(path):
     import librosa
     import torch
