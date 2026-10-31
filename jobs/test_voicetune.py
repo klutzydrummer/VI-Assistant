@@ -21,6 +21,10 @@ class VoiceTuneTest(unittest.TestCase):
         self.assertIn("missing text", bad[2])
         self.assertEqual(voicetune.validate(rows[:1], lambda p: 24000), [])
 
+    def test_warmup_factor_ramps_linearly_then_holds(self):
+        self.assertEqual([voicetune.warmup_factor(s, 4) for s in range(6)], [0.25, 0.5, 0.75, 1.0, 1.0, 1.0])
+        self.assertEqual(voicetune.warmup_factor(0, 0), 1.0)
+
     def test_alignment_matches_generation(self):
         # A sequence laid out like the official collate: prompt, codec bos at 3, frames 0..2 at 4..6, eos at 7.
         frames = [10, 11, 12]
