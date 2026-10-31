@@ -222,8 +222,13 @@ def mel(path):
                            hop_size=256, win_size=1024, fmin=0, fmax=12000).transpose(1, 2)
 
 
-def style_encoder(dim, width=256, out=2048):
-    """Reference encoder: mel [b, T, 128] + lengths -> a dim-number bottleneck -> a slot offset [b, out]."""
+def style_encoder(dim, width=256, out=2048, norm=None):
+    """Reference encoder: mel [b, T, 128] + lengths -> a dim-number bottleneck -> a slot offset [b, out].
+    norm="batch" (every run since 2026-10-31) standardises each of the dim numbers across the batch
+    before the tanh. Without it the 2026-10-30 full runs collapsed: the code learned one constant,
+    saturated the tanh at +-1 and stopped depending on the clip. With it the code has zero mean and
+    unit spread across clips, so it can't be a constant (constants belong in up.bias and the game
+    vectors) and the tanh stays in its working range. None = the old encoder, to load old runs."""
     import torch
     from torch import nn
 
@@ -239,13 +244,19 @@ def style_encoder(dim, width=256, out=2048):
             self.up = nn.Linear(dim, out)
             nn.init.zeros_(self.up.weight)  # starts as "no offset": her mean voice
             nn.init.zeros_(self.up.bias)
+            self.norm = nn.BatchNorm1d(dim, affine=False) if norm == "batch" else None
 
         def code(self, mels, lengths):
             h = self.conv(mels.transpose(1, 2)).transpose(1, 2)
             n = torch.clamp((lengths + 7) // 8, min=1, max=h.shape[1]).cpu()
             packed = nn.utils.rnn.pack_padded_sequence(h, n, batch_first=True, enforce_sorted=False)
             _, last = self.gru(packed)
-            return torch.tanh(self.bottleneck(last[-1]))
+            z = self.bottleneck(last[-1])
+            if self.norm is not None:
+                n = self.norm
+                z = nn.functional.batch_norm(z, n.running_mean, n.running_var, training=self.training and z.shape[0] > 1,
+                                             momentum=n.momentum, eps=n.eps)  # a 1-line batch uses the running stats
+            return torch.tanh(z)
 
         def forward(self, mels, lengths):
             return self.up(self.code(mels, lengths))
@@ -525,7 +536,7 @@ def cmd_train(a):
     enc = game_emb = game_head = pros_head = None
     fresh = []  # new, randomly started parts: they get their own, much higher learning rate
     if style:
-        enc = style_encoder(a.style_dim).to(model.device)
+        enc = style_encoder(a.style_dim, norm="batch").to(model.device)
         game_emb = torch.nn.Embedding(len(games), her_t.shape[0]).to(model.device)
         torch.nn.init.zeros_(game_emb.weight)
         fresh = list(enc.parameters()) + list(game_emb.parameters())
@@ -536,7 +547,7 @@ def cmd_train(a):
         if a.prosody_aux:
             pros_head = torch.nn.Linear(a.style_dim, 4).to(model.device)
             fresh += list(pros_head.parameters())
-        (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games}))
+        (a.out / "style.json").write_text(json.dumps({"dim": a.style_dim, "games": games, "norm": "batch"}))
     shuffle_gen = torch.Generator().manual_seed(a.seed + 7)
     chunk_frames = int(round(a.style_shuffle * SR / 256))  # mel hop 256
     # At the talker's 2e-6, a network that starts from scratch barely moves in ~500 steps (Adam moves each
@@ -548,6 +559,8 @@ def cmd_train(a):
     val_dl = loader(val, tts, config, a.batch, False, a.seed, xvec, a.qwen_finetuning, style, games) if val else None
     replay_it = itertools.cycle(loader(replay, tts, config, a.batch, True, a.seed + 1, xvec, a.qwen_finetuning)) if a.kl else None
 
+    stats = {}
+
     def slot(batch, training=True):
         """The speaker slot for her lines, and the style extras' loss (0 when off or not training)."""
         if not style:
@@ -557,6 +570,9 @@ def cmd_train(a):
         if training and chunk_frames:
             mels = torch.stack([shuffle_chunks(m, n, chunk_frames, shuffle_gen) for m, n in zip(mels, lens)])
         code = enc.code(mels.to(dev), lens.to(dev))
+        if training and code.shape[0] > 1:  # collapse check: a code that stops varying across clips is dead
+            stats["code_std"] = round(code.detach().float().std(0).mean().item(), 4)
+            stats["offset"] = round(enc.up(code.detach()).float().norm(dim=1).mean().item(), 3)
         aux = torch.zeros((), device=dev)
         if training and game_head is not None:
             aux = aux + a.game_adv * torch.nn.functional.cross_entropy(game_head(grad_reverse(code)).float(), batch["game"].to(dev))
@@ -586,8 +602,13 @@ def cmd_train(a):
                                    shuffle_gen)
         print(f"train: resuming after epoch {first - 1} (step {step})", flush=True)
     elif a.init_from:
-        load_weights(a.init_from, model, enc, game_emb)
-        print(f"train: starting from the weights in {a.init_from}, fresh optimizer", flush=True)
+        fresh_style = a.fresh_style
+        old = a.init_from.parent / "style.json"
+        if style and not fresh_style and (not old.exists() or not json.loads(old.read_text()).get("norm")):
+            fresh_style = True  # an old, unnormalised (collapsed) style encoder isn't worth keeping
+        load_weights(a.init_from, model, None if fresh_style else enc, game_emb if not fresh_style else None)
+        print(f"train: starting from the weights in {a.init_from}{' (talker only, fresh style encoder)' if fresh_style else ''},"
+              " fresh optimizer", flush=True)
     for g in opt.param_groups:
         g.setdefault("initial_lr", g["lr"])
     log = open(a.out / "train_log.jsonl", "a")
@@ -609,7 +630,7 @@ def cmd_train(a):
                 opt.zero_grad()
                 step += 1
                 rec = {"epoch": epoch, "step": step, "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "aux": round(aux.item(), 5),
-                       "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2), "s": round(time.time() - t0)}
+                       "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2), "s": round(time.time() - t0), **stats}
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
                 if step % 10 == 0:
@@ -685,13 +706,14 @@ def speak_slots(a, tune, voice, ep):
     if style:
         info = json.loads((ep.parent / "style.json").read_text())
         st = load_file(str(ep / "style.safetensors"))
-        enc = style_encoder(info["dim"])
+        enc = style_encoder(info["dim"], norm=info.get("norm"))
         enc.load_state_dict({k[4:]: v for k, v in st.items() if k.startswith("enc.")})
         enc.eval()
         g = info["games"].get(a.game)
         if g is None:
             sys.exit(f"speak: game {a.game!r} not in {sorted(info['games'])}")
-        game_vec = st["game"][g].float().numpy()
+        # her plain voice = code 0 (what style dropout trains): her mean + the game's vector + up's bias
+        game_vec = st["game"][g].float().numpy() + st["enc.up.bias"].float().numpy()
     out = [(f"her mean voice{f', {a.game} suit' if style else ''}", (her + game_vec).tolist())]
     if not a.style_from:
         return out
@@ -699,7 +721,7 @@ def speak_slots(a, tune, voice, ep):
         with torch.no_grad():
             for w in a.style_from:
                 m = mel(w)
-                off = enc(m, torch.tensor([m.shape[1]]))[0].numpy()
+                off = (enc(m, torch.tensor([m.shape[1]])) - enc.up.bias)[0].numpy()  # bias is in game_vec
                 out.append((f"delivery of {Path(w).stem}", (her + game_vec + off).tolist()))
     else:
         base = load_tts(tune["base"], a.device).model  # only for its speaker encoder
@@ -807,6 +829,9 @@ def main(argv=None):
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--init-from", type=Path,
                    help="an epoch-<k> folder to start from (talker and style weights) with a fresh optimizer; use --warmup")
+    t.add_argument("--fresh-style", action="store_true",
+                   help="with --init-from: take only the talker, start the style encoder and game vectors fresh "
+                        "(automatic when the folder's style encoder is the old, collapsed kind)")
     t.add_argument("--warmup", type=int, default=0,
                    help="optimizer steps over which the learning rates ramp up from zero (e.g. 50 with --init-from)")
     t.add_argument("--resume", action="store_true",
