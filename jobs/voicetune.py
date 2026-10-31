@@ -41,7 +41,7 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     python3 jobs/voicetune.py replay  --sentences s.txt --voices <dir of 24 kHz wavs> --out <folder>
     python3 jobs/voicetune.py prepare --raw train_raw.jsonl --out <folder> [--device cpu]
     python3 jobs/voicetune.py train   --data train_with_codes.jsonl --val val_with_codes.jsonl --out <folder>
-                                      [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N] [--resume]
+                                      [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N] [--resume | --init-from epoch-K --warmup 50]
     python3 jobs/voicetune.py speak   --run <folder> --sentences s.txt [--epoch K] [--icl-ref clip.wav]
                                       [--style-from her_clip.wav ...] [--game le3]
 
@@ -430,23 +430,33 @@ def save_resume(out, epoch, step, heads, opt, gen):
     tmp.replace(out / "resume.pt")
 
 
-def resume_state(out, model, enc, game_emb, heads, opt, gen):
-    """Load the last finished epoch back in (see save_resume); returns (step, first epoch to run).
-    A stop loses at most the epoch in progress. The data order of later epochs differs from an
-    unbroken run's, which doesn't matter for training."""
-    import torch
+def warmup_factor(step, warmup):
+    """Learning-rate multiplier for optimizer step `step` (0-based): a linear ramp over `warmup` steps."""
+    return 1.0 if warmup <= 0 else min(1.0, (step + 1) / warmup)
+
+
+def load_weights(ep, model, enc, game_emb):
+    """An epoch folder's talker (and style encoder and game vectors, for style runs) into the models."""
     from safetensors.torch import load_file
 
-    f = out / "resume.pt"
-    if not f.exists():
-        sys.exit(f"train --resume: no {f} (no epoch finished yet: start again without --resume)")
-    r = torch.load(f, map_location="cpu", weights_only=False)
-    ep = out / f"epoch-{r['epoch']}"
     model.talker.load_state_dict(load_file(str(ep / "talker.safetensors")))
     if enc is not None:
         st = load_file(str(ep / "style.safetensors"))
         enc.load_state_dict({k[4:]: v for k, v in st.items() if k.startswith("enc.")})
         game_emb.weight.data.copy_(st["game"].to(game_emb.weight.device))
+
+
+def resume_state(out, model, enc, game_emb, heads, opt, gen):
+    """Load the last finished epoch back in (see save_resume); returns (step, first epoch to run).
+    A stop loses at most the epoch in progress. The data order of later epochs differs from an
+    unbroken run's, which doesn't matter for training."""
+    import torch
+
+    f = out / "resume.pt"
+    if not f.exists():
+        sys.exit(f"train --resume: no {f} (no epoch finished yet: start again without --resume)")
+    r = torch.load(f, map_location="cpu", weights_only=False)
+    load_weights(out / f"epoch-{r['epoch']}", model, enc, game_emb)
     for k, h in heads.items():
         if h is not None:
             h.load_state_dict(r["heads"][k])
@@ -575,6 +585,11 @@ def cmd_train(a):
         step, first = resume_state(a.out, model, enc, game_emb, {"game_head": game_head, "pros_head": pros_head}, opt,
                                    shuffle_gen)
         print(f"train: resuming after epoch {first - 1} (step {step})", flush=True)
+    elif a.init_from:
+        load_weights(a.init_from, model, enc, game_emb)
+        print(f"train: starting from the weights in {a.init_from}, fresh optimizer", flush=True)
+    for g in opt.param_groups:
+        g.setdefault("initial_lr", g["lr"])
     log = open(a.out / "train_log.jsonl", "a")
     model.train()
     t0 = time.time()
@@ -588,6 +603,8 @@ def cmd_train(a):
             total.backward()
             if (k + 1) % a.accum == 0:
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
+                for g in opt.param_groups:
+                    g["lr"] = g["initial_lr"] * (1.0 if a.resume else warmup_factor(step, a.warmup))
                 opt.step()
                 opt.zero_grad()
                 step += 1
@@ -788,6 +805,10 @@ def main(argv=None):
     t.add_argument("--accum", type=int, default=4)
     t.add_argument("--max-steps", type=int, default=0, help="stop early (smoke)")
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--init-from", type=Path,
+                   help="an epoch-<k> folder to start from (talker and style weights) with a fresh optimizer; use --warmup")
+    t.add_argument("--warmup", type=int, default=0,
+                   help="optimizer steps over which the learning rates ramp up from zero (e.g. 50 with --init-from)")
     t.add_argument("--resume", action="store_true",
                    help="carry on after the last finished epoch in --out (same flags as the stopped run)")
     s = sub.add_parser("speak")
