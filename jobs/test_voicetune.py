@@ -1,5 +1,7 @@
 """Tests for voicetune.py's pure parts (no model). Run with `python3 -m unittest discover -s jobs`."""
 
+import json
+import re
 import unittest
 from unittest import mock
 
@@ -273,6 +275,126 @@ class VoiceTuneTest(unittest.TestCase):
             a2 = fake.call_args.args[0]
             self.assertIsNone(a2.publish)
             self.assertFalse(a2.no_resume_file)
+
+    def test_speak_argparse_accepts_seed_unblind_title_question_and_delivery_from(self):
+        with mock.patch.object(voicetune, "cmd_speak") as fake:
+            fake.return_value = None
+            self.assertEqual(voicetune.main(["speak", "--run", "r", "--sentences", "s",
+                                             "--seed", "3", "--unblind", "--title", "T", "--question", "Q",
+                                             "--delivery-from", "clip1=r.wav"]), 0)
+            a = fake.call_args.args[0]
+            self.assertEqual(a.seed, 3)
+            self.assertTrue(a.unblind)
+            self.assertEqual(a.title, "T")
+            self.assertEqual(a.question, "Q")
+            self.assertEqual(a.delivery_from, ["clip1=r.wav"])
+
+    def test_unblind_hub_shape_order_and_labels(self):
+        lines = ["the first line", "the second line", "the third line"]
+        entries = []
+        for epoch in range(6):
+            for li, text in enumerate(lines):
+                entries.append((epoch, li, text, "plain", f"e{epoch}-{li}.wav"))
+        for epoch, ids in ((4, ("x", "y", "z")), (5, ("p", "q", "r"))):
+            for li, clip_id in enumerate(ids):
+                entries.append((epoch, li, lines[li], f"delivery-of-{clip_id}", f"d{epoch}-{li}.wav"))
+        import random
+
+        random.Random(1).shuffle(entries)  # prove the hub sorts, it doesn't trust call order
+        text = voicetune.unblind_hub(entries, "T", "Q")
+        self.assertIn("blind = false", text)
+        self.assertIn('answers = ["acceptable", "close", "not yet"]', text)
+        self.assertIn('title = "T"', text)
+        self.assertIn('question = "Q"', text)
+        self.assertEqual(text.count("[[clip]]"), 24)
+        labels = [ln.split(" = ", 1)[1] for ln in text.splitlines() if ln.startswith("label = ")]
+        self.assertEqual(len(labels), 24)
+        epochs = []
+        for lab in labels:
+            m = re.match(r'"epoch (\d+), (plain|delivery-of-[^:]+): ', lab)
+            self.assertIsNotNone(m, lab)
+            epochs.append(int(m.group(1)))
+        self.assertEqual(epochs, sorted(epochs))  # epoch then line
+        self.assertEqual(epochs.count(4), 6)  # 3 plain lines + 3 delivery clips at the last two epochs
+        self.assertEqual(epochs.count(5), 6)
+        for epoch in range(4):
+            self.assertEqual(epochs.count(epoch), 3)
+
+    def test_check_abort_cases(self):
+        step = lambda s, loss, peak=1.0: {"step": s, "loss": loss, "peak_gb": peak}  # noqa: E731
+        self.assertEqual(voicetune.check_abort([step(1, 4.5)], 0), "step-1 loss > 4.0")
+        self.assertEqual(voicetune.check_abort([step(1, 0.5), step(2, float("nan"))], 0), "NaN loss")
+        # Genuinely rising: 50 flat steps then 10 at +50%, so the windowed mean is up 50%.
+        rising = [step(i + 1, 1.0) for i in range(50)] + [step(i + 51, 1.5) for i in range(10)]
+        self.assertIn("loss rising", voicetune.check_abort(rising, 0))
+        # Noisy-but-flat (±25% alternating, mean 1.0) must not trip the windowed rule.
+        noisy = [step(i + 1, 1.25 if i % 2 else 0.75) for i in range(70)]
+        self.assertIsNone(voicetune.check_abort(noisy, 0))
+        self.assertIn("peak memory", voicetune.check_abort([step(1, 0.5, 45.0)], 0))
+        self.assertIn("elapsed", voicetune.check_abort([step(1, 0.5)], 6301))
+        healthy = [{"step": i + 1, "loss": 4.0 - i * 0.01, "peak_gb": 40.0} for i in range(60)]
+        self.assertIsNone(voicetune.check_abort(healthy, 100))
+
+    def test_clip_filenames_are_distinct_across_epochs_and_kinds(self):
+        names = set()
+        for epoch in (0, 4):
+            for n in range(3):
+                names.add(voicetune.clip_filename(epoch, n, "plain"))
+            for clip_id in ("a", "b", "c"):
+                names.add(voicetune.clip_filename(epoch, 0, f"delivery-of-{clip_id}"))
+        self.assertEqual(len(names), 2 * (3 + 3))  # none collide within or across the two epochs
+        self.assertNotEqual(voicetune.clip_filename(4, 0, "plain"),
+                            voicetune.clip_filename(4, 0, "delivery-of-a"))
+
+    def test_delivery_clips_is_seeded_and_ignores_extra_fields(self):
+        base = [{"id": f"c{i}", "audio": f"a{i}.wav", "ref_audio": f"r{i}.wav", "text": "x"} for i in range(10)]
+        a = [dict(r, mood="happy", label=1) for r in base]
+        b = [dict(r, mood="sad", label=0, junk=[1, 2, 3]) for r in base]
+        pick_a = voicetune.delivery_clips(a, 0, 6)
+        pick_b = voicetune.delivery_clips(b, 0, 6)
+        self.assertEqual(pick_a, pick_b)  # same seed -> same ids/paths, extra fields ignored
+        self.assertEqual(len(pick_a), 6)
+        ids = {r["id"] for r in base}
+        refs = {r["ref_audio"] for r in base}
+        self.assertTrue({p[0] for p in pick_a} <= ids)
+        self.assertTrue({p[1] for p in pick_a} <= refs)
+
+    def test_check_reports_new_keys_and_generate_with_model_mocked(self):
+        import sys
+        import tempfile
+        import types
+        from pathlib import Path
+
+        saved = {}
+        for mod in ("qwen_tts", "transformers", "accelerate", "librosa", "soundfile", "huggingface_hub", "torch"):
+            saved[mod] = sys.modules.get(mod)
+            sys.modules[mod] = types.ModuleType(mod)
+        # A CPU-only torch stub, so the check runs the same with or without torch installed (CI has none).
+        sys.modules["torch"].__version__ = "stub"
+        sys.modules["torch"].version = types.SimpleNamespace(cuda=None)
+        sys.modules["torch"].cuda = types.SimpleNamespace(is_available=lambda: False)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                d = Path(d)
+                tts = mock.Mock()
+                tts.model.talker.parameters.return_value = iter([])
+                a = mock.Mock(out=d / "check", base=voicetune.BASE, no_model=False,
+                              work_dir=d / "work", generate=True)
+                with mock.patch.object(voicetune, "load_tts", return_value=tts), \
+                     mock.patch.object(voicetune, "_generate_one",
+                                       return_value={"line": "hi", "wav": "x.wav", "sr": 24000, "audio_s": 1.0}):
+                    rc = voicetune.cmd_check(a)
+                out = json.loads((d / "check" / "check.json").read_text())
+        finally:
+            for mod, m in saved.items():
+                if m is None:
+                    sys.modules.pop(mod, None)
+                else:
+                    sys.modules[mod] = m
+        self.assertEqual(rc, 0)
+        for key in ("torch", "cuda", "bf16", "nvidia", "sox", "gcc", "g++", "free_disk_gb", "generate", "ok"):
+            self.assertIn(key, out)
+        self.assertEqual(out["generate"]["wav"], "x.wav")
 
 
 if __name__ == "__main__":

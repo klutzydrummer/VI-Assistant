@@ -50,7 +50,8 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     python3 jobs/voicetune.py train   --data train_with_codes.jsonl --val val_with_codes.jsonl --out <folder>
                                       [--replay replay_with_codes.jsonl --kl 0.1] [--epochs 10] [--max-steps N] [--resume | --init-from epoch-K --warmup 50]
     python3 jobs/voicetune.py speak   --run <folder> --sentences s.txt [--epoch K] [--icl-ref clip.wav]
-                                      [--style-from her_clip.wav ...] [--game le3]
+                                      [--style-from her_clip.wav ...] [--delivery-from id=her_clip.wav ...]
+                                      [--seed N] [--unblind --title T --question Q] [--game le3]
 
 train_raw.jsonl (built at home): one line per clip, {"id", "audio" (24 kHz mono wav), "text",
 "ref_audio" (the clip itself, for its own x-vector), "game", optional "language"}. `prepare` adds
@@ -78,6 +79,8 @@ SPEAKER_SLOT = 6  # input position that holds the speaker embedding
 SR = 24000
 SUB_TALKER_WEIGHT = 0.3  # official residual-CE weight; use the same weight for residual replay KL
 REQUIRED = ["id", "audio", "text", "ref_audio"]
+CHECK_LINE = "This is a quick check of the voice pipeline."  # a neutral line for check --generate
+UNBLIND_ANSWERS = ["acceptable", "close", "not yet"]
 
 
 def read_jsonl(path):
@@ -240,6 +243,94 @@ def replay_kl_term(base_logits, logits, base_sub, sub, codec_0_labels):
     return main + SUB_TALKER_WEIGHT * residual
 
 
+def delivery_clips(rows, seed, n, ref_key="ref_audio"):
+    """The `n` clips for the delivery listening conditions, chosen by seed alone:
+    `random.Random(seed).sample` over the manifest rows. Ignores every field but `id` and `ref_key`,
+    so mood tags, labels and hand-labelled sets never steer the choice. Returns [(id, ref_path)] in
+    the sample's order."""
+    import random
+
+    if n > len(rows):
+        raise ValueError(f"delivery_clips: asked for {n} clips, manifest has {len(rows)} rows")
+    return [(r["id"], r[ref_key]) for r in random.Random(seed).sample(rows, n)]
+
+
+def check_abort(log_records, elapsed_s, mem_limit_gb=44.0, time_limit_s=6300.0):
+    """The fresh run's abort rule, as one testable function. `log_records` is the list of per-step
+    dicts train writes to train_log.jsonl (step, loss, peak_gb, ...); returns a reason to stop, or
+    None to carry on. Aborts on: a step-1 loss above 4.0, a NaN loss, a loss whose windowed mean has
+    risen more than 20% over 50 steps (mean of the last 10 losses vs the 10 losses ending 50 steps
+    earlier, so one noisy batch can't trip it), peak memory above `mem_limit_gb` (44 GB), or
+    `elapsed_s` over `time_limit_s` (1 h 45 m)."""
+    if elapsed_s > time_limit_s:
+        return f"elapsed {elapsed_s:.0f} s > {time_limit_s:.0f} s"
+    losses = []
+    for r in log_records:
+        loss = r.get("loss")
+        if loss is not None:
+            if r.get("step") == 1 and loss > 4.0:
+                return "step-1 loss > 4.0"
+            if loss != loss:  # NaN
+                return "NaN loss"
+            losses.append(loss)
+        peak = r.get("peak_gb")
+        if peak is not None and peak > mem_limit_gb:
+            return f"peak memory {peak} GB > {mem_limit_gb} GB"
+    if len(losses) >= 60:
+        recent = sum(losses[-10:]) / 10
+        older = sum(losses[-60:-50]) / 10
+        if recent > older * 1.2:
+            return f"loss rising {100 * (recent / older - 1):.0f}% over 50 steps"
+    return None
+
+
+def parse_delivery(arg):
+    """A --delivery-from argument: `id=path` (the id goes in the clip's kind label), or a bare path
+    (its stem is the id). Returns (id, path)."""
+    clip_id, sep, path = arg.partition("=")
+    if not sep:
+        return Path(arg).stem, arg
+    return clip_id or Path(path).stem, path
+
+
+def clip_filename(epoch, n, kind):
+    """A filename-safe WAV name for one listening clip, unique across epochs and slots:
+    `e{epoch}-{kind}-{n:02d}.wav` with `kind` ("plain" or "delivery-of-<id>") lowercased and every
+    non-alphanumeric turned into `-`, so two epochs or slots never overwrite each other."""
+    safe = "".join(c if c.isalnum() else "-" for c in kind.lower())
+    return f"e{epoch}-{safe}-{n:02d}.wav"
+
+
+def seed_all(seed):
+    """Reseed torch (CPU and every CUDA device) so the same line is generated the same across
+    checkpoints; a no-op for seed None."""
+    if seed is None:
+        return
+    import torch
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def unblind_entries(entries):
+    """The [[clip]] block lines for `entries` = [(epoch, line, text, kind, path)], ordered by epoch
+    then line (plain before delivery on the same line). `kind` is "plain" or "delivery-of-<id>"."""
+    out = []
+    ordered = sorted(entries, key=lambda e: (e[0], e[1], 0 if e[3] == "plain" else 1))
+    for epoch, line, text, kind, path in ordered:
+        out += ["[[clip]]", f"path = {json.dumps(path)}",
+                f"label = {json.dumps(f'epoch {epoch}, {kind}: {text}')}", ""]
+    return out
+
+
+def unblind_hub(entries, title, question):
+    """Full clips.toml text for an unblinded listening set: the title/question given on the command
+    line, the fixed human-ear answers, `blind = false`, then the entries (see unblind_entries)."""
+    head = [f"title = {json.dumps(title)}", f"question = {json.dumps(question)}",
+            f"answers = {json.dumps(UNBLIND_ANSWERS)}", "blind = false", ""]
+    return "\n".join(head + unblind_entries(entries))
+
+
 # --- GPU / model parts (not imported in CI) ---------------------------------------------------------
 
 
@@ -320,8 +411,39 @@ def xvectors(model, paths, cache):
     return got
 
 
+def _tool_version(exe):
+    """The first line of `exe --version`, or None when it isn't installed (reported, not gated)."""
+    import shutil
+    import subprocess
+
+    if not shutil.which(exe):
+        return None
+    try:
+        return subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15).stdout.splitlines()[0]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _generate_one(tts, out):
+    """Generate and decode one short line from Base and write it as a WAV, so `check --generate`
+    proves the whole generate-and-decode path before the paid run. Base clones a voice, so a short
+    synthetic tone stands in for the reference; the point is the path, not the voice."""
+    import numpy as np
+    import soundfile as sf
+
+    ref = out / "check-ref.wav"
+    sf.write(ref, 0.05 * np.sin(2 * np.pi * 220 * np.arange(SR) / SR), SR)
+    wavs, got_sr = tts.generate_voice_clone(text=CHECK_LINE, ref_audio=str(ref), x_vector_only_mode=True)
+    gen = out / "check-generate.wav"
+    sf.write(gen, wavs[0], got_sr)
+    return {"line": CHECK_LINE, "wav": str(gen), "sr": got_sr, "audio_s": round(len(wavs[0]) / got_sr, 2)}
+
+
 def cmd_check(a):
     """Everything the run needs, checked in one go before training (plan ahead, don't chase errors)."""
+    import shutil
+    import subprocess
+
     out = {}
     try:
         import torch
@@ -334,6 +456,16 @@ def cmd_check(a):
             out["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1)
     except Exception as e:  # noqa: BLE001 - report every failure, don't stop at the first
         out["torch_error"] = repr(e)
+    # The driver version torch can't see; nvidia-smi reports it (None without a GPU).
+    try:
+        drv = subprocess.run(["nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=15)
+        out["nvidia"] = [x.strip() for x in drv.stdout.splitlines() if x.strip()] if drv.returncode == 0 else None
+    except Exception:  # noqa: BLE001
+        out["nvidia"] = None
+    out["sox"] = shutil.which("sox")
+    out["gcc"] = _tool_version("gcc")  # report only: this sdpa/wheel-only job does not compile anything
+    out["g++"] = _tool_version("g++")
     for mod in ("qwen_tts", "transformers", "accelerate", "librosa", "soundfile", "huggingface_hub"):
         try:
             m = __import__(mod)
@@ -344,7 +476,12 @@ def cmd_check(a):
         out["transformers_warning"] = "qwen-tts 0.1.1 pins 4.57.3"
     if out.get("vram_gb") is not None and out["vram_gb"] < 40:
         out["vram_warning"] = "a full fine-tune of 1.7B with --kl wants a 48 GB card"
-    if not a.no_model and "qwen_tts_error" not in out:
+    a.out.mkdir(parents=True, exist_ok=True)
+    work = a.work_dir or a.out
+    work.mkdir(parents=True, exist_ok=True)
+    out["free_disk_gb"] = round(checkpoints.free_gb(work), 1)
+    tts = None
+    if (not a.no_model or a.generate) and "qwen_tts_error" not in out:
         try:
             dev = "cuda:0" if out.get("gpu") else "cpu"
             tts = load_tts(a.base, dev)
@@ -356,8 +493,12 @@ def cmd_check(a):
                 out["vram_after_load_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
         except Exception as e:  # noqa: BLE001
             out["model_error"] = repr(e)
+    if a.generate and tts is not None:
+        try:
+            out["generate"] = _generate_one(tts, a.out)
+        except Exception as e:  # noqa: BLE001
+            out["generate_error"] = repr(e)
     out["ok"] = not [k for k in out if k.endswith("_error")]
-    a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "check.json").write_text(json.dumps(out, indent=2))
     print(json.dumps(out, indent=2))
     return 0 if out["ok"] else 1
@@ -743,10 +884,11 @@ def voice_model(base, vec, talker_file, dst):
     return dst
 
 
-def speak_slots(a, tune, voice, ep):
-    """What goes in the speaker slot for each listening condition. Her mean voice always; with
-    --style-from, the delivery of each given clip of hers, so the list shows whether the slot still
-    steers her delivery (her x-vector of that clip, or the style encoder's reading of it)."""
+def speak_slots(a, tune, voice, ep, deliveries):
+    """What goes in the speaker slot for each listening condition, as (kind, label, vector). Her
+    mean voice first (kind "plain"), then one per delivery clip (kind "delivery-of-<id>"): for a
+    clip/mean run that clip's own x-vector (Base speaker encoder), for a style run the style
+    encoder's reading of the clip."""
     import numpy as np
     import torch
     from safetensors.torch import load_file
@@ -766,21 +908,22 @@ def speak_slots(a, tune, voice, ep):
             sys.exit(f"speak: game {a.game!r} not in {sorted(info['games'])}")
         # her plain voice = code 0 (what style dropout trains): her mean + the game's vector + up's bias
         game_vec = st["game"][g].float().numpy() + st["enc.up.bias"].float().numpy()
-    out = [(f"her mean voice{f', {a.game} suit' if style else ''}", (her + game_vec).tolist())]
-    if not a.style_from:
+    out = [("plain", f"her mean voice{f', {a.game} suit' if style else ''}", (her + game_vec).tolist())]
+    if not deliveries:
         return out
     if style:
         with torch.no_grad():
-            for w in a.style_from:
+            for clip_id, w in deliveries:
                 m = mel(w)
                 off = (enc(m, torch.tensor([m.shape[1]])) - enc.up.bias)[0].numpy()  # bias is in game_vec
-                out.append((f"delivery of {Path(w).stem}", (her + game_vec + off).tolist()))
+                out.append((f"delivery-of-{clip_id}", f"delivery of {Path(w).stem}", (her + game_vec + off).tolist()))
     else:
         base = load_tts(tune["base"], a.device).model  # only for its speaker encoder
         with torch.no_grad():
-            for w in a.style_from:
+            for clip_id, w in deliveries:
                 m = mel(w).to(base.device).to(base.dtype)
-                out.append((f"delivery of {Path(w).stem}", base.speaker_encoder(m)[0].float().cpu().tolist()))
+                out.append((f"delivery-of-{clip_id}", f"delivery of {Path(w).stem}",
+                            base.speaker_encoder(m)[0].float().cpu().tolist()))
         del base
     return out
 
@@ -800,39 +943,52 @@ def cmd_speak(a):
     ep = run / f"epoch-{epoch}"
     tune = json.loads((ep / "tune.json").read_text())
     sentences = [x.strip() for x in Path(a.sentences).read_text().splitlines() if x.strip()]
-    slots = speak_slots(a, tune, voice, ep)  # [(label, vector)]: her voice, plus one per --style-from clip
+    deliveries = [parse_delivery(x) for x in a.delivery_from] + [(Path(x).stem, x) for x in a.style_from]
+    slots = speak_slots(a, tune, voice, ep, deliveries)  # [(kind, label, vector)]
     vm = voice_model(tune["base"], voice["xvector"], ep / "talker.safetensors", run / f"voice-epoch-{epoch}")
     tts = load_tts(str(vm), a.device)
     row = tts.model.talker.model.codec_embedding.weight
     out = a.out or (run / f"speak-epoch-{epoch}")
     (out / "wav").mkdir(parents=True, exist_ok=True)
-    clips, timing = [], []
-    for j, (slot_label, vec) in enumerate(slots):
+    clips, entries, timing = [], [], []
+    for j, (kind, slot_label, vec) in enumerate(slots):
         with torch.no_grad():
             row[SPEAKER_ID] = torch.tensor(vec, dtype=row.dtype, device=row.device)
         for n, text in enumerate(sentences):
+            seed_all(a.seed)
             t0 = time.time()
             wavs, sr = tts.generate_custom_voice(text=text, speaker=SPEAKER)
-            p = out / "wav" / f"tuned-{j:02d}--{n:02d}.wav"
+            p = out / "wav" / clip_filename(epoch, n, kind)
             sf.write(p, wavs[0], sr)
             timing.append({"slot": slot_label, "n": n, "s": round(time.time() - t0, 2), "audio_s": round(len(wavs[0]) / sr, 2)})
             clips.append((f"fine-tuned epoch {epoch}, no reference, {slot_label} | sentence {n}: {text}", p))
+            entries.append((epoch, n, text, kind, str(p.relative_to(out))))
     if a.icl_ref:
         del tts  # one big model at a time
         base = load_tts(tune["base"], a.device)
         for n, text in enumerate(sentences):
+            seed_all(a.seed)
             wavs, sr = base.generate_voice_clone(text=text, ref_audio=a.icl_ref, ref_text=a.icl_ref_text)
             p = out / "wav" / f"base-icl--{n:02d}.wav"
             sf.write(p, wavs[0], sr)
             clips.append((f"Base model with her clip as the example | sentence {n}: {text}", p))
-    clips.sort(key=lambda c: hashlib.sha256(c[0].encode()).hexdigest())
-    hub = ['title = "Fine-tuned voice: is this Tali, with no reference clip?"',
-           'question = "Is this Tali with her suit and accent? Note short-line glitches or speed-ups."',
-           'answers = ["her, suit and accent", "her, suit or accent partly", "not quite her", "not her or broken"]',
-           "blind = true", 'asked_by = "Modeling Tali\'s suit effect"', ""]
-    for label, p in clips:
-        hub += ["[[clip]]", f"path = {json.dumps(str(p.relative_to(out)))}", f"label = {json.dumps(label)}", ""]
-    (out / "clips.toml").write_text("\n".join(hub))
+    if a.unblind:
+        title = a.title or "Fine-tuned voice: is this Tali, with no reference clip?"
+        question = a.question or "Is this Tali with her suit and accent? Note short-line glitches or speed-ups."
+        hub = out / "clips.toml"
+        if hub.exists():
+            hub.write_text(hub.read_text().rstrip() + "\n\n" + "\n".join(unblind_entries(entries)) + "\n")
+        else:
+            hub.write_text(unblind_hub(entries, title, question))
+    else:
+        clips.sort(key=lambda c: hashlib.sha256(c[0].encode()).hexdigest())
+        hub = ['title = "Fine-tuned voice: is this Tali, with no reference clip?"',
+               'question = "Is this Tali with her suit and accent? Note short-line glitches or speed-ups."',
+               'answers = ["her, suit and accent", "her, suit or accent partly", "not quite her", "not her or broken"]',
+               "blind = true", 'asked_by = "Modeling Tali\'s suit effect"', ""]
+        for label, p in clips:
+            hub += ["[[clip]]", f"path = {json.dumps(str(p.relative_to(out)))}", f"label = {json.dumps(label)}", ""]
+        (out / "clips.toml").write_text("\n".join(hub))
     write_jsonl(out / "timing.jsonl", timing)
     print(f"speak: {len(clips)} clips in {out}")
 
@@ -844,6 +1000,8 @@ def main(argv=None):
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--base", default=BASE)
     c.add_argument("--no-model", action="store_true", help="imports and GPU only")
+    c.add_argument("--generate", action="store_true", help="load Base, generate and decode one line, write a WAV")
+    c.add_argument("--work-dir", type=Path, help="directory whose free disk is reported (default --out)")
     r = sub.add_parser("replay")
     r.add_argument("--sentences", type=Path, required=True)
     r.add_argument("--voices", type=Path, required=True, help="24 kHz wavs of other (public) speakers")
@@ -900,6 +1058,13 @@ def main(argv=None):
     s.add_argument("--out", type=Path)
     s.add_argument("--icl-ref", help="her clip, for a Base-model ICL comparison")
     s.add_argument("--style-from", action="append", default=[], help="her clip whose delivery goes in the slot")
+    s.add_argument("--delivery-from", action="append", default=[], metavar="ID=PATH",
+                   help="her clip whose own x-vector (clip/mean run) goes in the slot; ID labels the entry")
+    s.add_argument("--seed", type=int, help="reseed torch before each clip, so the same line is generated the same across checkpoints")
+    s.add_argument("--unblind", action="store_true",
+                   help="write an unblinded clips.toml (epoch-ordered, labelled), not the hash-shuffled blind one")
+    s.add_argument("--title", help="clips.toml title with --unblind")
+    s.add_argument("--question", help="clips.toml question with --unblind")
     s.add_argument("--game", default="le3", help="--speaker style runs: which game's suit")
     s.add_argument("--icl-ref-text", default="")
     a = ap.parse_args(argv)
