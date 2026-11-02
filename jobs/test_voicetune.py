@@ -366,9 +366,13 @@ class VoiceTuneTest(unittest.TestCase):
         from pathlib import Path
 
         saved = {}
-        for mod in ("qwen_tts", "transformers", "accelerate", "librosa", "soundfile", "huggingface_hub"):
+        for mod in ("qwen_tts", "transformers", "accelerate", "librosa", "soundfile", "huggingface_hub", "torch"):
             saved[mod] = sys.modules.get(mod)
             sys.modules[mod] = types.ModuleType(mod)
+        # A CPU-only torch stub, so the check runs the same with or without torch installed (CI has none).
+        sys.modules["torch"].__version__ = "stub"
+        sys.modules["torch"].version = types.SimpleNamespace(cuda=None)
+        sys.modules["torch"].cuda = types.SimpleNamespace(is_available=lambda: False)
         try:
             with tempfile.TemporaryDirectory() as d:
                 d = Path(d)
