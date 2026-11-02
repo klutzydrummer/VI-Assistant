@@ -11,6 +11,11 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
     again (each frame learns the frame two ahead: "speech speeds up every epoch") and pairs the
     hidden state at p with frame p's codes. Here the labels go in unshifted (`train_labels`) and
     the code predictor gets the hidden state one position back (`predictor_hidden_mask`).
+  - text input: generation runs text_embedding through talker.text_projection; training does too
+    here (`forward`), so the talker sees the text the generator does.
+  - sub-talker loss: forward_sub_talker_finetune's own loss shifts labels again (codebook k scored
+    against codebook k+1); here its logits are scored against codebook k+1 directly (`forward`),
+    the pairing the code predictor is fed at generation.
   - attention: sdpa, not the hard-coded flash_attention_2.
   - speaker slot: each clip's OWN x-vector (`--speaker clip`, the default), not one fixed vector.
     Her x-vector moves with her mood (Brito 2026), so training on a fixed one would teach the model
@@ -412,12 +417,14 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
 def forward(model, batch, voice):
     """The official forward pass with the alignment fixes; voice = [b, d] for the speaker slot.
     Returns (talker outputs, sub-talker loss)."""
+    import torch.nn.functional as F
+
     dev = model.device
     input_ids = batch["input_ids"].to(dev)
     codec_ids = batch["codec_ids"].to(dev)
     labels = batch["codec_0_labels"].to(dev)
     codec_mask = batch["codec_mask"].to(dev)
-    emb = model.talker.model.text_embedding(input_ids[:, :, 0]) * batch["text_embedding_mask"].to(dev)
+    emb = model.talker.text_projection(model.talker.model.text_embedding(input_ids[:, :, 0])) * batch["text_embedding_mask"].to(dev)
     cemb = model.talker.model.codec_embedding(input_ids[:, :, 1]) * batch["codec_embedding_mask"].to(dev)
     cemb[:, SPEAKER_SLOT, :] = voice.to(dev, cemb.dtype)
     emb = emb + cemb
@@ -427,7 +434,11 @@ def forward(model, batch, voice):
     out = model.talker(inputs_embeds=emb[:, :-1, :], attention_mask=batch["attention_mask"].to(dev)[:, :-1],
                        labels=train_labels(labels), output_hidden_states=True)
     hidden = out.hidden_states[0][-1][predictor_hidden_mask(codec_mask)]
-    _, sub_loss = model.talker.forward_sub_talker_finetune(codec_ids[codec_mask], hidden)
+    sub_codes = codec_ids[codec_mask]
+    sub_logits, _ = model.talker.forward_sub_talker_finetune(sub_codes, hidden)
+    # Aligned like generation: codebook k's logit scores codebook k+1's code (its own loss shifts again).
+    sub_loss = F.cross_entropy(sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
+                               sub_codes[:, 1:].reshape(-1))
     return out, sub_loss
 
 

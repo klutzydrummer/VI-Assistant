@@ -20,6 +20,10 @@ Stage 5 step 1 of the Tali voice plan. I read the official `finetuning/` folder 
 
 1. **Double label shift.** `sft_12hz.py` on main still passes `labels=codec_0_labels[:, 1:]` to a model whose `transformers` loss shifts labels again. Each frame then learns the frame two ahead, which is the reported "speech speeds up every epoch" bug. The fix is `labels=codec_0_labels[:, :-1]`.
 1b. **Code predictor pairing (my reading of the code, to confirm in the smoke test).** At generation, the code predictor gets the hidden state from the position *before* each frame, together with that frame's first code (`past_hidden` in the talker's `forward`). The official training loop instead gives it the hidden state *at* the frame. `jobs/voicetune.py` uses the one-position-back pairing. The smoke test checks it: speech speed and quality must hold after a few hundred steps.
+1c. **Two more training/generation mismatches, measured on Base and fixed (2026-11-02).** `jobs/pairingcheck.py` teacher-forced Base on replay lines and found both, now fixed in `jobs/voicetune.py` `forward`:
+    - **Text input**: training used the raw `text_embedding`, but generation runs it through `talker.text_projection` first. On the 1.7B model the text and hidden dims both match so the bug is silent, but the talker still saw the wrong input (upstream issue #120).
+    - **Sub-talker loss**: `forward_sub_talker_finetune`'s own loss shifts the sub-code labels again (codebook k scored against codebook k+1). Take only its logits and score them against codebook k+1 directly (upstream issue #179, the same "speech speeds up every epoch" bug).
+    On Base this takes the main-talker loss from ~12.6 to ~0.54 and the aligned sub-talker loss from ~9.4 to ~4.35.
 2. **Learning rate.** Use 2e-6 (the main command). The one-click script's 2e-5 gives noise and endless output.
 3. **flash-attention 2 is hard-coded.** It needs a flash-attn build matching the worker's torch and CUDA, a classic install failure. Switch to `sdpa` or pin a known wheel, and smoke-test it.
 4. **Pinned versions:** `transformers==4.57.3`, `accelerate==1.12.0`. Plan the worker image around them.
