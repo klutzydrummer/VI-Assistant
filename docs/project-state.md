@@ -1,13 +1,14 @@
 # VI Assistant: project state and handoff
 
-Last updated 2026-10-31. This page is for an agent or person picking the project up cold. It covers the goal, the rules Brandon (the owner, GitHub `klutzydrummer`) has set, where everything lives, what is done, and what comes next. Live state moves quickly: when this page and GitHub disagree, trust GitHub and ask Brandon.
+Last updated 2026-11-02. This page is for an agent or person picking the project up cold. It covers the goal, the rules Brandon (the owner, GitHub `klutzydrummer`) has set, where everything lives, what is done, and what comes next. Live state moves quickly: when this page and GitHub disagree, trust GitHub and ask Brandon.
 
 ## Where things stand right now
 
 - **Nothing is running.** No rental is up, and no paid job is waiting.
-- **Latest result:** "run B v2" of the voice fine-tune finished on 2026-10-31. It ran 20 more epochs from run B's epoch-9 weights, with the fixed style encoder (PRs #98 and #99). Held-out loss improved to 4.55 (run B was 4.78, run A 4.84) and flattened out by the end. The style code now varies between clips, so the collapse is fixed. It cost $1.69, the rental was destroyed, and the checkpoints (best is epoch 19) are on Brandon's PC.
-- **Waiting on Brandon's ears:** a listening "platter" on the review hub, titled "Fine-tune continued (fixed style code): epochs 4, 9, 19". It has 18 clips, with no reference clip and no RVC. The question is whether the three moods now sound different from each other. His verdict decides the next step for the voice.
-- **Open PR:** draft #100 speeds up style-encoder runs. It awaits his review.
+- **Latest result:** "run B v2" of the voice fine-tune finished on 2026-10-31. It ran 20 more epochs from run B's epoch-9 weights, with the fixed style encoder (PRs #98 and #99). Held-out loss improved to 4.55 (run B was 4.78, run A 4.84) and flattened out by the end. The style code now varies between clips, so the collapse is fixed. It cost $1.69 and the rental was destroyed. Its logs and listening clips came home, and its kept weights are at `~/.cache/vi/voicetune/contrun/keep/`; the kept checkpoints from runs A and B are under `abrun/keep/A/` and `abrun/keep/B/`.
+- **Brandon's ears, so far:** the run B v2 platter ("Fine-tune continued (fixed style code): epochs 4, 9, 19", 18 clips, no reference clip and no RVC) was rated on 2026-10-31, and all 18 were "not yet" (his notes include "Broken" and "Not her voice"). On 2026-11-02 he re-rated the earlier smoke set: 18 of 72 were "her, suit or accent partly" and none was higher, and he heard the three moods as clearly different in every arm.
+- **In progress (2026-11-02):** a home check found two training bugs that all three runs were trained with (see Known issues), so the training-code fix is in review. Next is a fresh short run from Base: about 300 steps, checkpoints every 50, all brought home and verified, then pruned to the chosen one and the next; the job refuses to start under 50 GB free on `/home`. It needs Brandon's go and budget.
+- **PR #100** (faster style-encoder runs) is merged.
 - **Working voice today:** the "interim voice", which is the Qwen3-TTS Base model cloning from one of her real clips, then passed through the Collige01 fan RVC model. Brandon rated it "acceptable". The fine-tune clips from runs A and B were all rated "not yet".
 - **Money:** Vast.ai credit is $8.66. The Claude API labelling budget is $22.24 of $25 spent, and that run is finished.
 
@@ -92,7 +93,7 @@ A conversational assistant that feels like a friend and an executive assistant w
 | Voice steering on the base model (voicearms 1–3) | Done. Her voice survives only with her real clip as the prompt (in-context cloning). Indignation steers clearly; alarm and urgency are weaker; sadness, playful and blends don't steer. These results are the base-model baseline. |
 | Reference screening (refscreen) | Done. Every mood found clips of hers that carry it. RVC versions through Collige01 were made too. |
 | Suit checks | Done. The codec keeps the suit on LE2 and LE3 clips but degrades LE1. RVC puts her voice and suit back on 21 of 23 TTS clips. |
-| Voice fine-tune | Runs A and B done (rated "not yet"; the style encoder had collapsed). Run B v2 done with the fix; **its platter awaits Brandon's ears.** |
+| Voice fine-tune | Runs A and B done (rated "not yet"; the style encoder had collapsed). Run B v2 done with the fix, but its platter was rated "not yet" too. **All three runs trained with two bugs found on 2026-11-02; the next run starts from Base with the fix.** |
 | Vulkan on the RX 480 | Works for `vi chat` and for Qwen3-TTS trials at Q8. Final voice verdicts come from the rental. |
 | `vi chat` milestone | Not yet. It needs the steering and voice results wired into the persona pack. |
 
@@ -122,13 +123,14 @@ The full plan lives in a private Claude page, "Tali voice plan". Here is a summa
 - **Cause:** the style encoder collapsed. Every clip got the same code, pinned at its limits, and the plain-voice inference was missing a trained offset. PR #99 fixes both by normalising codes across the batch, making the plain voice code 0, and logging `code_std` to catch a collapse early. PR #98 adds `--init-from` with LR warmup.
 - **Run B v2** ($1.69): continued from B's epoch 9 for 20 epochs with a fresh style encoder. Held-out loss reached 4.55, and the style code stayed alive.
 - **Inference:** `--speaker style` with `speak --style-from <clip>` uses a clip's style code. The style code is 16 numbers in the speaker slot.
+- **Weights must come home:** any next run must bring its weights home and confirm them before the rental is destroyed.
 
 ## Next steps and decisions waiting on Brandon
 
-1. **His verdict on the run B v2 platter.**
-   - If the moods differ, the next steps are: cluster and name the style codes by ear, then train the text-to-style predictor and the mood-state projector (his yes is needed on the projector replacing the TTS vectors), then stage 6.
-   - If they don't differ, diagnose before spending more.
-2. **Review draft PR #100** (faster style runs).
+1. **The training-code fix** is in review. Next is a fresh short run from Base (about 300 steps, checkpoints every 50, all brought home and verified, then pruned to the chosen one and the next; the job refuses to start under 50 GB free on `/home`), which needs his go and budget.
+   - Once that run's weights are home and rated, the next steps are: cluster and name the style codes by ear, then train the text-to-style predictor and the mood-state projector (his yes is needed on the projector replacing the TTS vectors), then stage 6.
+   - If it still doesn't sound like her, diagnose before spending more.
+2. **His go for the next paid run,** the fresh short run from Base above, and a budget for it. PR #100 is reviewed and merged, so nothing waits on it.
 3. **Stage 3, our own RVC,** which needs a go for a rental under $1.
 4. **The 27B chat strength sweep,** which needs a go line once it has been built and dry-run.
 5. **Home cloning checks on the real model** (cpu-f32, then vk-q8), on his go. These must respect the home memory limits.
@@ -140,7 +142,7 @@ The full plan lives in a private Claude page, "Tali voice plan". Here is a summa
 
 | PR | What | State |
 |---|---|---|
-| #100 | Speeds up style-encoder runs | Draft, open, awaiting review |
+| #100 | Speeds up style-encoder runs | Merged |
 | #99 | Style-encoder collapse fix | Merged |
 | #98 | `--init-from` with LR warmup | Merged |
 | #97 | Full fine-tune with the style-encoder guards and `--style-lr` | Merged |
@@ -165,6 +167,7 @@ The full plan lives in a private Claude page, "Tali voice plan". Here is a summa
 ## Known issues and gotchas
 
 - **The pre-rental check must cover compilers.** It once missed a missing C++ compiler, which made an RVC step fail on the worker.
+- **Runs A, B and B v2 trained with two bugs** (the talker's text projection was skipped and the code-predictor loss was shifted one codebook; QwenLM/Qwen3-TTS issues #120 and #179). Their kept weights (~11.5 GB under `~/.cache/vi/voicetune/`) are not worth building on.
 - **The resume file from a full fine-tune is too big to bring home.** Continuing therefore restarts from the saved weights with a fresh optimizer (`--init-from`).
 - **Brandon's disk is tight:** the system disk had 12 GB free on 2026-10-26, and `/home` had 148 GB free. Big outputs and pip temp files go on `/home`.
 - **Vulkan:** anything that overfills the 8 GB RX 480 can crash the PC. F32 TTS runs on the CPU or a rental only.
