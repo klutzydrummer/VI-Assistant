@@ -7,6 +7,93 @@ import numpy as np
 import voicetune
 
 
+# Tiny stand-ins for the parts of Qwen3-TTS that forward() touches, so the two alignment fixes
+# can be tested without loading the real model. Every tensor uses an 8-wide hidden state.
+class _Const:
+    """Callable returning a constant [..., 8] tensor (an embedding that ignores its indices)."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __call__(self, x):
+        import torch
+
+        return torch.full((*x.shape, 8), self.value)
+
+
+class _Project:
+    """text_projection stand-in that scales its input, so projected text is distinct from raw."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def __call__(self, x):
+        return x * self.scale
+
+
+class _CodePredictor:
+    def get_input_embeddings(self):
+        return [_Const(0.0) for _ in range(15)]
+
+
+class _Talker:
+    def __init__(self, project_scale=1.0, sub_logits=None, sub_loss=0.0):
+        import torch
+
+        self.text_projection = _Project(project_scale)
+        self.model = type("_TextCodec", (), {"text_embedding": _Const(1.0), "codec_embedding": _Const(0.0)})()
+        self.code_predictor = _CodePredictor()
+        self._sub_logits = sub_logits
+        self._sub_loss = sub_loss
+        self.seen = {}
+
+    def __call__(self, inputs_embeds, attention_mask=None, labels=None, output_hidden_states=False):
+        import torch
+
+        self.seen["inputs_embeds"] = inputs_embeds
+        out = type("_Out", (), {})()
+        out.loss = torch.zeros(())
+        out.hidden_states = ([torch.zeros(*inputs_embeds.shape)],)
+        out.logits = torch.zeros(*inputs_embeds.shape[:2], 8)
+        return out
+
+    def forward_sub_talker_finetune(self, codes, hidden):
+        import torch
+
+        if self._sub_logits is not None:
+            return self._sub_logits, torch.full((), self._sub_loss)
+        return torch.zeros(*codes.shape[:1], 15, 8), torch.full((), self._sub_loss)
+
+
+class _Model:
+    device = "cpu"
+
+    def __init__(self, **kw):
+        self.talker = _Talker(**kw)
+
+
+def _batch(frames, rows=None):
+    """A collate-like batch: `frames` are the masked codec positions; rows[i] sets codec row i."""
+    import torch
+
+    T = 8  # longer than SPEAKER_SLOT (6)
+    mask = torch.zeros(1, T, dtype=torch.bool)
+    mask[0, list(frames)] = True
+    codec_ids = torch.zeros(1, T, 16, dtype=torch.long)
+    if rows:
+        for p, row in zip(frames, rows):
+            codec_ids[0, p] = torch.tensor(row)
+    return {
+        "input_ids": torch.zeros(1, T, 2, dtype=torch.long),
+        "codec_ids": codec_ids,
+        "codec_0_labels": torch.zeros(1, T, dtype=torch.long),
+        "codec_mask": mask,
+        "text_embedding_mask": torch.ones(1, T, 1),
+        "codec_embedding_mask": torch.zeros(1, T, 1),
+        "attention_mask": torch.ones(1, T, dtype=torch.long),
+    }
+
+
 class VoiceTuneTest(unittest.TestCase):
     def test_validate_flags_missing_fields_duplicates_and_sample_rate(self):
         rows = [
@@ -120,6 +207,37 @@ class VoiceTuneTest(unittest.TestCase):
         enc = voicetune.style_encoder(16)
         self.assertEqual(tuple(enc.code(mels, n).shape), (2, 16))
         self.assertEqual(float(enc(mels, n).abs().sum()), 0.0)  # zero offset until trained
+
+    def test_forward_projects_text_through_talker_text_projection(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        # text_embedding yields 1s; text_projection doubles them. The talker must see 2s (projected),
+        # not 1s (raw), at every text position.
+        model = _Model(project_scale=2.0)
+        voicetune.forward(model, _batch((2,)), torch.zeros(1, 8))
+        emb = model.talker.seen["inputs_embeds"]
+        self.assertTrue(torch.allclose(emb, torch.full_like(emb, 2.0)))
+
+    def test_forward_scores_the_sub_talker_loss_aligned(self):
+        try:
+            import torch
+            import torch.nn.functional as F
+        except ImportError:
+            self.skipTest("no torch")
+        V = 4
+        frames = (2, 4)  # two frames -> sub_logits [2, 15, V]
+        rows = ([1] * 16, [2] * 16)
+        sub_logits = torch.randn(2, 15, V)
+        # sub_loss sentinel 999: forward() must ignore the model's own (double-shifted) loss.
+        model = _Model(sub_logits=sub_logits, sub_loss=999.0)
+        batch = _batch(frames, rows)
+        _, sub = voicetune.forward(model, batch, torch.zeros(1, 8))
+        sub_codes = batch["codec_ids"][batch["codec_mask"]]
+        expected = F.cross_entropy(sub_logits.reshape(-1, V).float(), sub_codes[:, 1:].reshape(-1))
+        self.assertAlmostEqual(float(sub), float(expected), places=5)
+        self.assertNotAlmostEqual(float(sub), 999.0, places=5)
 
 
 if __name__ == "__main__":
