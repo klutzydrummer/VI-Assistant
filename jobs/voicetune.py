@@ -39,8 +39,10 @@ docs/design/qwen3tts-finetune-guide.md), with its problems fixed:
   - forgetting: `--kl` adds a KL-to-Base term on replay lines, i.e. lines Base itself spoke in
     OTHER voices (`replay`). Teacher-forcing on the frozen model's own samples estimates the KL to
     it (Context-Free Synthetic Data, arXiv 2505.13811), so this keeps reading skill and expressive
-    range without pulling her own voice back toward Base's version of it. lr 2e-6 (2e-5 gives
-    noise and endless output); a held-out loss per epoch picks the checkpoint.
+    range without pulling her own voice back toward Base's version of it. The term covers all 16
+    codebooks — the talker logits plus the 15 residual code-predictor logits, the latter at the
+    residual-CE weight — so the residual codebooks are held to Base too. lr 2e-6 (2e-5 gives noise
+    and endless output); a held-out loss per epoch picks the checkpoint.
 
     python3 jobs/voicetune.py check   --out <folder>
     python3 jobs/voicetune.py replay  --sentences s.txt --voices <dir of 24 kHz wavs> --out <folder>
@@ -66,12 +68,15 @@ import sys
 import time
 from pathlib import Path
 
+import checkpoints
+
 BASE = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 TOKENIZER = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 SPEAKER = "tali"
 SPEAKER_ID = 3000  # the codec-embedding row the official recipe gives a new speaker
 SPEAKER_SLOT = 6  # input position that holds the speaker embedding
 SR = 24000
+SUB_TALKER_WEIGHT = 0.3  # official residual-CE weight; use the same weight for residual replay KL
 REQUIRED = ["id", "audio", "text", "ref_audio"]
 
 
@@ -114,6 +119,23 @@ def predictor_hidden_mask(codec_mask):
     """Which hidden states (of inputs_embeds[:, :-1]) feed the code predictor, one per audio frame:
     the position just before each frame, whose output predicted that frame's first code."""
     return codec_mask[:, 1:]
+
+
+def causal_label_mask(codec_0_labels):
+    """Which returned talker logits have a causal-LM target after transformers shifts the labels.
+
+    The talker scores logits[t] against train_labels(labels)[:, t + 1] itself, so position t has a
+    CE target iff that shifted label is not -100; the last logit (t = T - 1) has none. Returns a
+    bool mask shaped like out.logits[:, :, 0], i.e. [b, T - 1]: the shifted labels are [b, T - 2],
+    padded with a trailing False for the final, untargeted logit."""
+    shifted = train_labels(codec_0_labels)[:, 1:] != -100  # targets for t = 0 .. T - 3
+    if hasattr(shifted, "new_zeros"):  # a torch tensor
+        import torch
+
+        return torch.cat([shifted, shifted.new_zeros(shifted.shape[0], 1)], dim=1)
+    import numpy as np
+
+    return np.concatenate([shifted, np.zeros((shifted.shape[0], 1), dtype=bool)], axis=1)
 
 
 def mean_voice(vectors):
@@ -203,6 +225,19 @@ def kl_to_base(base_logits, logits, mask):
     lb = F.log_softmax(base_logits[mask].float(), -1)
     lt = F.log_softmax(logits[mask].float(), -1)
     return (lb.exp() * (lb - lt)).sum(-1).mean()
+
+
+def replay_kl_term(base_logits, logits, base_sub, sub, codec_0_labels):
+    """The replay KL-to-Base term over all 16 codebooks: the talker (codebook 0) logits at the
+    positions the causal-LM loss scores, plus every residual code-predictor logit at the residual-CE
+    weight. Pure (no model), so the weighting is testable without a GPU."""
+    import torch
+
+    mask = causal_label_mask(codec_0_labels).to(logits.device)
+    main = kl_to_base(base_logits, logits, mask)
+    residual_mask = torch.ones(sub.shape[:-1], dtype=torch.bool, device=sub.device)
+    residual = kl_to_base(base_sub, sub, residual_mask)
+    return main + SUB_TALKER_WEIGHT * residual
 
 
 # --- GPU / model parts (not imported in CI) ---------------------------------------------------------
@@ -416,7 +451,7 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
 
 def forward(model, batch, voice):
     """The official forward pass with the alignment fixes; voice = [b, d] for the speaker slot.
-    Returns (talker outputs, sub-talker loss)."""
+    Returns (talker outputs, aligned sub-talker loss, sub-talker logits)."""
     import torch.nn.functional as F
 
     dev = model.device
@@ -439,7 +474,7 @@ def forward(model, batch, voice):
     # Aligned like generation: codebook k's logit scores codebook k+1's code (its own loss shifts again).
     sub_loss = F.cross_entropy(sub_logits.reshape(-1, sub_logits.shape[-1]).float(),
                                sub_codes[:, 1:].reshape(-1))
-    return out, sub_loss
+    return out, sub_loss, sub_logits
 
 
 def save_resume(out, epoch, step, heads, opt, gen):
@@ -504,6 +539,8 @@ def cmd_train(a):
     rows = read_jsonl(a.data)
     val = read_jsonl(a.val) if a.val else []
     replay = read_jsonl(a.replay) if a.replay else []
+    if not rows:
+        sys.exit("train: no training rows")
     if a.kl and not replay:
         sys.exit("train: --kl needs --replay")
     bad = validate(rows + val + replay)
@@ -599,15 +636,14 @@ def cmd_train(a):
 
     def her_loss(batch, training=True):
         voice, aux = slot(batch, training)
-        out, sub = forward(model, batch, voice)
-        return out.loss + 0.3 * sub, aux
+        out, sub, _ = forward(model, batch, voice)
+        return out.loss + SUB_TALKER_WEIGHT * sub, aux
 
     def replay_kl(batch):
-        out, _ = forward(model, batch, batch["xvec"])
+        out, _, sub = forward(model, batch, batch["xvec"])
         with torch.no_grad():
-            ref, _ = forward(base, batch, batch["xvec"])
-        mask = train_labels(batch["codec_0_labels"]).to(model.device) != -100
-        return kl_to_base(ref.logits, out.logits, mask)
+            ref, _, ref_sub = forward(base, batch, batch["xvec"])
+        return replay_kl_term(ref.logits, out.logits, ref_sub, sub, batch["codec_0_labels"])
 
     step, first = 0, 0
     if a.resume:
@@ -670,10 +706,13 @@ def cmd_train(a):
         (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
                                                   "style_lr": a.style_lr if style else None, "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
                                                   "prosody_aux": a.prosody_aux, "style_dropout": a.style_dropout}))
-        save_resume(a.out, epoch, step, {"game_head": game_head, "pros_head": pros_head}, opt, shuffle_gen)
+        if not a.no_resume_file:
+            save_resume(a.out, epoch, step, {"game_head": game_head, "pros_head": pros_head}, opt, shuffle_gen)
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
+        if a.publish:
+            checkpoints.publish_epoch(ep, a.publish)
         if a.max_steps and step >= a.max_steps:
             break
     print(f"train: done in {time.time() - t0:.0f} s, {step} steps, checkpoints in {a.out}")
@@ -849,6 +888,10 @@ def main(argv=None):
                    help="optimizer steps over which the learning rates ramp up from zero (e.g. 50 with --init-from)")
     t.add_argument("--resume", action="store_true",
                    help="carry on after the last finished epoch in --out (same flags as the stopped run)")
+    t.add_argument("--publish", type=Path,
+                   help="copy each finished epoch into this folder, hash-verified (see checkpoints.py)")
+    t.add_argument("--no-resume-file", action="store_true",
+                   help="skip save_resume (the ~12 GB optimizer file)")
     s = sub.add_parser("speak")
     s.add_argument("--run", type=Path, required=True)
     s.add_argument("--sentences", type=Path, required=True)

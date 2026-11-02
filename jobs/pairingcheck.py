@@ -71,7 +71,7 @@ def main(argv=None):
 
     for batch in dl:
         # 1. voicetune.forward exactly as training calls it: the two losses the fix targets.
-        out, sub = voicetune.forward(model, batch, batch["xvec"])
+        out, sub, _ = voicetune.forward(model, batch, batch["xvec"])
         n_frames = int(batch["codec_mask"].sum())
         add("voicetune talker loss (out.loss)", out.loss.item(), n_frames)
         add("voicetune sub-talker loss (aligned)", sub.item(), n_frames)
