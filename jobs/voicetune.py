@@ -68,6 +68,8 @@ import sys
 import time
 from pathlib import Path
 
+import checkpoints
+
 BASE = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 TOKENIZER = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 SPEAKER = "tali"
@@ -704,10 +706,13 @@ def cmd_train(a):
         (ep / "tune.json").write_text(json.dumps({"base": a.base, "lr": a.lr, "kl": a.kl, "speaker": a.speaker,
                                                   "style_lr": a.style_lr if style else None, "style_shuffle": a.style_shuffle, "game_adv": a.game_adv,
                                                   "prosody_aux": a.prosody_aux, "style_dropout": a.style_dropout}))
-        save_resume(a.out, epoch, step, {"game_head": game_head, "pros_head": pros_head}, opt, shuffle_gen)
+        if not a.no_resume_file:
+            save_resume(a.out, epoch, step, {"game_head": game_head, "pros_head": pros_head}, opt, shuffle_gen)
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(rec, flush=True)
+        if a.publish:
+            checkpoints.publish_epoch(ep, a.publish)
         if a.max_steps and step >= a.max_steps:
             break
     print(f"train: done in {time.time() - t0:.0f} s, {step} steps, checkpoints in {a.out}")
@@ -883,6 +888,10 @@ def main(argv=None):
                    help="optimizer steps over which the learning rates ramp up from zero (e.g. 50 with --init-from)")
     t.add_argument("--resume", action="store_true",
                    help="carry on after the last finished epoch in --out (same flags as the stopped run)")
+    t.add_argument("--publish", type=Path,
+                   help="copy each finished epoch into this folder, hash-verified (see checkpoints.py)")
+    t.add_argument("--no-resume-file", action="store_true",
+                   help="skip save_resume (the ~12 GB optimizer file)")
     s = sub.add_parser("speak")
     s.add_argument("--run", type=Path, required=True)
     s.add_argument("--sentences", type=Path, required=True)
