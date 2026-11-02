@@ -1,6 +1,7 @@
 """Tests for voicetune.py's pure parts (no model). Run with `python3 -m unittest discover -s jobs`."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -259,6 +260,19 @@ class VoiceTuneTest(unittest.TestCase):
         expected = F.cross_entropy(sub_logits.reshape(-1, V).float(), sub_codes[:, 1:].reshape(-1))
         self.assertAlmostEqual(float(sub), float(expected), places=5)
         self.assertNotAlmostEqual(float(sub), 999.0, places=5)
+
+    def test_train_argparse_parses_publish_and_no_resume_file(self):
+        with mock.patch.object(voicetune, "cmd_train") as fake:
+            fake.return_value = None
+            self.assertEqual(voicetune.main(["train", "--data", "d", "--out", "o",
+                                             "--publish", "pub", "--no-resume-file"]), 0)
+            a = fake.call_args.args[0]
+            self.assertEqual(str(a.publish), "pub")
+            self.assertTrue(a.no_resume_file)
+            voicetune.main(["train", "--data", "d", "--out", "o"])
+            a2 = fake.call_args.args[0]
+            self.assertIsNone(a2.publish)
+            self.assertFalse(a2.no_resume_file)
 
 
 if __name__ == "__main__":
