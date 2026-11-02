@@ -53,6 +53,7 @@ settings = {{ judge = "gemma" }}
         .args(["dataset", "run", pipeline.to_str().unwrap()])
         .env("VI_WORKER_HOST", "local")
         .env("VI_WORKER_ROOT", dir.join("worker"))
+        .env("VI_STATE_DIR", dir.join("state"))
         .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
         .unwrap()
@@ -180,6 +181,17 @@ echo clip-1 >> "$VI_CHECKPOINT/step.jsonl"; exit 3"#,
         "clip-1\n"
     );
     assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+    // The unverified-checkpoint guard wrote its marker into the temp state
+    // dir (never ~/.local/state/vi), naming the checkpoint path it came from.
+    let marker = dir.path().join("state/unverified/on-gpu");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().trim().to_string(),
+        saved[0]
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
 }
 
 #[test]
@@ -192,6 +204,7 @@ fn check_worker_round_trips_a_token() {
     let out = Command::new(script)
         .env("VI_WORKER_HOST", "local")
         .env("VI_WORKER_ROOT", dir.path().join("worker"))
+        .env("VI_STATE_DIR", dir.path().join("state"))
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);

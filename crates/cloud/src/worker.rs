@@ -1,11 +1,12 @@
 //! Renting, waiting for, and releasing the worker.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
-use crate::state::{StateDir, Tracked};
+use crate::state::{Marker, StateDir, Tracked};
 use crate::vast::{Endpoint, Instance, Offer, Vast};
 use crate::{onstart, Config, Error, Result};
 
@@ -90,6 +91,13 @@ pub struct Report {
     /// Everything else on the account. Not ours to touch, but it may cost money.
     pub others: Vec<Instance>,
     pub credit: Option<f64>,
+}
+
+/// What `down_force` reports: the ids destroyed, plus any unverified markers it
+/// overrode (left in place until a later `checkpoints.py verify` clears them).
+pub struct Down {
+    pub ids: Vec<u64>,
+    pub overridden: Vec<Marker>,
 }
 
 impl<V: Vast, H: Host> Cloud<V, H> {
@@ -247,8 +255,28 @@ impl<V: Vast, H: Host> Cloud<V, H> {
     }
 
     /// Destroys the tracked worker and any other instance carrying our label.
-    /// Returns the ids destroyed.
+    /// Returns the ids destroyed. Refuses while an unverified checkpoint marker
+    /// is present, so a pushed-home checkpoint isn't lost before it's been
+    /// verified; `down_force` overrides that.
     pub fn down(&self) -> Result<Vec<u64>> {
+        let markers = self.state.markers()?;
+        if !markers.is_empty() {
+            return Err(Error::Worker(unverified_error(&markers)));
+        }
+        self.destroy()
+    }
+
+    /// `down`, ignoring unverified markers. Returns the ids destroyed and the
+    /// markers it overrode (they stay in place until a later verify clears them).
+    pub fn down_force(&self) -> Result<Down> {
+        let overridden = self.state.markers()?;
+        let ids = self.destroy()?;
+        Ok(Down { ids, overridden })
+    }
+
+    /// The actual destruction, without consulting markers. `reap` uses this so
+    /// the idle/max-hours backstop can still release the worker no matter what.
+    fn destroy(&self) -> Result<Vec<u64>> {
         let mut ids = Vec::new();
         let tracked = self.state.load()?;
         if let Some(t) = &tracked {
@@ -284,7 +312,9 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         } else {
             return Ok(None);
         };
-        self.down()?;
+        // The money backstop ignores markers: a worker with an unverified
+        // checkpoint must still be released rather than kept billing.
+        self.destroy()?;
         Ok(Some(why))
     }
 
@@ -374,6 +404,21 @@ fn failed(inst: &Instance) -> Option<String> {
 
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The message `down` returns when unverified markers are in the way.
+fn unverified_error(markers: &[Marker]) -> String {
+    let mut msg = String::from(
+        "an unverified checkpoint is still at home; verify it before destroying the worker:\n",
+    );
+    for m in markers {
+        let _ = writeln!(msg, "  {}: {}", m.stage, m.path.display());
+    }
+    msg.push_str(
+        "run `python3 jobs/checkpoints.py verify <checkpoint> --expect N` for each, \
+         or `vi cloud down --force` to destroy anyway",
+    );
+    msg
 }
 
 #[cfg(test)]
@@ -607,5 +652,70 @@ mod tests {
     #[test]
     fn quoting_survives_single_quotes() {
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn down_refuses_with_an_unverified_marker_and_force_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, |_, _| true).unwrap();
+
+        let marker = dir.path().join("unverified").join("voicetune");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            "/home/brandon/corpus/stages/voicetune/.checkpoint-x\n",
+        )
+        .unwrap();
+
+        // Refused, and nothing is destroyed on the fake Vast.
+        let err = c.down().unwrap_err().to_string();
+        assert!(err.contains("voicetune"), "{err}");
+        assert!(
+            err.contains("/home/brandon/corpus/stages/voicetune/.checkpoint-x"),
+            "{err}"
+        );
+        assert!(err.contains("checkpoints.py verify"), "{err}");
+        assert!(vast.destroyed.borrow().is_empty());
+
+        // Force destroys and reports the overridden marker, leaving it in place.
+        let down = c.down_force().unwrap();
+        assert_eq!(down.ids, vec![100]);
+        assert_eq!(down.overridden.len(), 1);
+        assert_eq!(down.overridden[0].stage, "voicetune");
+        assert_eq!(*vast.destroyed.borrow(), vec![100]);
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn down_is_allowed_once_the_marker_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, |_, _| true).unwrap();
+
+        let marker = dir.path().join("unverified").join("voicetune");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "/checkpoint\n").unwrap();
+        assert!(c.down().is_err());
+
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(c.down().unwrap(), vec![100]);
+        assert_eq!(*vast.destroyed.borrow(), vec![100]);
     }
 }

@@ -33,7 +33,7 @@ pub(crate) const USAGE: &str = "usage:
   (every review mode also takes --host ADDR; default 127.0.0.1)
   vi cloud offers
   vi cloud up [--offer ID] [--yes]
-  vi cloud down
+  vi cloud down [--force]
   vi cloud status
   vi cloud reap
   vi cloud ssh [command]
@@ -90,7 +90,7 @@ fn main() -> ExitCode {
             }
         },
         ["review", rest @ ..] => review(rest),
-        ["cloud", rest @ ..] => cloud::run(rest),
+        ["cloud", rest @ ..] => cloud::run(rest, force),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

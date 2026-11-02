@@ -86,6 +86,7 @@ settings = {{ permutations = 5, bootstrap = 10 }}
         .args(["dataset", "run", pipeline.to_str().unwrap()])
         .env("VI_WORKER_HOST", "local")
         .env("VI_WORKER_ROOT", dir.path().join("worker"))
+        .env("VI_STATE_DIR", dir.path().join("state"))
         .output()
         .unwrap();
     assert!(
