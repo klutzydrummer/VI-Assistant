@@ -198,6 +198,34 @@ def _write_verified(dir, epochs):
         indent=1) + "\n")
 
 
+def state_dir():
+    """The same state dir `vi` uses: `$VI_STATE_DIR`, else `$XDG_STATE_HOME/vi`,
+    else `~/.local/state/vi`."""
+    if os.environ.get("VI_STATE_DIR"):
+        return Path(os.environ["VI_STATE_DIR"])
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg) / "vi"
+    return Path.home() / ".local" / "state" / "vi"
+
+
+def _clear_markers(dir):
+    """Drop every unverified marker whose recorded checkpoint path is `dir` or a
+    parent of it. Nothing else under `<state dir>/unverified/` is touched."""
+    dir = dir.resolve()
+    marker_dir = state_dir() / "unverified"
+    if not marker_dir.is_dir():
+        return
+    for p in marker_dir.iterdir():
+        if p.is_symlink() or not p.is_file():
+            continue  # only regular files written by on-worker.sh
+        recorded = p.read_text().strip()
+        if not recorded:
+            continue
+        if Path(recorded).resolve() == dir or Path(recorded).resolve() in dir.parents:
+            p.unlink()
+
+
 def verify(dir, expect):
     """Check a run dir has exactly `expect` verified epochs, then write VERIFIED.
     Exits non-zero on any symlink, leftover `.part`, missing/empty/mismatched file."""
@@ -210,6 +238,7 @@ def verify(dir, expect):
             print(p, file=sys.stderr)
         sys.exit(1)
     _write_verified(dir, epochs)
+    _clear_markers(dir)
     print(f"verified: {len(epochs)} epochs ok ({', '.join(sorted(epochs))})")
     return epochs
 

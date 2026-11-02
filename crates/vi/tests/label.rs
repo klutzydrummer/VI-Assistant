@@ -84,6 +84,7 @@ settings = {{ backend = "fake" }}
         .args(["dataset", "run", pipeline.to_str().unwrap()])
         .env("VI_WORKER_HOST", "local")
         .env("VI_WORKER_ROOT", dir.path().join("worker"))
+        .env("VI_STATE_DIR", dir.path().join("state"))
         .output()
         .unwrap();
     assert!(
@@ -185,6 +186,7 @@ fn the_worker_sends_the_checkpoint_home_even_when_the_job_fails() {
             .args(["dataset", "run", pipeline.to_str().unwrap()])
             .env("VI_WORKER_HOST", "local")
             .env("VI_WORKER_ROOT", dir.path().join("worker"))
+            .env("VI_STATE_DIR", dir.path().join("state"))
             .output()
             .unwrap()
     };

@@ -13,9 +13,9 @@ pub mod vast;
 pub mod worker;
 
 pub use config::Config;
-pub use state::{StateDir, Tracked};
+pub use state::{Marker, StateDir, Tracked};
 pub use vast::{Endpoint, HttpVast, Instance, Offer, Vast};
-pub use worker::{Cloud, Host, SystemHost};
+pub use worker::{Cloud, Down, Host, SystemHost};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

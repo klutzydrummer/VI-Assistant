@@ -198,6 +198,14 @@ push "$jobs_dir/" "$work/jobs/"
 push "$VI_SETTINGS" "$work/settings.json"
 return_start
 if [ -n "$checkpoint" ]; then
+  # A pushed-home checkpoint stays unverified until `checkpoints.py verify`
+  # clears its marker, so `vi cloud down` refuses while it exists. Record the
+  # absolute home path under the same state dir as `vi` (VI_STATE_DIR, else
+  # XDG_STATE_HOME/vi, else ~/.local/state/vi).
+  state_dir=${VI_STATE_DIR:-}
+  [ -n "$state_dir" ] || state_dir=${XDG_STATE_HOME:-${HOME:-.}/.local/state}/vi
+  mkdir -p "$state_dir/unverified"
+  printf '%s\n' "$checkpoint" >"$state_dir/unverified/$VI_STAGE"
   mkdir -p "$checkpoint"
   # A copy taken mid-write can end in half a line; drop it before resuming.
   for f in "$checkpoint"/*.jsonl; do

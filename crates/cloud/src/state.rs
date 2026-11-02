@@ -23,6 +23,17 @@ pub struct Tracked {
     pub endpoint: Option<Endpoint>,
 }
 
+/// A checkpoint `on-worker.sh` pushed home but nobody has verified yet. The
+/// file lives at `<state dir>/unverified/<stage>` and holds the absolute home
+/// checkpoint path on one line, so `vi cloud down` can refuse while it exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    /// The stage name (`VI_STAGE`).
+    pub stage: String,
+    /// The absolute home checkpoint path recorded in the marker.
+    pub path: PathBuf,
+}
+
 pub struct StateDir {
     pub dir: PathBuf,
 }
@@ -48,6 +59,38 @@ impl StateDir {
     /// doesn't trip a host key mismatch.
     pub fn known_hosts(&self, id: u64) -> PathBuf {
         self.dir.join(format!("known_hosts-{id}"))
+    }
+
+    /// Where `on-worker.sh` drops a marker per unverified checkpoint.
+    pub fn unverified_dir(&self) -> PathBuf {
+        self.dir.join("unverified")
+    }
+
+    /// Every marker currently present, ordered by stage name.
+    pub fn markers(&self) -> Result<Vec<Marker>> {
+        let dir = self.unverified_dir();
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(io_err(&dir)(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_err(&dir))?;
+            // Only regular files; a symlink must not be followed.
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let stage = entry.file_name().to_string_lossy().into_owned();
+            let recorded = std::fs::read_to_string(&path).map_err(io_err(&path))?;
+            out.push(Marker {
+                stage,
+                path: PathBuf::from(recorded.trim()),
+            });
+        }
+        out.sort_by(|a, b| a.stage.cmp(&b.stage));
+        Ok(out)
     }
 
     pub fn load(&self) -> Result<Option<Tracked>> {

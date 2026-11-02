@@ -20,7 +20,7 @@ fn open() -> Result<Cloud<HttpVast, SystemHost>, cloud::Error> {
     })
 }
 
-pub fn run(args: &[&str]) -> ExitCode {
+pub fn run(args: &[&str], force: bool) -> ExitCode {
     let c = match open() {
         Ok(c) => c,
         Err(e) => return fail(e),
@@ -28,7 +28,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     match args {
         ["offers"] => offers(&c),
         ["up", rest @ ..] => up(&c, rest),
-        ["down"] => down(&c),
+        ["down"] => down(&c, force),
         ["status"] => status(&c),
         ["reap"] => match c.reap() {
             Ok(Some(why)) => {
@@ -138,7 +138,31 @@ fn up(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
     }
 }
 
-fn down(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
+fn down(c: &Cloud<HttpVast, SystemHost>, force: bool) -> ExitCode {
+    if force {
+        return match c.down_force() {
+            Ok(down) => {
+                if down.ids.is_empty() {
+                    println!("no worker to release");
+                } else {
+                    for id in &down.ids {
+                        println!("destroyed instance {id}");
+                    }
+                }
+                for m in &down.overridden {
+                    println!(
+                        "overrode unverified marker for stage {} ({}): run \
+                         `python3 jobs/checkpoints.py verify {} --expect N` to clear it",
+                        m.stage,
+                        m.path.display(),
+                        m.path.display()
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        };
+    }
     match c.down() {
         Ok(ids) if ids.is_empty() => {
             println!("no worker to release");
