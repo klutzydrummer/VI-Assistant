@@ -6,11 +6,12 @@
 #
 # It copies this jobs/ folder, the stage's settings, each VI_INPUT_* folder and
 # any --put files to a fresh folder on the worker, runs the command there with
-# the same VI_* variables pointing at the copies, copies VI_OUT back, and deletes
-# the worker's folder whether the job worked or not. The job sees:
+# the same VI_* variables pointing at the copies, then the worker pushes VI_OUT
+# home through a home-created reverse SSH tunnel and restricted rsync receiver.
+# The worker's folder is deleted whether the job worked or not. The job sees:
 #   jobs/            this folder
 #   files/<name>     each --put file, by its base name
-#   VI_STAGE, VI_OUT, VI_SETTINGS, VI_INPUT_<NAME>, VI_CHECKPOINT, VI_WORKER=1
+#   VI_STAGE, VI_OUT, VI_SETTINGS, VI_INPUT_<NAME>, VI_CHECKPOINT, VI_WORKER=1, VI_RETURN_PORT
 #
 # VI_CHECKPOINT goes up with whatever an earlier, failed run of the same stage
 # left in it, and comes home every VI_SYNC_SECONDS (default 60) while the job
@@ -108,36 +109,94 @@ if [ -z "${VI_WORKER_HOST-}" ]; then
 fi
 root=${VI_WORKER_ROOT:-/root/vi-jobs}
 work="$root/$VI_STAGE.$(date +%s).$$"
+checkpoint=${VI_CHECKPOINT:-}
+[ -z "$checkpoint" ] || mkdir -p "$checkpoint"
+return_state=
+return_port=
+return_tunnel=
+return_scratch=
 q() { printf '%q' "$1"; }
 
 if [ "$VI_WORKER_HOST" = local ]; then
   remote() { bash -c "$1"; }
-  push() { rsync -a "$1" "$2"; }
-  pull() { rsync -a "${@:3}" "$1" "$2"; }
+  push() { local src=$1 dst=$2; shift 2; rsync -a "$@" "$src" "$dst"; }
 else
+  # No agent or X11 forwarding: the worker must never gain home's credentials
+  # or identity. ForwardAgent/ForwardX11 are explicit even though OpenSSH
+  # defaults them off, so the property is enforced rather than accidental.
   ssh_opts=(-p "$VI_WORKER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new
-    -o "UserKnownHostsFile=$VI_WORKER_KNOWN_HOSTS" -o ServerAliveInterval=30)
+    -o "UserKnownHostsFile=$VI_WORKER_KNOWN_HOSTS" -o ServerAliveInterval=30
+    -o ForwardAgent=no -o ForwardX11=no)
   target="root@$VI_WORKER_HOST"
   remote() { ssh "${ssh_opts[@]}" "$target" "$1"; }
-  push() { rsync -a -e "ssh ${ssh_opts[*]}" "$1" "$target:$2"; }
-  pull() { rsync -a -e "ssh ${ssh_opts[*]}" "${@:3}" "$target:$1" "$2"; }
+  push() { local src=$1 dst=$2; shift 2; rsync -a -e "ssh ${ssh_opts[*]}" "$@" "$src" "$target:$dst"; }
   # Keep home's idle clock running while the job does.
   (while sleep 60 >/dev/null 2>&1; do "$vi" cloud touch >/dev/null 2>&1 || true; done) &
   heartbeat=$!
 fi
+
+return_stop() {
+  if [ -n "$return_tunnel" ]; then kill "$return_tunnel" 2>/dev/null || true; return_tunnel=; fi
+  if [ -n "$return_state" ]; then "$jobs_dir/worker-return.sh" stop "$return_state" || true; return_state=; fi
+  if [ -n "$return_scratch" ]; then rmdir "$return_scratch" 2>/dev/null || true; return_scratch=; fi
+}
+
+worker_sync() {
+  local src=$1 module=$2 arg args=""
+  shift 2
+  for arg in "$@"; do args+=" $(q "$arg")"; done
+  remote "VI_RETURN_PORT=$(q "$return_port") $(q "$work/jobs/worker-return.sh") push $(q "$src") $(q "$module")$args"
+}
+
+return_start() {
+  return_state=$(mktemp -d)
+  return_checkpoint=$checkpoint
+  [ -n "$return_checkpoint" ] || return_scratch=$(mktemp -d)
+  [ -n "$return_checkpoint" ] || return_checkpoint=$return_scratch
+  return_port=$("$jobs_dir/worker-return.sh" start "$VI_OUT" "$return_checkpoint" "$return_state" "${VI_RETURN_PORT:-}")
+  if [ "$VI_WORKER_HOST" != local ]; then
+    # Home initiates both the reverse tunnel and the temporary receiver. The remote listener is
+    # loopback-only; no home credential, agent, or public port lives on the worker.
+    ssh "${ssh_opts[@]}" -N -T -o ExitOnForwardFailure=yes \
+      -R "127.0.0.1:$return_port:127.0.0.1:$return_port" "$target" >"$return_state/ssh.log" 2>&1 &
+    return_tunnel=$!
+  fi
+  local token ok= n
+  token=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+  for n in {1..20}; do
+    if remote "printf '%s\n' $(q "$token") > $(q "$work/.return-token") && VI_RETURN_PORT=$(q "$return_port") $(q "$work/jobs/worker-return.sh") push $(q "$work/.return-token") vi-out" >/dev/null 2>&1 &&
+       [ -f "$VI_OUT/.return-token" ] && [ "$(cat "$VI_OUT/.return-token")" = "$token" ]; then
+      ok=1; break
+    fi
+    sleep 0.25
+  done
+  [ "$ok" = 1 ] || {
+    echo "on-worker.sh: worker could not push through the reverse SSH return tunnel" >&2
+    [ -z "$return_tunnel" ] || cat "$return_state/ssh.log" >&2 || true
+    return 1
+  }
+  rm -f "$VI_OUT/.return-token"
+  echo "on-worker.sh: worker-to-home return path verified on loopback port $return_port" >&2
+}
 
 cleanup() {
   [ -n "${heartbeat-}" ] && kill "$heartbeat" 2>/dev/null
   [ -n "${syncer-}" ] && kill "$syncer" 2>/dev/null
   remote "rm -rf $(q "$work")" ||
     echo "on-worker.sh: could not delete $work on the worker; \`vi cloud down\` removes it with the instance" >&2
+  return_stop
 }
+# Stop the receiver and tunnel on every exit path: normal exit, Ctrl-C (INT)
+# and kill/TERM. The signal traps turn the signal into `exit`, which runs the
+# EXIT trap, so cleanup runs exactly once and the recorded PIDs are used.
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 remote "mkdir -p $(q "$work")/inputs $(q "$work")/out $(q "$work")/files && touch $(q "$root/.active")"
 push "$jobs_dir/" "$work/jobs/"
 push "$VI_SETTINGS" "$work/settings.json"
-checkpoint=${VI_CHECKPOINT:-}
+return_start
 if [ -n "$checkpoint" ]; then
   mkdir -p "$checkpoint"
   # A copy taken mid-write can end in half a line; drop it before resuming.
@@ -146,12 +205,15 @@ if [ -n "$checkpoint" ]; then
       truncate -s $(($(wc -c <"$f") - $(tail -n1 "$f" | wc -c))) "$f"
     fi
   done
-  push "$checkpoint/" "$work/checkpoint/"
+  # Model epoch-<k> weights (tens of GB) live in the checkpoint too, but a
+  # later task publishes them separately; skip them here so a rerun doesn't
+  # re-send them up to the worker.
+  push "$checkpoint/" "$work/checkpoint/" --exclude='epoch-*/'
 fi
 for f in "${puts[@]}"; do
   push "$f" "$work/files/"
 done
-exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$work/settings.json") VI_WORKER=1"
+exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$work/settings.json") VI_WORKER=1 VI_RETURN_PORT=$(q "$return_port")"
 [ -n "$checkpoint" ] && exports+=" VI_CHECKPOINT=$(q "$work/checkpoint")"
 # Preflight: time a small upload and stop before sending the inputs if they'd
 # take longer than VI_MAX_UPLOAD_MINUTES (default 30), unless
@@ -218,7 +280,9 @@ script="cd $(q "$work") && export $exports && {
 # Checkpoint files only grow, so --append sends just the new lines instead of
 # rereading whole files on home's busy disk every minute. That needs home's
 # copy to be a prefix of the worker's, which the trimming above ensures.
-sync_home() { [ -z "$checkpoint" ] || pull "$work/checkpoint/" "$checkpoint/" --append; }
+# The worker pushes through the home-created return tunnel; home never pulls.
+# epoch-<k> weights are published separately, so the periodic sync skips them.
+sync_home() { [ -z "$checkpoint" ] || worker_sync "$work/checkpoint/" vi-checkpoint --append --exclude='epoch-*/'; }
 if [ -n "$checkpoint" ]; then
   (while sleep "${VI_SYNC_SECONDS:-60}" >/dev/null 2>&1; do
     sync_home >/dev/null 2>&1 || echo "on-worker.sh: could not copy the checkpoint home; will retry" >&2
@@ -234,7 +298,7 @@ kill "${syncer-}" 2>/dev/null || true
 syncer=
 sync_home || echo "on-worker.sh: could not copy the final checkpoint home; the last periodic copy is kept" >&2
 if [ $rc -eq 0 ]; then
-  pull "$work/out/" "$VI_OUT/"
+  worker_sync "$work/out/" vi-out
 else
   echo "on-worker.sh: $1 exited with $rc on the worker" >&2
 fi
