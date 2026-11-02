@@ -8,8 +8,8 @@
 # and its checkpoint and records what the worker has (GPU, disk, Python, torch).
 # The check passes only if both copies come back home matching what went up.
 # So it proves home can reach the worker, send files, run code there, and get
-# results and checkpoints back. Nothing on the worker connects to home; every
-# connection is home's ssh, as for real stages.
+# results and checkpoints back. Home opens a reverse SSH tunnel and a temporary,
+# localhost-only rsync receiver; the worker proves it can push before the job runs.
 #
 # The worker comes from `vi cloud env` (run `vi cloud up` first), or
 # VI_WORKER_HOST=local with VI_WORKER_ROOT for tests. Prints what the worker
