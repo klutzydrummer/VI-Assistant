@@ -131,6 +131,14 @@ class VoiceTuneTest(unittest.TestCase):
         self.assertEqual(list(np.flatnonzero(hid[0])), [3, 4, 5])
         self.assertEqual(int(hid.sum()), int(codec_mask.sum()))
 
+    def test_causal_label_mask_matches_logits_shape_and_marks_targets(self):
+        # labels [1, 5] -> train_labels [1, 4] -> logits [1, 4]. The logit at t has target
+        # train_labels[:, t + 1], and the last logit has none.
+        labels = np.array([[3, 5, -100, 7, 9]])
+        mask = voicetune.causal_label_mask(labels)
+        self.assertEqual(mask.shape, (1, 4))  # out.logits[:, :, 0] is [b, T - 1]
+        self.assertEqual(mask.tolist(), [[True, False, True, False]])
+
     def test_mean_voice_keeps_average_length(self):
         x = np.array([[3.0, 0.0], [0.0, 3.0]])
         m = voicetune.mean_voice(x)
@@ -195,6 +203,19 @@ class VoiceTuneTest(unittest.TestCase):
         self.assertAlmostEqual(float(voicetune.kl_to_base(base, base.clone(), mask)), 0.0, places=6)
         self.assertGreater(float(voicetune.kl_to_base(base, base.flip(-1), mask)), 0.1)
 
+    def test_replay_kl_all_codebooks_zero_when_identical_and_positive_when_residual_moves(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+        labels = torch.tensor([[3, 5, 7, 9]])  # [1, 4] -> logits [1, 3], targets at positions 0 and 1
+        main = torch.tensor([[[1.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]])  # [1, 3, 3]
+        sub = torch.tensor([[[1.0, 0.0, -1.0], [0.0, 1.0, 0.0]]])  # [1, 2, 3]: two residual codebooks
+        kl = voicetune.replay_kl_term(main, main.clone(), sub, sub.clone(), labels)
+        self.assertAlmostEqual(float(kl), 0.0, places=6)
+        moved = voicetune.replay_kl_term(main, main.clone(), sub, sub.flip(-1), labels)
+        self.assertGreater(float(moved), 0.0)
+
     def test_style_encoder_starts_at_her_mean_voice_and_pads(self):
         try:
             import torch
@@ -233,7 +254,7 @@ class VoiceTuneTest(unittest.TestCase):
         # sub_loss sentinel 999: forward() must ignore the model's own (double-shifted) loss.
         model = _Model(sub_logits=sub_logits, sub_loss=999.0)
         batch = _batch(frames, rows)
-        _, sub = voicetune.forward(model, batch, torch.zeros(1, 8))
+        _, sub, _ = voicetune.forward(model, batch, torch.zeros(1, 8))
         sub_codes = batch["codec_ids"][batch["codec_mask"]]
         expected = F.cross_entropy(sub_logits.reshape(-1, V).float(), sub_codes[:, 1:].reshape(-1))
         self.assertAlmostEqual(float(sub), float(expected), places=5)
