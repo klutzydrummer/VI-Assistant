@@ -27,6 +27,11 @@ env:
   CARGO_TERM_COLOR: always
   CMAKE_BUILD_PARALLEL_LEVEL: "4"
   GGML_VK_VISIBLE_DEVICES: "0"
+  # Mesa 26's lavapipe (ubuntu-26.04) advertises VK_KHR_cooperative_matrix,
+  # and llama.cpp's coopmat matmul shaders give wrong results on it (worst
+  # cosine 0.96 against CPU). With coopmat off it matches 24.04 exactly; see
+  # run 41550188769. Every other Vulkan path is still tested.
+  GGML_VK_DISABLE_COOPMAT: "1"
 
 jobs:
   lavapipe:
@@ -47,6 +52,7 @@ jobs:
         run: cargo build --release -p vi --features vulkan
       - name: Selftest, capture on Vulkan against CPU
         run: |
+          set -o pipefail  # otherwise tee hides a failed selftest
           target/release/vi vectors selftest --dir /tmp/selftest | tee selftest.log
           grep -q 'on Vulkan0' selftest.log || { echo "the capture didn't run on Vulkan" >&2; exit 1; }
           grep '"backend"' /tmp/selftest/store/capture.json
