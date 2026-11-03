@@ -15,6 +15,9 @@ pub struct Tracked {
     pub gpu_name: String,
     /// Dollars per hour quoted when rented.
     pub dph: f64,
+    /// Account credit (dollars) when rented, for the spend report.
+    #[serde(default)]
+    pub credit: f64,
     /// Unix seconds.
     pub created: u64,
     /// Unix seconds of the last job, ssh session or `vi cloud touch`.
@@ -144,6 +147,7 @@ mod tests {
             machine_id: 3,
             gpu_name: "RTX 3090".into(),
             dph: 0.2,
+            credit: 12.0,
             created: 100,
             last_used: 100,
             endpoint: None,

@@ -20,14 +20,14 @@ fn open() -> Result<Cloud<HttpVast, SystemHost>, cloud::Error> {
     })
 }
 
-pub fn run(args: &[&str], force: bool) -> ExitCode {
+pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -> ExitCode {
     let c = match open() {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
     match args {
         ["offers"] => offers(&c),
-        ["up", rest @ ..] => up(&c, rest),
+        ["up", rest @ ..] => up(&c, rest, cap, until),
         ["down"] => down(&c, force),
         ["status"] => status(&c),
         ["reap"] => match c.reap() {
@@ -86,7 +86,12 @@ fn offers(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
     }
 }
 
-fn up(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
+fn up(
+    c: &Cloud<HttpVast, SystemHost>,
+    args: &[&str],
+    cap: Option<&str>,
+    until: Option<&str>,
+) -> ExitCode {
     let mut yes = false;
     let mut offer = None;
     let mut args = args.iter();
@@ -103,8 +108,31 @@ fn up(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
             }
         }
     }
+    // The approval Brandon gave this run: the most it may cost, and when it
+    // expires. Both are required before anything can be rented.
+    let cap: f64 = match cap {
+        Some(v) => match v.parse() {
+            Ok(cap) if cap > 0.0 => cap,
+            _ => {
+                return fail("--cap needs a positive dollar amount (the most this rental may cost)")
+            }
+        },
+        None => return fail("--cap is required: the most this rental may cost"),
+    };
+    let until = match until {
+        Some(v) => match cloud::parse_until(v, cloud::Host::now(&c.host)) {
+            Ok(t) => t,
+            Err(e) => return fail(e),
+        },
+        None => return fail("--until is required: when the approval for this rental expires"),
+    };
     let confirm = |o: &Offer, credit: Option<f64>| {
         println!("{}", describe(o));
+        let worst = c.cfg.max_hours * o.dph_total;
+        println!(
+            "worst case ${worst:.2} ({:.1} h at ${:.3}/hr) against the ${cap:.2} cap",
+            c.cfg.max_hours, o.dph_total
+        );
         if let Some(credit) = credit {
             println!(
                 "credit ${credit:.2}, about {:.0} hours at this price; released after {} idle minutes",
@@ -125,7 +153,7 @@ fn up(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
         let _ = std::io::stdin().lock().read_line(&mut answer);
         matches!(answer.trim(), "y" | "Y" | "yes")
     };
-    match c.up(offer, confirm) {
+    match c.up(offer, cap, until, confirm) {
         Ok(t) => {
             let ep = t.endpoint.expect("up returns a reachable worker");
             println!(
@@ -158,24 +186,38 @@ fn down(c: &Cloud<HttpVast, SystemHost>, force: bool) -> ExitCode {
                         m.path.display()
                     );
                 }
+                print_spend(&down);
                 ExitCode::SUCCESS
             }
             Err(e) => fail(e),
         };
     }
     match c.down() {
-        Ok(ids) if ids.is_empty() => {
+        Ok(down) if down.ids.is_empty() => {
             println!("no worker to release");
             ExitCode::SUCCESS
         }
-        Ok(ids) => {
-            for id in ids {
+        Ok(down) => {
+            for id in &down.ids {
                 println!("destroyed instance {id}");
             }
+            print_spend(&down);
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
     }
+}
+
+/// The spend report: credit when the worker was rented, credit now, and the
+/// difference, printed once the worker has actually been released.
+fn print_spend(down: &cloud::Down) {
+    let (Some(before), Some(after)) = (down.credit_before, down.credit_after) else {
+        return;
+    };
+    println!(
+        "credit ${before:.2} before, ${after:.2} now (${:.2} spent)",
+        before - after
+    );
 }
 
 fn minutes(secs: u64) -> String {

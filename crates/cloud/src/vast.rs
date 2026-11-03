@@ -30,6 +30,12 @@ pub struct Offer {
     pub inet_down: f64,
     #[serde(default)]
     pub geolocation: Option<String>,
+    /// CUDA compute capability times 100 (800 = Ampere).
+    #[serde(default)]
+    pub compute_cap: u32,
+    /// Newest CUDA version the driver supports.
+    #[serde(default)]
+    pub cuda_max_good: f64,
 }
 
 /// One of the account's instances.
