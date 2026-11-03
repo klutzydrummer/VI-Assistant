@@ -496,7 +496,7 @@ def cmd_check(a):
             if dev.startswith("cuda"):
                 import torch
 
-                out["vram_after_load_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+                out["vram_after_load_gb"] = round(torch.cuda.max_memory_reserved() / 2**30, 2)
         except Exception as e:  # noqa: BLE001
             out["model_error"] = repr(e)
     if a.generate and tts is not None:
@@ -826,7 +826,7 @@ def cmd_train(a):
                 opt.zero_grad()
                 step += 1
                 rec = {"epoch": epoch, "step": step, "loss": round(loss.item(), 4), "kl": round(kl.item(), 5), "aux": round(aux.item(), 5),
-                       "peak_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2), "s": round(time.time() - t0), **stats}
+                       "peak_gb": round(torch.cuda.max_memory_reserved() / 2**30, 2), "s": round(time.time() - t0), **stats}
                 log.write(json.dumps(rec) + "\n")
                 log.flush()
                 if step % 10 == 0:
@@ -890,11 +890,12 @@ def voice_model(base, vec, talker_file, dst):
     return dst
 
 
-def speak_slots(a, tune, voice, ep, deliveries):
+def speak_slots(a, tune, voice, ep, deliveries, no_plain=False):
     """What goes in the speaker slot for each listening condition, as (kind, label, vector). Her
     mean voice first (kind "plain"), then one per delivery clip (kind "delivery-of-<id>"): for a
     clip/mean run that clip's own x-vector (Base speaker encoder), for a style run the style
-    encoder's reading of the clip."""
+    encoder's reading of the clip. `no_plain` drops the plain mean-voice slot, leaving only the
+    delivery slots (for the delivery-only speak calls)."""
     import numpy as np
     import torch
     from safetensors.torch import load_file
@@ -914,7 +915,8 @@ def speak_slots(a, tune, voice, ep, deliveries):
             sys.exit(f"speak: game {a.game!r} not in {sorted(info['games'])}")
         # her plain voice = code 0 (what style dropout trains): her mean + the game's vector + up's bias
         game_vec = st["game"][g].float().numpy() + st["enc.up.bias"].float().numpy()
-    out = [("plain", f"her mean voice{f', {a.game} suit' if style else ''}", (her + game_vec).tolist())]
+    out = [] if no_plain else [("plain", f"her mean voice{f', {a.game} suit' if style else ''}",
+                                 (her + game_vec).tolist())]
     if not deliveries:
         return out
     if style:
@@ -935,6 +937,8 @@ def speak_slots(a, tune, voice, ep, deliveries):
 
 
 def cmd_speak(a):
+    if a.no_plain and not (a.delivery_from or a.style_from):
+        sys.exit("speak: --no-plain needs at least one --delivery-from or --style-from")
     import hashlib
 
     import soundfile as sf
@@ -950,7 +954,7 @@ def cmd_speak(a):
     tune = json.loads((ep / "tune.json").read_text())
     sentences = [x.strip() for x in Path(a.sentences).read_text().splitlines() if x.strip()]
     deliveries = [parse_delivery(x) for x in a.delivery_from] + [(Path(x).stem, x) for x in a.style_from]
-    slots = speak_slots(a, tune, voice, ep, deliveries)  # [(kind, label, vector)]
+    slots = speak_slots(a, tune, voice, ep, deliveries, no_plain=a.no_plain)  # [(kind, label, vector)]
     vm = voice_model(tune["base"], voice["xvector"], ep / "talker.safetensors", run / f"voice-epoch-{epoch}")
     tts = load_tts(str(vm), a.device)
     row = tts.model.talker.model.codec_embedding.weight
@@ -1066,6 +1070,9 @@ def main(argv=None):
     s.add_argument("--style-from", action="append", default=[], help="her clip whose delivery goes in the slot")
     s.add_argument("--delivery-from", action="append", default=[], metavar="ID=PATH",
                    help="her clip whose own x-vector (clip/mean run) goes in the slot; ID labels the entry")
+    s.add_argument("--no-plain", action="store_true",
+                   help="speak only the delivery/style slots, never the plain mean-voice slot; "
+                        "needs at least one --delivery-from or --style-from")
     s.add_argument("--seed", type=int, help="reseed torch before each clip, so the same line is generated the same across checkpoints")
     s.add_argument("--unblind", action="store_true",
                    help="write an unblinded clips.toml (epoch-ordered, labelled), not the hash-shuffled blind one")

@@ -248,7 +248,7 @@ for cid, path in voicetune.delivery_clips(rows, 0, 6):
       esac
       "$PY" "$jobs_dir/voicetune.py" speak --run "$run" --epoch "$epoch" \
         --sentences "$one" --seed 0 --unblind --title "$title" --question "$question" \
-        "${delivery_args[@]}" --out "$platter"
+        --no-plain "${delivery_args[@]}" --out "$platter"
     fi
     rm -rf "$run/voice-epoch-$epoch"  # the ~3.4 GB voice-model copy, deleted after speaking
   done
