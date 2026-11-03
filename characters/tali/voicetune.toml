@@ -1,0 +1,57 @@
+# Tali's fresh voice fine-tune (stage 5). Home prepares one data folder
+# (voicetune_data), then the rented GPU worker runs two manual stages over it:
+#   vi dataset run characters/tali/voicetune.toml voicetune_data
+#   vi cloud up
+#   vi dataset run characters/tali/voicetune.toml voicetune_preflight
+#   vi dataset run characters/tali/voicetune.toml voicetune_train
+# Both GPU stages run jobs/voicetune-fresh.sh; the mode argument picks preflight
+# or train. Preflight proves the card, disk, generate path and a 5-step probe,
+# then pushes the probe checkpoint home. Train runs 6 epochs from Base, pushes
+# each finished epoch home, aborts on bad loss/memory/time, and builds the
+# unblinded listening set. Home-side preparation and the run order:
+# docs/design/voicetune-fresh-run.md.
+
+corpus = "../../corpus/tali"
+
+# Home, CPU. Builds the one prepared folder both GPU stages read through
+# VI_INPUT_VOICETUNE_DATA: train/val/val100/replay manifests with codec codes,
+# her clips in wav/ (hard-linked, not re-encoded) and the public replay voices
+# in voices/. Every audio/ref_audio path is relative to the out/ folder, so it
+# is relocatable and packs whole. jobs/voicetune_data.sh runs the job under the
+# qwen-tts venv; see that script and jobs/voicetune_data.py for the details.
+# files lists every corpus file buildset.py reads (the harvest/clean current
+# pointers and the lines/clips manifests they name, voice_sets.json, and the
+# refscreen exclude in dataset.toml) so a corpus change marks the stage stale.
+[stage.voicetune_data]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7", "bash", "../../jobs/voicetune_data.sh"]
+files = ["../../jobs/voicetune_data.sh", "../../jobs/voicetune_data.py",
+         "../../jobs/voicetune.py", "../../jobs/buildset.py", "../../jobs/checkpoints.py",
+         "../../jobs/requirements-tune.txt",
+         "corpus:stages/harvest/current",
+         "corpus:stages/harvest/9dcac666ce3a58935d4c6e83a22b5f95a13d173b39b38cd31e068e1fd5063d46/out/lines.jsonl",
+         "corpus:stages/clean/current",
+         "corpus:stages/clean/d2edacdd862ba5f0b3fd00edb38ff5b0fb71a5f41850cfb71a4eda2af8729858/out/clips.jsonl",
+         "corpus:analysis/after_labels/voice_sets.json",
+         "dataset.toml"]
+
+# GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_preflight`
+# after `vi cloud up`. jobs/voicetune-fresh.sh preflight runs check --generate,
+# gates VRAM/disk, runs a 5-step probe at the real batch/accum/kl, pushes the
+# probe checkpoint home (must beat 8 MB/s) and speaks one line from it.
+[stage.voicetune_preflight]
+command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
+inputs = ["voicetune_data"]
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/voicetune.py",
+         "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
+manual = true
+
+# GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_train`
+# only after the preflight checkpoint is verified and Brandon okays the paid
+# run. jobs/voicetune-fresh.sh train runs 6 epochs, pushes each home as it
+# lands, aborts on bad loss/memory/time, then builds the unblinded platter.
+[stage.voicetune_train]
+command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "train"]
+inputs = ["voicetune_data"]
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/voicetune.py",
+         "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
+manual = true
