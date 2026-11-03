@@ -243,7 +243,11 @@ fn published_epochs_are_verified_and_survive_runner_cleanup() {
     }
     let dir = tempfile::tempdir().unwrap();
     let out = run_settings(dir.path(), &publish_job(2, "w"), "expect_epochs = 2", &[]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let d = durable_dir(dir.path());
     assert!(d.join("VERIFIED").is_file());
     assert!(d.join("epoch-0").is_dir());
