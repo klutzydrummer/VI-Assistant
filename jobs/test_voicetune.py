@@ -111,6 +111,23 @@ class VoiceTuneTest(unittest.TestCase):
         self.assertIn("missing text", bad[2])
         self.assertEqual(voicetune.validate(rows[:1], lambda p: 24000), [])
 
+    def test_validate_accepts_prepared_rows_whose_audio_file_is_missing(self):
+        # Replay lines carry precomputed `audio_codes`; their spoken audio wavs
+        # never came home, so the sample-rate check must skip `audio` for them
+        # while still checking `ref_audio` (the x-vector encoder reads it).
+        def sr(p):
+            if p == "replay.wav":
+                raise FileNotFoundError(p)
+            return 24000
+
+        coded = {"id": "r", "audio": "replay.wav", "text": "hi", "ref_audio": "voices/1.wav",
+                 "audio_codes": [[1, 2], [3, 4]]}
+        self.assertEqual(voicetune.validate([coded], sr), [])
+        # The same row without codes must still be checked (and surface the missing file).
+        uncoded = {k: v for k, v in coded.items() if k != "audio_codes"}
+        with self.assertRaises(FileNotFoundError):
+            voicetune.validate([uncoded], sr)
+
     def test_warmup_factor_ramps_linearly_then_holds(self):
         self.assertEqual([voicetune.warmup_factor(s, 4) for s in range(6)], [0.25, 0.5, 0.75, 1.0, 1.0, 1.0])
         self.assertEqual(voicetune.warmup_factor(0, 0), 1.0)
