@@ -19,6 +19,12 @@ probe, push the probe home) or `train` (the real 6-epoch run). They are separate
 stages on purpose: separate `VI_STAGE` means separate home checkpoint dirs, so
 each can push its own epoch-0 without the two colliding in the return path.
 
+On the worker, `voicetune-fresh.sh` first fetches the official Qwen3-TTS
+`finetuning/` folder (`dataset.py`) at the pinned commit
+`022e286b98fbec7e1e916cb940cdf532cd9f488e` into `~/.cache/vi/`, and passes it to
+both `voicetune.py train` calls via `--qwen-finetuning` so the training loader's
+import of that folder resolves.
+
 ## The `voicetune_data` stage (home, CPU)
 
 `jobs/voicetune_data.sh` (wrapping `jobs/voicetune_data.py`) builds one folder
