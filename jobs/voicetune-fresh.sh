@@ -6,12 +6,15 @@
 # pushes it plus the run files home.
 #
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
-#   VI_INPUT_TRAIN/train_with_codes.jsonl    prepared train manifest (id, audio, text, ref_audio, audio_codes)
-#   VI_INPUT_VAL/val_with_codes.jsonl        held-out manifest, same shape
-#   VI_INPUT_REPLAY/replay_with_codes.jsonl  replay lines for the KL term, same shape
-#   VI_INPUT_SENTENCES/sentences.txt         the 3 fixed listening lines, one per line (optional; defaults below)
-# The train manifest's `ref_audio` paths must resolve on this worker (the clips' wavs ride along in
-# the input). The 6 delivery clips are picked from that manifest by seed 0 alone — never a label.
+#   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home by the
+#                                           voicetune_data stage, holding
+#     train_with_codes.jsonl                 prepared train manifest (id, audio, text, ref_audio, audio_codes)
+#     val_with_codes.jsonl                   held-out manifest, same shape
+#     replay_with_codes.jsonl                replay lines for the KL term, same shape
+#     sentences.txt                          the 3 fixed listening lines (optional; defaults below)
+#     wav/ voices/                           the clips' and replay voices' audio, beside the manifests
+# Every audio/ref_audio path is relative to that folder, so this script runs with it as the working
+# directory. The 6 delivery clips are picked from the train manifest by seed 0 alone — never a label.
 set -euo pipefail
 
 jobs_dir=$(cd "$(dirname "$0")" && pwd)
@@ -30,9 +33,12 @@ esac
 
 : "${VI_OUT:?voicetune-fresh.sh runs through jobs/on-worker.sh}" \
   "${VI_RETURN_PORT:?voicetune-fresh.sh needs the worker return tunnel}" \
-  "${VI_INPUT_TRAIN:?missing VI_INPUT_TRAIN}" \
-  "${VI_INPUT_VAL:?missing VI_INPUT_VAL}" \
-  "${VI_INPUT_REPLAY:?missing VI_INPUT_REPLAY}"
+  "${VI_INPUT_VOICETUNE_DATA:?missing VI_INPUT_VOICETUNE_DATA}"
+
+# The prepared data folder; every manifest path inside it is relative to it, so
+# run with it as the working directory for the job (all other paths are absolute).
+data_dir="$VI_INPUT_VOICETUNE_DATA"
+cd "$data_dir"
 
 # qwen-tts pins an older transformers, so voicetune runs in its own venv — the same one
 # vi_job.ensure_venv("requirements-tune.txt") builds (sha256[:16] of the requirements file).
@@ -54,8 +60,8 @@ PY=$(tune_python)
 
 # The 3 fixed listening lines: plain neutral sentences, not from any labelled set. The same three
 # every epoch, so a line is generated the same across checkpoints and only the checkpoint differs.
-if [ -s "${VI_INPUT_SENTENCES:-}/sentences.txt" ]; then
-  lines="${VI_INPUT_SENTENCES}/sentences.txt"
+if [ -s "$data_dir/sentences.txt" ]; then
+  lines="$data_dir/sentences.txt"
 else
   lines="$VI_OUT/sentences.txt"
   cat >"$lines" <<'LINES'
@@ -74,9 +80,9 @@ probe_run="$scratch/probe-run"
 probe_publish="$scratch/probe-publish"
 mkdir -p "$scratch"
 
-train_manifest="$VI_INPUT_TRAIN/train_with_codes.jsonl"
-val_manifest="$VI_INPUT_VAL/val_with_codes.jsonl"
-replay_manifest="$VI_INPUT_REPLAY/replay_with_codes.jsonl"
+train_manifest="train_with_codes.jsonl"
+val_manifest="val_with_codes.jsonl"
+replay_manifest="replay_with_codes.jsonl"
 
 title="Fine-tuned voice: is this Tali, with no reference clip?"
 question="Is this Tali with her suit and accent? Note short-line glitches or speed-ups."

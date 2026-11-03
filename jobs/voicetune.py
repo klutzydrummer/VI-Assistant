@@ -105,6 +105,12 @@ def validate(rows, sample_rate=None):
         seen.add(r["id"])
         if sample_rate is not None:
             for k in ("audio", "ref_audio"):
+                # A row that already carries codec codes never re-opens its audio
+                # (the loader reads `audio_codes`), so a missing audio file is fine
+                # there. This is how replay lines ship: Base's spoken clips were
+                # generated on an old worker and never came home, only their codes.
+                if k == "audio" and r.get("audio_codes"):
+                    continue
                 sr = sample_rate(r[k])
                 if sr != SR:
                     bad.append(f"line {n + 1}: {k} is {sr} Hz, needs {SR}")
