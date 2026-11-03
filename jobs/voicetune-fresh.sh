@@ -58,6 +58,15 @@ tune_python() {
 }
 PY=$(tune_python)
 
+# The official recipe's finetuning/ folder (dataset.py), pinned to the commit the guide was
+# read at (docs/design/qwen3tts-finetune-guide.md). voicetune.py's loader imports it.
+qwen_rev=022e286b98fbec7e1e916cb940cdf532cd9f488e
+qwen_ft="$HOME/.cache/vi/Qwen3-TTS-$qwen_rev/finetuning"
+if [ ! -f "$qwen_ft/dataset.py" ]; then
+  mkdir -p "$HOME/.cache/vi"
+  curl -fsSL "https://codeload.github.com/QwenLM/Qwen3-TTS/tar.gz/$qwen_rev" | tar xz -C "$HOME/.cache/vi"
+fi
+
 # The 3 fixed listening lines: plain neutral sentences, not from any labelled set. The same three
 # every epoch, so a line is generated the same across checkpoints and only the checkpoint differs.
 if [ -s "$data_dir/sentences.txt" ]; then
@@ -129,7 +138,7 @@ preflight() {
 
   # Five optimizer steps at the full batch/accum/kl, published into the probe dir, to measure the
   # peak memory of the real run before the paid one.
-  "$PY" "$jobs_dir/voicetune.py" train \
+  "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
     --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
     --kl 0.1 --batch 8 --accum 4 --epochs 1 --max-steps 5 --seed 0 --speaker clip \
     --no-resume-file --publish "$probe_publish" --out "$probe_run"
@@ -143,7 +152,7 @@ if peak > 44:
     sys.exit(1)
 PY
 
-  # Push the probe checkpoint home, timed; record bytes/seconds in preflight.json, fail under 8 MB/s.
+  # Push the probe checkpoint home, timed; record bytes/seconds in preflight.json, fail under 3 MB/s (Brandon lowered it from 8 on 2026-11-03: home measured 4 MB/s).
   local bytes seconds mb_s t0 t1
   bytes=$(du -sb "$probe_publish" | cut -f1)
   t0=$(date +%s%N)
@@ -157,8 +166,8 @@ import json, sys
 json.dump({"probe_bytes": int(sys.argv[2]), "seconds": int(sys.argv[3]), "mb_s": int(sys.argv[4])},
           open(sys.argv[1], "w"), indent=1)
 PY
-  if [ "$mb_s" -lt 8 ]; then
-    echo "probe push was $mb_s MB/s < 8 MB/s" >&2
+  if [ "$mb_s" -lt 3 ]; then
+    echo "probe push was $mb_s MB/s < 3 MB/s" >&2
     exit 1
   fi
 
@@ -177,7 +186,7 @@ train() {
 
   local start train_pid reason elapsed rc
   start=$(date +%s)
-  "$PY" "$jobs_dir/voicetune.py" train \
+  "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
     --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
     --epochs 6 --lr 2e-6 --kl 0.1 --batch 8 --accum 4 --seed 0 --speaker clip \
     --no-resume-file --publish "$publish" --out "$run" &
