@@ -5,14 +5,18 @@
 # @IDLE_MINUTES@ minutes with no job or ssh session, or @MAX_MINUTES@ minutes
 # after boot (0 = no limit), so a forgotten worker can't drain the credit
 # while the home machine is asleep.
-mkdir -p /root/vi-jobs && rm -rf /root/vi-jobs/* && touch /root/vi-jobs/.active
+mkdir -p /root/vi-jobs && touch /root/vi-jobs/.active
+# Keep the first boot time across container restarts, so max_hours counts from
+# the first start instead of resetting. Job dirs are never wiped here: a
+# restart must not destroy un-pushed work.
+[ -s /root/vi-jobs/.boot ] || date +%s >/root/vi-jobs/.boot
 # gcc: Triton (vLLM, and transformers models that use it) compiles a small
 # helper at run time, and the pytorch runtime image ships no compiler.
 # sox: qwen-tts calls it (voicesteer).
 for t in rsync curl pgrep gcc sox; do command -v $t >/dev/null || missing=1; done
 [ -n "$missing" ] && { apt-get update -qq; apt-get install -y -qq rsync curl procps gcc sox; } >/var/log/vi-onstart.log 2>&1
 cat >/root/vi-watchdog.sh <<'EOF'
-IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(date +%s)
+IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(cat /root/vi-jobs/.boot)
 API=https://console.vast.ai/api/v0/instances/$CONTAINER_ID/
 release() {
   echo "$(date -u) releasing: $1" >>/var/log/vi-watchdog.log

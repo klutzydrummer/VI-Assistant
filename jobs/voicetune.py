@@ -65,6 +65,7 @@ given. Needs qwen-tts==0.1.1 (requirements-tune.txt) and, for training, a 48 GB 
 import argparse
 import functools
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -264,10 +265,10 @@ def delivery_clips(rows, seed, n, ref_key="ref_audio"):
 def check_abort(log_records, elapsed_s, mem_limit_gb=44.0, time_limit_s=6300.0):
     """The fresh run's abort rule, as one testable function. `log_records` is the list of per-step
     dicts train writes to train_log.jsonl (step, loss, peak_gb, ...); returns a reason to stop, or
-    None to carry on. Aborts on: a step-1 loss above 4.0, a NaN loss, a loss whose windowed mean has
-    risen more than 20% over 50 steps (mean of the last 10 losses vs the 10 losses ending 50 steps
-    earlier, so one noisy batch can't trip it), peak memory above `mem_limit_gb` (44 GB), or
-    `elapsed_s` over `time_limit_s` (1 h 45 m)."""
+    None to carry on. Aborts on: a step-1 loss above 4.0, a non-finite (NaN or ±Inf) loss, a
+    windowed mean that has risen more than 20% over 50 steps (mean of the last 10 losses vs the 10
+    losses ending 50 steps earlier, so one noisy batch can't trip it), peak memory above
+    `mem_limit_gb` (44 GB), or `elapsed_s` over `time_limit_s` (1 h 45 m)."""
     if elapsed_s > time_limit_s:
         return f"elapsed {elapsed_s:.0f} s > {time_limit_s:.0f} s"
     losses = []
@@ -276,8 +277,8 @@ def check_abort(log_records, elapsed_s, mem_limit_gb=44.0, time_limit_s=6300.0):
         if loss is not None:
             if r.get("step") == 1 and loss > 4.0:
                 return "step-1 loss > 4.0"
-            if loss != loss:  # NaN
-                return "NaN loss"
+            if not math.isfinite(loss):  # NaN or ±Inf
+                return "non-finite loss"
             losses.append(loss)
         peak = r.get("peak_gb")
         if peak is not None and peak > mem_limit_gb:
