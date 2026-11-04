@@ -244,6 +244,35 @@ PY
 preflight() {
   check_and_gate --generate
 
+  # Row 35's loadbench: a short steady-state timing run at the real batch/accum/kl, after the venv
+  # and model load and before the 5-step probe. The probe starts cold (it read ~4x slow on
+  # 2026-11-04), so its time is not what the push gate uses. The loop also samples nvidia-smi after
+  # each timed step: that is the only honest load for row 31's clock gate. Warmup steps are dropped.
+  local steady_step steps_per_epoch steady_epoch
+  "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
+    --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
+    --kl 0.1 --batch 8 --accum 4 --epochs 1 --seed 0 --speaker clip \
+    --no-resume-file --loadbench-steps 6 --loadbench-warmup 2 --out "$scratch/loadbench-run"
+  read -r steady_step steps_per_epoch < <(PYTHONPATH="$jobs_dir" "$PY" - "$scratch/loadbench-run/loadbench.json" <<'PY'
+import json, sys
+lb = json.load(open(sys.argv[1]))
+print(lb["steady_step_s"], lb["steps_per_epoch"])
+PY
+)
+  steady_epoch=$(python3 -c 'import sys; print(round(float(sys.argv[1]) * int(sys.argv[2]), 3))' "$steady_step" "$steps_per_epoch")
+
+  # Row 31: a throttled card cannot finish the run on time. Fail when the median sm clock under
+  # load is below 70% of clocks.max.sm; active throttle reasons are named in the message.
+  PYTHONPATH="$jobs_dir" "$PY" - "$scratch/loadbench-run/loadbench.json" <<'PY'
+import json, sys, voicetune
+gpus = json.load(open(sys.argv[1])).get("gpu_under_load", [])
+ok, message = voicetune.gpu_clock_gate(gpus)
+print(f"check: {message}")
+if not ok:
+    print(f"worker preflight: {message}", file=sys.stderr)
+sys.exit(0 if ok else 1)
+PY
+
   # Five optimizer steps at the full batch/accum/kl, published into the probe dir, to measure the
   # peak memory of the real run before the paid one.
   "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
@@ -260,7 +289,10 @@ if peak > 44:
     sys.exit(1)
 PY
 
-  # Push the probe checkpoint home, timed; record bytes/seconds in preflight.json, fail under 3 MB/s (Brandon lowered it from 8 on 2026-11-03: home measured 4 MB/s).
+  # Push the probe checkpoint home as an end-to-end integrity proof, timed for the record. It no
+  # longer gates on its own speed: row 35 derives the rate a real epoch needs from the probe's byte
+  # count and the loadbench steady step time, and compares it with the row-34 dummy push rate
+  # recorded in preflight.json (the probe's 5 cold steps underestimate the steady rate ~4x).
   local bytes seconds mb_s t0 t1
   bytes=$(du -sb "$probe_publish" | cut -f1)
   t0=$(date +%s%N)
@@ -268,16 +300,35 @@ PY
   t1=$(date +%s%N)
   seconds=$(( (t1 - t0) / 1000000000 ))
   [ "$seconds" -gt 0 ] || seconds=1
-  mb_s=$(( bytes / seconds / 1048576 ))
-  "$PY" - "$VI_OUT/preflight.json" "$bytes" "$seconds" "$mb_s" <<'PY'
-import json, sys
-json.dump({"probe_bytes": int(sys.argv[2]), "seconds": int(sys.argv[3]), "mb_s": int(sys.argv[4])},
-          open(sys.argv[1], "w"), indent=1)
+  mb_s=$(python3 -c 'import sys; print(round(int(sys.argv[1]) / int(sys.argv[2]) / 1e6, 2))' "$bytes" "$seconds")
+  PYTHONPATH="$jobs_dir" "$PY" - "$VI_OUT/preflight.json" "$bytes" "$seconds" "$mb_s" "$steady_epoch" "$steady_step" "$steps_per_epoch" <<'PY'
+import json, sys, voicetune
+
+path, epoch_bytes, seconds, mb_s = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+steady_epoch, steady_step, steps_per_epoch = float(sys.argv[5]), float(sys.argv[6]), int(sys.argv[7])
+try:
+    report = json.load(open(path))
+except (OSError, ValueError):
+    report = {}
+measured = float(report.get("push_mb_s") or 0)
+ok, required = voicetune.push_gate_from_steady_epoch_time_and_bytes(steady_epoch, epoch_bytes, measured)
+report.update({
+    "probe_bytes": epoch_bytes, "seconds": seconds, "mb_s": mb_s,
+    "steady_step_s": steady_step, "steps_per_epoch": steps_per_epoch,
+    "steady_epoch_seconds": round(steady_epoch, 3), "epoch_bytes": epoch_bytes,
+    "measured_push_mb_s": measured,
+    # Row 24 hook: this gate should later also require the projected end (steady epoch time times
+    # the epochs left, under the deadline) to fit. That belongs to a later wave; not implemented.
+    "push_gate": {"ok": ok, "required_mb_s": round(required, 2), "measured_mb_s": measured},
+})
+json.dump(report, open(path, "w"), indent=1, sort_keys=True)
+print(f"probe push {mb_s} MB/s; an epoch of {epoch_bytes / 1e9:.1f} GB at {steady_epoch:.0f} s "
+      f"needs {required:.2f} MB/s, measured {measured} MB/s")
+if not ok:
+    print(f"probe push gate: {measured} MB/s < {required:.2f} MB/s needed to publish an epoch "
+          f"within its {steady_epoch:.0f} s", file=sys.stderr)
+sys.exit(0 if ok else 1)
 PY
-  if [ "$mb_s" -lt 3 ]; then
-    echo "probe push was $mb_s MB/s < 3 MB/s" >&2
-    exit 1
-  fi
 
   # Speak one line from the probe epoch, so a real checkpoint's generate path is exercised too.
   head -n1 "$lines" >"$scratch/one-line.txt"

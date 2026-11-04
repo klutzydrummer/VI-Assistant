@@ -26,8 +26,29 @@ pub struct Offer {
     pub dph_total: f64,
     #[serde(default)]
     pub reliability2: f64,
+    /// The searchable reliability score, 0-1. `reliability2` is only the
+    /// enforcement check in `Config::offer_violations`.
+    #[serde(default)]
+    pub reliability: f64,
+    /// Mb/s.
     #[serde(default)]
     pub inet_down: f64,
+    /// Mb/s, worker to home. This is the leg a published epoch takes, and it is
+    /// often far below the download figure.
+    #[serde(default)]
+    pub inet_up: f64,
+    /// vCPUs after the host's overcommit.
+    #[serde(default)]
+    pub cpu_cores_effective: f64,
+    /// MB, like `gpu_ram`. The config takes GB and multiplies by 1000.
+    #[serde(default)]
+    pub cpu_ram: f64,
+    /// Disk read/write bandwidth, MB/s.
+    #[serde(default)]
+    pub disk_bw: f64,
+    /// Rented disk space, GB.
+    #[serde(default)]
+    pub disk_space: f64,
     #[serde(default)]
     pub geolocation: Option<String>,
     /// CUDA compute capability times 100 (800 = Ampere).
