@@ -27,4 +27,23 @@ mod tests {
         // It travels in an API field; keep it small.
         assert!(script.len() < 3000, "{} bytes", script.len());
     }
+
+    #[test]
+    fn onstart_never_deletes_job_dirs_and_persists_boot() {
+        let script = render(&Config::default());
+        assert!(!script.contains("rm -rf /root/vi-jobs"), "{script}");
+        // The first boot time survives container restarts, so max_hours does
+        // not restart from zero.
+        assert!(
+            script.contains("[ -s /root/vi-jobs/.boot ] || date +%s >/root/vi-jobs/.boot"),
+            "{script}"
+        );
+        assert!(
+            script.contains("BOOT=$(cat /root/vi-jobs/.boot)"),
+            "{script}"
+        );
+        // A later step adds about 600 bytes of LIVE logic; keep room below the
+        // 3000-byte cap (and the existing assert above).
+        assert!(script.len() < 2500, "{} bytes", script.len());
+    }
 }

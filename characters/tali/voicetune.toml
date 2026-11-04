@@ -53,6 +53,7 @@ manual = true
 [stage.voicetune_preflight.settings]
 expect_epochs = 1
 min_home_gb = 50
+home_gate_reserve_gb = 27
 
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_train`
 # only after the preflight checkpoint is verified and Brandon okays the paid
@@ -68,3 +69,4 @@ manual = true
 [stage.voicetune_train.settings]
 expect_epochs = 6
 min_home_gb = 50
+home_gate_reserve_gb = 27

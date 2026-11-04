@@ -5,15 +5,18 @@ with a SHA256SUMS manifest (files hard-linked, checksums written last, then the
 `.part` dir renamed into place), so home can prove a checkpoint arrived intact. The
 CLI here is the other half, run at home:
 
-    python3 jobs/checkpoints.py gate   PATH --min-gb 50 [--reserve-gb 27]
-    python3 jobs/checkpoints.py verify DIR --expect N
-    python3 jobs/checkpoints.py prune  DIR --keep K [--yes]
-    python3 jobs/checkpoints.py audit  ROOT
+    python3 jobs/checkpoints.py gate    PATH --min-gb 50 [--reserve-gb 27]
+    python3 jobs/checkpoints.py verify  DIR --expect N
+    python3 jobs/checkpoints.py prune   DIR --keep K [--yes]
+    python3 jobs/checkpoints.py abandon DIR --reason TEXT
+    python3 jobs/checkpoints.py audit   ROOT
 
 `gate` refuses to start below the free-space floor, after setting aside a reserve for projected checkpoint bytes; `verify` checks every epoch's
 hashes (no symlinks, no leftover `.part` dirs, exactly the N epochs 0..N-1) and
 writes VERIFIED;
-`prune` keeps at most two verified epochs; `audit` lists runs holding more than two.
+`prune` keeps at most two verified epochs; `abandon` marks a run dir as given up
+on and clears its unverified marker while keeping every file; `audit` lists runs
+holding more than two.
 """
 
 import argparse
@@ -53,6 +56,16 @@ def _link_or_copy(src, dst):
         shutil.copyfile(src, dst)
 
 
+def _refuse_under_checkpoints(path):
+    """Exit when `path` resolves inside ~/.cache/vi/checkpoints. Only `prune`
+    deletes there, so no other code may treat a path in that store as its own
+    debris. On the worker that home store is absent, so this is a no-op."""
+    root = (Path.home() / ".cache" / "vi" / "checkpoints").resolve()
+    target = Path(path).resolve()
+    if target == root or root in target.parents:
+        sys.exit(f"refusing to delete inside {root}: {path}")
+
+
 def publish_epoch(src_epoch_dir, publish_dir):
     """Publish one saved epoch folder (and the run-level files) into `publish_dir`.
 
@@ -60,6 +73,7 @@ def publish_epoch(src_epoch_dir, publish_dir):
     the folder is renamed to `epoch-<k>` so a reader never sees a half-written epoch."""
     src = Path(src_epoch_dir)
     publish = Path(publish_dir)
+    _refuse_under_checkpoints(publish)
     for name in REQUIRED_EPOCH_FILES:
         if not (src / name).is_file():
             raise FileNotFoundError(f"{src / name}")
@@ -253,6 +267,24 @@ def verify(dir, expect):
     return epochs
 
 
+def abandon(dir, reason):
+    """Mark a run dir ABANDONED: the explicit human decision to give up on it.
+    Clears the exact unverified marker that names `dir` and keeps every file.
+    `prune` refuses it (it is not VERIFIED), so only a human outside vi removes
+    the files."""
+    dir = Path(dir)
+    vf = dir / "VERIFIED"
+    if not dir.is_dir():
+        sys.exit(f"abandon: {dir} is not a directory")
+    if vf.is_file() or vf.is_symlink():
+        sys.exit(f"abandon: {dir} is VERIFIED; nothing to abandon")
+    (dir / "ABANDONED").write_text(json.dumps(
+        {"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "reason": reason},
+        indent=1) + "\n")
+    _clear_markers(dir)
+    print(f"abandoned: {dir} (files kept)")
+
+
 def _keep_set(ks, keep):
     """The epoch numbers prune keeps: `keep` plus its next (or previous, at the end)."""
     ks = sorted(ks)
@@ -335,6 +367,10 @@ def cmd_prune(a):
     prune(a.dir, a.keep, a.yes)
 
 
+def cmd_abandon(a):
+    abandon(a.dir, a.reason)
+
+
 def cmd_audit(a):
     for run, n in audit(a.root):
         print(f"{run}: {n} epoch dirs")
@@ -354,10 +390,14 @@ def main(argv=None):
     p.add_argument("dir", type=Path)
     p.add_argument("--keep", type=int, required=True)
     p.add_argument("--yes", action="store_true", help="delete instead of printing")
+    b = sub.add_parser("abandon", help="mark a run dir as given up on; keep every file")
+    b.add_argument("dir", type=Path)
+    b.add_argument("--reason", required=True, help="why this run is being abandoned")
     u = sub.add_parser("audit", help="list run dirs holding more than two epochs")
     u.add_argument("root", type=Path)
     a = ap.parse_args(argv)
-    cmds = {"gate": cmd_gate, "verify": cmd_verify, "prune": cmd_prune, "audit": cmd_audit}
+    cmds = {"gate": cmd_gate, "verify": cmd_verify, "prune": cmd_prune,
+            "abandon": cmd_abandon, "audit": cmd_audit}
     cmds[a.cmd](a)
     return 0
 
