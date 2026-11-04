@@ -11,7 +11,8 @@ CLI here is the other half, run at home:
     python3 jobs/checkpoints.py audit  ROOT
 
 `gate` refuses to start below the free-space floor; `verify` checks every epoch's
-hashes (no symlinks, no leftover `.part` dirs, exactly N epochs) and writes VERIFIED;
+hashes (no symlinks, no leftover `.part` dirs, exactly the N epochs 0..N-1) and
+writes VERIFIED;
 `prune` keeps at most two verified epochs; `audit` lists runs holding more than two.
 """
 
@@ -210,8 +211,8 @@ def state_dir():
 
 
 def _clear_markers(dir):
-    """Drop every unverified marker whose recorded checkpoint path is `dir` or a
-    parent of it. Nothing else under `<state dir>/unverified/` is touched."""
+    """Drop every unverified marker whose recorded checkpoint path is exactly
+    `dir`. Nothing else under `<state dir>/unverified/` is touched."""
     dir = dir.resolve()
     marker_dir = state_dir() / "unverified"
     if not marker_dir.is_dir():
@@ -222,17 +223,22 @@ def _clear_markers(dir):
         recorded = p.read_text().strip()
         if not recorded:
             continue
-        if Path(recorded).resolve() == dir or Path(recorded).resolve() in dir.parents:
+        if Path(recorded).resolve() == dir:
             p.unlink()
 
 
 def verify(dir, expect):
     """Check a run dir has exactly `expect` verified epochs, then write VERIFIED.
-    Exits non-zero on any symlink, leftover `.part`, missing/empty/mismatched file."""
+    Exits non-zero on any symlink, leftover `.part`, missing/empty/mismatched file,
+    or epoch dirs not numbered 0..N-1."""
     dir = Path(dir)
     problems, epochs = _check(dir)
     if len(epochs) != expect:
         problems.append(f"expected {expect} epoch dirs, found {len(epochs)}")
+    elif set(epochs) != {f"epoch-{k}" for k in range(expect)}:
+        problems.append(
+            f"epoch dirs must be epoch-0..epoch-{expect - 1}; found {', '.join(sorted(epochs))}"
+        )
     if problems:
         for p in problems:
             print(p, file=sys.stderr)

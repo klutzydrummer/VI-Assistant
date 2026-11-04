@@ -3,7 +3,7 @@
 # The unencrypted rsync daemon is safe only with both listeners on 127.0.0.1 and the SSH tunnel up.
 set -euo pipefail
 
-cmd=${1:?usage: worker-return.sh start OUT CHECKPOINT STATE [PORT] | stop STATE | push SOURCE MODULE [RSYNC_OPTS...]}
+cmd=${1:?usage: worker-return.sh start OUT CHECKPOINT STATE [PUBLISH] [PORT] | stop STATE | push SOURCE MODULE [RSYNC_OPTS...]}
 shift
 
 free_port() {
@@ -13,14 +13,17 @@ free_port() {
 case "$cmd" in
   start)
     out=${1:?output directory}; checkpoint=${2:?checkpoint directory}; state=${3:?state directory}
-    port=${4:-${VI_RETURN_PORT:-}}
+    publish=${4:-}
+    port=${5:-${VI_RETURN_PORT:-}}
     [ -n "$port" ] || port=$(free_port)
     mkdir -p "$out" "$checkpoint" "$state"
+    [ -n "$publish" ] && mkdir -p "$publish"
     # The daemon detaches and may not keep this cwd, so resolve every path to an
     # absolute one before writing it into the config; a relative path here would
     # point the daemon at the wrong place (or nowhere) after it forks.
     out=$(cd "$out" && pwd -P)
     checkpoint=$(cd "$checkpoint" && pwd -P)
+    [ -n "$publish" ] && publish=$(cd "$publish" && pwd -P)
     state=$(cd "$state" && pwd -P)
     [ -z "$(find "$state" -mindepth 1 -maxdepth 1 -print -quit)" ] || {
       echo "worker-return: state directory is not empty: $state" >&2; exit 1;
@@ -51,6 +54,18 @@ refuse options = delete
 list = false
 hosts allow = 127.0.0.1
 EOF
+    if [ -n "$publish" ]; then
+      cat >>"$state/rsyncd.conf" <<EOF
+
+[vi-publish]
+path = $publish
+read only = false
+write only = true
+refuse options = delete
+list = false
+hosts allow = 127.0.0.1
+EOF
+    fi
     printf '%s\n' "$port" >"$state/port"
     rsync --daemon --config="$state/rsyncd.conf"
     for _ in {1..50}; do
@@ -74,9 +89,9 @@ EOF
     rmdir "$state" 2>/dev/null || true
     ;;
   push)
-    src=${1:?source}; module=${2:?module vi-out or vi-checkpoint}; shift 2
+    src=${1:?source}; module=${2:?module vi-out, vi-checkpoint or vi-publish}; shift 2
     : "${VI_RETURN_PORT:?worker-return push needs the tunnel port}"
-    case "$module" in vi-out|vi-checkpoint) ;; *) echo "worker-return: unknown module $module" >&2; exit 2 ;; esac
+    case "$module" in vi-out|vi-checkpoint|vi-publish) ;; *) echo "worker-return: unknown module $module" >&2; exit 2 ;; esac
     if [ -d "$src" ] && [[ "$src" != */ ]]; then src="$src/"; fi
     for _ in {1..20}; do
       if rsync -a "$@" "$src" "rsync://127.0.0.1:$VI_RETURN_PORT/$module/"; then exit 0; else rc=$?; fi

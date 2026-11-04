@@ -256,21 +256,29 @@ class MarkerTest(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         (d / stage).write_text(f"{path}\n")
 
-    def test_verify_clears_matching_and_parent_markers_only(self):
+    def test_verify_clears_exact_marker_only(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             state = root / "state"
             run = root / "runs" / "checkpoint"
             unrelated = root / "other" / "checkpoint"
             self._marker(state, "stage-eq", run)          # recorded path == run
-            self._marker(state, "stage-parent", run.parent)  # recorded path is a parent
+            self._marker(state, "stage-parent", run.parent)  # a parent, must stay
             self._marker(state, "stage-other", unrelated)    # unrelated, must stay
             _epoch(run, 0, {"talker.safetensors": b"a", "tune.json": b"b"})
             with mock.patch.dict(os.environ, {"VI_STATE_DIR": str(state)}):
                 checkpoints.verify(run, 1)
             self.assertFalse((state / "unverified" / "stage-eq").exists())
-            self.assertFalse((state / "unverified" / "stage-parent").exists())
+            self.assertTrue((state / "unverified" / "stage-parent").exists())
             self.assertTrue((state / "unverified" / "stage-other").exists())
+
+    def test_verify_fails_when_epochs_are_not_contiguous(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _epoch(run, 0, {"talker.safetensors": b"a", "tune.json": b"b"})
+            _epoch(run, 2, {"talker.safetensors": b"c", "tune.json": b"d"})
+            with self.assertRaises(SystemExit):
+                checkpoints.verify(run, 2)
 
     def test_failed_verify_clears_nothing(self):
         with tempfile.TemporaryDirectory() as d:
