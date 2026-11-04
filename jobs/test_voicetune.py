@@ -314,7 +314,10 @@ class VoiceTuneTest(unittest.TestCase):
         import sys
         import types
 
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
 
         # speak_slots imports `from safetensors.torch import load_file` up front, even on the
         # clip/mean path that never calls it; stub it so this pure test needs no safetensors.
