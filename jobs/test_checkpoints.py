@@ -187,6 +187,22 @@ class GateTest(unittest.TestCase):
             sv.return_value = mock.Mock(f_bavail=49 * 2**18, f_frsize=4096)
             self.assertFalse(checkpoints.gate(Path("/run"), 50))
 
+    def test_gate_reserve_refuses_when_projected_checkpoints_leave_too_little(self):
+        with mock.patch("checkpoints.os.statvfs") as sv:
+            # 60 free, 27 reserved, 50 needed: 33 left < 50 -> refuse.
+            sv.return_value = mock.Mock(f_bavail=60 * 2**18, f_frsize=4096)
+            self.assertFalse(checkpoints.gate(Path("/run"), 50, 27))
+            # 80 free: 53 left >= 50 -> pass.
+            sv.return_value = mock.Mock(f_bavail=80 * 2**18, f_frsize=4096)
+            self.assertTrue(checkpoints.gate(Path("/run"), 50, 27))
+
+    def test_gate_reserve_zero_keeps_current_behavior(self):
+        with mock.patch("checkpoints.os.statvfs") as sv:
+            sv.return_value = mock.Mock(f_bavail=51 * 2**18, f_frsize=4096)
+            self.assertTrue(checkpoints.gate(Path("/run"), 50, 0))
+            sv.return_value = mock.Mock(f_bavail=49 * 2**18, f_frsize=4096)
+            self.assertFalse(checkpoints.gate(Path("/run"), 50, 0))
+
 
 class PruneTest(unittest.TestCase):
     def test_prune_first_epoch_keeps_zero_and_one(self):

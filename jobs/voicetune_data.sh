@@ -12,7 +12,26 @@
 set -euo pipefail
 
 jobs_dir=$(cd "$(dirname "$0")" && pwd)
-: "${VI_OUT:?voicetune_data runs from \`vi dataset run\`}"
+: "${VI_OUT:?voicetune_data runs from \`vi dataset run\`}" "${VI_SETTINGS:?}"
+
+# Refuse to start when home lacks the RAM the CPU prepare peak needs (16 GiB),
+# before the venv is built or any corpus file is read.
+mem_avail_kb=$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo)
+if [ -n "$mem_avail_kb" ] && [ "$mem_avail_kb" -lt $((16 * 1024 * 1024)) ]; then
+  echo "voicetune_data: only $((mem_avail_kb / 1024)) MiB RAM available; need at least 16 GiB" >&2
+  exit 1
+fi
+
+# The stage names a home-disk floor (min_home_gb) and a reserve for the
+# checkpoint bytes the GPU stages will publish home (home_gate_reserve_gb), so
+# the prepare refuses before it starts when landing them would underrun the
+# floor. Both come from the settings JSON the runner exports as VI_SETTINGS,
+# read the same way on-worker.sh reads them.
+min_home_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("min_home_gb",""))' "$VI_SETTINGS")
+home_gate_reserve_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("home_gate_reserve_gb",""))' "$VI_SETTINGS")
+if [ -n "$min_home_gb" ]; then
+  python3 "$jobs_dir/checkpoints.py" gate "$HOME" --min-gb "$min_home_gb" --reserve-gb "${home_gate_reserve_gb:-0}"
+fi
 
 # qwen-tts pins an older transformers, so voicetune runs in its own venv — the
 # same one voicetune-fresh.sh builds from requirements-tune.txt. QWEN_TTS_PYTHON

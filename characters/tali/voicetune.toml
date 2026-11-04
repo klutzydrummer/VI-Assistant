@@ -34,6 +34,10 @@ files = ["../../jobs/voicetune_data.sh", "../../jobs/voicetune_data.py",
          "corpus:analysis/after_labels/voice_sets.json",
          "dataset.toml"]
 
+[stage.voicetune_data.settings]
+min_home_gb = 50
+home_gate_reserve_gb = 27
+
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_preflight`
 # after `vi cloud up`. jobs/voicetune-fresh.sh preflight runs check --generate,
 # gates VRAM/disk, runs a 5-step probe at the real batch/accum/kl, pushes the
