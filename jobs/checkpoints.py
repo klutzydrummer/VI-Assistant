@@ -7,13 +7,15 @@ CLI here is the other half, run at home:
 
     python3 jobs/checkpoints.py gate    PATH --min-gb 50 [--reserve-gb 27]
     python3 jobs/checkpoints.py verify  DIR --expect N
+    python3 jobs/checkpoints.py verify-epoch DIR N
     python3 jobs/checkpoints.py prune   DIR --keep K [--yes]
     python3 jobs/checkpoints.py abandon DIR --reason TEXT
     python3 jobs/checkpoints.py audit   ROOT
 
 `gate` refuses to start below the free-space floor, after setting aside a reserve for projected checkpoint bytes; `verify` checks every epoch's
 hashes (no symlinks, no leftover `.part` dirs, exactly the N epochs 0..N-1) and
-writes VERIFIED;
+writes VERIFIED; `verify-epoch` checks one epoch and writes nothing, so the home
+supervisor can ack each epoch as it arrives;
 `prune` keeps at most two verified epochs; `abandon` marks a run dir as given up
 on and clears its unverified marker while keeping every file; `audit` lists runs
 holding more than two.
@@ -359,8 +361,30 @@ def cmd_gate(a):
         sys.exit(1)
 
 
+def verify_epoch(dir, key):
+    """Check one epoch dir against its SHA256SUMS; return its file hashes.
+    Writes no VERIFIED and clears no marker: a run is verified as a whole."""
+    dir = Path(dir)
+    ep = dir / f"epoch-{key}"
+    if not dir.is_dir():
+        sys.exit(f"verify-epoch: {dir} is not a directory")
+    if ep.is_symlink() or not ep.is_dir():
+        sys.exit(f"verify-epoch: {ep} is not a directory")
+    per, problems = _check_epoch(ep)
+    if problems:
+        for p in problems:
+            print(p, file=sys.stderr)
+        sys.exit(1)
+    print(f"epoch-{key}: ok ({len(per)} files)")
+    return per
+
+
 def cmd_verify(a):
     verify(a.dir, a.expect)
+
+
+def cmd_verify_epoch(a):
+    verify_epoch(a.dir, a.key)
 
 
 def cmd_prune(a):
@@ -386,6 +410,9 @@ def main(argv=None):
     v = sub.add_parser("verify", help="check every epoch's SHA256SUMS and write VERIFIED")
     v.add_argument("dir", type=Path)
     v.add_argument("--expect", type=int, required=True)
+    e = sub.add_parser("verify-epoch", help="check one epoch's SHA256SUMS; write nothing")
+    e.add_argument("dir", type=Path)
+    e.add_argument("key", type=int)
     p = sub.add_parser("prune", help="keep at most two verified epochs")
     p.add_argument("dir", type=Path)
     p.add_argument("--keep", type=int, required=True)
@@ -396,8 +423,8 @@ def main(argv=None):
     u = sub.add_parser("audit", help="list run dirs holding more than two epochs")
     u.add_argument("root", type=Path)
     a = ap.parse_args(argv)
-    cmds = {"gate": cmd_gate, "verify": cmd_verify, "prune": cmd_prune,
-            "abandon": cmd_abandon, "audit": cmd_audit}
+    cmds = {"gate": cmd_gate, "verify": cmd_verify, "verify-epoch": cmd_verify_epoch,
+            "prune": cmd_prune, "abandon": cmd_abandon, "audit": cmd_audit}
     cmds[a.cmd](a)
     return 0
 

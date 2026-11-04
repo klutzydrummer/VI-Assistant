@@ -6,7 +6,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const VI: &str = env!("CARGO_BIN_EXE_vi");
@@ -198,6 +198,210 @@ fn wait_for_work(dir: &Path) -> PathBuf {
     }
 }
 
+fn jobs_dir() -> PathBuf {
+    jobs_file("on-worker.sh").parent().unwrap().to_path_buf()
+}
+
+fn unique_token(prefix: &str) -> String {
+    format!(
+        "viow-{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Poll every second so a test never waits for the production 30 s cadence.
+fn poll_env() -> Vec<(&'static str, String)> {
+    vec![("VI_POLL_SECONDS", "1".to_string())]
+}
+
+/// Start `vi dataset run` with its output in files, so the test can read the
+/// supervisor's log while the run is still going.
+fn start_stage(
+    dir: &Path,
+    name: &str,
+    job: &str,
+    settings: &str,
+    envs: &[(&str, String)],
+) -> (Child, PathBuf) {
+    let err = dir.join(format!("{name}.err"));
+    let out = dir.join(format!("{name}.out"));
+    let child = command_settings(dir, job, settings, envs)
+        .stdout(Stdio::from(fs::File::create(&out).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&err).unwrap()))
+        .spawn()
+        .unwrap();
+    (child, err)
+}
+
+fn err_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Wait for the run, killing it (and failing the test) if it hangs.
+fn wait_stage(child: &mut Child, secs: u64) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the stage run did not finish within {secs}s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn pgrep_f(pattern: &str) -> Vec<u32> {
+    let out = Command::new("pgrep")
+        .args(["-f", pattern])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+/// The home supervisor pid for one test run, named by a token only this test's
+/// job text carries.
+fn supervisor_pid(token: &str) -> u32 {
+    let pattern = format!("on-worker\\.sh.*{token}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = pgrep_f(&pattern).into_iter().next() {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "on-worker.sh carrying {token} was not found"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn send_signal(pid: u32, sig: &str) -> bool {
+    Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// A SIGSTOPped supervisor is resumed even when the test fails early.
+struct Paused(u32);
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        send_signal(self.0, "-CONT");
+    }
+}
+
+fn pause(pid: u32) -> Paused {
+    assert!(send_signal(pid, "-STOP"), "could not SIGSTOP {pid}");
+    Paused(pid)
+}
+
+/// Live children a test started and must reap.
+struct Kids(Vec<Child>);
+
+impl Drop for Kids {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// `on-gpu.<key>.<attempt>` -> (key, attempt).
+fn split_attempt(work: &Path) -> (String, String) {
+    let name = work.file_name().unwrap().to_string_lossy().into_owned();
+    let (rest, attempt) = name.rsplit_once('.').expect("no attempt suffix");
+    let key = rest.split_once('.').expect("no stage prefix").1;
+    (key.to_string(), attempt.to_string())
+}
+
+/// The attempt's durable dir once on-worker.sh has made it, without failing
+/// while the run is still starting.
+fn maybe_durable(dir: &Path) -> Option<PathBuf> {
+    let root = dir.join("home/.cache/vi/checkpoints/on-gpu");
+    let entries: Vec<_> = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    (entries.len() == 1).then(|| entries[0].clone())
+}
+
+/// The home checkpoint dir the runner gave this stage.
+fn home_checkpoint(dir: &Path) -> PathBuf {
+    let stage = dir.join("corpus/stages/on-gpu");
+    let mut found: Vec<PathBuf> = fs::read_dir(&stage)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".checkpoint-")
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.remove(0)
+}
+
+fn progress_lines(cp: &Path) -> usize {
+    fs::read_to_string(cp.join("progress.jsonl"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// The receiver pid recorded in this run's return state dir.
+fn receiver_pid(dir: &Path) -> Option<u32> {
+    for e in fs::read_dir(dir.join("state/return")).ok()?.flatten() {
+        if let Ok(s) = fs::read_to_string(e.path().join("rsyncd.pid")) {
+            if let Ok(pid) = s.trim().parse() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// A synthetic `on-gpu.<key>.<attempt>` work dir with a live stage pid and
+/// fresh activity, so `pick_attempt` counts it as LIVE.
+fn fake_live(root: &Path, key: &str, attempt: &str, kids: &mut Kids) -> PathBuf {
+    let d = root.join(format!("on-gpu.{key}.{attempt}"));
+    fs::create_dir_all(d.join("out")).unwrap();
+    let c = Command::new("sleep")
+        .arg("600")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fs::write(d.join("stage.pid"), c.id().to_string()).unwrap();
+    fs::write(d.join("activity"), "x").unwrap();
+    kids.0.push(c);
+    d
+}
+
+/// The unverified marker on-worker.sh writes before a stage launches.
+fn write_marker(dir: &Path, key: &str, attempt: &str) -> PathBuf {
+    let mdir = dir.join("state/unverified");
+    fs::create_dir_all(&mdir).unwrap();
+    let m = mdir.join(format!("on-gpu-{key}-{attempt}"));
+    let durable = dir.join(format!("home/.cache/vi/checkpoints/on-gpu/{key}-{attempt}"));
+    fs::write(&m, format!("{}\n", durable.display())).unwrap();
+    m
+}
+
 /// Every regular file under `root` with its bytes, sorted by relative path.
 fn tree_files(root: &Path) -> Vec<(String, Vec<u8>)> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
@@ -238,16 +442,21 @@ fn ctrl_c_mid_job_keeps_worker_dir() {
             .unwrap()
             .as_nanos()
     );
-    // The job records the receiver's port and waits. The test releases the
-    // wait after signalling, because bash runs a trap only once the foreground
-    // command returns (a real Ctrl-C also stops that command).
+    // The job records the receiver's port and waits, so the signal arrives
+    // while it is running. The test releases the wait once the supervisor has
+    // stopped, which lets the detached stage finish and exit.
     let job = format!(
         r#"# {token}
 echo "$VI_RETURN_PORT" > "$VI_OUT/port"
 while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done"#
     );
-    let envs = [("TMPDIR", tmp.display().to_string())];
-    let child = command_settings(dir.path(), &job, "judge = \"gemma\"", &envs)
+    let envs = [
+        ("TMPDIR", tmp.display().to_string()),
+        // A short poll interval keeps the deferred INT trap a fraction of a
+        // second away instead of the 30 s default.
+        ("VI_POLL_SECONDS", "1".to_string()),
+    ];
+    let mut child = command_settings(dir.path(), &job, "judge = \"gemma\"", &envs)
         .spawn()
         .unwrap();
     let work = wait_for_work(dir.path());
@@ -257,7 +466,9 @@ while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done"#
         .parse()
         .unwrap();
 
-    // SIGINT the home runner while the job runs (row 9).
+    // SIGINT the home supervisor while the job runs (row 9). Command
+    // substitutions and sleeps defer the trap until the foreground command
+    // returns, so give it a few polls to take effect.
     let pgrep = Command::new("pgrep")
         .args(["-f", &format!("on-worker\\.sh.*{token}")])
         .output()
@@ -279,7 +490,20 @@ while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done"#
         .unwrap()
         .success());
 
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stopped = None;
+    while stopped.is_none() {
+        stopped = child.try_wait().unwrap();
+        assert!(Instant::now() < deadline, "the supervisor ignored SIGINT");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The stage is detached, so it must be released separately; then it can
+    // finish and write its exit code.
     fs::write(work.join("out/release"), "").unwrap();
+    wait_until("the detached stage did not finish", 15, || {
+        work.join("stage.rc").is_file()
+    });
+
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
@@ -380,6 +604,15 @@ fn durable_dir_survives_runner_error_path() {
     assert!(d.join("epoch-0/talker.safetensors").is_file());
     let before = tree_files(&d);
 
+    // A rerun would normally reattach to the newest unverified marker; this
+    // test is about a genuinely new attempt, so clear the marker first (the
+    // same thing `checkpoints.py abandon` does when a human gives up on one).
+    for e in fs::read_dir(dir.path().join("state/unverified"))
+        .unwrap()
+        .flatten()
+    {
+        fs::remove_file(e.path()).unwrap();
+    }
     // The rerun has the same stage key, so it deletes its own `.tmp-` scratch
     // dir; the first attempt's durable dir lives outside corpus/ and must not
     // change. Sleep past the durable name's one-second resolution so this
@@ -1099,4 +1332,616 @@ fn vf_exit_75_does_not_kill_the_surviving_trainer() {
     );
     let _ = holder.kill();
     let _ = holder.wait();
+}
+
+/// Row 39: the cursor decides only what is printed. Deleting it reprints the
+/// log from the start and changes no action: the epoch is verified and acked
+/// once, and nothing is pushed or repaired twice.
+#[test]
+fn deleting_cursor_reprints_log_but_changes_no_action() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let job = r#"set -e
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+echo hello-from-job
+p=voicetune-fresh/publish
+mkdir -p "$p/epoch-0"
+printf 'v0' > "$p/epoch-0/talker.safetensors"
+printf '{}' > "$p/epoch-0/tune.json"
+( cd "$p/epoch-0" && sha256sum talker.safetensors tune.json > SHA256SUMS )
+jobs/worker-return.sh push "$p" vi-publish
+while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done
+echo after-release
+echo ok > "$VI_OUT/ok.txt""#;
+    let (mut child, err_path) =
+        start_stage(dir.path(), "cursor", job, "expect_epochs = 1", &poll_env());
+    let work = wait_for_work(dir.path());
+    let (_, attempt) = split_attempt(&work);
+    wait_until("the epoch was never acked", 60, || {
+        work.join("acked/epoch-0").is_file()
+    });
+    let cursor = dir
+        .path()
+        .join("state/hs")
+        .join(format!("{attempt}.offset"));
+    assert!(cursor.is_file(), "no log cursor at {}", cursor.display());
+    fs::remove_file(&cursor).unwrap();
+    wait_until("deleting the cursor did not reprint the log", 30, || {
+        err_text(&err_path).matches("hello-from-job").count() >= 2
+    });
+    fs::write(work.join("out/release"), "").unwrap();
+    let status = wait_stage(&mut child, 120);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(fs::read_to_string(got.join("ok.txt")).unwrap(), "ok\n");
+    assert_eq!(
+        err.matches("epoch 0 verified home and acked").count(),
+        1,
+        "the ack was repeated after the cursor was deleted: {err}"
+    );
+    assert!(!err.contains("failed verification"), "{err}");
+    assert!(cursor.is_file(), "the cursor was not rewritten");
+}
+
+/// Row 19: the checkpoint copy loop lives in worker-job.sh, so it keeps
+/// running while the home supervisor is stopped, and the loss is not noticed.
+#[test]
+fn checkpoint_sync_continues_with_home_supervisor_paused() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let token = unique_token("cpsync");
+    let job = format!(
+        r#"# {token}
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+w=$(dirname "$VI_OUT")
+jobs/worker-job.sh --work "$w/wj" --run "$w/run" -- sh -c 'i=0; while [ $i -lt 20 ]; do i=$((i+1)); echo line-$i >> "$VI_CHECKPOINT/progress.jsonl"; sleep 1; done'"#
+    );
+    let mut envs = poll_env();
+    envs.push(("VI_SYNC_SECONDS", "1".to_string()));
+    let (mut child, _err_path) =
+        start_stage(dir.path(), "cpsync", &job, "judge = \"gemma\"", &envs);
+    wait_for_work(dir.path());
+    let cp = home_checkpoint(dir.path());
+    wait_until("the checkpoint never reached home", 30, || {
+        progress_lines(&cp) >= 2
+    });
+    let supervisor = supervisor_pid(&token);
+    let paused = pause(supervisor);
+    // Let any push that was already in flight land before taking the baseline.
+    std::thread::sleep(Duration::from_secs(2));
+    let at_stop = progress_lines(&cp);
+    wait_until(
+        "worker-job.sh stopped copying the checkpoint home",
+        30,
+        || progress_lines(&cp) > at_stop,
+    );
+    drop(paused);
+    let status = wait_stage(&mut child, 180);
+    let err = err_text(&_err_path);
+    assert!(status.success(), "{err}");
+    // The grow-while-paused check above is the assertion; the scratch
+    // checkpoint is moved to the durable dir once the run succeeds, so it
+    // cannot be counted again here.
+}
+
+/// Row 6: a home supervisor stopped long enough to miss the whole run resumes
+/// and reattaches: the return receiver is restarted and re-proved, the stage
+/// is not relaunched, and the output still comes home. The pause is 10
+/// seconds of wall clock rather than 10 minutes; the code keys on state, not
+/// on how long the process was stopped.
+#[test]
+fn sigstop_home_supervisor_10min_then_sigcont_reattaches() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let token = unique_token("sigstop");
+    let job = format!(
+        r#"# {token}
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+echo "$BASHPID" > "$VI_OUT/jobpid"
+echo run >> "$VI_OUT/runs"
+sleep 8
+echo done > "$VI_OUT/done.txt""#
+    );
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "sigstop",
+        &job,
+        "judge = \"gemma\"",
+        &poll_env(),
+    );
+    let work = wait_for_work(dir.path());
+    wait_until("the job never wrote jobpid", 30, || {
+        work.join("out/jobpid").is_file()
+    });
+    let supervisor = supervisor_pid(&token);
+    let paused = pause(supervisor);
+    std::thread::sleep(Duration::from_secs(1));
+    let receiver = receiver_pid(dir.path()).expect("the receiver never wrote its pid");
+    assert!(
+        send_signal(receiver, "-TERM"),
+        "could not stop the receiver"
+    );
+    wait_until("the receiver did not die", 10, || !pid_alive(receiver));
+    std::thread::sleep(Duration::from_secs(4));
+    drop(paused);
+    let status = wait_stage(&mut child, 120);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("the return receiver is down; restarting it"),
+        "{err}"
+    );
+    assert!(
+        err.matches("return path re-proved").count() >= 2,
+        "the restarted return path was not proved again: {err}"
+    );
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(fs::read_to_string(got.join("done.txt")).unwrap(), "done\n");
+    assert_eq!(
+        fs::read_to_string(got.join("runs"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the job was launched more than once"
+    );
+}
+
+/// Row 7: a home SIGKILL leaves the detached stage running. The rerun picks
+/// that live attempt, reuses its durable dir, sends no inputs, and collects
+/// the output the first run never got.
+#[test]
+fn rerun_after_home_kill9_reattaches_same_durable_dir() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let token = unique_token("kill9");
+    let job = format!(
+        r#"# {token}
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+p=voicetune-fresh/publish
+mkdir -p "$p/epoch-0"
+printf 'w0' > "$p/epoch-0/talker.safetensors"
+printf '{{}}' > "$p/epoch-0/tune.json"
+( cd "$p/epoch-0" && sha256sum talker.safetensors tune.json > SHA256SUMS )
+jobs/worker-return.sh push "$p" vi-publish
+while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done
+echo done > "$VI_OUT/ok.txt""#
+    );
+    let (mut first, _first_err) = start_stage(
+        dir.path(),
+        "kill9-first",
+        &job,
+        "expect_epochs = 1",
+        &poll_env(),
+    );
+    let work = wait_for_work(dir.path());
+    wait_until("the epoch was never acked", 60, || {
+        work.join("acked/epoch-0").is_file()
+    });
+    let durable_before = durable_dir(dir.path());
+    let receiver = receiver_pid(dir.path());
+    let supervisor = supervisor_pid(&token);
+    assert!(send_signal(supervisor, "-KILL"));
+    let status = wait_stage(&mut first, 30);
+    assert!(!status.success(), "the killed run reported success");
+    if let Some(pid) = receiver {
+        wait_until("the receiver outlived its owner", 10, || !pid_alive(pid));
+    }
+
+    let (mut second, err_path) = start_stage(
+        dir.path(),
+        "kill9-second",
+        &job,
+        "expect_epochs = 1",
+        &poll_env(),
+    );
+    wait_until("the rerun did not reattach", 30, || {
+        err_text(&err_path).contains("reattaching to")
+    });
+    let err = err_text(&err_path);
+    assert!(
+        err.contains(&format!("reattaching to {}", work.display())),
+        "{err}"
+    );
+    assert!(err.contains("no inputs will be sent"), "{err}");
+    fs::write(work.join("out/release"), "").unwrap();
+    let status = wait_stage(&mut second, 180);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        durable_dir(dir.path()).canonicalize().unwrap(),
+        durable_before.canonicalize().unwrap(),
+        "the rerun used a different durable dir"
+    );
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(fs::read_to_string(got.join("ok.txt")).unwrap(), "done\n");
+}
+
+/// Row 7: two live attempts are a human decision, never a silent pick.
+#[test]
+fn reattach_refuses_when_two_live_candidates() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let probe = "echo \"$VI_RETURN_PORT\" > \"$VI_OUT/port\"; exit 3";
+    let first = run_settings(dir.path(), probe, "expect_epochs = 1", &poll_env());
+    assert!(!first.status.success());
+    let work = wait_for_work(dir.path());
+    let (key, _attempt) = split_attempt(&work);
+    let root = dir.path().join("worker");
+    let mut kids = Kids(Vec::new());
+    let a = fake_live(&root, &key, "20260101T000001Z", &mut kids);
+    let b = fake_live(&root, &key, "20260101T000002Z", &mut kids);
+    write_marker(dir.path(), &key, "20260101T000001Z");
+    write_marker(dir.path(), &key, "20260101T000002Z");
+
+    let err_path = dir.path().join("refuse.err");
+    let out = command_settings(dir.path(), probe, "expect_epochs = 1", &poll_env())
+        .stderr(Stdio::from(fs::File::create(&err_path).unwrap()))
+        .output()
+        .unwrap();
+    let err = err_text(&err_path);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("refusing to choose between 2 live attempts"),
+        "{err}"
+    );
+    assert!(
+        err.contains("checkpoints.py") && err.contains("abandon"),
+        "{err}"
+    );
+    assert!(err.contains("nothing was chosen or deleted"), "{err}");
+    assert!(a.is_dir(), "the refusing run deleted {}", a.display());
+    assert!(b.is_dir(), "the refusing run deleted {}", b.display());
+    assert!(a.join("stage.pid").is_file() && b.join("stage.pid").is_file());
+}
+
+/// Row 7: a live attempt wins over a newer unverified marker, because the
+/// marker only names a dir whose attempt is already dead.
+#[test]
+fn reattach_prefers_live_over_newest_marker() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let probe = "echo \"$VI_RETURN_PORT\" > \"$VI_OUT/port\"; exit 3";
+    let first = run_settings(dir.path(), probe, "expect_epochs = 1", &poll_env());
+    assert!(!first.status.success());
+    let probe_work = wait_for_work(dir.path());
+    let (key, _attempt) = split_attempt(&probe_work);
+    let root = dir.path().join("worker");
+
+    // The live attempt: a fake stage that finishes by itself, a jobs/ folder
+    // for the fresh-token proof, and output for the final push.
+    let live_attempt = "20260101T000003Z";
+    let live = root.join(format!("on-gpu.{key}.{live_attempt}"));
+    fs::create_dir_all(live.join("out")).unwrap();
+    fs::write(live.join("out/ok.txt"), "live\n").unwrap();
+    std::os::unix::fs::symlink(jobs_dir(), live.join("jobs")).unwrap();
+    fs::write(live.join("stage.pid"), "").unwrap();
+    let stage = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sleep 5; printf '0\\n' > '{}'",
+            live.join("stage.rc").display()
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    fs::write(live.join("stage.pid"), stage.id().to_string()).unwrap();
+    // A zombie still answers `kill -0`, so reap the fake stage the moment it
+    // exits; otherwise the supervisor waits forever on a stage it believes is
+    // alive, even though stage.rc is already there.
+    let reaper = std::thread::spawn(move || {
+        let mut stage = stage;
+        let _ = stage.wait();
+    });
+
+    // The reattached run still verifies the durable checkpoint home, so give
+    // the live attempt one valid epoch there.
+    let durable = dir.path().join(format!(
+        "home/.cache/vi/checkpoints/on-gpu/{key}-{live_attempt}"
+    ));
+    let epoch = durable.join("epoch-0");
+    fs::create_dir_all(&epoch).unwrap();
+    fs::write(epoch.join("talker.safetensors"), "w0").unwrap();
+    fs::write(epoch.join("tune.json"), "{}").unwrap();
+    assert!(Command::new("sh")
+        .arg("-c")
+        .arg("sha256sum talker.safetensors tune.json > SHA256SUMS")
+        .current_dir(&epoch)
+        .status()
+        .unwrap()
+        .success());
+
+    // A newer marker names a dead attempt; the live one must still win.
+    let dead_attempt = "20260101T000004Z";
+    let dead = root.join(format!("on-gpu.{key}.{dead_attempt}"));
+    fs::create_dir_all(&dead).unwrap();
+    fs::write(dead.join("activity"), "x").unwrap();
+    write_marker(dir.path(), &key, live_attempt);
+    std::thread::sleep(Duration::from_millis(1100));
+    write_marker(dir.path(), &key, dead_attempt);
+
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "prefer",
+        probe,
+        "expect_epochs = 1",
+        &poll_env(),
+    );
+    wait_until("the rerun did not reattach", 30, || {
+        err_text(&err_path).contains("reattaching to")
+    });
+    let err = err_text(&err_path);
+    assert!(
+        err.contains(&format!("reattaching to {}", live.display())),
+        "{err}"
+    );
+    assert!(
+        !err.contains(&format!("reattaching to {}", dead.display())),
+        "{err}"
+    );
+    let status = wait_stage(&mut child, 120);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(fs::read_to_string(got.join("ok.txt")).unwrap(), "live\n");
+    assert!(dead.is_dir(), "the run touched the dir a marker named");
+    let _ = reaper.join();
+}
+
+/// Row 18/40: a same-size, same-mtime byte flip survives rsync's quick check,
+/// so only the checksum repair push can fix it. The home supervisor notices
+/// the failed verify, asks for a re-send, acks the repaired epoch, and keeps
+/// the corrupt copy under `.rsync-replaced-1/`.
+#[test]
+fn corrupt_same_size_epoch_is_repaired_and_acked() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let job = r#"set -e
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+p=voicetune-fresh/publish
+mkdir -p "$p/epoch-0"
+printf 'w0' > "$p/epoch-0/talker.safetensors"
+printf '{}' > "$p/epoch-0/tune.json"
+jobs/worker-return.sh push "$p" vi-publish
+while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done
+( cd "$p/epoch-0" && sha256sum talker.safetensors tune.json > SHA256SUMS )
+jobs/worker-return.sh push "$p" vi-publish
+echo done > "$VI_OUT/done.txt""#;
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    let (mut child, err_path) = start_stage(dir.path(), "repair", job, "expect_epochs = 1", &envs);
+    let work = wait_for_work(dir.path());
+    wait_until("the epoch never arrived home", 60, || {
+        maybe_durable(dir.path())
+            .and_then(|d| fs::read_to_string(d.join("epoch-0/talker.safetensors")).ok())
+            .is_some_and(|s| s == "w0")
+    });
+    let durable = maybe_durable(dir.path()).unwrap();
+    let target = durable.join("epoch-0/talker.safetensors");
+    let keep = dir.path().join("original-copy");
+    fs::copy(&target, &keep).unwrap();
+    assert!(Command::new("touch")
+        .arg("-r")
+        .arg(&target)
+        .arg(&keep)
+        .status()
+        .unwrap()
+        .success());
+    let mut bytes = fs::read(&target).unwrap();
+    bytes[0] ^= 0xff;
+    fs::write(&target, &bytes).unwrap();
+    assert_eq!(fs::metadata(&target).unwrap().len(), 2);
+    assert!(Command::new("touch")
+        .arg("-r")
+        .arg(&keep)
+        .arg(&target)
+        .status()
+        .unwrap()
+        .success());
+    fs::write(work.join("out/release"), "").unwrap();
+
+    let status = wait_stage(&mut child, 180);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("epoch 0 failed verification; asked the worker to re-send it"),
+        "{err}"
+    );
+    assert!(err.contains("epoch 0 re-sent"), "{err}");
+    assert_eq!(
+        err.matches("epoch 0 verified home and acked").count(),
+        1,
+        "{err}"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "w0");
+    assert_eq!(
+        fs::read_to_string(durable.join("epoch-0/tune.json")).unwrap(),
+        "{}"
+    );
+    assert!(durable.join("VERIFIED").is_file());
+    let files = tree_files(&durable);
+    let backup = files
+        .iter()
+        .find(|(p, _)| {
+            p.starts_with(".rsync-replaced-1/") && p.ends_with("epoch-0/talker.safetensors")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no corrupt copy under .rsync-replaced-1: {:?}",
+                files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(backup.1, bytes, "the replaced copy is not the corrupt one");
+}
+
+/// Row 21 (home supervisor side): while home is below its disk floor the
+/// supervisor pauses acks and pushes, but the stage keeps running and the run
+/// completes once space returns. A fake python3 fails only the gate, so the
+/// pre-flight gate passes and the floor can drop mid-run.
+#[test]
+fn hs_pauses_acks_below_disk_floor_and_resumes() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("home")).unwrap();
+    let gate_fail = dir.path().join("gate-fail");
+    let real_python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(real_python.status.success());
+    let real_python = String::from_utf8_lossy(&real_python.stdout)
+        .trim()
+        .to_string();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let py = bin.join("python3");
+    fs::write(
+        &py,
+        format!(
+            "#!/bin/sh\n\
+             script= cmd=\n\
+             for a in \"$@\"; do\n\
+             case $a in */checkpoints.py) script=1;; gate) cmd=1;; esac\n\
+             done\n\
+             [ \"$script$cmd\" = 11 ] && [ -e {gate} ] && exit 1\n\
+             exec {real} \"$@\"\n",
+            gate = gate_fail.display(),
+            real = real_python,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let job = format!(
+        r#"set -e
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+: > {gate}
+p=voicetune-fresh/publish
+mkdir -p "$p/epoch-0"
+printf 'w0' > "$p/epoch-0/talker.safetensors"
+printf '{{}}' > "$p/epoch-0/tune.json"
+( cd "$p/epoch-0" && sha256sum talker.safetensors tune.json > SHA256SUMS )
+jobs/worker-return.sh push "$p" vi-publish
+echo done > "$VI_OUT/stage-done.txt""#,
+        gate = gate_fail.display(),
+    );
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    envs.push((
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "disk-floor",
+        &job,
+        "expect_epochs = 1, min_home_gb = 0",
+        &envs,
+    );
+    let work = wait_for_work(dir.path());
+    wait_until(
+        "the stage never finished while the floor was low",
+        60,
+        || work.join("out/stage-done.txt").is_file(),
+    );
+    wait_until("the supervisor never reported the paused gate", 20, || {
+        err_text(&err_path).contains("ALERT: home disk is below the floor; training continues")
+    });
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the run ended while acks were paused"
+    );
+    assert!(
+        !work.join("acked/epoch-0").exists(),
+        "the supervisor acked an epoch below the disk floor"
+    );
+
+    fs::remove_file(&gate_fail).unwrap();
+    let status = wait_stage(&mut child, 60);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("home disk is above the floor again; resuming acks and pushes"),
+        "{err}"
+    );
+    assert!(err.contains("epoch 0 verified home and acked"), "{err}");
+    let durable = maybe_durable(dir.path()).expect("no durable dir after the run");
+    assert!(durable.join("VERIFIED").is_file(), "{err}");
+    assert_eq!(
+        fs::read_to_string(durable.join("epoch-0/talker.safetensors")).unwrap(),
+        "w0"
+    );
+}
+
+/// Row 3: a worker that cannot be polled is retried; only after
+/// VI_LOST_MINUTES does the supervisor give up, and it keeps the worker copy
+/// so a reattach is still possible.
+#[test]
+fn poll_failures_retry_then_give_up_keeping_worker_copy() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let job = r#"echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done
+echo done > "$VI_OUT/done.txt""#;
+    let mut envs = poll_env();
+    envs.push(("VI_LOST_MINUTES", "1".to_string()));
+    let (mut child, err_path) = start_stage(dir.path(), "giveup", job, "judge = \"gemma\"", &envs);
+    let work = wait_for_work(dir.path());
+    // Make the worker side of every poll impossible: the supervisor's `cd`
+    // into the work dir fails, so no status block is printed.
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o000)).unwrap();
+    wait_until("the supervisor never gave up", 100, || {
+        err_text(&err_path).contains("giving up after 1 min")
+    });
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = wait_stage(&mut child, 30);
+    let err = err_text(&err_path);
+    assert!(!status.success(), "{err}");
+    assert!(
+        err.matches("poll failed; will retry").count() >= 2,
+        "the supervisor did not retry a failed poll: {err}"
+    );
+    assert!(err.contains("keeping"), "{err}");
+    assert!(work.is_dir(), "the worker copy was deleted");
+    assert!(work.join("stage.pid").is_file());
+    // The stage itself was never stopped and still finishes.
+    fs::write(work.join("out/release"), "").unwrap();
+    wait_until("the detached stage did not finish", 20, || {
+        work.join("stage.rc").is_file()
+    });
+    assert_eq!(
+        fs::read_to_string(work.join("stage.rc")).unwrap().trim(),
+        "0"
+    );
+    // Cleanup stopped the receiver and removed its state dir.
+    assert_eq!(
+        fs::read_dir(dir.path().join("state/return"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

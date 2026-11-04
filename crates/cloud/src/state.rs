@@ -64,6 +64,36 @@ impl StateDir {
         self.dir.join(format!("known_hosts-{id}"))
     }
 
+    /// The file holding the stamp of the newest VI-HOSTKEY batch accepted for
+    /// this instance. A later rotation must present a newer stamp.
+    pub fn hostkey_stamp(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("hostkey-{id}.stamp"))
+    }
+
+    /// `None` until the first rotation is accepted.
+    pub fn last_hostkey_stamp(&self, id: u64) -> Result<Option<u64>> {
+        let path = self.hostkey_stamp(id);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+        text.trim().parse().map(Some).map_err(|_| {
+            crate::Error::Worker(format!(
+                "{} does not hold a stamp; delete it to accept the next host-key rotation",
+                path.display()
+            ))
+        })
+    }
+
+    pub fn save_hostkey_stamp(&self, id: u64, stamp: u64) -> Result<()> {
+        std::fs::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
+        let path = self.hostkey_stamp(id);
+        let tmp = path.with_extension("stamp.tmp");
+        std::fs::write(&tmp, format!("{stamp}\n")).map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, &path).map_err(io_err(&path))
+    }
+
     /// Where `on-worker.sh` drops a marker per unverified checkpoint.
     pub fn unverified_dir(&self) -> PathBuf {
         self.dir.join("unverified")
@@ -119,7 +149,7 @@ impl StateDir {
     }
 
     pub fn clear(&self, id: u64) -> Result<()> {
-        for path in [self.file(), self.known_hosts(id)] {
+        for path in [self.file(), self.known_hosts(id), self.hostkey_stamp(id)] {
             remove(&path)?;
         }
         Ok(())
@@ -155,8 +185,12 @@ mod tests {
         state.save(&t).unwrap();
         assert_eq!(state.load().unwrap(), Some(t));
         std::fs::write(state.known_hosts(9), "x").unwrap();
+        state.save_hostkey_stamp(9, 42).unwrap();
+        assert_eq!(state.last_hostkey_stamp(9).unwrap(), Some(42));
         state.clear(9).unwrap();
         assert_eq!(state.load().unwrap(), None);
         assert!(!state.known_hosts(9).exists());
+        assert!(!state.hostkey_stamp(9).exists());
+        assert_eq!(state.last_hostkey_stamp(9).unwrap(), None);
     }
 }

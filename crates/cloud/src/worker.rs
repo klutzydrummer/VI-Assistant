@@ -20,6 +20,15 @@ pub trait Host {
     /// Does `ssh root@endpoint true` succeed?
     fn reachable(&self, ep: &Endpoint, known_hosts: &Path) -> bool;
     fn log(&self, msg: &str);
+    /// The host keys `ssh-keyscan` presents for `ep`, as known_hosts lines.
+    /// Empty when the scan fails.
+    fn keyscan(&self, _ep: &Endpoint) -> Vec<String> {
+        Vec::new()
+    }
+    /// `ssh-keygen -lf -` output for `keyscan` lines, one line per key.
+    fn key_fingerprints(&self, _lines: &[String]) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct SystemHost;
@@ -53,6 +62,53 @@ impl Host for SystemHost {
 
     fn log(&self, msg: &str) {
         eprintln!("{msg}");
+    }
+
+    fn keyscan(&self, ep: &Endpoint) -> Vec<String> {
+        let out = Command::new("ssh-keyscan")
+            .args(["-T", "10", "-p", &ep.port.to_string(), &ep.host])
+            .stdin(Stdio::null())
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn key_fingerprints(&self, lines: &[String]) -> Vec<String> {
+        use std::io::Write as _;
+
+        let mut child = match Command::new("ssh-keygen")
+            .args(["-lf", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return Vec::new(),
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            for line in lines {
+                if writeln!(stdin, "{line}").is_err() {
+                    return Vec::new();
+                }
+            }
+        }
+        match child.wait_with_output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -106,6 +162,78 @@ pub struct Down {
     pub credit_before: Option<f64>,
     /// Account credit after the worker was released.
     pub credit_after: Option<f64>,
+}
+
+/// A host key the worker presents now, as a known_hosts line and the
+/// fingerprint `ssh-keygen` reports for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedKey {
+    pub line: String,
+    pub fingerprint: String,
+    /// Uppercase, like `ED25519` in `ssh-keygen -lf` output.
+    pub key_type: String,
+}
+
+/// What `vi cloud hostkey` accepted: the rotated keys and the boot they belong
+/// to. Only a reattach continues after this; no inputs are sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rotation {
+    pub endpoint: Endpoint,
+    pub stamp: u64,
+    /// The fingerprints of the keys written to known_hosts.
+    pub fingerprints: Vec<String>,
+}
+
+/// The VI-HOSTKEY lines of one boot. Every line the boot script prints shares
+/// the boot's timestamp, which orders rotations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostkeyBatch {
+    pub stamp: u64,
+    /// `(SHA256 fingerprint, uppercase key type)`.
+    pub keys: Vec<(String, String)>,
+}
+
+/// Parse one `ssh-keygen -lf` line, like
+/// `256 SHA256:abc... comment (ED25519)`, into the fingerprint and its key type.
+pub fn parse_keygen_line(line: &str) -> Option<(String, String)> {
+    let fingerprint = line
+        .split_whitespace()
+        .find(|t| t.starts_with("SHA256:"))?
+        .to_owned();
+    let open = line.rfind('(')?;
+    let close = line[open..].find(')')? + open;
+    let key_type = line[open + 1..close].trim().to_ascii_uppercase();
+    (!key_type.is_empty()).then_some((fingerprint, key_type))
+}
+
+/// The newest VI-HOSTKEY batch in an instance log, if it is newer than the
+/// last accepted stamp. The boot script prints
+/// `VI-HOSTKEY <unix seconds> <ssh-keygen -lf line>` for every host key type,
+/// so a batch is the group of lines sharing the highest stamp.
+pub fn newest_hostkey_batch(log: &str, last: Option<u64>) -> Option<HostkeyBatch> {
+    use std::collections::BTreeMap;
+
+    let mut batches: BTreeMap<u64, Vec<(String, String)>> = BTreeMap::new();
+    for line in log.lines() {
+        // The line may carry a container-log timestamp before the marker.
+        let Some((_, rest)) = line.split_once("VI-HOSTKEY ") else {
+            continue;
+        };
+        let Some((stamp, details)) = rest.split_once(' ') else {
+            continue;
+        };
+        let Ok(stamp) = stamp.parse::<u64>() else {
+            continue;
+        };
+        if let Some(key) = parse_keygen_line(details) {
+            batches.entry(stamp).or_default().push(key);
+        }
+    }
+    let (stamp, keys) = batches.into_iter().next_back()?;
+    if last.is_some_and(|last| stamp <= last) {
+        return None;
+    }
+    Some(HostkeyBatch { stamp, keys })
 }
 
 impl<V: Vast, H: Host> Cloud<V, H> {
@@ -248,6 +376,88 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         Ok(credit)
     }
 
+    /// Re-reads the tracked instance from the API and saves its current ssh
+    /// endpoint. This is the same endpoint discovery `wait` uses, but without
+    /// the ssh reachability probe: the home supervisor calls it while polls are
+    /// failing or a host key changed, when ssh cannot answer yet. It never
+    /// rents and never switches instances.
+    pub fn refresh(&self) -> Result<Option<Tracked>> {
+        let Some(mut t) = self.state.load()? else {
+            return Ok(None);
+        };
+        let inst = self.vast.instance(t.id)?.ok_or_else(|| {
+            Error::Worker(format!(
+                "worker {} is gone; `vi cloud up` rents a new one",
+                t.id
+            ))
+        })?;
+        let ep = inst
+            .endpoints()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Worker(format!("worker {} has no ssh endpoint yet", t.id)))?;
+        if t.endpoint.as_ref() != Some(&ep) {
+            self.host.log(&format!(
+                "worker {} endpoint is now {}:{}",
+                t.id, ep.host, ep.port
+            ));
+            t.endpoint = Some(ep);
+            self.state.save(&t)?;
+        }
+        Ok(Some(t))
+    }
+
+    /// Starts the tracked worker again (`vi cloud start`). The approval guards
+    /// are `up`'s: the deadline must be open, the worst case (`max_hours` at
+    /// the instance's price) must stay under `cap`, and the account must hold
+    /// at least `cap`. Restarting does not reset the tracked `created` time, so
+    /// `reap` still measures `max_hours` from the original rental.
+    pub fn start(&self, cap: f64, until: u64) -> Result<Tracked> {
+        let Some(mut t) = self.state.load()? else {
+            return Err(Error::Worker(
+                "no worker is rented; there is nothing to start".into(),
+            ));
+        };
+        if self.host.now() >= until {
+            return Err(Error::Worker(
+                "the approval deadline has passed; pass a later --until".into(),
+            ));
+        }
+        let inst = self.vast.instance(t.id)?.ok_or_else(|| {
+            Error::Worker(format!(
+                "worker {} is gone; `vi cloud up` rents a new one",
+                t.id
+            ))
+        })?;
+        let dph = if inst.dph_total > 0.0 {
+            inst.dph_total
+        } else {
+            t.dph
+        };
+        let worst = self.cfg.max_hours * dph;
+        if worst > cap {
+            return Err(Error::Worker(format!(
+                "worst case ${worst:.2} ({:.1} h at ${:.3}/hr) exceeds the ${cap:.2} cap",
+                self.cfg.max_hours, dph
+            )));
+        }
+        let credit = self.vast.credit()?;
+        if credit < cap {
+            return Err(Error::Worker(format!(
+                "credit ${credit:.2} is below the ${cap:.2} cap"
+            )));
+        }
+        self.vast.start(t.id)?;
+        self.host.log(&format!(
+            "asked Vast to start worker {} again; worst case ${worst:.2} at ${dph:.3}/hr",
+            t.id
+        ));
+        if let Some(ep) = inst.endpoints().into_iter().next() {
+            t.endpoint = Some(ep);
+        }
+        self.touch_tracked(t)
+    }
+
     pub fn create_request(&self) -> Value {
         json!({
             "client_id": "me",
@@ -293,6 +503,168 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             }
             self.host.sleep(POLL_SECS);
         }
+    }
+
+    /// Accepts the worker's new ssh host key after a rotation (R50). A new key
+    /// is trusted only when `ssh-keyscan` presents it now *and* its fingerprint
+    /// and type appear in the newest VI-HOSTKEY batch the instance logged after
+    /// the last accepted stamp. A mismatch or a timeout refuses: the caller
+    /// halts pushes and escalates instead of accepting blindly. Only this
+    /// instance's `known_hosts-<id>` is rewritten. After a rotation only a
+    /// reattach continues; no inputs are sent.
+    pub fn accept_hostkey(&self, wait_secs: u64) -> Result<Rotation> {
+        let Some(mut t) = self.state.load()? else {
+            return Err(Error::Worker(
+                "no worker is rented; there is nothing to check".into(),
+            ));
+        };
+        let inst = self.vast.instance(t.id)?.ok_or_else(|| {
+            Error::Worker(format!("worker {} is gone; refusing the host key", t.id))
+        })?;
+        if inst.status() != "running" {
+            return Err(Error::Worker(format!(
+                "worker {} is {}; refusing the host key",
+                t.id,
+                inst.status()
+            )));
+        }
+        let ep = inst
+            .endpoints()
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Worker(format!("worker {} has no ssh endpoint", t.id)))?;
+
+        // R50 step 2: what the worker presents right now.
+        let lines = self.host.keyscan(&ep);
+        if lines.is_empty() {
+            return Err(Error::Worker(format!(
+                "ssh-keyscan found no host key at {}:{}; refusing",
+                ep.host, ep.port
+            )));
+        }
+        let fingerprints = self.host.key_fingerprints(&lines);
+        if fingerprints.len() != lines.len() {
+            return Err(Error::Worker(
+                "could not fingerprint every presented host key; refusing".into(),
+            ));
+        }
+        let mut presented = Vec::new();
+        for (line, fp) in lines.iter().zip(&fingerprints) {
+            let Some((fingerprint, key_type)) = parse_keygen_line(fp) else {
+                return Err(Error::Worker(format!(
+                    "unexpected ssh-keygen output {fp:?}; refusing"
+                )));
+            };
+            if line.split_whitespace().count() < 3 {
+                return Err(Error::Worker(format!(
+                    "unexpected ssh-keyscan output {line:?}; refusing"
+                )));
+            }
+            presented.push(PresentedKey {
+                line: line.clone(),
+                fingerprint,
+                key_type,
+            });
+        }
+
+        // R50 step 3: the boot script logs each host key it generated, stamped
+        // with the boot time. Vast needs a moment to make the log available.
+        // Only a batch newer than the last accepted stamp may be trusted, so a
+        // stale log cannot re-authorise an old key.
+        let last = self.state.last_hostkey_stamp(t.id)?;
+        let deadline = self.host.now() + wait_secs;
+        loop {
+            let log = self.vast.logs(t.id)?;
+            if let Some(batch) = newest_hostkey_batch(&log, last) {
+                // R50 step 4: accept only a presented key whose type and
+                // fingerprint are in the batch.
+                let accepted: Vec<PresentedKey> = presented
+                    .iter()
+                    .filter(|key| {
+                        batch
+                            .keys
+                            .iter()
+                            .any(|(fp, ty)| fp == &key.fingerprint && ty == &key.key_type)
+                    })
+                    .cloned()
+                    .collect();
+                if accepted.is_empty() {
+                    return Err(Error::Worker(format!(
+                        "the worker presents {}, but the newest VI-HOSTKEY batch \
+                         (stamp {}) does not match; refusing the new host key",
+                        describe_keys(&presented),
+                        batch.stamp
+                    )));
+                }
+                self.rewrite_known_hosts(t.id, &accepted)?;
+                self.state.save_hostkey_stamp(t.id, batch.stamp)?;
+                if t.endpoint.as_ref() != Some(&ep) {
+                    t.endpoint = Some(ep.clone());
+                    self.state.save(&t)?;
+                }
+                self.host.log(&format!(
+                    "accepted a host-key rotation for instance {} (stamp {}): {}; \
+                     only a reattach continues, no inputs are sent",
+                    t.id,
+                    batch.stamp,
+                    describe_keys(&accepted)
+                ));
+                return Ok(Rotation {
+                    endpoint: ep,
+                    stamp: batch.stamp,
+                    fingerprints: accepted.iter().map(|k| k.fingerprint.clone()).collect(),
+                });
+            }
+            if self.host.now() >= deadline {
+                return Err(Error::Worker(format!(
+                    "no new VI-HOSTKEY line from worker {} within {wait_secs} seconds; \
+                     refusing the new host key",
+                    t.id
+                )));
+            }
+            self.host.sleep(30);
+        }
+    }
+
+    /// Removes this instance's old entry for the scanned host and appends the
+    /// accepted key lines. `ssh-keygen -R` never touches other hosts or other
+    /// instances' files.
+    fn rewrite_known_hosts(&self, id: u64, keys: &[PresentedKey]) -> Result<()> {
+        use std::io::Write as _;
+
+        let path = self.state.known_hosts(id);
+        let host = keys[0]
+            .line
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| Error::Worker("the ssh-keyscan line has no host".into()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(crate::io_err(parent))?;
+        }
+        if !path.exists() {
+            std::fs::write(&path, b"").map_err(crate::io_err(&path))?;
+        }
+        let status = Command::new("ssh-keygen")
+            .args(["-R", host, "-f"])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            return Err(Error::Worker(format!(
+                "could not remove the old host key for {host} from {}; refusing",
+                path.display()
+            )));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(crate::io_err(&path))?;
+        for key in keys {
+            writeln!(file, "{}", key.line).map_err(crate::io_err(&path))?;
+        }
+        Ok(())
     }
 
     /// Destroys the tracked worker and any other instance carrying our label.
@@ -447,6 +819,13 @@ impl<V: Vast, H: Host> Cloud<V, H> {
 /// nothing by being replaced, so `up` destroys them instead of restarting.
 fn stopped(inst: &Instance) -> bool {
     inst.status() == "exited" || inst.intended_status.as_deref() == Some("stopped")
+}
+
+fn describe_keys(keys: &[PresentedKey]) -> String {
+    keys.iter()
+        .map(|k| format!("{} {}", k.key_type, k.fingerprint))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn failed(inst: &Instance) -> Option<String> {
