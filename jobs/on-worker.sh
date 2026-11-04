@@ -52,15 +52,18 @@ fi
 : "${VI_STAGE:?on-worker.sh runs from \`vi dataset run\`}" "${VI_OUT:?}" "${VI_SETTINGS:?}"
 vi=${VI_BIN:-vi}
 
-# A stage may name a home-disk floor (min_home_gb) and the epoch count to
-# verify before success (expect_epochs). Read both from the settings JSON once;
-# the worker never sees either value.
+# A stage may name a home-disk floor (min_home_gb), a reserve for the checkpoint
+# bytes it will publish home (home_gate_reserve_gb), and the epoch count to
+# verify before success (expect_epochs). Read them from the settings JSON once;
+# the worker never sees any of them.
 min_home_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("min_home_gb",""))' "$VI_SETTINGS")
+reserve_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("home_gate_reserve_gb",""))' "$VI_SETTINGS")
 expect_epochs=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("expect_epochs",""))' "$VI_SETTINGS")
-# Refuse to start under the floor before anything is packed or a worker looked
-# up, so the GPU is never billed with too little home disk to hold the result.
+# Refuse to start under the floor plus the reserve before anything is packed or
+# a worker looked up, so the GPU is never billed with too little home disk to
+# hold the result.
 if [ -n "$min_home_gb" ]; then
-  python3 "$jobs_dir/checkpoints.py" gate "$HOME" --min-gb "$min_home_gb"
+  python3 "$jobs_dir/checkpoints.py" gate "$HOME" --min-gb "$min_home_gb" --reserve-gb "${reserve_gb:-0}"
 fi
 
 # Pack each large input into one zstd'd tar at home before touching the
@@ -87,8 +90,15 @@ if command -v zstd >/dev/null 2>&1; then
     else
       mkdir -p "$bundle_dir"
       t0=$(date +%s%N)
-      nice -n 19 ionice -c2 -n7 tar -C "$dir" -cf - . | nice -n 19 ionice -c2 -n7 zstd -q -T0 -3 -o "$f.part"
-      mv "$f.part" "$f"
+      # One packer at a time per bundle dir. A killed pack leaves `$f.part`
+      # behind and zstd refuses to overwrite it, so take the lock, drop the
+      # debris, and let zstd replace it.
+      (
+        flock 9
+        rm -f "$f.part"
+        nice -n 19 ionice -c2 -n7 tar -C "$dir" -cf - . | nice -n 19 ionice -c2 -n7 zstd -q -f -T0 -3 -o "$f.part"
+        mv "$f.part" "$f"
+      ) 9>"$bundle_dir/.lock"
       ms=$((($(date +%s%N) - t0) / 1000000 + 1))
       echo "on-worker.sh: packed ${var#VI_INPUT_}: $((kb / 1024)) MB read in $((ms / 1000)) s ($((kb * 1000 / ms / 1024)) MB/s from disk), $(($(stat -c %s "$f") / 1048576)) MB to send" >&2
     fi
@@ -334,6 +344,10 @@ if [ -n "$checkpoint" ]; then
   syncer=$!
 fi
 
+# From the launch until a verified result is home, keep the worker's copy: a
+# signal (Ctrl-C, TERM), a crash, or a failed push must leave it for a re-push
+# or a reattach, so cleanup never deletes un-pushed work.
+keep_work=1
 set +e
 remote "$script"
 rc=$?
@@ -353,6 +367,9 @@ if [ $rc -eq 0 ]; then
       exit 1
     fi
   fi
+  # The result is home and verified (when the stage asked for verification), so
+  # the worker's copy may go.
+  keep_work=
 else
   echo "on-worker.sh: $1 exited with $rc on the worker" >&2
   keep_work=1

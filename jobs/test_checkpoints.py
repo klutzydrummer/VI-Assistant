@@ -1,5 +1,6 @@
 """Tests for checkpoints.py (standard library only, tiny files in temp dirs)."""
 
+import json
 import os
 import tempfile
 import unittest
@@ -33,6 +34,15 @@ def _verified_run(root, n):
 
 def _epoch_names(run):
     return sorted(p.name for p in run.glob("epoch-*") if not p.name.endswith(".part"))
+
+
+def _snapshot(root):
+    """Every entry under `root` with its bytes, for byte-for-byte comparisons."""
+    out = {}
+    for p in sorted(Path(root).rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        out[rel] = b"<dir>" if p.is_dir() else p.read_bytes()
+    return out
 
 
 class PublishTest(unittest.TestCase):
@@ -78,6 +88,25 @@ class PublishTest(unittest.TestCase):
             sums = (publish / "epoch-0" / "SHA256SUMS").read_text()
             self.assertNotIn("style.safetensors", sums)
             self.assertFalse((publish / "epoch-0" / "style.safetensors").exists())
+
+    def test_publish_epoch_refuses_target_under_home_checkpoints(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            home = root / "home"
+            publish = home / ".cache" / "vi" / "checkpoints" / "stage" / "run"
+            publish.mkdir(parents=True)
+            _epoch(publish, 0, {"talker.safetensors": b"old", "tune.json": b"{}"})
+            (publish / "notes.txt").write_text("keep me")
+            before = _snapshot(publish)
+            ep = root / "src" / "epoch-1"
+            ep.mkdir(parents=True)
+            (ep / "talker.safetensors").write_bytes(b"new")
+            (ep / "tune.json").write_bytes(b"{}")
+            with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                with self.assertRaises(SystemExit):
+                    checkpoints.publish_epoch(ep, publish)
+            # The guard fires before any mkdir or rmtree: nothing changed.
+            self.assertEqual(_snapshot(publish), before)
 
     def test_publish_epoch_raises_on_missing_required_file(self):
         for missing in ("talker.safetensors", "tune.json"):
@@ -232,6 +261,29 @@ class PruneTest(unittest.TestCase):
                 checkpoints.prune(run, 0, yes=True)
             self.assertEqual(len(_epoch_names(run)), 3)
 
+    def test_prune_refuses_unverified_and_leaves_every_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for k in range(3):
+                _epoch(run, k, {"talker.safetensors": f"w{k}".encode(), "tune.json": b"{}"})
+            (run / "logs").mkdir()
+            (run / "logs" / "train.log").write_text("line\n")
+            before = _snapshot(run)
+            with self.assertRaises(SystemExit):
+                checkpoints.prune(run, 0, yes=True)
+            self.assertEqual(_snapshot(run), before)
+
+    def test_prune_refuses_abandoned_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for k in range(3):
+                _epoch(run, k, {"talker.safetensors": f"w{k}".encode(), "tune.json": b"{}"})
+            (run / "ABANDONED").write_text('{"reason": "gave up"}\n')
+            before = _snapshot(run)
+            with self.assertRaises(SystemExit):
+                checkpoints.prune(run, 0, yes=True)
+            self.assertEqual(_snapshot(run), before)
+
     def test_prune_dry_run_deletes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             run = _verified_run(Path(d), 3)
@@ -308,6 +360,33 @@ class MarkerTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     checkpoints.verify(run, 1)
             self.assertTrue((state / "unverified" / "stage-eq").exists())
+
+
+class AbandonTest(unittest.TestCase):
+    def test_abandon_clears_exact_marker_and_keeps_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = root / "state"
+            run = root / "runs" / "checkpoint"
+            unrelated = root / "other" / "checkpoint"
+            marker_dir = state / "unverified"
+            marker_dir.mkdir(parents=True)
+            (marker_dir / "stage-eq").write_text(f"{run}\n")
+            (marker_dir / "stage-parent").write_text(f"{run.parent}\n")
+            (marker_dir / "stage-other").write_text(f"{unrelated}\n")
+            _epoch(run, 0, {"talker.safetensors": b"a", "tune.json": b"b"})
+            (run / "notes.txt").write_text("keep me")
+            before = _snapshot(run)
+            with mock.patch.dict(os.environ, {"VI_STATE_DIR": str(state)}):
+                checkpoints.abandon(run, "gave up on this attempt")
+            after = _snapshot(run)
+            for rel, data in before.items():
+                self.assertEqual(after.get(rel), data, rel)
+            record = json.loads((run / "ABANDONED").read_text())
+            self.assertEqual(record["reason"], "gave up on this attempt")
+            self.assertFalse((marker_dir / "stage-eq").exists())
+            self.assertTrue((marker_dir / "stage-parent").exists())
+            self.assertTrue((marker_dir / "stage-other").exists())
 
 
 if __name__ == "__main__":

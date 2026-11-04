@@ -394,7 +394,8 @@ class VoiceTuneTest(unittest.TestCase):
     def test_check_abort_cases(self):
         step = lambda s, loss, peak=1.0: {"step": s, "loss": loss, "peak_gb": peak}  # noqa: E731
         self.assertEqual(voicetune.check_abort([step(1, 4.5)], 0), "step-1 loss > 4.0")
-        self.assertEqual(voicetune.check_abort([step(1, 0.5), step(2, float("nan"))], 0), "NaN loss")
+        self.assertEqual(voicetune.check_abort([step(1, 0.5), step(2, float("nan"))], 0), "non-finite loss")
+        self.assertEqual(voicetune.check_abort([step(1, 0.5), step(2, float("inf"))], 0), "non-finite loss")
         # Genuinely rising: 50 flat steps then 10 at +50%, so the windowed mean is up 50%.
         rising = [step(i + 1, 1.0) for i in range(50)] + [step(i + 51, 1.5) for i in range(10)]
         self.assertIn("loss rising", voicetune.check_abort(rising, 0))
