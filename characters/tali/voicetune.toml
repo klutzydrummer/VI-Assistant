@@ -46,7 +46,7 @@ home_gate_reserve_gb = 27
 [stage.voicetune_preflight]
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
 inputs = ["voicetune_data"]
-files = ["../../jobs/voicetune-fresh.sh", "../../jobs/voicetune.py",
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/voicetune.py",
          "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
 manual = true
 
@@ -57,12 +57,14 @@ home_gate_reserve_gb = 27
 
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_train`
 # only after the preflight checkpoint is verified and Brandon okays the paid
-# run. jobs/voicetune-fresh.sh train runs 6 epochs, pushes each home as it
-# lands, aborts on bad loss/memory/time, then builds the unblinded platter.
+# run. jobs/voicetune-fresh.sh train runs 6 epochs through worker-job.sh, which
+# survives the stage session dying, holds the job lock and restarts a crash
+# with --resume; it pushes each home as it lands, aborts on bad loss/memory/time,
+# then builds the unblinded platter.
 [stage.voicetune_train]
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "train"]
 inputs = ["voicetune_data"]
-files = ["../../jobs/voicetune-fresh.sh", "../../jobs/voicetune.py",
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/voicetune.py",
          "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
 manual = true
 

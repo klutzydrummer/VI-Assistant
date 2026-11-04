@@ -1,38 +1,52 @@
 #!/bin/bash
-# vi-worker boot script. `vi cloud up` fills in the limits and hands it to
-# Vast.ai, which runs it when the instance starts. It installs what
-# jobs/on-worker.sh needs and a watchdog that destroys this instance after
-# @IDLE_MINUTES@ minutes with no job or ssh session, or @MAX_MINUTES@ minutes
-# after boot (0 = no limit), so a forgotten worker can't drain the credit
-# while the home machine is asleep.
-mkdir -p /root/vi-jobs && touch /root/vi-jobs/.active
-# Keep the first boot time across container restarts, so max_hours counts from
-# the first start instead of resetting. Job dirs are never wiped here: a
-# restart must not destroy un-pushed work.
-[ -s /root/vi-jobs/.boot ] || date +%s >/root/vi-jobs/.boot
-# gcc: Triton (vLLM, and transformers models that use it) compiles a small
-# helper at run time, and the pytorch runtime image ships no compiler.
-# sox: qwen-tts calls it (voicesteer).
-for t in rsync curl pgrep gcc sox; do command -v $t >/dev/null || missing=1; done
-[ -n "$missing" ] && { apt-get update -qq; apt-get install -y -qq rsync curl procps gcc sox; } >/var/log/vi-onstart.log 2>&1
+# vi-worker boot: job tools, host keys, release watchdog.
+export R=/root/vi-jobs
+mkdir -p $R && touch $R/.active
+[ -s $R/.boot ] || date +%s >$R/.boot
+date +%s >$R/.this-boot
+for t in rsync curl pgrep gcc sox setsid flock; do command -v $t >/dev/null || missing=1; done
+[ -n "$missing" ] && { apt-get update -qq; apt-get install -y -qq rsync curl procps gcc sox util-linux; } >/var/log/vi-onstart.log 2>&1
+# No ssh port: home gets it from the authenticated instance API.
+for f in /etc/ssh/ssh_host_*_key.pub; do [ -e "$f" ] || continue; echo "VI-HOSTKEY $(date +%s) $(ssh-keygen -lf "$f")"; done | tee -a /var/log/vi-hostkey.log
 cat >/root/vi-watchdog.sh <<'EOF'
-IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(cat /root/vi-jobs/.boot)
+IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(cat $R/.boot)
+PH=$((${PENDING_HOLD:-120} * 60)) RM=${RECOVERY_MINUTES:-30}
 API=https://console.vast.ai/api/v0/instances/$CONTAINER_ID/
-release() {
-  echo "$(date -u) releasing: $1" >>/var/log/vi-watchdog.log
-  for _ in 1 2 3; do
-    curl -fsS -X DELETE -H "Authorization: Bearer $CONTAINER_API_KEY" "$API" && exit 0
-    sleep 30
-  done
-  # Stopping at least ends the GPU charge; disk is billed until destroyed.
-  curl -fsS -X PUT -H "Authorization: Bearer $CONTAINER_API_KEY" \
-    -H 'Content-Type: application/json' -d '{"state":"stopped"}' "$API"
+A="Authorization: Bearer $CONTAINER_API_KEY"
+log(){ echo "$(date -u) $*" >>/var/log/vi-watchdog.log; }
+put(){ curl -fsS -X PUT -H "$A" -H 'Content-Type: application/json' -d '{"state":"stopped"}' "$API"; }
+del(){ curl -fsS -X DELETE -H "$A" "$API"; }
+release(){
+  log "release: $1"
+  if ls $R/*/pending/* >/dev/null 2>&1; then
+    for _ in 1 2 3; do put&&{ touch $R/.stopped-at; log stopped; exit; }; sleep 30; done
+    log stop-failed; del
+  else
+    for _ in 1 2 3; do del&&{ log destroyed; exit; }; sleep 30; done
+    log destroy-failed; put
+  fi
+  exit
 }
+log start
 while sleep 60; do
-  now=$(date +%s)
-  pgrep -f 'sshd: [^ ]+@' >/dev/null && touch /root/vi-jobs/.active
-  [ $((now - $(stat -c %Y /root/vi-jobs/.active))) -ge $IDLE ] && release idle
-  [ $MAX -gt 0 ] && [ $((now - BOOT)) -ge $MAX ] && release max-hours
+  now=$(date +%s); ssh=0; l=0; t=0; p=0; rc=0; g=0
+  pgrep -f 'sshd: [^ ]+@' >/dev/null&&ssh=1
+  for d in $R/*/; do
+    [ -d "$d" ]||continue
+    [ -e "$d/job.lock" ]&&! flock -n "$d/job.lock" true 2>/dev/null&&l=1
+    [ -s "$d/train.pid" ]&&kill -0 "$(cat "$d/train.pid")" 2>/dev/null&&t=1
+    ls "$d"/pending/* >/dev/null 2>&1&&p=1
+    [ -s "$d/rc" ]&&{ rc=1; rct=$(stat -c %Y "$d/rc"); }
+  done
+  find $R -mindepth 2 -newermt "@$((now-IDLE))" -print -quit 2>/dev/null|grep -q .&&g=1
+  live=$ssh
+  [ $live = 0 ]&&[ $((l+t+p)) -gt 0 ]&&[ $g = 1 ]&&live=1
+  if [ $live = 1 ];then touch $R/.active
+  elif [ $l = 0 ]&&[ $t = 0 ]&&[ $p = 1 ]&&[ $rc = 1 ];then
+    [ $((now-rct)) -ge $PH ]&&release pending
+  elif [ $((now-$(stat -c %Y $R/.active))) -ge $IDLE ];then release idle;fi
+  if [ -e $R/.stopped-at ];then S=$(cat $R/.this-boot 2>/dev/null||echo $BOOT); M=$((RM*60)); else S=$BOOT; M=$MAX; fi
+  [ $M -gt 0 ]&&[ $((now-S)) -ge $M ]&&release max-hours
 done
 EOF
 nohup bash /root/vi-watchdog.sh >/dev/null 2>&1 &

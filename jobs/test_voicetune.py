@@ -1,6 +1,7 @@
 """Tests for voicetune.py's pure parts (no model). Run with `python3 -m unittest discover -s jobs`."""
 
 import json
+import os
 import re
 import unittest
 from unittest import mock
@@ -467,6 +468,137 @@ class VoiceTuneTest(unittest.TestCase):
         for key in ("torch", "cuda", "bf16", "nvidia", "sox", "gcc", "g++", "free_disk_gb", "generate", "ok"):
             self.assertIn(key, out)
         self.assertEqual(out["generate"]["wav"], "x.wav")
+
+
+    def test_loader_respects_vi_num_workers_env(self):
+        # worker-job.sh exports VI_NUM_WORKERS=0 only on an OOM retry; the
+        # loader must pass it through and default to 0 processes.
+        import sys
+        import types
+
+        saved = {name: sys.modules.get(name)
+                 for name in ("torch", "torch.utils", "torch.utils.data", "dataset")}
+        calls = {}
+        torch = types.ModuleType("torch")
+        torch.tensor = lambda x: x
+        torch.utils = types.ModuleType("torch.utils")
+        torch.utils.data = types.ModuleType("torch.utils.data")
+
+        class _Loader:
+            def __init__(self, ds, **kw):
+                calls["num_workers"] = kw.get("num_workers")
+
+        torch.utils.data.DataLoader = _Loader
+        dataset = types.ModuleType("dataset")
+
+        class _Dataset:
+            collate_fn = None
+
+            def __init__(self, data, processor, config):
+                self.data_list = data
+
+        dataset.TTSDataset = _Dataset
+        sys.modules.update({"torch": torch, "torch.utils": torch.utils,
+                            "torch.utils.data": torch.utils.data, "dataset": dataset})
+        try:
+            def workers():
+                voicetune.loader([{"ref_audio": "r.wav"}], mock.Mock(), mock.Mock(),
+                                 2, False, 0, {}, "/nonexistent")
+                return calls["num_workers"]
+
+            with mock.patch.dict(os.environ, {"VI_NUM_WORKERS": "3"}):
+                self.assertEqual(workers(), 3)
+            with mock.patch.dict(os.environ, {"VI_NUM_WORKERS": "0"}):
+                self.assertEqual(workers(), 0)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("VI_NUM_WORKERS", None)
+                self.assertEqual(workers(), 0)
+        finally:
+            for name, mod in saved.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+    def test_resume_after_kill_continues_from_last_epoch(self):
+        # A run killed mid-epoch leaves epoch-0 and resume.pt; a fresh process
+        # must restart at epoch 1 with the step counter intact.
+        try:
+            import torch
+            from safetensors.torch import save_file
+        except ImportError:
+            self.skipTest("no torch/safetensors")
+        import subprocess
+        import sys
+        import tempfile
+        import time
+        import types
+        from pathlib import Path
+
+        child = """
+import sys, time
+from pathlib import Path
+import torch
+from safetensors.torch import save_file
+import voicetune
+
+out = Path(sys.argv[1])
+talker = torch.nn.Linear(2, 2)
+heads = {"speaker": torch.nn.Linear(1, 1)}
+(out / "epoch-0").mkdir()
+save_file(talker.state_dict(), str(out / "epoch-0" / "talker.safetensors"))
+opt = torch.optim.SGD(list(talker.parameters()) + list(heads["speaker"].parameters()), lr=0.1)
+gen = torch.Generator().manual_seed(7)
+voicetune.save_resume(out, 0, 3, heads, opt, gen)
+(out / "ready").write_text("1")
+time.sleep(60)
+"""
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "run"
+            out.mkdir()
+            env = dict(os.environ, PYTHONPATH=str(Path(voicetune.__file__).resolve().parent))
+            proc = subprocess.Popen([sys.executable, "-c", child, str(out)],
+                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.time() + 120
+                while not (out / "ready").exists():
+                    if proc.poll() is not None:
+                        _, err = proc.communicate()
+                        self.fail("the first run died before epoch 0: " + err.decode())
+                    if time.time() > deadline:
+                        self.fail("the first run never finished epoch 0")
+                    time.sleep(0.05)
+                proc.kill()  # the process dies mid-epoch 1, as a crash would
+                proc.wait(timeout=30)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            self.assertEqual(proc.returncode, -9)
+
+            def fresh():
+                talker = torch.nn.Linear(2, 2)
+                heads = {"speaker": torch.nn.Linear(1, 1)}
+                opt = torch.optim.SGD(
+                    list(talker.parameters()) + list(heads["speaker"].parameters()), lr=0.1)
+                return types.SimpleNamespace(talker=talker), heads, opt, torch.Generator()
+
+            model, heads, opt, gen = fresh()
+            step, first = voicetune.resume_state(out, model, None, None, heads, opt, gen)
+            self.assertEqual((step, first), (3, 1))
+            self.assertFalse((out / "resume.pt.tmp").exists())  # saved by atomic replace
+
+            # Epoch 1 finishes, then another crash; resume picks up at step 4.
+            with torch.no_grad():
+                for p in model.talker.parameters():
+                    p.add_(0.5)
+            (out / "epoch-1").mkdir()
+            save_file(model.talker.state_dict(), str(out / "epoch-1" / "talker.safetensors"))
+            voicetune.save_resume(out, 1, 4, heads, opt, gen)
+            model2, heads2, opt2, gen2 = fresh()
+            self.assertEqual(
+                voicetune.resume_state(out, model2, None, None, heads2, opt2, gen2), (4, 2))
+            self.assertTrue(torch.equal(model2.talker.weight, model.talker.weight))
 
 
 if __name__ == "__main__":

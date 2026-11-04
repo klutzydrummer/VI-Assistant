@@ -66,6 +66,7 @@ import argparse
 import functools
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -594,7 +595,11 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
     data = [{**r, "_ref": r["ref_audio"], "ref_audio": fixed} for r in rows]
     ds = WithVoice(data, tts.processor, config)
     g = torch.Generator().manual_seed(seed) if shuffle else None
-    return DataLoader(ds, batch_size=size, shuffle=shuffle, generator=g, collate_fn=ds.collate_fn)
+    # Loader processes multiply the model's memory; worker-job.sh sets
+    # VI_NUM_WORKERS=0 on a retry only after the cgroup oom_kill counter rose.
+    workers = int(os.environ.get("VI_NUM_WORKERS", "0"))
+    return DataLoader(ds, batch_size=size, shuffle=shuffle, generator=g,
+                      collate_fn=ds.collate_fn, num_workers=workers)
 
 
 def forward(model, batch, voice):

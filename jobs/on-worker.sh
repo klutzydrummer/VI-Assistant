@@ -319,14 +319,11 @@ for arg in "$@"; do
   cmd+=" $(q "$arg")"
 done
 active=$(q "$root/.active")
-# The worker's watchdog releases it after idle_minutes without this file
-# changing, so touch it while the job runs.
+# The watchdog watches the job dirs for file changes, so the job itself needs
+# no heartbeat; the final touch marks the job's end for the idle timer.
 script="cd $(q "$work") && export $exports && {
-  (while sleep 60; do touch $active; done) >/dev/null 2>&1 &
-  hb=\$!
   $cmd
   rc=\$?
-  kill \$hb
   touch $active
   exit \$rc
 }"

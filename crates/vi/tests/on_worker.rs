@@ -3,11 +3,68 @@
 
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const VI: &str = env!("CARGO_BIN_EXE_vi");
+
+fn jobs_file(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../jobs")
+        .join(name)
+        .canonicalize()
+        .unwrap()
+}
+
+/// Test-only pids: `kill -0` checks liveness without signalling anything else.
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn wait_until(what: &str, seconds: u64, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !cond() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The stage session dying signals its whole process group, as sshd does.
+fn hup_group(pgid: u32) {
+    let ok = Command::new("kill")
+        .args(["-HUP", &format!("-{pgid}")])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "could not HUP process group {pgid}");
+}
+
+fn run_worker_job(dir: &Path, run: &Path, cmd: &[&str], envs: &[(&str, String)]) -> Output {
+    let work = dir.join("work");
+    let mut c = Command::new("bash");
+    c.arg(jobs_file("worker-job.sh"))
+        .args([
+            "--work",
+            work.to_str().unwrap(),
+            "--run",
+            run.to_str().unwrap(),
+            "--",
+        ])
+        .args(cmd)
+        .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    c.output().unwrap()
+}
 
 fn on_worker() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -609,4 +666,437 @@ fn check_worker_round_trips_a_token() {
     assert!(stdout.contains("check-worker: OK"), "{stdout}");
     assert!(stdout.contains("gpu: "), "{stdout}");
     assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+}
+
+/// Row 1: the stage session's sshd dies mid-job. The trainer runs in its own
+/// session (and the wrapper in another), so both survive the group HUP and the
+/// wrapper still records the trainer's exit code.
+#[test]
+fn detached_job_survives_stage_session_kill() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let job = r#"w=$(dirname "$VI_OUT")
+jobs/worker-job.sh --work "$w/wj" --run "$w/run" -- sh -c 'sleep 3'"#;
+    let mut child = command_settings(dir.path(), job, "judge = \"gemma\"", &[])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let (work, trainer) = {
+        let mut found = None;
+        let mut scan = || {
+            if let Ok(entries) = fs::read_dir(dir.path().join("worker")) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if !p
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("on-gpu.")
+                    {
+                        continue;
+                    }
+                    if let Ok(s) = fs::read_to_string(p.join("wj/train.pid")) {
+                        if let Ok(pid) = s.trim().parse::<u32>() {
+                            found = Some((p, pid));
+                        }
+                    }
+                }
+            }
+            found.is_some()
+        };
+        wait_until("the detached job never wrote train.pid", 30, &mut scan);
+        found.unwrap()
+    };
+
+    hup_group(child.id());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        pid_alive(trainer),
+        "the trainer died with the stage session"
+    );
+    let worker: u32 = fs::read_to_string(work.join("wj/worker.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        pid_alive(worker),
+        "the detached runner died with the stage session"
+    );
+
+    let rc_file = work.join("wj/rc");
+    wait_until("the detached runner never wrote rc", 20, || {
+        rc_file.is_file()
+    });
+    assert_eq!(fs::read_to_string(&rc_file).unwrap().trim(), "0");
+    let _ = child.wait();
+}
+
+/// Row 12: abort.json means the supervisor stopped the run; never restart it.
+#[test]
+fn wj_does_not_retry_after_abort_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("abort.json"), "{}").unwrap();
+    let count = dir.path().join("count");
+    let out = run_worker_job(
+        dir.path(),
+        &run,
+        &[
+            "sh",
+            "-c",
+            "echo x >> \"$1\"; exit 1",
+            "sh",
+            count.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("work/rc"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+}
+
+/// Row 12: a lock collision (exit 75) is another job, not a crash; the command
+/// must not run and must not be retried.
+#[test]
+fn wj_does_not_retry_lock_collision_exit_75() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let run = dir.path().join("run");
+    fs::create_dir_all(&work).unwrap();
+    fs::create_dir_all(&run).unwrap();
+    let lock = work.join("job.lock");
+    fs::write(&lock, "").unwrap();
+    let mut holder = Command::new("flock")
+        .arg(&lock)
+        .arg("sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the test could not take the job lock", 10, || {
+        !Command::new("flock")
+            .args(["-n", lock.to_str().unwrap(), "true"])
+            .status()
+            .unwrap()
+            .success()
+    });
+
+    let marker = dir.path().join("ran");
+    let out = run_worker_job(
+        dir.path(),
+        &run,
+        &[
+            "sh",
+            "-c",
+            "echo ran > \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "{stderr}");
+    assert!(!marker.exists(), "the command ran despite the held lock");
+    assert_eq!(fs::read_to_string(work.join("rc")).unwrap().trim(), "75");
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
+
+/// Row 14: rc 137 alone is not OOM. Only a rise in cgroup v2's oom_kill
+/// counter lowers VI_NUM_WORKERS; without the counter, retry unchanged once.
+#[test]
+fn wj_reduces_workers_only_when_oom_kill_counter_rises() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    fs::create_dir_all(&run).unwrap();
+    let events = dir.path().join("memory.events");
+    let seen = dir.path().join("workers");
+    // The first attempt (unset) fakes an OOM kill and fails; only the retry
+    // with VI_NUM_WORKERS=0 succeeds.
+    fs::write(&events, "oom_kill 1\n").unwrap();
+    let script = "echo \"${VI_NUM_WORKERS-unset}\" >> \"$1\"\n\
+                  [ \"${VI_NUM_WORKERS-}\" = 0 ] && exit 0\n\
+                  echo 'oom_kill 2' > \"$2\"\nexit 137";
+    let out = run_worker_job(
+        dir.path(),
+        &run,
+        &[
+            "sh",
+            "-c",
+            script,
+            "sh",
+            seen.to_str().unwrap(),
+            events.to_str().unwrap(),
+        ],
+        &[("VI_MEMORY_EVENTS", events.display().to_string())],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&seen)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["unset", "0"]
+    );
+
+    // The same failure with a flat counter retries unchanged.
+    let flat = dir.path().join("flat.events");
+    fs::write(&flat, "oom_kill 1\n").unwrap();
+    let seen_flat = dir.path().join("workers-flat");
+    let script = "echo \"${VI_NUM_WORKERS-unset}\" >> \"$1\"\nexit 137";
+    let work2 = dir.path().join("work2");
+    let out = Command::new("bash")
+        .arg(jobs_file("worker-job.sh"))
+        .args([
+            "--work",
+            work2.to_str().unwrap(),
+            "--run",
+            run.to_str().unwrap(),
+            "--retries",
+            "1",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            seen_flat.to_str().unwrap(),
+        ])
+        .env("VI_MEMORY_EVENTS", &flat)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(137), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&seen_flat)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["unset", "unset"]
+    );
+
+    // No cgroup v2 memory.events at all: retry unchanged, but only once.
+    let seen_none = dir.path().join("workers-none");
+    let work3 = dir.path().join("work3");
+    let out = Command::new("bash")
+        .arg(jobs_file("worker-job.sh"))
+        .args([
+            "--work",
+            work3.to_str().unwrap(),
+            "--run",
+            run.to_str().unwrap(),
+            "--retries",
+            "2",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            seen_none.to_str().unwrap(),
+        ])
+        .env("VI_MEMORY_EVENTS", dir.path().join("absent"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(137));
+    assert_eq!(
+        fs::read_to_string(&seen_none)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["unset", "unset"]
+    );
+}
+
+/// Row 38: voicetune-fresh.sh dying (HUP from the stage session, then its own
+/// abort/teardown) must not kill the trainer; worker-job.sh keeps it running
+/// and records the exit. The home supervisor's relaunch is a later task.
+#[test]
+fn trainer_survives_vf_kill() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let vf = jobs_file("voicetune-fresh.sh");
+    let text = fs::read_to_string(&vf).unwrap();
+    let rev = text
+        .lines()
+        .find_map(|l| l.strip_prefix("qwen_rev="))
+        .expect("voicetune-fresh.sh names the qwen revision")
+        .trim();
+    let ft = home.join(format!(".cache/vi/Qwen3-TTS-{rev}/finetuning"));
+    fs::create_dir_all(&ft).unwrap();
+    fs::write(ft.join("dataset.py"), "").unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let work = dir.path().join("work");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    // A stand-in for the qwen-tts venv: passes the check gate, then is the
+    // long-running trainer.
+    let py = dir.path().join("py");
+    fs::write(
+        &py,
+        "#!/bin/sh\ncase \"$*\" in\n\
+         *'voicetune.py train'*) exec sleep 30 ;;\n\
+         *'voicetune.py check'*)\n\
+         out=; prev=; for a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+         mkdir -p \"$out\"; echo '{\"vram_gb\": 80, \"free_disk_gb\": 500}' > \"$out/check.json\"\n\
+         exit 0 ;;\n\
+         *) exit 0 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut child = Command::new("bash")
+        .arg(&vf)
+        .arg("train")
+        .env("VI_OUT", &out_dir)
+        .env("VI_RETURN_PORT", "1")
+        .env("VI_INPUT_VOICETUNE_DATA", &data)
+        .env("QWEN_TTS_PYTHON", &py)
+        .env("VI_TRAIN_RETRIES", "0")
+        .env("HOME", &home)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let trainer = {
+        let mut pid = 0;
+        wait_until("voicetune-fresh.sh never started the trainer", 30, || {
+            pid = fs::read_to_string(work.join("train.pid"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            pid != 0
+        });
+        pid
+    };
+    assert!(pid_alive(trainer));
+
+    hup_group(child.id());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "voicetune-fresh.sh did not exit after the session HUP"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
+    assert!(
+        pid_alive(trainer),
+        "the trainer died with voicetune-fresh.sh"
+    );
+    let worker: u32 = fs::read_to_string(work.join("worker.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        pid_alive(worker),
+        "the detached runner died with the session"
+    );
+
+    // A trainer killed by its own failure ends this wrapper attempt (no
+    // retries); the wrapper exits and the home supervisor can relaunch later.
+    let _ = Command::new("kill")
+        .args(["-KILL", &trainer.to_string()])
+        .status();
+    wait_until("the wrapper never recorded the trainer's exit", 20, || {
+        work.join("rc").is_file()
+    });
+    assert_eq!(fs::read_to_string(work.join("rc")).unwrap().trim(), "137");
+    wait_until("the detached runner did not exit", 10, || {
+        !pid_alive(worker)
+    });
+}
+
+/// Row 38: a relaunched voicetune-fresh.sh that loses the job lock (exit 75)
+/// must not kill the attempt that holds it. The wrapper holding the lock wrote
+/// `$work/train.pid`, so the dying script's EXIT trap must leave that trainer
+/// alone; the lock holder stands in for the surviving attempt's trainer.
+#[test]
+fn vf_exit_75_does_not_kill_the_surviving_trainer() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let vf = jobs_file("voicetune-fresh.sh");
+    let text = fs::read_to_string(&vf).unwrap();
+    let rev = text
+        .lines()
+        .find_map(|l| l.strip_prefix("qwen_rev="))
+        .expect("voicetune-fresh.sh names the qwen revision")
+        .trim();
+    let ft = home.join(format!(".cache/vi/Qwen3-TTS-{rev}/finetuning"));
+    fs::create_dir_all(&ft).unwrap();
+    fs::write(ft.join("dataset.py"), "").unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let work = dir.path().join("work");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let py = dir.path().join("py");
+    fs::write(
+        &py,
+        "#!/bin/sh\ncase \"$*\" in\n\
+         *'voicetune.py train'*) exec sleep 60 ;;\n\
+         *'voicetune.py check'*)\n\
+         out=; prev=; for a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+         mkdir -p \"$out\"; echo '{\"vram_gb\": 80, \"free_disk_gb\": 500}' > \"$out/check.json\"\n\
+         exit 0 ;;\n\
+         *) exit 0 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Another attempt is alive and holds the job lock; its wrapper recorded
+    // its trainer's pid before this relaunch arrived.
+    let lock = work.join("job.lock");
+    fs::write(&lock, "").unwrap();
+    let mut holder = Command::new("flock")
+        .arg(&lock)
+        .arg("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the test could not take the job lock", 10, || {
+        !Command::new("flock")
+            .args(["-n", lock.to_str().unwrap(), "true"])
+            .status()
+            .unwrap()
+            .success()
+    });
+    fs::write(work.join("train.pid"), holder.id().to_string()).unwrap();
+
+    let out = Command::new("bash")
+        .arg(&vf)
+        .arg("train")
+        .env("VI_OUT", &out_dir)
+        .env("VI_RETURN_PORT", "1")
+        .env("VI_INPUT_VOICETUNE_DATA", &data)
+        .env("QWEN_TTS_PYTHON", &py)
+        .env("VI_TRAIN_RETRIES", "0")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "{stderr}");
+    assert!(
+        pid_alive(holder.id()),
+        "voicetune-fresh.sh killed the attempt that holds the job lock: {stderr}"
+    );
+    let _ = holder.kill();
+    let _ = holder.wait();
 }
