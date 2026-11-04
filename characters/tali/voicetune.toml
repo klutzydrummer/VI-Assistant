@@ -37,13 +37,18 @@ files = ["../../jobs/voicetune_data.sh", "../../jobs/voicetune_data.py",
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_preflight`
 # after `vi cloud up`. jobs/voicetune-fresh.sh preflight runs check --generate,
 # gates VRAM/disk, runs a 5-step probe at the real batch/accum/kl, pushes the
-# probe checkpoint home (must beat 8 MB/s) and speaks one line from it.
+# probe checkpoint home (must beat 3 MB/s) and speaks one line from it. The
+# probe epoch is verified at home before the stage reports success.
 [stage.voicetune_preflight]
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
 inputs = ["voicetune_data"]
 files = ["../../jobs/voicetune-fresh.sh", "../../jobs/voicetune.py",
          "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
 manual = true
+
+[stage.voicetune_preflight.settings]
+expect_epochs = 1
+min_home_gb = 50
 
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_train`
 # only after the preflight checkpoint is verified and Brandon okays the paid
@@ -55,3 +60,7 @@ inputs = ["voicetune_data"]
 files = ["../../jobs/voicetune-fresh.sh", "../../jobs/voicetune.py",
          "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
 manual = true
+
+[stage.voicetune_train.settings]
+expect_epochs = 6
+min_home_gb = 50

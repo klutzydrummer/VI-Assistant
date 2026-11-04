@@ -298,13 +298,67 @@ class VoiceTuneTest(unittest.TestCase):
             fake.return_value = None
             self.assertEqual(voicetune.main(["speak", "--run", "r", "--sentences", "s",
                                              "--seed", "3", "--unblind", "--title", "T", "--question", "Q",
-                                             "--delivery-from", "clip1=r.wav"]), 0)
+                                             "--delivery-from", "clip1=r.wav", "--no-plain"]), 0)
             a = fake.call_args.args[0]
             self.assertEqual(a.seed, 3)
             self.assertTrue(a.unblind)
             self.assertEqual(a.title, "T")
             self.assertEqual(a.question, "Q")
             self.assertEqual(a.delivery_from, ["clip1=r.wav"])
+            self.assertTrue(a.no_plain)
+            voicetune.main(["speak", "--run", "r", "--sentences", "s"])
+            a2 = fake.call_args.args[0]
+            self.assertFalse(a2.no_plain)
+
+    def test_speak_slots_no_plain_omits_plain_and_keeps_deliveries_in_order(self):
+        import sys
+        import types
+
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("no torch")
+
+        # speak_slots imports `from safetensors.torch import load_file` up front, even on the
+        # clip/mean path that never calls it; stub it so this pure test needs no safetensors.
+        saved = (sys.modules.get("safetensors"), sys.modules.get("safetensors.torch"))
+        sys.modules["safetensors"] = types.ModuleType("safetensors")
+        sys.modules["safetensors.torch"] = types.ModuleType("safetensors.torch")
+        sys.modules["safetensors.torch"].load_file = mock.Mock()
+        try:
+            voice = {"xvector": [0.1, 0.2, 0.3]}
+            tune = {"base": "base", "speaker": "clip"}  # clip/mean run: deliveries use Base's encoder
+            a = mock.Mock(game="le3", device="cpu")
+            ep = mock.Mock()
+            deliveries = [("x", "x.wav"), ("y", "y.wav")]
+            base = mock.Mock()
+            base.device = "cpu"
+            base.dtype = torch.float32
+            tts = mock.Mock(model=base)
+            with mock.patch.object(voicetune, "load_tts", return_value=tts), \
+                 mock.patch.object(voicetune, "mel", return_value=torch.zeros(1, 2)):
+                base.speaker_encoder.side_effect = [torch.tensor([[0.5, 0.6]]), torch.tensor([[0.7, 0.8]])]
+                slots = voicetune.speak_slots(a, tune, voice, ep, deliveries, no_plain=True)
+            self.assertEqual([k for k, _, _ in slots], ["delivery-of-x", "delivery-of-y"])
+            np.testing.assert_allclose([v for _, _, v in slots], [[0.5, 0.6], [0.7, 0.8]])
+            with mock.patch.object(voicetune, "load_tts", return_value=tts), \
+                 mock.patch.object(voicetune, "mel", return_value=torch.zeros(1, 2)):
+                base.speaker_encoder.side_effect = [torch.tensor([[0.5, 0.6]]), torch.tensor([[0.7, 0.8]])]
+                slots = voicetune.speak_slots(a, tune, voice, ep, deliveries)
+            self.assertEqual([k for k, _, _ in slots], ["plain", "delivery-of-x", "delivery-of-y"])
+        finally:
+            for name, mod in zip(("safetensors", "safetensors.torch"), saved):
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+    def test_speak_no_plain_requires_a_delivery_or_style(self):
+        a = mock.Mock(no_plain=True, delivery_from=[], style_from=[])
+        with self.assertRaises(SystemExit) as cm:
+            voicetune.cmd_speak(a)
+        self.assertIn("--no-plain", str(cm.exception))
+        self.assertIn("--delivery-from", str(cm.exception))
 
     def test_unblind_hub_shape_order_and_labels(self):
         lines = ["the first line", "the second line", "the third line"]

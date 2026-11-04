@@ -103,12 +103,13 @@ class WorkerReturnTest(unittest.TestCase):
 
     def test_start_accepts_relative_paths(self):
         # A detached daemon does not keep this cwd, so `start` must resolve
-        # OUT/CHECKPOINT/STATE to absolute paths before writing the config.
+        # OUT/CHECKPOINT/PUBLISH/STATE to absolute paths before writing the config.
         out = self.root / "rel-out"
         checkpoint = self.root / "rel-checkpoint"
+        publish = self.root / "rel-publish"
         state = self.root / "rel-state"
         started = subprocess.run(
-            [SCRIPT, "start", "rel-out", "rel-checkpoint", "rel-state"],
+            [SCRIPT, "start", "rel-out", "rel-checkpoint", "rel-state", "rel-publish"],
             cwd=self.root, check=True, capture_output=True, text=True,
         )
         try:
@@ -116,6 +117,7 @@ class WorkerReturnTest(unittest.TestCase):
             conf = (state / "rsyncd.conf").read_text()
             self.assertIn(f"path = {out}\n", conf)
             self.assertIn(f"path = {checkpoint}\n", conf)
+            self.assertIn(f"path = {publish}\n", conf)
             self.assertIn(f"pid file = {state}/rsyncd.pid\n", conf)
             (self.src / "out" / "rel.txt").write_text("relative\n")
             result = subprocess.run(
@@ -126,6 +128,45 @@ class WorkerReturnTest(unittest.TestCase):
             self.assertEqual((out / "rel.txt").read_text(), "relative\n")
         finally:
             subprocess.run([SCRIPT, "stop", str(state)], check=True, capture_output=True)
+
+    def test_publish_module_is_restricted_and_receives_epochs(self):
+        publish = self.root / "publish"
+        state = self.root / "pub-state"
+        started = subprocess.run(
+            [SCRIPT, "start", self.out, self.checkpoint, state, publish],
+            check=True, capture_output=True, text=True,
+        )
+        port = started.stdout.strip()
+        try:
+            conf = (state / "rsyncd.conf").read_text()
+            self.assertIn("[vi-publish]\n", conf)
+            self.assertIn(f"path = {publish.resolve()}\n", conf)
+            for line in ("read only = false\n", "write only = true\n",
+                         "refuse options = delete\n", "list = false\n",
+                         "hosts allow = 127.0.0.1\n"):
+                self.assertIn(line, conf)
+            # vi-publish stays hidden from the module list, like the others.
+            listing = subprocess.run(
+                ["rsync", f"rsync://127.0.0.1:{port}/"],
+                capture_output=True, text=True,
+            )
+            self.assertNotIn("vi-publish", listing.stdout)
+            (self.src / "publish" / "epoch-0").mkdir(parents=True)
+            (self.src / "publish" / "epoch-0" / "talker.safetensors").write_text("w0\n")
+            result = subprocess.run(
+                [SCRIPT, "push", str(self.src / "publish"), "vi-publish"],
+                env={**os.environ, "VI_RETURN_PORT": port}, check=True, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((publish / "epoch-0" / "talker.safetensors").read_text(), "w0\n")
+            # delete is refused on the publish module too.
+            refused = subprocess.run(
+                [SCRIPT, "push", str(self.src / "publish"), "vi-publish", "--delete"],
+                env={**os.environ, "VI_RETURN_PORT": port}, check=False, capture_output=True, text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+        finally:
+            subprocess.run([SCRIPT, "stop", state], check=True, capture_output=True)
 
     def test_receiver_refuses_download_and_delete(self):
         (self.out / "keep.txt").write_text("keep\n")

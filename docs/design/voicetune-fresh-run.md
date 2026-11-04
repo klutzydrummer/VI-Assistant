@@ -16,8 +16,8 @@ vi dataset run characters/tali/voicetune.toml voicetune_train      # GPU, manual
 The two GPU stages run `jobs/voicetune-fresh.sh` through `jobs/on-worker.sh`;
 the argument picks `preflight` (check `--generate`, gate VRAM/disk, a 5-step
 probe, push the probe home) or `train` (the real 6-epoch run). They are separate
-stages on purpose: separate `VI_STAGE` means separate home checkpoint dirs, so
-each can push its own epoch-0 without the two colliding in the return path.
+stages on purpose: separate `VI_STAGE` means separate durable home dirs and
+markers, so each attempt's epochs are kept and verified independently.
 
 On the worker, `voicetune-fresh.sh` first fetches the official Qwen3-TTS
 `finetuning/` folder (`dataset.py`) at the pinned commit
@@ -71,29 +71,37 @@ transcripts, seeded, reading only speaker id and transcript — no labels.
 
 ## Run order
 
-1. `python3 jobs/checkpoints.py gate /home --min-gb 50` — refuses to start
-   under 50 GiB free on `/home` (the checkpoints come home before `cloud down`).
-2. `vi dataset run characters/tali/voicetune.toml voicetune_data` — home, CPU,
+1. `vi dataset run characters/tali/voicetune.toml voicetune_data` — home, CPU,
    under `nice -n 19 ionice -c2 -n7`. See the note below about the home qwen-tts
    environment.
-3. `vi cloud up --cap <usd> --until <time>` — the approved cap and deadline for
+2. `vi cloud up --cap <usd> --until <time>` — the approved cap and deadline for
    the rental; `--until` is an RFC 3339 timestamp or `HH:MM` (today, local time).
-4. `vi dataset run characters/tali/voicetune.toml voicetune_preflight`.
-5. `vi dataset run characters/tali/voicetune.toml voicetune_train` — only after
+3. `vi dataset run characters/tali/voicetune.toml voicetune_preflight`.
+4. `vi dataset run characters/tali/voicetune.toml voicetune_train` — only after
    the preflight probe is verified and Brandon has okayed the paid run and its
    budget.
-6. Before `vi cloud down`, verify every pushed checkpoint so it refuses to
-   destroy the worker with an unverified one still at home:
+
+Each GPU stage now gates the home disk itself (its `min_home_gb` setting
+refuses to start under 50 GiB free), publishes every finished epoch into a
+fresh per-attempt durable dir, and verifies it before the stage reports
+success — 1 epoch for the probe, 6 for train. A failed or missing epoch fails
+the stage and keeps both the marker and the worker's copy, so nothing is lost.
+The durable dirs live under `~/.cache/vi/checkpoints/<stage>/<key>-<UTC stamp>/`
+(gitignored, outside `corpus/`, so neither the runner nor `vi dataset gc`
+touches them); `on-worker.sh` records each one's absolute path in a per-attempt
+marker `~/.local/state/vi/unverified/<stage>-<basename>`, which `vi cloud down`
+refuses to destroy past. A successful stage has already written its VERIFIED
+file and cleared its marker, so the operator's check is just a read.
+
+5. `vi cloud down`.
+
+After Brandon picks the epoch by ear, prune the kept run to two epochs (the
+prune refuses without a matching VERIFIED):
 
    ```
-   python3 jobs/checkpoints.py verify <preflight checkpoint dir> --expect 1
-   python3 jobs/checkpoints.py verify <train checkpoint dir>      --expect 6
+   nice -n 19 ionice -c2 -n7 python3 jobs/checkpoints.py prune \
+     ~/.cache/vi/checkpoints/voicetune_train/<key>-<stamp> --keep <k> --yes
    ```
-
-   Each checkpoint dir is the stage's `.checkpoint-<key>/` under
-   `corpus/tali/stages/voicetune_<mode>/`; `on-worker.sh` also records the
-   absolute path in `~/.local/state/vi/unverified/voicetune_<mode>`.
-7. `vi cloud down`.
 
 ### The home qwen-tts environment (open item)
 

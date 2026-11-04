@@ -8,15 +8,20 @@
 # any --put files to a fresh folder on the worker, runs the command there with
 # the same VI_* variables pointing at the copies, then the worker pushes VI_OUT
 # home through a home-created reverse SSH tunnel and restricted rsync receiver.
-# The worker's folder is deleted whether the job worked or not. The job sees:
+# The worker's folder is deleted once the result is home and (when the stage
+# asks for it) verified; otherwise it is kept for a re-push. The job sees:
 #   jobs/            this folder
 #   files/<name>     each --put file, by its base name
-#   VI_STAGE, VI_OUT, VI_SETTINGS, VI_INPUT_<NAME>, VI_CHECKPOINT, VI_WORKER=1, VI_RETURN_PORT
+#   VI_STAGE, VI_OUT, VI_SETTINGS, VI_INPUT_<NAME>, VI_CHECKPOINT, VI_PUBLISH,
+#   VI_WORKER=1, VI_RETURN_PORT
 #
 # VI_CHECKPOINT goes up with whatever an earlier, failed run of the same stage
 # left in it, and comes home every VI_SYNC_SECONDS (default 60) while the job
 # runs and once more when it ends. So if the worker dies or the credit runs
 # out, a rerun of `vi dataset run` on a new worker resumes from the last copy.
+# Finished epochs instead land in a durable per-attempt dir under
+# ~/.cache/vi/checkpoints/<stage>/ (the `vi-publish` return module) that
+# nothing deletes, and are verified there before the stage reports success.
 # VI_CORPUS isn't sent: a GPU job gets only what its inputs and --put name.
 #
 # Inputs over VI_PACK_MIN_KB (default 1024) are packed at home first, before
@@ -46,6 +51,17 @@ if [ $# -eq 0 ]; then
 fi
 : "${VI_STAGE:?on-worker.sh runs from \`vi dataset run\`}" "${VI_OUT:?}" "${VI_SETTINGS:?}"
 vi=${VI_BIN:-vi}
+
+# A stage may name a home-disk floor (min_home_gb) and the epoch count to
+# verify before success (expect_epochs). Read both from the settings JSON once;
+# the worker never sees either value.
+min_home_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("min_home_gb",""))' "$VI_SETTINGS")
+expect_epochs=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("expect_epochs",""))' "$VI_SETTINGS")
+# Refuse to start under the floor before anything is packed or a worker looked
+# up, so the GPU is never billed with too little home disk to hold the result.
+if [ -n "$min_home_gb" ]; then
+  python3 "$jobs_dir/checkpoints.py" gate "$HOME" --min-gb "$min_home_gb"
+fi
 
 # Pack each large input into one zstd'd tar at home before touching the
 # worker. Home's disk is slow (spinning, encrypted, busy) and a stage input
@@ -111,6 +127,18 @@ root=${VI_WORKER_ROOT:-/root/vi-jobs}
 work="$root/$VI_STAGE.$(date +%s).$$"
 checkpoint=${VI_CHECKPOINT:-}
 [ -z "$checkpoint" ] || mkdir -p "$checkpoint"
+# The durable, per-attempt home dir finished epochs are published into and
+# verified in. It lives under ~/.cache/vi (gitignored, outside corpus/) so
+# neither the runner nor `vi dataset gc` can delete it, and it is fresh per
+# attempt so epochs from a rerun never mix. The worker only ever sees the
+# module name `vi-publish`, never this home path.
+durable=
+if [ -n "$checkpoint" ]; then
+  key=$(basename "$checkpoint")
+  key=${key#.checkpoint-}
+  durable="$HOME/.cache/vi/checkpoints/$VI_STAGE/$key-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$durable"
+fi
 return_state=
 return_port=
 return_tunnel=
@@ -153,7 +181,7 @@ return_start() {
   return_checkpoint=$checkpoint
   [ -n "$return_checkpoint" ] || return_scratch=$(mktemp -d)
   [ -n "$return_checkpoint" ] || return_checkpoint=$return_scratch
-  return_port=$("$jobs_dir/worker-return.sh" start "$VI_OUT" "$return_checkpoint" "$return_state" "${VI_RETURN_PORT:-}")
+  return_port=$("$jobs_dir/worker-return.sh" start "$VI_OUT" "$return_checkpoint" "$return_state" "$durable" "${VI_RETURN_PORT:-}")
   if [ "$VI_WORKER_HOST" != local ]; then
     # Home initiates both the reverse tunnel and the temporary receiver. The remote listener is
     # loopback-only; no home credential, agent, or public port lives on the worker.
@@ -182,8 +210,15 @@ return_start() {
 cleanup() {
   [ -n "${heartbeat-}" ] && kill "$heartbeat" 2>/dev/null
   [ -n "${syncer-}" ] && kill "$syncer" 2>/dev/null
-  remote "rm -rf $(q "$work")" ||
-    echo "on-worker.sh: could not delete $work on the worker; \`vi cloud down\` removes it with the instance" >&2
+  # Delete the worker's job dir only once the result is safely home and
+  # verified; otherwise keep it so a re-push is possible (vi cloud down removes
+  # it with the instance).
+  if [ -z "${keep_work-}" ]; then
+    remote "rm -rf $(q "$work")" ||
+      echo "on-worker.sh: could not delete $work on the worker; \`vi cloud down\` removes it with the instance" >&2
+  else
+    echo "on-worker.sh: keeping $work on the worker; \`vi cloud down\` removes it with the instance" >&2
+  fi
   return_stop
 }
 # Stop the receiver and tunnel on every exit path: normal exit, Ctrl-C (INT)
@@ -198,14 +233,14 @@ push "$jobs_dir/" "$work/jobs/"
 push "$VI_SETTINGS" "$work/settings.json"
 return_start
 if [ -n "$checkpoint" ]; then
-  # A pushed-home checkpoint stays unverified until `checkpoints.py verify`
-  # clears its marker, so `vi cloud down` refuses while it exists. Record the
+  # The durable dir stays unverified until `checkpoints.py verify` clears its
+  # per-attempt marker, so `vi cloud down` refuses while it exists. Record the
   # absolute home path under the same state dir as `vi` (VI_STATE_DIR, else
   # XDG_STATE_HOME/vi, else ~/.local/state/vi).
   state_dir=${VI_STATE_DIR:-}
   [ -n "$state_dir" ] || state_dir=${XDG_STATE_HOME:-${HOME:-.}/.local/state}/vi
   mkdir -p "$state_dir/unverified"
-  printf '%s\n' "$checkpoint" >"$state_dir/unverified/$VI_STAGE"
+  printf '%s\n' "$durable" >"$state_dir/unverified/$VI_STAGE-$(basename "$durable")"
   mkdir -p "$checkpoint"
   # A copy taken mid-write can end in half a line; drop it before resuming.
   for f in "$checkpoint"/*.jsonl; do
@@ -223,6 +258,7 @@ for f in "${puts[@]}"; do
 done
 exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$work/settings.json") VI_WORKER=1 VI_RETURN_PORT=$(q "$return_port")"
 [ -n "$checkpoint" ] && exports+=" VI_CHECKPOINT=$(q "$work/checkpoint")"
+[ -n "$durable" ] && exports+=" VI_PUBLISH=vi-publish"
 # Preflight: time a small upload and stop before sending the inputs if they'd
 # take longer than VI_MAX_UPLOAD_MINUTES (default 30), unless
 # VI_UPLOAD_ANYWAY=1. A slow uplink otherwise bills the GPU for hours of
@@ -307,7 +343,18 @@ syncer=
 sync_home || echo "on-worker.sh: could not copy the final checkpoint home; the last periodic copy is kept" >&2
 if [ $rc -eq 0 ]; then
   worker_sync "$work/out/" vi-out
+  # Verify the published epochs before the stage reports success, so a partial
+  # or corrupt push fails the stage (and keeps the worker's copy) instead of
+  # deleting the only other copy. N comes from the stage settings, not by hand.
+  if [ -n "${durable:-}" ] && [ -n "$expect_epochs" ]; then
+    if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" verify "$durable" --expect "$expect_epochs"; then
+      echo "on-worker.sh: verify failed for $durable" >&2
+      keep_work=1
+      exit 1
+    fi
+  fi
 else
   echo "on-worker.sh: $1 exited with $rc on the worker" >&2
+  keep_work=1
 fi
 exit $rc

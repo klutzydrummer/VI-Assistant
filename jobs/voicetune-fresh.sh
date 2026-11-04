@@ -96,12 +96,11 @@ replay_manifest="replay_with_codes.jsonl"
 title="Fine-tuned voice: is this Tali, with no reference clip?"
 question="Is this Tali with her suit and accent? Note short-line glitches or speed-ups."
 
-# push_publish DIR: push a publish dir's finished epochs (never a .part) home via vi-checkpoint.
-# NOTE: preflight and train must run as separate stages (separate VI_STAGE -> separate home
-# checkpoint dirs), because both push an epoch-0 into the vi-checkpoint module root.
+# push_publish DIR: push a publish dir's finished epochs (never a .part) home via
+# the vi-publish module, which on-worker.sh points at this attempt's durable dir.
 push_publish() {
   [ -d "$1" ] || return 0
-  "$jobs_dir/worker-return.sh" push "$1" vi-checkpoint --exclude='*.part'
+  "$jobs_dir/worker-return.sh" push "$1" "${VI_PUBLISH:-vi-publish}" --exclude='*.part'
 }
 
 # abort_reason LOG ELAPSED_S -> the check_abort reason, or empty. Pure Python, no qwen-tts import.
@@ -184,18 +183,23 @@ train() {
   # Preflight already proved generate, so this gates VRAM/disk without the extra model load.
   check_and_gate
 
-  local start train_pid reason elapsed rc
+  local start reason elapsed rc
   start=$(date +%s)
   "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
     --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
     --epochs 6 --lr 2e-6 --kl 0.1 --batch 8 --accum 4 --seed 0 --speaker clip \
     --no-resume-file --publish "$publish" --out "$run" &
   train_pid=$!
+  # If this script exits while train still runs (a push failure, an abort, or a
+  # signal), kill it so the GPU job never keeps burning money orphaned.
+  trap 'kill "$train_pid" 2>/dev/null || true' EXIT
 
   # Watchdog: push each finished epoch home as it appears, and stop the run on the abort rules.
   reason=""
   while kill -0 "$train_pid" 2>/dev/null; do
-    push_publish "$publish"
+    # A loop push failure must not orphan the running train, so it is non-fatal
+    # here; the final push below is the one that decides success.
+    push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
     elapsed=$(( $(date +%s) - start ))
     reason=$(abort_reason "$run/train_log.jsonl" "$elapsed")
     if [ -n "$reason" ]; then
@@ -209,6 +213,7 @@ train() {
   wait "$train_pid"
   rc=$?
   set -e
+  trap - EXIT
   push_publish "$publish"  # push what exists (the final epochs, or the ones before an abort)
   if [ -n "$reason" ]; then
     echo "train aborted: $reason" >&2
@@ -243,7 +248,7 @@ for cid, path in voicetune.delivery_clips(rows, 0, 6):
       esac
       "$PY" "$jobs_dir/voicetune.py" speak --run "$run" --epoch "$epoch" \
         --sentences "$one" --seed 0 --unblind --title "$title" --question "$question" \
-        "${delivery_args[@]}" --out "$platter"
+        --no-plain "${delivery_args[@]}" --out "$platter"
     fi
     rm -rf "$run/voice-epoch-$epoch"  # the ~3.4 GB voice-model copy, deleted after speaking
   done
