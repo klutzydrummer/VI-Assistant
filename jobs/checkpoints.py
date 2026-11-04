@@ -5,12 +5,12 @@ with a SHA256SUMS manifest (files hard-linked, checksums written last, then the
 `.part` dir renamed into place), so home can prove a checkpoint arrived intact. The
 CLI here is the other half, run at home:
 
-    python3 jobs/checkpoints.py gate   PATH --min-gb 50
+    python3 jobs/checkpoints.py gate   PATH --min-gb 50 [--reserve-gb 27]
     python3 jobs/checkpoints.py verify DIR --expect N
     python3 jobs/checkpoints.py prune  DIR --keep K [--yes]
     python3 jobs/checkpoints.py audit  ROOT
 
-`gate` refuses to start below the free-space floor; `verify` checks every epoch's
+`gate` refuses to start below the free-space floor, after setting aside a reserve for projected checkpoint bytes; `verify` checks every epoch's
 hashes (no symlinks, no leftover `.part` dirs, exactly the N epochs 0..N-1) and
 writes VERIFIED;
 `prune` keeps at most two verified epochs; `audit` lists runs holding more than two.
@@ -92,12 +92,16 @@ def free_gb(path):
     return st.f_bavail * st.f_frsize / 2**30
 
 
-def gate(path, min_gb):
-    """Print the free space; return False (with a message) when below `min_gb` GiB."""
+def gate(path, min_gb, reserve_gb=0):
+    """Print the free space; return False (with a message) when it is under
+    `min_gb` GiB after reserving `reserve_gb` GiB for projected checkpoints."""
     gb = free_gb(path)
     print(f"{path}: {gb:.2f} GiB free")
-    if gb < min_gb:
-        print(f"gate: {gb:.2f} GiB free, need {min_gb} GiB", file=sys.stderr)
+    if gb - reserve_gb < min_gb:
+        need = f"{min_gb} GiB"
+        if reserve_gb:
+            need += f" plus a {reserve_gb} GiB reserve"
+        print(f"gate: {gb:.2f} GiB free, need {need}", file=sys.stderr)
         return False
     return True
 
@@ -319,7 +323,7 @@ def audit(root):
 
 
 def cmd_gate(a):
-    if not gate(a.path, a.min_gb):
+    if not gate(a.path, a.min_gb, a.reserve_gb):
         sys.exit(1)
 
 
@@ -342,6 +346,7 @@ def main(argv=None):
     g = sub.add_parser("gate", help="refuse to start under the free-space floor")
     g.add_argument("path", type=Path)
     g.add_argument("--min-gb", type=float, default=50.0)
+    g.add_argument("--reserve-gb", type=float, default=0.0)
     v = sub.add_parser("verify", help="check every epoch's SHA256SUMS and write VERIFIED")
     v.add_argument("dir", type=Path)
     v.add_argument("--expect", type=int, required=True)

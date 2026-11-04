@@ -93,7 +93,9 @@ marker `~/.local/state/vi/unverified/<stage>-<basename>`, which `vi cloud down`
 refuses to destroy past. A successful stage has already written its VERIFIED
 file and cleared its marker, so the operator's check is just a read.
 
-5. `vi cloud down`.
+5. `vi cloud down`. If a stage failed, its marker is kept and a plain
+   `vi cloud down` refuses to destroy past it — verify or archive the kept
+   checkpoints first, then `vi cloud down --force`.
 
 After Brandon picks the epoch by ear, prune the kept run to two epochs (the
 prune refuses without a matching VERIFIED):

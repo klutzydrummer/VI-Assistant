@@ -141,6 +141,10 @@ impl<V: Vast, H: Host> Cloud<V, H> {
                     return self.wait(t);
                 }
                 Some(_) => {
+                    let markers = self.state.markers()?;
+                    if !markers.is_empty() {
+                        return Err(Error::Worker(unverified_up_error(&markers)));
+                    }
                     self.host.log(&format!(
                         "worker {} was stopped; destroying it and renting a fresh one",
                         t.id
@@ -475,6 +479,22 @@ fn unverified_error(markers: &[Marker]) -> String {
     msg
 }
 
+/// The message `up` returns when unverified markers would be destroyed with the
+/// stopped worker it wants to replace.
+fn unverified_up_error(markers: &[Marker]) -> String {
+    let mut msg = String::from(
+        "an unverified checkpoint is still at home; verify it before replacing the worker:\n",
+    );
+    for m in markers {
+        let _ = writeln!(msg, "  {}: {}", m.stage, m.path.display());
+    }
+    msg.push_str(
+        "run `python3 jobs/checkpoints.py verify <checkpoint> --expect N` for each, \
+         or `vi cloud down --force` the old worker first",
+    );
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +815,44 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(c.down().unwrap().ids, vec![100]);
         assert_eq!(*vast.destroyed.borrow(), vec![100]);
+    }
+
+    #[test]
+    fn up_refuses_to_replace_a_stopped_worker_with_an_unverified_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+
+        // Stop the worker and leave an unverified marker: `up` must refuse to
+        // destroy the stopped worker rather than rent over it.
+        vast.live.borrow_mut()[0].actual_status = Some("exited".into());
+        let marker = dir.path().join("unverified").join("voicetune");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(
+            &marker,
+            "/home/brandon/corpus/stages/voicetune/.checkpoint-x\n",
+        )
+        .unwrap();
+
+        let err = c
+            .up(None, CAP, UNTIL, |_, _| {
+                panic!("must not rent over a marker")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("voicetune"), "{err}");
+        assert!(err.contains("checkpoints.py verify"), "{err}");
+        assert!(err.contains("down --force"), "{err}");
+        assert!(vast.destroyed.borrow().is_empty());
+        assert_eq!(vast.created.borrow().len(), 1); // only the original rental
     }
 
     #[test]

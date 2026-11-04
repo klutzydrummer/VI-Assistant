@@ -87,7 +87,7 @@ if command -v zstd >/dev/null 2>&1; then
     else
       mkdir -p "$bundle_dir"
       t0=$(date +%s%N)
-      tar -C "$dir" -cf - . | zstd -q -T0 -3 -o "$f.part"
+      nice -n 19 ionice -c2 -n7 tar -C "$dir" -cf - . | nice -n 19 ionice -c2 -n7 zstd -q -T0 -3 -o "$f.part"
       mv "$f.part" "$f"
       ms=$((($(date +%s%N) - t0) / 1000000 + 1))
       echo "on-worker.sh: packed ${var#VI_INPUT_}: $((kb / 1024)) MB read in $((ms / 1000)) s ($((kb * 1000 / ms / 1024)) MB/s from disk), $(($(stat -c %s "$f") / 1048576)) MB to send" >&2
@@ -342,7 +342,7 @@ kill "${syncer-}" 2>/dev/null || true
 syncer=
 sync_home || echo "on-worker.sh: could not copy the final checkpoint home; the last periodic copy is kept" >&2
 if [ $rc -eq 0 ]; then
-  worker_sync "$work/out/" vi-out
+  worker_sync "$work/out/" vi-out || { keep_work=1; exit 1; }
   # Verify the published epochs before the stage reports success, so a partial
   # or corrupt push fails the stage (and keeps the worker's copy) instead of
   # deleting the only other copy. N comes from the stage settings, not by hand.
