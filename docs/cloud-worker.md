@@ -4,8 +4,8 @@ Heavy jobs run on a GPU rented from Vast.ai. The worker keeps nothing that matte
 
 ## Commands
 - `vi cloud offers`: the ten cheapest machines that fit the config. Read only.
-- `vi cloud up [--offer ID] [--yes]`: shows the cheapest offer, your credit and how many hours it buys, asks, then rents it and waits until ssh answers. If a machine fails to boot it's given back and the next one is tried (three at most). Run it again while a worker is up and it just reuses it.
-- `vi cloud down`: destroys our worker, plus any instance labelled `vi-worker` that home lost track of. It never touches other instances on the account.
+- `vi cloud up --cap USD --until TIME [--offer ID] [--yes]`: shows the cheapest offer, its worst case next to your cap, and your credit, asks, then rents it and waits until ssh answers. `--cap` is the most the rental may cost and `--until` when that approval expires (an RFC 3339 timestamp, or `HH:MM` meaning today). It refuses before renting anything if the deadline has passed, the worst case (`max_hours` at this price) would exceed the cap, or the account holds less than the cap. It rents at most one offer: if that machine fails to boot it's given back and `up` exits nonzero rather than renting a replacement. Run it again while a worker is up and it just reuses it (the flags are still required).
+- `vi cloud down`: destroys our worker, plus any instance labelled `vi-worker` that home lost track of. It never touches other instances on the account. It prints the credit before, after, and the difference, so you can see what the rental actually cost.
 - `vi cloud status`: state, price, time up, rough spend so far, idle minutes left, credit, and any other instances on the account (a stopped instance still bills for its disk).
 - `vi cloud reap`: releases the worker if it has been idle for `idle_minutes` or up for `max_hours`.
 - `vi cloud ssh [command]`: a shell on the worker.

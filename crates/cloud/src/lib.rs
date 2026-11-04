@@ -12,7 +12,7 @@ pub mod state;
 pub mod vast;
 pub mod worker;
 
-pub use config::Config;
+pub use config::{parse_until, Config};
 pub use state::{Marker, StateDir, Tracked};
 pub use vast::{Endpoint, HttpVast, Instance, Offer, Vast};
 pub use worker::{Cloud, Down, Host, SystemHost};

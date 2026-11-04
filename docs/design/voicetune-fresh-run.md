@@ -74,7 +74,8 @@ transcripts, seeded, reading only speaker id and transcript — no labels.
 1. `vi dataset run characters/tali/voicetune.toml voicetune_data` — home, CPU,
    under `nice -n 19 ionice -c2 -n7`. See the note below about the home qwen-tts
    environment.
-2. `vi cloud up`.
+2. `vi cloud up --cap <usd> --until <time>` — the approved cap and deadline for
+   the rental; `--until` is an RFC 3339 timestamp or `HH:MM` (today, local time).
 3. `vi dataset run characters/tali/voicetune.toml voicetune_preflight`.
 4. `vi dataset run characters/tali/voicetune.toml voicetune_train` — only after
    the preflight probe is verified and Brandon has okayed the paid run and its

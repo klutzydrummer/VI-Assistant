@@ -32,7 +32,7 @@ pub(crate) const USAGE: &str = "usage:
   vi review --channel <corpus-folder> [--port N]
   (every review mode also takes --host ADDR; default 127.0.0.1)
   vi cloud offers
-  vi cloud up [--offer ID] [--yes]
+  vi cloud up --cap USD --until TIME [--offer ID] [--yes]
   vi cloud down [--force]
   vi cloud status
   vi cloud reap
@@ -57,6 +57,8 @@ fn main() -> ExitCode {
     let id = take_option(&mut args, "--id");
     let character = take_option(&mut args, "--character");
     let out = take_option(&mut args, "--out");
+    let cap = take_option(&mut args, "--cap");
+    let until = take_option(&mut args, "--until");
     match args
         .iter()
         .map(String::as_str)
@@ -90,7 +92,7 @@ fn main() -> ExitCode {
             }
         },
         ["review", rest @ ..] => review(rest),
-        ["cloud", rest @ ..] => cloud::run(rest, force),
+        ["cloud", rest @ ..] => cloud::run(rest, force, cap.as_deref(), until.as_deref()),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

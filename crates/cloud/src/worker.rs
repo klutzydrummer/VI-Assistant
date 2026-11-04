@@ -10,8 +10,6 @@ use crate::state::{Marker, StateDir, Tracked};
 use crate::vast::{Endpoint, Instance, Offer, Vast};
 use crate::{onstart, Config, Error, Result};
 
-/// How many machines `up` tries before giving up, when one fails to boot.
-const ATTEMPTS: usize = 3;
 const POLL_SECS: u64 = 10;
 
 /// The outside world, so tests can fake time and ssh.
@@ -71,6 +69,10 @@ pub fn ssh_args(ep: &Endpoint, known_hosts: &Path) -> Vec<String> {
         format!("UserKnownHostsFile={}", known_hosts.display()),
         "-o".into(),
         "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "ForwardAgent=no".into(),
+        "-o".into(),
+        "ForwardX11=no".into(),
     ]
 }
 
@@ -93,11 +95,17 @@ pub struct Report {
     pub credit: Option<f64>,
 }
 
-/// What `down_force` reports: the ids destroyed, plus any unverified markers it
-/// overrode (left in place until a later `checkpoints.py verify` clears them).
+/// What `down`/`down_force` reports: the ids destroyed, any unverified markers
+/// it overrode (left in place until a later `checkpoints.py verify` clears
+/// them), and the account credit before and after for the spend report.
+#[derive(Debug)]
 pub struct Down {
     pub ids: Vec<u64>,
     pub overridden: Vec<Marker>,
+    /// Account credit when the worker was rented.
+    pub credit_before: Option<f64>,
+    /// Account credit after the worker was released.
+    pub credit_after: Option<f64>,
 }
 
 impl<V: Vast, H: Host> Cloud<V, H> {
@@ -106,11 +114,17 @@ impl<V: Vast, H: Host> Cloud<V, H> {
     }
 
     /// Rents a worker (or reuses the one we have) and waits until ssh answers.
-    /// `confirm` sees the cheapest offer and the account credit before anything
+    /// `cap` and `until` are the approval the caller checked with Brandon: the
+    /// most this run may cost, and when the approval expires. Before renting it
+    /// refuses if the deadline has passed, the worst case (`max_hours` at the
+    /// offer's price) exceeds `cap`, or the account holds less than `cap`.
+    /// `confirm` sees the chosen offer and the account credit before anything
     /// is rented, and returns false to back out.
     pub fn up(
         &self,
         offer: Option<u64>,
+        cap: f64,
+        until: u64,
         confirm: impl FnOnce(&Offer, Option<f64>) -> bool,
     ) -> Result<Tracked> {
         if let Some(t) = self.state.load()? {
@@ -142,6 +156,13 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             }
         }
 
+        // The approval window must still be open before we look at any offer.
+        if self.host.now() >= until {
+            return Err(Error::Worker(
+                "the approval deadline has passed; pass a later --until".into(),
+            ));
+        }
+
         let candidates = match offer {
             // Vast's search ignores `id`; an offer's id is its ask_contract_id.
             Some(id) => self.vast.offers(&json!({
@@ -157,54 +178,70 @@ impl<V: Vast, H: Host> Cloud<V, H> {
                     .into(),
             }));
         };
-        if !confirm(first, self.vast.credit().ok()) {
+        // `--offer` bypasses the search, so re-apply its limits here.
+        if offer.is_some() {
+            if let Some(why) = self.cfg.offer_violations(first).first() {
+                return Err(Error::Worker(format!(
+                    "offer {} fails the search limits: {why}",
+                    first.id
+                )));
+            }
+        }
+        let credit = self.check_budget(first, cap)?;
+        if !confirm(first, Some(credit)) {
             return Err(Error::Worker("nothing rented".into()));
         }
 
-        let mut tried = Vec::new();
-        let mut last_err = None;
-        for offer in candidates {
-            if tried.len() == ATTEMPTS {
-                break;
-            }
-            if tried.contains(&offer.machine_id) {
-                continue;
-            }
-            tried.push(offer.machine_id);
-            if tried.len() > 1 {
+        let id = self.vast.create(first.id, &self.create_request())?;
+        let now = self.host.now();
+        let t = Tracked {
+            id,
+            machine_id: first.machine_id,
+            gpu_name: first.gpu_name.clone(),
+            dph: first.dph_total,
+            credit,
+            created: now,
+            last_used: now,
+            endpoint: None,
+        };
+        // Saved before waiting, so `vi cloud down` can release it even if
+        // this process is interrupted.
+        self.state.save(&t)?;
+        self.host
+            .log(&format!("rented instance {id}; waiting for it to boot"));
+        match self.wait(t) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                // One rental per invocation: a failed boot is given back and
+                // `up` exits nonzero rather than renting a replacement.
                 self.host.log(&format!(
-                    "trying offer {} ({}, ${:.3}/hr) instead",
-                    offer.id, offer.gpu_name, offer.dph_total
+                    "instance {id} failed to boot ({e}); giving it back without renting another"
                 ));
-            }
-            let id = self.vast.create(offer.id, &self.create_request())?;
-            let now = self.host.now();
-            let t = Tracked {
-                id,
-                machine_id: offer.machine_id,
-                gpu_name: offer.gpu_name.clone(),
-                dph: offer.dph_total,
-                created: now,
-                last_used: now,
-                endpoint: None,
-            };
-            // Saved before waiting, so `vi cloud down` can release it even if
-            // this process is interrupted.
-            self.state.save(&t)?;
-            self.host
-                .log(&format!("rented instance {id}; waiting for it to boot"));
-            match self.wait(t) {
-                Ok(t) => return Ok(t),
-                Err(e) => {
-                    self.host
-                        .log(&format!("instance {id} failed: {e}; giving it back"));
-                    self.vast.destroy(id)?;
-                    self.state.clear(id)?;
-                    last_err = Some(e);
-                }
+                self.vast.destroy(id)?;
+                self.state.clear(id)?;
+                Err(e)
             }
         }
-        Err(last_err.unwrap_or_else(|| Error::Worker("no usable offers".into())))
+    }
+
+    /// The money guards that need the chosen offer: the worst case (`max_hours`
+    /// at this price) must stay under `cap`, and the account must already hold
+    /// at least `cap`. Returns the credit for the confirmation and spend report.
+    fn check_budget(&self, offer: &Offer, cap: f64) -> Result<f64> {
+        let worst = self.cfg.max_hours * offer.dph_total;
+        if worst > cap {
+            return Err(Error::Worker(format!(
+                "worst case ${worst:.2} ({:.1} h at ${:.3}/hr) exceeds the ${cap:.2} cap",
+                self.cfg.max_hours, offer.dph_total
+            )));
+        }
+        let credit = self.vast.credit()?;
+        if credit < cap {
+            return Err(Error::Worker(format!(
+                "credit ${credit:.2} is below the ${cap:.2} cap"
+            )));
+        }
+        Ok(credit)
     }
 
     pub fn create_request(&self) -> Value {
@@ -255,23 +292,40 @@ impl<V: Vast, H: Host> Cloud<V, H> {
     }
 
     /// Destroys the tracked worker and any other instance carrying our label.
-    /// Returns the ids destroyed. Refuses while an unverified checkpoint marker
-    /// is present, so a pushed-home checkpoint isn't lost before it's been
-    /// verified; `down_force` overrides that.
-    pub fn down(&self) -> Result<Vec<u64>> {
+    /// Refuses while an unverified checkpoint marker is present, so a pushed-home
+    /// checkpoint isn't lost before it's been verified; `down_force` overrides
+    /// that. Reports the credit before and after for the spend report.
+    pub fn down(&self) -> Result<Down> {
         let markers = self.state.markers()?;
         if !markers.is_empty() {
             return Err(Error::Worker(unverified_error(&markers)));
         }
-        self.destroy()
+        self.release(Vec::new())
     }
 
     /// `down`, ignoring unverified markers. Returns the ids destroyed and the
     /// markers it overrode (they stay in place until a later verify clears them).
     pub fn down_force(&self) -> Result<Down> {
         let overridden = self.state.markers()?;
+        self.release(overridden)
+    }
+
+    /// Destroys the worker and reports the credit before and after, so the CLI
+    /// can show what the rental actually cost.
+    fn release(&self, overridden: Vec<Marker>) -> Result<Down> {
+        let credit_before = self.state.load()?.map(|t| t.credit);
         let ids = self.destroy()?;
-        Ok(Down { ids, overridden })
+        let credit_after = if ids.is_empty() {
+            None
+        } else {
+            self.vast.credit().ok()
+        };
+        Ok(Down {
+            ids,
+            overridden,
+            credit_before,
+            credit_after,
+        })
     }
 
     /// The actual destruction, without consulting markers. `reap` uses this so
@@ -426,7 +480,13 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
-    #[derive(Default)]
+    /// A cap large enough for the default test offers (dph 0.15–0.2 over
+    /// `max_hours` 4) and below the fake account credit of $12, so the budget
+    /// guards pass for the tests that don't exercise them.
+    const CAP: f64 = 10.0;
+    /// Far in the future, for the tests that don't exercise the deadline.
+    const UNTIL: u64 = 10_000_000;
+
     struct FakeVast {
         offers: Vec<Offer>,
         /// Status each created instance reports, in creation order.
@@ -434,6 +494,20 @@ mod tests {
         live: RefCell<Vec<Instance>>,
         created: RefCell<Vec<(u64, Value)>>,
         destroyed: RefCell<Vec<u64>>,
+        credit: Cell<f64>,
+    }
+
+    impl Default for FakeVast {
+        fn default() -> Self {
+            FakeVast {
+                offers: Vec::new(),
+                boots: RefCell::new(Vec::new()),
+                live: RefCell::new(Vec::new()),
+                created: RefCell::new(Vec::new()),
+                destroyed: RefCell::new(Vec::new()),
+                credit: Cell::new(12.0),
+            }
+        }
     }
 
     impl Vast for &FakeVast {
@@ -470,7 +544,7 @@ mod tests {
             Ok(())
         }
         fn credit(&self) -> Result<f64> {
-            Ok(12.0)
+            Ok(self.credit.get())
         }
     }
 
@@ -501,6 +575,8 @@ mod tests {
             reliability2: 0.99,
             inet_down: 900.0,
             geolocation: None,
+            compute_cap: 800,
+            cuda_max_good: 13.0,
         }
     }
 
@@ -543,7 +619,7 @@ mod tests {
 
         let mut seen = None;
         let t = c
-            .up(None, |o, credit| {
+            .up(None, CAP, UNTIL, |o, credit| {
                 seen = Some((o.id, credit));
                 true
             })
@@ -557,11 +633,13 @@ mod tests {
         assert!(req["onstart"].as_str().unwrap().contains("vi-watchdog"));
 
         // A second `up` reuses it without renting or asking.
-        let again = c.up(None, |_, _| panic!("asked to rent again")).unwrap();
+        let again = c
+            .up(None, CAP, UNTIL, |_, _| panic!("asked to rent again"))
+            .unwrap();
         assert_eq!(again.id, 100);
         assert!(c.env().unwrap().contains("VI_WORKER_PORT='2100'"));
 
-        assert_eq!(c.down().unwrap(), vec![100]);
+        assert_eq!(c.down().unwrap().ids, vec![100]);
         assert_eq!(*vast.destroyed.borrow(), vec![100]);
         assert_eq!(c.state.load().unwrap(), None);
         // The stopped instance from another project is reported, not touched.
@@ -571,24 +649,24 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_that_fails_to_boot_is_returned_and_the_next_tried() {
+    fn a_failed_boot_is_returned_without_trying_another_offer() {
         let dir = tempfile::tempdir().unwrap();
         let vast = FakeVast {
-            offers: vec![offer(1, 10, 0.15), offer(3, 10, 0.16), offer(2, 20, 0.2)],
-            boots: RefCell::new(vec!["loading", "running"]),
+            offers: vec![offer(1, 10, 0.15), offer(2, 20, 0.2)],
+            boots: RefCell::new(vec!["loading"]),
             ..FakeVast::default()
         };
         let host = FakeHost {
             now: Cell::new(1000),
         };
         let c = cloud(&vast, &host, dir.path());
-        let t = c.up(None, |_, _| true).unwrap();
-        assert_eq!(*vast.destroyed.borrow(), vec![100]);
-        // Offer 3 is on the machine that just failed, so it's skipped.
+        let err = c.up(None, CAP, UNTIL, |_, _| true).unwrap_err();
+        assert!(err.to_string().contains("Error: bad GPU"), "{err}");
+        // Only the cheapest offer was rented, and it was given back.
         let rented: Vec<u64> = vast.created.borrow().iter().map(|c| c.0).collect();
-        assert_eq!(rented, vec![1, 2]);
-        assert_eq!(t.id, 101);
-        assert_eq!(c.state.load().unwrap().unwrap().id, 101);
+        assert_eq!(rented, vec![1]);
+        assert_eq!(*vast.destroyed.borrow(), vec![100]);
+        assert!(c.state.load().unwrap().is_none());
     }
 
     #[test]
@@ -602,7 +680,7 @@ mod tests {
             now: Cell::new(1000),
         };
         let c = cloud(&vast, &host, dir.path());
-        assert!(c.up(None, |_, _| false).is_err());
+        assert!(c.up(None, CAP, UNTIL, |_, _| false).is_err());
         assert!(vast.created.borrow().is_empty());
     }
 
@@ -618,7 +696,7 @@ mod tests {
             now: Cell::new(1000),
         };
         let c = cloud(&vast, &host, dir.path());
-        c.up(None, |_, _| true).unwrap();
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
 
         host.now.set(1000 + 19 * 60);
         assert_eq!(c.reap().unwrap(), None);
@@ -641,7 +719,7 @@ mod tests {
         };
         let host = FakeHost { now: Cell::new(0) };
         let c = cloud(&vast, &host, dir.path());
-        c.up(None, |_, _| true).unwrap();
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
         for _ in 0..24 {
             host.now.set(host.now.get() + 10 * 60);
             c.touch().unwrap();
@@ -666,7 +744,7 @@ mod tests {
             now: Cell::new(1000),
         };
         let c = cloud(&vast, &host, dir.path());
-        c.up(None, |_, _| true).unwrap();
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
 
         let marker = dir.path().join("unverified").join("voicetune");
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
@@ -707,7 +785,7 @@ mod tests {
             now: Cell::new(1000),
         };
         let c = cloud(&vast, &host, dir.path());
-        c.up(None, |_, _| true).unwrap();
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
 
         let marker = dir.path().join("unverified").join("voicetune");
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
@@ -715,7 +793,155 @@ mod tests {
         assert!(c.down().is_err());
 
         std::fs::remove_file(&marker).unwrap();
-        assert_eq!(c.down().unwrap(), vec![100]);
+        assert_eq!(c.down().unwrap().ids, vec![100]);
         assert_eq!(*vast.destroyed.borrow(), vec![100]);
+    }
+
+    #[test]
+    fn up_refuses_once_the_deadline_has_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        let err = c
+            .up(None, CAP, 999, |_, _| {
+                panic!("must not ask after the deadline")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("deadline"), "{err}");
+        assert!(vast.created.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_refuses_when_the_worst_case_exceeds_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        // max_hours (4) at $0.15/hr is $0.60, so a $0.50 cap is too small.
+        let err = c
+            .up(None, 0.50, UNTIL, |_, _| {
+                panic!("must not ask over the cap")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(vast.created.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_refuses_when_the_account_holds_less_than_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            credit: Cell::new(2.0),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        let err = c
+            .up(None, 10.0, UNTIL, |_, _| {
+                panic!("must not ask on low credit")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("below"), "{err}");
+        assert!(vast.created.borrow().is_empty());
+    }
+
+    #[test]
+    fn up_refuses_an_offer_that_fails_the_search_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![Offer {
+                dph_total: 0.5,
+                ..offer(1, 10, 0.15)
+            }],
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        let err = c
+            .up(Some(1), CAP, UNTIL, |_, _| {
+                panic!("must not ask for a filtered offer")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("search limits"), "{err}");
+        assert!(vast.created.borrow().is_empty());
+    }
+
+    #[test]
+    fn ssh_args_disable_agent_and_x11_forwarding() {
+        let ep = Endpoint {
+            host: "ssh1.vast.ai".into(),
+            port: 2100,
+        };
+        let args = ssh_args(&ep, Path::new("/tmp/known_hosts"));
+        let has = |a: &str, b: &str| args.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(has("-o", "ForwardAgent=no"), "{args:?}");
+        assert!(has("-o", "ForwardX11=no"), "{args:?}");
+    }
+
+    #[test]
+    fn down_reports_the_credit_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+        // The account is billed while it ran.
+        vast.credit.set(9.25);
+        let down = c.down().unwrap();
+        assert_eq!(down.ids, vec![100]);
+        assert_eq!(down.credit_before, Some(12.0));
+        assert_eq!(down.credit_after, Some(9.25));
+    }
+
+    #[test]
+    fn up_confirms_before_replacing_a_gone_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+        // The instance vanishes, so the next `up` has to rent a fresh one.
+        vast.live.borrow_mut().clear();
+
+        // Reaching the confirmation proves the fresh rental still went through
+        // the deadline and budget guards instead of being rented silently.
+        let asked = Cell::new(false);
+        let err = c
+            .up(None, CAP, UNTIL, |_, _| {
+                asked.set(true);
+                false
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing rented"), "{err}");
+        assert!(asked.get());
+        assert_eq!(vast.created.borrow().len(), 1);
     }
 }
