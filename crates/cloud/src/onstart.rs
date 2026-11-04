@@ -34,16 +34,44 @@ mod tests {
         assert!(!script.contains("rm -rf /root/vi-jobs"), "{script}");
         // The first boot time survives container restarts, so max_hours does
         // not restart from zero.
+        assert!(script.contains("export R=/root/vi-jobs"), "{script}");
         assert!(
-            script.contains("[ -s /root/vi-jobs/.boot ] || date +%s >/root/vi-jobs/.boot"),
+            script.contains("[ -s $R/.boot ] || date +%s >$R/.boot"),
             "{script}"
         );
-        assert!(
-            script.contains("BOOT=$(cat /root/vi-jobs/.boot)"),
-            "{script}"
-        );
-        // A later step adds about 600 bytes of LIVE logic; keep room below the
-        // 3000-byte cap (and the existing assert above).
+        assert!(script.contains("BOOT=$(cat $R/.boot)"), "{script}");
+        // The LIVE logic stays under the boot script's size cap.
         assert!(script.len() < 2500, "{} bytes", script.len());
+    }
+
+    #[test]
+    fn onstart_installs_util_linux_tools() {
+        // worker-job.sh detaches with setsid and serialises jobs with flock;
+        // both come from util-linux, which the runtime image may not carry.
+        let script = render(&Config::default());
+        assert!(script.contains("setsid flock"), "{script}");
+        assert!(script.contains("util-linux"), "{script}");
+    }
+
+    #[test]
+    fn onstart_prints_hostkeys_and_no_ssh_port() {
+        let script = render(&Config::default());
+        assert!(script.contains("VI-HOSTKEY"), "{script}");
+        assert!(script.contains("/etc/ssh/ssh_host_*_key.pub"), "{script}");
+        // Stdout and the log both get it, so a restart can be checked against
+        // the host key home recorded.
+        assert!(
+            script.contains("tee -a /var/log/vi-hostkey.log"),
+            "{script}"
+        );
+        // The external port comes from the authenticated instance API at home;
+        // the boot output must not print a port.
+        assert!(!script.contains("VI-SSHPORT"), "{script}");
+        assert!(
+            !script
+                .lines()
+                .any(|l| l.trim_start().starts_with("echo") && l.to_lowercase().contains("port")),
+            "{script}"
+        );
     }
 }

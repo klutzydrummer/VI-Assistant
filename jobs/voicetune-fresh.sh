@@ -183,20 +183,32 @@ train() {
   # Preflight already proved generate, so this gates VRAM/disk without the extra model load.
   check_and_gate
 
-  local start reason elapsed rc
+  local start reason elapsed rc wj_pid rc_file pid_file
   start=$(date +%s)
-  "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
+  rc_file="$(dirname "$VI_OUT")/rc"
+  # worker-job.sh writes the trainer's pid beside its own files (the job dir,
+  # which the watchdog scans), not under --run.
+  pid_file="$(dirname "$VI_OUT")/train.pid"
+  # worker-job.sh detaches the trainer from this stage session, holds the job
+  # lock, writes train.pid and restarts a crash with --resume. This script
+  # stays the supervisor: it pushes finished epochs home and stops the run on
+  # the abort rules.
+  "$jobs_dir/worker-job.sh" --work "$(dirname "$VI_OUT")" --run "$run" \
+    --publish "$publish" -- "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
     --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
     --epochs 6 --lr 2e-6 --kl 0.1 --batch 8 --accum 4 --seed 0 --speaker clip \
-    --no-resume-file --publish "$publish" --out "$run" &
-  train_pid=$!
-  # If this script exits while train still runs (a push failure, an abort, or a
-  # signal), kill it so the GPU job never keeps burning money orphaned.
-  trap 'kill "$train_pid" 2>/dev/null || true' EXIT
+    --publish "$publish" --out "$run" &
+  wj_pid=$!
+  # If this script exits on its own (an abort, or a push failure), kill the
+  # trainer. A signal that kills only the stage session must not: the detached
+  # wrapper keeps running and writes rc, so the attempt can be recovered.
+  dying=0
+  trap 'dying=1; exit 143' HUP TERM
+  trap '[ "$dying" = 1 ] || kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true' EXIT
 
   # Watchdog: push each finished epoch home as it appears, and stop the run on the abort rules.
   reason=""
-  while kill -0 "$train_pid" 2>/dev/null; do
+  while [ ! -s "$rc_file" ]; do
     # A loop push failure must not orphan the running train, so it is non-fatal
     # here; the final push below is the one that decides success.
     push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
@@ -204,16 +216,19 @@ train() {
     reason=$(abort_reason "$run/train_log.jsonl" "$elapsed")
     if [ -n "$reason" ]; then
       echo "train abort: $reason" >&2
-      kill "$train_pid" 2>/dev/null || true
+      # Written before the kill: worker-job.sh sees it and never restarts an
+      # aborted run.
+      "$PY" -c 'import json, sys; print(json.dumps({"reason": sys.argv[1]}))' "$reason" >"$run/abort.json"
+      kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
       break
     fi
     sleep 15
   done
   set +e
-  wait "$train_pid"
+  wait "$wj_pid"
   rc=$?
   set -e
-  trap - EXIT
+  trap - EXIT HUP TERM
   push_publish "$publish"  # push what exists (the final epochs, or the ones before an abort)
   if [ -n "$reason" ]; then
     echo "train aborted: $reason" >&2
