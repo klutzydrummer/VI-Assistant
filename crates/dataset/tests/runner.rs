@@ -3,6 +3,8 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use dataset::runner::{Outcome, Status};
 use dataset::{Pipeline, Runner};
@@ -273,4 +275,120 @@ fn a_corpus_file_appearing_reruns_its_stage() {
         dataset::runner::current_out(&f.root.join("corpus"), "count"),
         Some(f.current_out("count"))
     );
+}
+
+const HOLD_ENV: &str = "DATASET_TEST_HOLD_ROOT";
+
+/// A pipeline whose only stage blocks while the `hold` file in its working
+/// directory (the pipeline folder) exists.
+const HOLDING: &str = r#"
+corpus = "corpus"
+
+[stage.hold]
+command = ["sh", "-c", "while [ -e hold ]; do sleep 0.05; done"]
+"#;
+
+fn holding_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("pipeline.toml"), HOLDING).unwrap();
+    fs::write(root.join("hold"), "").unwrap();
+    Fixture { _dir: dir, root }
+}
+
+/// Takes the corpus lock in a child process and keeps it until killed.
+///
+/// The child is this test binary rerun with `HOLD_ENV` set, so it goes
+/// through [`holder`] instead of the test body. That gives the tests a real
+/// separate process whose death the kernel can act on.
+struct Holder {
+    child: Child,
+    root: PathBuf,
+}
+
+impl Holder {
+    fn take(root: &Path, test: &str) -> Self {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(HOLD_ENV, root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut holder = Holder {
+            child,
+            root: root.to_path_buf(),
+        };
+        holder.wait_until_held();
+        holder
+    }
+
+    /// Waits for the child to record its pid in the corpus lock; the pid is
+    /// written only after `flock` succeeds.
+    fn wait_until_held(&mut self) {
+        let lock = self.root.join("corpus/.lock");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let held = fs::read_to_string(&lock)
+                .is_ok_and(|text| text.trim() == self.child.id().to_string());
+            if held {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!("holder exited before taking the lock: {status}");
+            }
+            assert!(Instant::now() < deadline, "holder never took the lock");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn sigkill(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        // The holder's stage, left behind as an orphan, waits on this file;
+        // removing it also lets this test's own stage finish.
+        let _ = fs::remove_file(self.root.join("hold"));
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.root.join("hold"));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Runs this process as the lock holder when [`Holder::take`] spawned it.
+fn holder() {
+    let Some(root) = std::env::var_os(HOLD_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let pipeline = Pipeline::load(&root.join("pipeline.toml")).unwrap();
+    let mut runner = Runner::new(pipeline, PathBuf::from("/nonexistent/vi")).unwrap();
+    let _ = runner.run(None, false, |_| {});
+    unreachable!("holder was not killed");
+}
+
+#[test]
+fn lock_released_after_holder_sigkill() {
+    holder();
+    let f = holding_fixture();
+    let mut child = Holder::take(&f.root, "lock_released_after_holder_sigkill");
+    child.sigkill();
+    assert_eq!(
+        f.run(),
+        outcomes(&[("hold", Outcome::Ran)]),
+        "a SIGKILLed holder must not leave the corpus locked"
+    );
+}
+
+#[test]
+fn second_live_holder_refused() {
+    holder();
+    let f = holding_fixture();
+    let child = Holder::take(&f.root, "second_live_holder_refused");
+    let err = f.runner().run(None, false, |_| {}).unwrap_err().to_string();
+    assert!(err.contains("another vi dataset command"), "{err}");
+    assert!(err.contains(&format!("pid {}", child.child.id())), "{err}");
 }
