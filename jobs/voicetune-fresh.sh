@@ -202,9 +202,11 @@ train() {
   # If this script exits on its own (an abort, or a push failure), kill the
   # trainer. A signal that kills only the stage session must not: the detached
   # wrapper keeps running and writes rc, so the attempt can be recovered.
+  # Exit 75 is a lost job lock: another attempt holds it and wrote train.pid,
+  # so that pid is not this script's trainer to kill.
   dying=0
   trap 'dying=1; exit 143' HUP TERM
-  trap '[ "$dying" = 1 ] || kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true' EXIT
+  trap '[ "$dying" = 1 ] || [ "${rc:-0}" -eq 75 ] || kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true' EXIT
 
   # Watchdog: push each finished epoch home as it appears, and stop the run on the abort rules.
   reason=""

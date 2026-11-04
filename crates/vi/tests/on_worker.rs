@@ -1020,3 +1020,83 @@ fn trainer_survives_vf_kill() {
         !pid_alive(worker)
     });
 }
+
+/// Row 38: a relaunched voicetune-fresh.sh that loses the job lock (exit 75)
+/// must not kill the attempt that holds it. The wrapper holding the lock wrote
+/// `$work/train.pid`, so the dying script's EXIT trap must leave that trainer
+/// alone; the lock holder stands in for the surviving attempt's trainer.
+#[test]
+fn vf_exit_75_does_not_kill_the_surviving_trainer() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let vf = jobs_file("voicetune-fresh.sh");
+    let text = fs::read_to_string(&vf).unwrap();
+    let rev = text
+        .lines()
+        .find_map(|l| l.strip_prefix("qwen_rev="))
+        .expect("voicetune-fresh.sh names the qwen revision")
+        .trim();
+    let ft = home.join(format!(".cache/vi/Qwen3-TTS-{rev}/finetuning"));
+    fs::create_dir_all(&ft).unwrap();
+    fs::write(ft.join("dataset.py"), "").unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let work = dir.path().join("work");
+    let out_dir = work.join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+
+    let py = dir.path().join("py");
+    fs::write(
+        &py,
+        "#!/bin/sh\ncase \"$*\" in\n\
+         *'voicetune.py train'*) exec sleep 60 ;;\n\
+         *'voicetune.py check'*)\n\
+         out=; prev=; for a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
+         mkdir -p \"$out\"; echo '{\"vram_gb\": 80, \"free_disk_gb\": 500}' > \"$out/check.json\"\n\
+         exit 0 ;;\n\
+         *) exit 0 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Another attempt is alive and holds the job lock; its wrapper recorded
+    // its trainer's pid before this relaunch arrived.
+    let lock = work.join("job.lock");
+    fs::write(&lock, "").unwrap();
+    let mut holder = Command::new("flock")
+        .arg(&lock)
+        .arg("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the test could not take the job lock", 10, || {
+        !Command::new("flock")
+            .args(["-n", lock.to_str().unwrap(), "true"])
+            .status()
+            .unwrap()
+            .success()
+    });
+    fs::write(work.join("train.pid"), holder.id().to_string()).unwrap();
+
+    let out = Command::new("bash")
+        .arg(&vf)
+        .arg("train")
+        .env("VI_OUT", &out_dir)
+        .env("VI_RETURN_PORT", "1")
+        .env("VI_INPUT_VOICETUNE_DATA", &data)
+        .env("QWEN_TTS_PYTHON", &py)
+        .env("VI_TRAIN_RETRIES", "0")
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "{stderr}");
+    assert!(
+        pid_alive(holder.id()),
+        "voicetune-fresh.sh killed the attempt that holds the job lock: {stderr}"
+    );
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
