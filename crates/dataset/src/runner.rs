@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -471,28 +471,59 @@ struct Planned {
 }
 
 /// Keeps two runs from writing the same corpus at once.
-struct Lock(PathBuf);
+///
+/// It is an advisory `flock` on the corpus's `.lock` file. The kernel drops
+/// the lock when the holding process exits, however it dies, so a killed or
+/// rebooted run never blocks the next one. The file stays behind with the
+/// holder's pid in it for humans; the open handle is what holds the lock.
+struct Lock {
+    _file: fs::File,
+}
 
 impl Lock {
     fn take(corpus: &Path) -> Result<Self, Error> {
         let path = corpus.join(".lock");
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                let _ = writeln!(f, "{}", std::process::id());
-                Ok(Lock(path))
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .at(&path)?;
+        // A lock fd inherited by a child forked on another thread keeps the
+        // lock alive until that child execs, which can briefly outlast its
+        // owner. Give that window a moment before deciding the lock is held.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    let pid = fs::read_to_string(&path).unwrap_or_default();
+                    let pid = pid.trim();
+                    let holder = if pid.is_empty() {
+                        "another vi dataset command".to_string()
+                    } else {
+                        format!("another vi dataset command (pid {pid})")
+                    };
+                    return Err(Error::Invalid {
+                        path,
+                        message: format!("{holder} is using this corpus"),
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::Io {
+                        path,
+                        source: e.into(),
+                    })
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::Invalid {
-                path: path.clone(),
-                message: "another vi dataset command is using this corpus; delete this file if none is running".into(),
-            }),
-            Err(e) => Err(Error::Io { path, source: e }),
         }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        file.set_len(0).at(&path)?;
+        writeln!(file, "{}", std::process::id()).at(&path)?;
+        Ok(Lock { _file: file })
     }
 }
 
