@@ -33,6 +33,9 @@ pub(crate) const USAGE: &str = "usage:
   (every review mode also takes --host ADDR; default 127.0.0.1)
   vi cloud offers
   vi cloud up --cap USD --until TIME [--offer ID] [--yes]
+  vi cloud start --cap USD --until TIME
+  vi cloud refresh
+  vi cloud hostkey
   vi cloud down [--force]
   vi cloud status
   vi cloud reap

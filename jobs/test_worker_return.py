@@ -9,7 +9,9 @@ import getpass
 import hashlib
 import os
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -526,31 +528,7 @@ class WorkerReturnTest(unittest.TestCase):
         # Stub `ssh` so on-worker.sh's non-local path runs its "worker" commands
         # locally, and its reverse-tunnel invocation records its PID and holds
         # the line. This exercises the real launcher's cleanup on both exits.
-        bindir = self.root / "bin"
-        bindir.mkdir()
-        (bindir / "ssh").write_text(
-            "#!/bin/bash\n"
-            "set -u\n"
-            'for a in "$@"; do\n'
-            '  if [ "$a" = -N ]; then echo "$$" > "$SSH_STUB_TUNNEL_PID"; exec sleep 3600; fi\n'
-            "done\n"
-            "# rsync transport: rsync splits 'root@host' into '-l root <host>' and\n"
-            "# appends 'rsync --server ...', so there is no @ to find. Run the server\n"
-            "# locally (it writes to the path rsync already names on this machine).\n"
-            "i=0\n"
-            'for a in "$@"; do\n'
-            "  i=$((i + 1))\n"
-            '  if [ "$a" = rsync ]; then shift $((i - 1)); exec "$@"; fi\n'
-            "done\n"
-            "# direct ssh (remote): the command is everything after the root@host target.\n"
-            "i=0\n"
-            'for a in "$@"; do\n'
-            "  i=$((i + 1))\n"
-            '  [[ "$a" == *@* ]] && { shift "$i"; break; }\n'
-            "done\n"
-            'exec bash -c "$*"\n'
-        )
-        (bindir / "ssh").chmod(0o755)
+        bindir = write_stub_ssh(self.root / "bin")
         settings = self.root / "settings.json"
         settings.write_text("{}\n")
         for fail in (False, True):
@@ -568,6 +546,8 @@ class WorkerReturnTest(unittest.TestCase):
                     "VI_OUT": str(out),
                     "VI_SETTINGS": str(settings),
                     "VI_BIN": "true",
+                    "SSH_STUB_LOG": str(self.root / "stub-tunnels.log"),
+                    "SSH_STUB_FORWARDER": str(bindir / "forward.py"),
                     "SSH_STUB_TUNNEL_PID": str(pidfile),
                 }
                 job = 'printf ok > "$VI_OUT/ok.txt"; exit 3' if fail else 'printf ok > "$VI_OUT/ok.txt"'
@@ -580,10 +560,24 @@ class WorkerReturnTest(unittest.TestCase):
                 tunnel_pid = int(pidfile.read_text().strip())
                 self.assert_process_gone(tunnel_pid, "reverse tunnel")
 
-    @unittest.skipUnless(shutil.which("ssh") and shutil.which("sshd") and shutil.which("ssh-keygen"),
-                         "OpenSSH client/server tools are not installed")
-    def test_reverse_ssh_tunnel_carries_worker_push(self):
-        sshd_port, remote_port = free_port(), free_port()
+    def wait_port(self, port, process):
+        for _ in range(50):
+            self.assertIsNone(process.poll(), "SSH process exited before opening its listener")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    return
+            except OSError:
+                time.sleep(0.1)
+        self.fail(f"port {port} did not open")
+
+    def start_disposable_sshd(self):
+        """Start an sshd on loopback as this user; return (process, port).
+
+        It runs unprivileged, so it can only accept this user's key. That is
+        enough for the session and tunnel tests; on-worker.sh logs in as root
+        and cannot use this harness.
+        """
+        sshd_port = free_port()
         for name in ("host", "client"):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", self.root / name], check=True)
         config = self.root / "sshd_config"
@@ -605,18 +599,123 @@ PrintMotd no
             sshd = subprocess.Popen([shutil.which("sshd"), "-D", "-e", "-f", config],
                                     stdout=log, stderr=subprocess.STDOUT)
         self.processes.append(sshd)
+        self.wait_port(sshd_port, sshd)
+        return sshd, sshd_port
 
-        def wait_port(port, process):
-            for _ in range(50):
-                self.assertIsNone(process.poll(), "SSH process exited before opening its listener")
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                        return
-                except OSError:
-                    time.sleep(0.1)
-            self.fail(f"port {port} did not open")
+    def sshd_sessions(self, sshd):
+        """Pids of this sshd's session children that are not on a tty.
 
-        wait_port(sshd_port, sshd)
+        OpenSSH 9 titles them `sshd: user@notty`; OpenSSH 10 uses
+        `sshd-session: user@notty`. Only descendants of this disposable
+        listener are considered, so no other login on the machine matches.
+        """
+        out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="],
+                             capture_output=True, text=True, check=True).stdout
+        children = {}
+        for line in out.splitlines():
+            pid, ppid, args = line.split(None, 2)
+            children.setdefault(int(ppid), []).append((int(pid), args))
+        sessions, stack = [], [sshd.pid]
+        while stack:
+            for pid, args in children.get(stack.pop(), []):
+                stack.append(pid)
+                if "@notty" in args and "sshd" in args:
+                    sessions.append(pid)
+        return sessions
+
+    def kill_if_ours(self, pid, marker):
+        """SIGKILL pid's group only if its command line still names `marker`."""
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return
+        if str(marker).encode() in cmdline:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    @unittest.skipUnless(shutil.which("ssh") and shutil.which("sshd") and shutil.which("ssh-keygen"),
+                         "OpenSSH client/server tools are not installed")
+    def test_stage_session_killed_mid_job_leaves_detached_job_running(self):
+        """Row 1: killing the stage's ssh session mid-job must not stop it.
+
+        The sshd harness runs on-worker.sh's launch shape (`setsid -f` plus
+        `</dev/null`), then holds the session open like the old long stage
+        session. Killing the session and its old process group must leave the
+        detached job alive and finishing. A full on-worker.sh run against this
+        server is impossible because on-worker.sh logs in as root and the
+        disposable server runs as the test user; the supervisor's reattach
+        half is covered by the stub-ssh reconnect tests.
+        """
+        sshd, port = self.start_disposable_sshd()
+        work = self.root / "stage-session"
+        work.mkdir()
+        (work / "job.sh").write_text(
+            "for i in 1 2 3 4 5 6 7 8; do\n"
+            f'  printf "%s\\n" "$i" >> {work / "steps"}\n'
+            "  sleep 0.5\n"
+            "done\n"
+            f'printf "0\\n" > {work / "stage.rc"}\n'
+        )
+        launcher = self.root / "launch.sh"
+        launcher.write_text(
+            f"echo $$ > {work / 'launcher.pid'}\n"
+            f"setsid -f bash -c 'echo $$ > {work / 'stage.pid'}; bash {work / 'job.sh'} "
+            f">> {work / 'job.log'} 2>&1; printf \"%s\\n\" \"$?\" > {work / 'stage.rc'}' </dev/null\n"
+            "sleep 60\n"
+        )
+        with (self.root / "session.log").open("w") as log:
+            ssh = subprocess.Popen([
+                shutil.which("ssh"), "-p", str(port),
+                "-i", self.root / "client", "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                f"{getpass.getuser()}@127.0.0.1", "bash", str(launcher),
+            ], stdout=log, stderr=subprocess.STDOUT)
+        self.processes.append(ssh)
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if (work / "stage.pid").exists() and (work / "steps").exists():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the stage did not start through sshd\n"
+                      + (self.root / "session.log").read_text()
+                      + (self.root / "sshd.log").read_text())
+        stage_pid = int((work / "stage.pid").read_text())
+        launcher_pid = int((work / "launcher.pid").read_text())
+        self.addCleanup(self.kill_if_ours, launcher_pid, launcher)
+        steps_before = len((work / "steps").read_text().splitlines())
+        self.assertLess(steps_before, 8, "the job finished before the session was killed")
+
+        sessions = self.sshd_sessions(sshd)
+        self.assertTrue(sessions, "no sshd session process to kill")
+        for pid in sessions:
+            os.kill(pid, signal.SIGTERM)
+        # A dying session also hangs up its process group; the setsid'd job is
+        # in its own group and must not care.
+        try:
+            os.killpg(launcher_pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        ssh.wait(timeout=5)
+        self.assertIsNotNone(ssh.poll())
+
+        os.kill(stage_pid, 0)  # still alive right after the session died
+        deadline = time.time() + 15
+        while time.time() < deadline and not (work / "stage.rc").exists():
+            time.sleep(0.05)
+        self.assertEqual((work / "stage.rc").read_text().strip(), "0",
+                         (work / "job.log").read_text())
+        self.assertEqual(len((work / "steps").read_text().splitlines()), 8)
+        self.assert_process_gone(stage_pid, "detached stage")
+
+    @unittest.skipUnless(shutil.which("ssh") and shutil.which("sshd") and shutil.which("ssh-keygen"),
+                         "OpenSSH client/server tools are not installed")
+    def test_reverse_ssh_tunnel_carries_worker_push(self):
+        sshd, sshd_port = self.start_disposable_sshd()
+        remote_port = free_port()
         with (self.root / "tunnel.log").open("w") as log:
             tunnel = subprocess.Popen([
                 shutil.which("ssh"), "-N", "-T", "-p", str(sshd_port),
@@ -626,7 +725,7 @@ PrintMotd no
                 "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{self.port}", f"{getpass.getuser()}@127.0.0.1",
             ], stdout=log, stderr=subprocess.STDOUT)
         self.processes.append(tunnel)
-        wait_port(remote_port, tunnel)
+        self.wait_port(remote_port, tunnel)
         (self.src / "out" / "tunnel.txt").write_text("through ssh\n")
         result = subprocess.run([SCRIPT, "push", self.src / "out", "vi-out"],
                                 env={**self.env, "VI_RETURN_PORT": str(remote_port)},
@@ -649,6 +748,708 @@ PrintMotd no
     def test_unknown_module_is_rejected(self):
         result = self.push(self.src / "out", "vi-other", check=False)
         self.assertEqual(result.returncode, 2)
+
+
+STUB_SSH = r'''#!/bin/bash
+set -u
+# A tunnel invocation (-N): listen on the requested remote loopback port and
+# forward it to the home receiver port, the way ssh -R would on the worker.
+for a in "$@"; do
+  if [ "$a" = -N ]; then
+    prev=
+    for b in "$@"; do [ "$prev" = -R ] && spec=$b; prev=$b; done
+    rp=${spec#127.0.0.1:}; rp=${rp%%:*}
+    rest=${spec#*:}; rest=${rest#*:}; p=${rest##*:}
+    echo "$$ $rp $p" >> "$SSH_STUB_LOG"
+    [ -n "${SSH_STUB_TUNNEL_PID:-}" ] && echo "$$" > "$SSH_STUB_TUNNEL_PID"
+    exec python3 "$SSH_STUB_FORWARDER" "$rp" "$p"
+  fi
+done
+# rsync's transport: run the server command locally. A push's client is
+# throttled by a PATH wrapper (SSH_STUB_BWLIMIT) so a test can interrupt a
+# transfer mid-flight.
+i=0
+for a in "$@"; do
+  i=$((i + 1))
+  if [ "$a" = rsync ]; then
+    shift $((i - 1))
+    exec "$@"
+  fi
+done
+# A short link flap: every direct remote command fails while the flag exists.
+if [ -e "${SSH_STUB_FAIL:-/nonexistent-flag}" ]; then exit 255; fi
+# A regenerated worker host key: ssh refuses every direct command with the
+# message a real client prints, until home accepts the new key through the API.
+if [ -e "${SSH_STUB_HOSTKEY:-/nonexistent-hostkey-flag}" ]; then
+  echo "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" >&2
+  echo "Host key verification failed." >&2
+  exit 255
+fi
+# A direct remote command: everything after the root@host target.
+i=0
+for a in "$@"; do
+  i=$((i + 1))
+  if [[ "$a" == *@* ]]; then shift "$i"; break; fi
+done
+exec bash -c "$*"
+'''
+
+STUB_FORWARDER = r'''import socket, sys, threading
+rp, p = int(sys.argv[1]), int(sys.argv[2])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", rp))
+s.listen(16)
+
+def pipe(a, b):
+    try:
+        while True:
+            data = a.recv(65536)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+while True:
+    client, _ = s.accept()
+    peer = socket.create_connection(("127.0.0.1", p))
+    threading.Thread(target=pipe, args=(client, peer), daemon=True).start()
+    threading.Thread(target=pipe, args=(peer, client), daemon=True).start()
+'''
+
+
+def write_stub_ssh(bindir):
+    """A stand-in ssh that runs the 'worker' locally and forwards tunnels.
+
+    Direct commands run through bash; the rsync transport execs the server
+    command it is given; -N starts a loopback TCP forwarder from the remote
+    port to the local receiver port and records `pid remote_port local_port`.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    (bindir / "ssh").write_text(STUB_SSH)
+    (bindir / "ssh").chmod(0o755)
+    (bindir / "forward.py").write_text(STUB_FORWARDER)
+    real_rsync = shutil.which("rsync")
+    (bindir / "rsync").write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "${SSH_STUB_RSYNC_LOG:-/dev/null}"\n'
+        'if [ -n "${SSH_STUB_BWLIMIT:-}" ]; then\n'
+        '  for a in "$@"; do\n'
+        f'    case $a in *@*) exec {real_rsync} --bwlimit="$SSH_STUB_BWLIMIT" "$@";; esac\n'
+        "  done\n"
+        "fi\n"
+        f'exec {real_rsync} "$@"\n'
+    )
+    (bindir / "rsync").chmod(0o755)
+    return bindir
+
+
+def wait_for(what, seconds, cond):
+    deadline = time.time() + seconds
+    while True:
+        value = cond()
+        if value:
+            return value
+        if time.time() >= deadline:
+            raise AssertionError(what)
+        time.sleep(0.05)
+
+
+@unittest.skipUnless(shutil.which("rsync") and shutil.which("python3"),
+                     "rsync and python3 are needed")
+class HomeSupervisorTest(unittest.TestCase):
+    """on-worker.sh's poll loop, tunnel reconnect and reattach (rows 3, 6-8, 33, 36, 46)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.state = self.root / "state"
+        self.worker = self.root / "worker"
+        self.out = self.root / "home-out"
+        self.bindir = write_stub_ssh(self.root / "bin")
+        self.settings = self.root / "settings.json"
+        self.settings.write_text("{}\n")
+        self.job_path = self.root / "job.sh"
+        self.checkpoint = self.root / ".checkpoint-test"
+        self.checkpoint.mkdir()
+        self.tunnel_log = self.root / "tunnels.log"
+        self.fail_flag = self.root / "link-down"
+        self.hostkey_flag = self.root / "hostkey-changed"
+        self.rotations_log = None
+        self.logs = []
+        self.procs = []
+
+    def tearDown(self):
+        for process in self.procs:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        for log in self.logs:
+            log.close()
+        for conf in (self.state / "return").glob("*/rsyncd.conf"):
+            subprocess.run([SCRIPT, "stop", str(conf.parent)], capture_output=True)
+        for line in self.tunnel_lines():
+            try:
+                os.kill(line[0], 9)
+            except ProcessLookupError:
+                pass
+        # The detached stage is its own session; kill only the pid that still
+        # runs this test's work dir.
+        for pidfile in self.worker.glob("*.*.*/stage.pid"):
+            try:
+                pid = int(pidfile.read_text().strip())
+            except (OSError, ValueError):
+                continue
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+            except OSError:
+                continue
+            if str(self.worker).encode() in cmdline:
+                try:
+                    os.killpg(pid, 9)
+                except ProcessLookupError:
+                    pass
+        self.tmp.cleanup()
+
+    # -- harness -----------------------------------------------------------
+    def env(self, stage, **extra):
+        env = {
+            **os.environ,
+            "PATH": f"{self.bindir}{os.pathsep}{os.environ['PATH']}",
+            "HOME": str(self.home),
+            "VI_STATE_DIR": str(self.state),
+            "VI_WORKER_HOST": "127.0.0.1",
+            "VI_WORKER_PORT": "22",
+            "VI_WORKER_KNOWN_HOSTS": str(self.root / "known_hosts"),
+            "VI_WORKER_ROOT": str(self.worker),
+            "VI_STAGE": stage,
+            "VI_OUT": str(self.out),
+            "VI_SETTINGS": str(self.settings),
+            "VI_CHECKPOINT": str(self.checkpoint),
+            "VI_BIN": "true",
+            "VI_POLL_SECONDS": "1",
+            "VI_LOST_MINUTES": "1",
+            "VI_SYNC_SECONDS": "1",
+            "VI_PUSH_SECONDS": "1",
+            "SSH_STUB_LOG": str(self.tunnel_log),
+            "SSH_STUB_FORWARDER": str(self.bindir / "forward.py"),
+            "SSH_STUB_FAIL": str(self.fail_flag),
+            "SSH_STUB_HOSTKEY": str(self.hostkey_flag),
+        }
+        env.update(extra)
+        return env
+
+    def start(self, stage, job, **extra):
+        self.job_path.write_text("set -e\n" + job)
+        log = open(self.root / f"{stage}.err", "w")
+        self.logs.append(log)
+        process = subprocess.Popen(
+            [str(ON_WORKER), "bash", str(self.job_path)],
+            env=self.env(stage, **extra), stdout=subprocess.DEVNULL, stderr=log,
+        )
+        self.procs.append(process)
+        return process
+
+    def stderr(self, stage):
+        return (self.root / f"{stage}.err").read_text()
+
+    def tunnel_lines(self):
+        try:
+            text = self.tunnel_log.read_text()
+        except OSError:
+            return []
+        out = []
+        for line in text.splitlines():
+            try:
+                pid, rp, p = line.split()
+                out.append((int(pid), int(rp), int(p)))
+            except ValueError:
+                continue
+        return out
+
+    def wait_tunnels(self, count, seconds=25):
+        return wait_for(f"fewer than {count} tunnel(s) started",
+                        seconds, lambda: len(self.tunnel_lines()) >= count
+                        and self.tunnel_lines()[count - 1])
+
+    def return_dir(self, stage):
+        def find():
+            dirs = [p.parent for p in (self.state / "return").glob(f"{stage}.*/tunnel.log")]
+            return dirs[0] if dirs else None
+        return find()
+
+    def return_log(self, stage):
+        path = self.return_dir(stage)
+        return (path / "tunnel.log").read_text() if path else ""
+
+    def worker_work(self, stage):
+        def find():
+            dirs = list(self.worker.glob(f"{stage}.*"))
+            return dirs[0] if dirs else None
+        return find()
+
+    def wait_worker_work(self, stage, seconds=20):
+        return wait_for(f"the worker dir for {stage} never appeared", seconds,
+                        lambda: self.worker_work(stage))
+
+    def write_vi_stub(self, accept=True):
+        """A stand-in `vi` for the host-key rotation path.
+
+        `cloud hostkey` records the call in rotations.log and, when accepting,
+        clears the host-key-changed flag. The real fingerprint matching and the
+        Vast log check are covered by the Rust tests; this stub stands in for a
+        successful `vi cloud hostkey`, so the test exercises on-worker.sh's
+        response. `cloud env` refuses, which leaves the worker env unchanged.
+        """
+        self.rotations_log = self.root / "rotations.log"
+        decision = (
+            f"rm -f {shlex.quote(str(self.hostkey_flag))}\n    exit 0"
+            if accept else "exit 1"
+        )
+        script = self.root / "vi"
+        script.write_text(f'''#!/bin/bash
+case "$1 $2" in
+  "cloud hostkey")
+    echo hostkey >> {shlex.quote(str(self.rotations_log))}
+    {decision}
+    ;;
+  "cloud env") exit 1 ;;
+  *) exit 0 ;;
+esac
+''')
+        script.chmod(0o755)
+        return script
+
+    def rotations(self):
+        if self.rotations_log is None:
+            return 0
+        try:
+            return len(self.rotations_log.read_text().splitlines())
+        except OSError:
+            return 0
+
+    def receiver(self, stage):
+        path = self.return_dir(stage)
+        if not path:
+            return None
+        pid_file = path / "rsyncd.pid"
+        try:
+            return int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def finish(self, process, seconds=90):
+        try:
+            return process.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            self.fail("on-worker.sh did not finish")
+
+    # -- row 3: tunnel reconnect and token re-proof ------------------------
+    def test_tunnel_reconnects_after_kill(self):
+        stage = "tunnel-reconnect"
+        process = self.start(stage, 'sleep 16\necho done > "$VI_OUT/ok.txt"\n')
+        first = self.wait_tunnels(1)
+        # The first start proves the path on a 5 s budget; let it finish so the
+        # kill exercises the reconnect path and not a failed first start.
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        os.kill(first[0], 9)
+
+        second = self.wait_tunnels(2)
+        self.assertNotEqual(second[1], first[1], "the reconnect reused the old remote port")
+        work = self.wait_worker_work(stage)
+        wait_for("the worker was not told the new remote port", 10,
+                 lambda: (work / ".return-port").is_file()
+                 and (work / ".return-port").read_text().strip() == str(second[1]))
+        # The successful cleanup removes the return dir, so keep the log now.
+        # The first "tunnel up" line is not required: the token proof can win
+        # the race against the loop's one-second liveness check.
+        settled = f"tunnel up: remote loopback port {second[1]}"
+        log = ""
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            text = self.return_log(stage)
+            if text:
+                log = text
+            if settled in log:
+                break
+            time.sleep(0.05)
+        self.assertIn(settled, log, log or self.stderr(stage))
+
+        self.assertEqual(self.finish(process), 0, self.stderr(stage))
+        self.assertIn("tunnel down", log)
+        self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
+
+    def test_reconnect_uses_new_remote_port_when_old_listener_lingers(self):
+        stage = "tunnel-lingering-port"
+        process = self.start(stage, 'sleep 16\necho done > "$VI_OUT/ok.txt"\n')
+        first = self.wait_tunnels(1)
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        os.kill(first[0], 9)
+        # Stand in for a listener the worker-side ssh left on the old port.
+        linger = subprocess.Popen([
+            "python3", "-c",
+            "import socket, time\n"
+            "s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            f"s.bind(('127.0.0.1', {first[1]})); s.listen()\n"
+            "time.sleep(60)\n",
+        ])
+        try:
+            time.sleep(0.3)
+            self.assertIsNone(linger.poll(), "could not hold the old remote port")
+            second = self.wait_tunnels(2)
+            self.assertNotEqual(second[1], first[1])
+            self.assertEqual(second[2], first[2], "the local receiver port must stay fixed")
+            self.assertEqual(self.finish(process), 0, self.stderr(stage))
+            self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
+            self.assertIsNone(linger.poll(), "the old port's listener was disturbed")
+        finally:
+            linger.kill()
+            linger.wait(timeout=5)
+
+    def test_reconnect_token_proof_survives_short_flap(self):
+        stage = "tunnel-short-flap"
+        process = self.start(stage, 'sleep 20\necho done > "$VI_OUT/ok.txt"\n')
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        self.wait_tunnels(1)
+        os.kill(self.tunnel_lines()[0][0], 9)
+        self.fail_flag.write_text("")
+        time.sleep(3)
+        self.fail_flag.unlink()
+        self.wait_tunnels(2)
+        self.assertEqual(self.finish(process, 90), 0, self.stderr(stage))
+        err = self.stderr(stage)
+        self.assertIn("poll failed; will retry", err)
+        self.assertGreaterEqual(err.count("return path re-proved"), 2, err)
+        self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
+
+    def test_security_holds_after_reconnect_and_receiver_restart(self):
+        stage = "security-after-reconnect"
+        process = self.start(stage, 'sleep 20\necho done > "$VI_OUT/ok.txt"\n')
+        first = self.wait_tunnels(1)
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        os.kill(first[0], 9)
+        second = self.wait_tunnels(2)
+        old = self.receiver(stage)
+        self.assertIsNotNone(old)
+        os.kill(old, 9)
+        def restarted():
+            pid = self.receiver(stage)
+            if pid in (None, old) or not Path(f"/proc/{pid}").exists():
+                return None
+            return pid
+
+        new = wait_for("the receiver was never restarted", 20, restarted)
+        self.assertNotEqual(new, old)
+        wait_for("the restarted receiver is not listening", 20,
+                 lambda: port_open(int((self.return_dir(stage) / "rsyncd.conf").read_text()
+                                      .split("port = ")[1].splitlines()[0])))
+        port = second[1]
+        src = self.root / "security-src"
+        (src / "out").mkdir(parents=True)
+        (self.out / "keep.txt").write_text("keep\n")
+        for option in ("--delete", "--delete-after"):
+            with self.subTest(option=option):
+                refused = subprocess.run(
+                    [str(SCRIPT), "push", str(src / "out"), "vi-out", option],
+                    env={**self.env(stage), "VI_RETURN_PORT": str(port)},
+                    capture_output=True, text=True)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertEqual((self.out / "keep.txt").read_text(), "keep\n")
+        download = subprocess.run(
+            ["rsync", "-a", f"rsync://127.0.0.1:{port}/vi-out/keep.txt",
+             str(self.root / "download.txt")], capture_output=True, text=True)
+        self.assertNotEqual(download.returncode, 0)
+        self.assertFalse((self.root / "download.txt").exists())
+        listing = subprocess.run(["rsync", f"rsync://127.0.0.1:{port}/"],
+                                 capture_output=True, text=True)
+        for module in ("vi-out", "vi-checkpoint", "vi-publish"):
+            self.assertNotIn(module, listing.stdout)
+
+        secret = self.root / "secret.txt"
+        secret.write_text("outside\n")
+        (src / "out" / "link").symlink_to(secret)
+        result = subprocess.run(
+            [str(SCRIPT), "push", str(src / "out"), "vi-out"],
+            env={**self.env(stage), "VI_RETURN_PORT": str(port)},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        link = self.out / "link"
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(os.readlink(link).startswith("/rsyncd-munged/"))
+        with self.assertRaises(OSError):
+            link.read_text()
+
+        self.assertEqual(self.finish(process), 0, self.stderr(stage))
+        self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
+
+    # -- row 8: a SIGKILLed runner leaves nothing behind -------------------
+    def test_kill9_runner_leaves_no_receiver_or_tunnel(self):
+        stage = "kill9-cleanup"
+        process = self.start(stage, 'sleep 20\necho done > "$VI_OUT/ok.txt"\n')
+        tunnel = self.wait_tunnels(1)
+        work = self.wait_worker_work(stage)
+        wait_for("the stage never started", 10, lambda: (work / "stage.pid").is_file())
+        receiver = self.receiver(stage)
+        self.assertIsNotNone(receiver)
+        port = int((self.return_dir(stage) / "rsyncd.conf").read_text()
+                   .split("port = ")[1].splitlines()[0])
+
+        process.kill()
+        process.wait(timeout=5)
+        wait_for("the tunnel outlived the killed runner", 8,
+                 lambda: not Path(f"/proc/{tunnel[0]}").exists())
+        wait_for("the receiver outlived the killed runner", 8,
+                 lambda: not Path(f"/proc/{receiver}").exists())
+        self.assertFalse(port_open(port), "the receiver still accepts connections")
+        # The detached job is untouched: home's death only detaches it (row 1).
+        self.assertEqual(subprocess.run(
+            ["kill", "-0", (work / "stage.pid").read_text().strip()]).returncode, 0)
+
+    # -- row 7: reattach needs a fresh token -------------------------------
+    def test_reattach_requires_fresh_token(self):
+        stage = "reattach-token"
+        process = self.start(
+            stage, 'sleep 12\necho done > "$VI_OUT/ok.txt"\n',
+            VI_WORKER_HOST="local",
+        )
+        work = self.wait_worker_work(stage)
+        wait_for("the stage never started", 10, lambda: (work / "stage.pid").is_file())
+        stage_pid = (work / "stage.pid").read_text().strip()
+        wait_for("the first run never proved its return path", 10,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        process.kill()
+        process.wait(timeout=5)
+        # A reattach must prove a FRESH token. Break only the worker-side
+        # pusher; the home receiver still starts and answers.
+        pusher = work / "jobs" / "worker-return.sh"
+        pusher.write_text("#!/bin/sh\nexit 1\n")
+        pusher.chmod(0o755)
+
+        again = self.start(
+            stage, 'sleep 12\necho done > "$VI_OUT/ok.txt"\n',
+            VI_WORKER_HOST="local", VI_LOST_MINUTES="0", VI_PROVE_WAIT="0",
+        )
+        self.assertNotEqual(self.finish(again, 30), 0)
+        err = self.stderr(stage)
+        self.assertIn("reattaching to", err)
+        self.assertIn("could not push through the reverse SSH return tunnel", err)
+        self.assertIn("the return path did not come up; nothing will be sent", err)
+        self.assertEqual((work / "stage.pid").read_text().strip(), stage_pid,
+                         "the reattach relaunched the stage before proving the path")
+
+    # -- row 46: the watchdog is restarted when missing --------------------
+    def test_hs_restarts_missing_watchdog(self):
+        stage = "watchdog-restart"
+        alive = self.root / "watchdog.alive"
+        script = self.root / "vi-watchdog.sh"
+        script.write_text(f"#!/bin/sh\ntouch {alive}\nexec sleep 60\n")
+        script.chmod(0o755)
+        fake_pgrep = self.bindir / "pgrep"
+        fake_pgrep.write_text(
+            "#!/bin/sh\n"
+            f'[ -e {alive} ] && exit 0\n'
+            "exit 1\n"
+        )
+        fake_pgrep.chmod(0o755)
+        process = self.start(
+            stage, 'sleep 12\necho done > "$VI_OUT/ok.txt"\n',
+            VI_WATCHDOG_SCRIPT=str(script),
+            VI_WATCHDOG_LOG=str(self.root / "watchdog.log"),
+        )
+        try:
+            wait_for("the missing watchdog was never restarted", 10, alive.exists)
+            wait_for("the restart was not reported", 10,
+                     lambda: "the worker watchdog was missing; restarted" in self.stderr(stage))
+            self.assertEqual(self.finish(process), 0, self.stderr(stage))
+        finally:
+            subprocess.run(["pkill", "-f", str(script)], capture_output=True)
+
+    # -- row 33: the upload gate reads the stage setting -------------------
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is not installed")
+    def test_upload_gate_reads_stage_setting(self):
+        stage = "upload-gate"
+        data = self.root / "data"
+        data.mkdir()
+        (data / "clip.wav").write_bytes(b"audio\n")
+        self.settings.write_text('{"max_upload_minutes": 0}\n')
+        process = self.start(
+            stage, 'echo ran > "$VI_OUT/ran.txt"\n',
+            VI_INPUT_DATA=str(data), VI_PACK_MIN_KB="0",
+            VI_BUNDLE_DIR=str(self.root / "bundles"),
+        )
+        self.assertNotEqual(self.finish(process, 60), 0)
+        err = self.stderr(stage)
+        self.assertIn("max_upload_minutes is 0", err)
+        work = self.worker_work(stage)
+        self.assertIsNotNone(work)
+        self.assertFalse((work / "inputs" / "DATA").exists(), "inputs were sent")
+        self.assertFalse((work / "bundles").exists(), "a bundle was sent")
+        self.assertFalse((work / "stage.pid").exists(), "the stage ran")
+        # Home finished packing before the refusal, as designed.
+        self.assertEqual(len(list((self.root / "bundles").glob("*.tar.zst"))), 1)
+
+    # -- row 36: a killed bundle upload keeps its bytes --------------------
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is not installed")
+    def test_bundle_upload_resumes_after_kill(self):
+        stage = "bundle-resume"
+        target = "root@127.0.0.1"
+        data = self.root / "data"
+        data.mkdir()
+        payload = os.urandom(40 * 1024 * 1024)
+        (data / "big.bin").write_bytes(payload)
+        process = self.start(
+            stage, 'echo ran > "$VI_OUT/ran.txt"\n',
+            VI_INPUT_DATA=str(data), VI_PACK_MIN_KB="0",
+            VI_BUNDLE_DIR=str(self.root / "bundles"),
+            SSH_STUB_BWLIMIT="2000",
+        )
+        work = self.wait_worker_work(stage)
+        bundles = work / "bundles"
+        src_bundle = wait_for(
+            "the bundle was never packed", 60,
+            lambda: next(iter((self.root / "bundles").glob("*.tar.zst")), None))
+        bundle = bundles / src_bundle.name
+        src_size = src_bundle.stat().st_size
+
+        def uploading():
+            if not bundles.is_dir():
+                return 0
+            return sum(p.stat().st_size for p in bundles.iterdir() if p.is_file())
+
+        wait_for("the upload never made progress", 120,
+                 lambda: uploading() > 0.6 * src_size)
+        start = uploading()
+
+        # Stop home first so its EXIT trap cannot delete the worker dir, then
+        # kill only the rsync client: its server sees EOF and keeps the
+        # partial under the destination name (--partial).
+        os.kill(process.pid, signal.SIGSTOP)
+        client = None
+        for pid in subprocess.run(["pgrep", "-f", f"rsync.*{bundles}"],
+                                  capture_output=True, text=True).stdout.split():
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+            except OSError:
+                continue
+            if b"@" in cmdline and str(bundles).encode() in cmdline:
+                client = int(pid)
+        self.assertIsNotNone(client, "no rsync client found")
+        os.kill(client, signal.SIGTERM)
+        wait_for("the partial bundle was not kept", 20,
+                 lambda: bundle.is_file() and bundle.stat().st_size >= start)
+        kept = bundle.stat().st_size
+        self.assertGreater(kept, 0)
+        self.assertLess(kept, src_size)
+        os.kill(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+        # The same push to the same destination resumes instead of restarting.
+        env = {k: v for k, v in self.env(stage).items()
+               if not k.startswith("SSH_STUB_") or k in ("SSH_STUB_LOG", "SSH_STUB_FORWARDER")}
+        result = subprocess.run(
+            ["rsync", "-a", "--partial", "--timeout=300", "--stats",
+             "-e", str(self.bindir / "ssh"),
+             f"{self.root / 'bundles' / bundle.name}", f"{target}:{bundles}/"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = [int(n.replace(",", "")) for n in re.findall(r"Total bytes sent: ([\d,]+)", result.stdout)]
+        self.assertTrue(sent, result.stdout[-2000:])
+        self.assertLess(sum(sent), 0.7 * src_size, f"resume sent {sum(sent)} bytes")
+        self.assertEqual(bundle.stat().st_size, src_size)
+
+    # -- R50: a regenerated worker host key --------------------------------
+    def test_rotation_after_regenerated_key_with_matching_log_succeeds_and_sends_no_inputs(self):
+        """The worker's key changed; home accepts it through the API and only
+        reattaches. The running stage is never relaunched, so the job writes its
+        start marker exactly once."""
+        stage = "hostkey-rotation"
+        vi = self.write_vi_stub()
+        process = self.start(
+            stage,
+            'echo started >> "$VI_OUT/runs.txt"\n'
+            'sleep 20\necho done > "$VI_OUT/ok.txt"\n',
+            VI_BIN=str(vi),
+        )
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        work = self.wait_worker_work(stage)
+        wait_for("the stage never started", 10, lambda: (work / "stage.pid").is_file())
+        stage_pid = (work / "stage.pid").read_text().strip()
+
+        # The worker regenerated its key: direct ssh commands now print the
+        # changed-key message. The stub `vi cloud hostkey` stands in for the
+        # authenticated API check accepting a matching key.
+        self.hostkey_flag.write_text("")
+        wait_for("the rotation was never checked through the API", 20,
+                 lambda: self.rotations() >= 1)
+        wait_for("the rotation was not accepted", 20,
+                 lambda: "accepted host-key rotation 1" in self.stderr(stage))
+        wait_for("the return path was not re-proved after the rotation", 20,
+                 lambda: self.stderr(stage).count("return path re-proved") >= 2)
+
+        self.assertEqual((work / "stage.pid").read_text().strip(), stage_pid,
+                         "the rotation relaunched the stage")
+        self.assertEqual(self.finish(process, 90), 0, self.stderr(stage))
+        err = self.stderr(stage)
+        self.assertIn("ALERT: the worker's ssh host key changed", err)
+        self.assertIn("only a reattach continues, no inputs are sent", err)
+        self.assertGreaterEqual(len(self.tunnel_lines()), 2,
+                                "the tunnel was not restarted after the rotation")
+        self.assertEqual((self.out / "runs.txt").read_text(), "started\n",
+                         "a rotation sent new inputs")
+        self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
+
+    def test_unlimited_rotations_each_logged(self):
+        """A worker may regenerate its key repeatedly; each rotation is checked
+        and logged, with a new number and no stage relaunch."""
+        stage = "hostkey-many"
+        vi = self.write_vi_stub()
+        process = self.start(
+            stage, 'sleep 30\necho done > "$VI_OUT/ok.txt"\n', VI_BIN=str(vi))
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        work = self.wait_worker_work(stage)
+        wait_for("the stage never started", 10, lambda: (work / "stage.pid").is_file())
+        stage_pid = (work / "stage.pid").read_text().strip()
+
+        for n in (1, 2, 3):
+            self.hostkey_flag.write_text("")
+            wait_for(f"rotation {n} was never checked", 30,
+                     lambda n=n: self.rotations() >= n)
+            wait_for(f"rotation {n} was not accepted", 30,
+                     lambda n=n: f"accepted host-key rotation {n}" in self.stderr(stage))
+            wait_for(f"the path after rotation {n} was not re-proved", 30,
+                     lambda n=n: self.stderr(stage).count("return path re-proved") >= n + 1)
+
+        self.assertEqual((work / "stage.pid").read_text().strip(), stage_pid,
+                         "a rotation relaunched the stage")
+        self.assertEqual(self.finish(process, 120), 0, self.stderr(stage))
+        err = self.stderr(stage)
+        for n in (1, 2, 3):
+            self.assertIn(f"accepted host-key rotation {n} for this worker", err)
+            self.assertIn("only a reattach continues, no inputs are sent", err)
+        self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
 
 
 if __name__ == "__main__":

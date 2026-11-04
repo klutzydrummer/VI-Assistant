@@ -5,6 +5,11 @@
 # home as it lands, aborts on bad loss/memory/time, then builds the unblinded listening set and
 # pushes it plus the run files home.
 #
+# `push` runs only the publish-push loop. The train mode holds $work/push.lock while it runs, so
+# when a killed session leaves the detached trainer alive, the home supervisor starts `push`
+# under the same lock: finished epochs keep going home, and epochs home found corrupt are re-sent
+# with --checksum while the receiver moves the old copy aside (nothing is deleted).
+#
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
 #   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home by the
 #                                           voicetune_data stage, holding
@@ -21,18 +26,138 @@ jobs_dir=$(cd "$(dirname "$0")" && pwd)
 MODE=${1:-}
 
 usage() {
-  echo "usage: voicetune-fresh.sh preflight|train" >&2
+  echo "usage: voicetune-fresh.sh preflight|train|push" >&2
   echo "  preflight  check --generate, gate VRAM/disk, run a 5-step probe, push it home, speak one line" >&2
   echo "  train      6 epochs from Base, push each epoch home, abort on bad loss/mem/time, build the platter" >&2
+  echo "  push       only push finished epochs and repairs home (started by the home supervisor)" >&2
 }
 
 case "$MODE" in
-  preflight|train) ;;
+  preflight|train|push) ;;
   *) usage; exit 2 ;;
 esac
 
-: "${VI_OUT:?voicetune-fresh.sh runs through jobs/on-worker.sh}" \
-  "${VI_RETURN_PORT:?voicetune-fresh.sh needs the worker return tunnel}" \
+: "${VI_OUT:?voicetune-fresh.sh runs through jobs/on-worker.sh}"
+
+# Worker-side scratch inside on-worker.sh's work dir (deleted with the job): run/publish/probe live
+# here, not under VI_OUT, so epoch weights aren't re-sent over vi-out at the end.
+scratch="$(cd "$(dirname "$VI_OUT")" && pwd)/voicetune-fresh"
+run="$scratch/run"
+publish="$scratch/publish"
+probe_run="$scratch/probe-run"
+probe_publish="$scratch/probe-publish"
+mkdir -p "$scratch"
+work="$(cd "$(dirname "$VI_OUT")" && pwd)"
+
+# Which finished epochs still need to go home. `ack_epochs` in on-worker.sh
+# writes $work/acked/epoch-<k> only after the copy home verifies, so an acked
+# epoch is never re-sent; everything else is, every pass.
+acked_epochs() {
+  local e n acked=()
+  for e in "$publish"/epoch-*; do
+    [ -d "$e" ] || continue
+    case ${e##*/} in *.part) continue ;; esac
+    n=${e##*/epoch-}
+    [ -e "$work/acked/epoch-$n" ] || continue
+    acked+=("--exclude=/${e##*/}")
+  done
+  [ ${#acked[@]} -eq 0 ] || printf '%s\n' "${acked[@]}"
+}
+
+mark_bad() {  # N
+  mkdir -p "$work/bad"
+  : >"$work/bad/epoch-$1"
+  rm -f "$work/repush/epoch-$1" "$work/repush/epoch-$1.fails"
+  echo "voicetune-fresh: ALERT: epoch $1 failed three repair pushes; marked $work/bad/epoch-$1 and no longer retried (the corrupt copy stays home beside the repaired files)" >&2
+}
+
+# push_repairs: re-send epochs home found corrupt. --checksum ignores size and
+# mtime (a flipped byte keeps both), --backup moves the bad copy into
+# .rsync-replaced-<attempt>/ instead of overwriting it, and --relative keeps
+# the epoch-<k>/ layout the whole-directory push uses. After three failed
+# pushes the epoch is marked bad, loudly, and never retried.
+push_repairs() {
+  local rp n fails f
+  for rp in "$work/repush"/epoch-*; do
+    [ -e "$rp" ] || continue
+    case ${rp##*/} in *.fails) continue ;; esac
+    n=${rp##*/epoch-}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    f="$work/repush/epoch-$n.fails"
+    fails=$(cat "$f" 2>/dev/null || true)
+    case $fails in ''|*[!0-9]*) fails=0 ;; esac
+    if [ "$fails" -ge 3 ]; then mark_bad "$n"; continue; fi
+    if [ ! -d "$publish/epoch-$n" ]; then
+      printf '%s\n' "$((fails + 1))" >"$f"
+      echo "voicetune-fresh: epoch $n not found in $publish; cannot repair it" >&2
+      [ "$((fails + 1))" -lt 3 ] || mark_bad "$n"
+      continue
+    fi
+    if "$jobs_dir/worker-return.sh" push "$publish/./epoch-$n" "${VI_PUBLISH:-vi-publish}" \
+         --relative --checksum --backup --backup-dir=".rsync-replaced-$((fails + 1))" --exclude='*.part'; then
+      rm -f "$rp" "$f"
+      echo "voicetune-fresh: epoch $n re-sent; the copy it replaced is under .rsync-replaced-$((fails + 1))/" >&2
+    else
+      fails=$((fails + 1))
+      printf '%s\n' "$fails" >"$f"
+      echo "voicetune-fresh: epoch $n repair push failed ($fails/3)" >&2
+      [ "$fails" -lt 3 ] || mark_bad "$n"
+    fi
+  done
+}
+
+# push_publish DIR: push a publish dir's finished epochs (never a .part) home
+# via the vi-publish module, which on-worker.sh points at this attempt's
+# durable dir. Repairs go first, then the ordinary push.
+push_publish() {
+  local dir=$1 acked=()
+  [ -d "$dir" ] || return 0
+  push_repairs
+  mapfile -t acked < <(acked_epochs)
+  "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' "${acked[@]}"
+}
+
+push_loop() {
+  local e n pending
+  while :; do
+    push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
+    # A live trainer can still publish another epoch: keep going.
+    if [ -s "$work/train.pid" ] && kill -0 "$(cat "$work/train.pid" 2>/dev/null)" 2>/dev/null; then
+      sleep "${VI_PUSH_SECONDS:-15}"
+      continue
+    fi
+    pending=0
+    for e in "$publish"/epoch-*; do
+      [ -d "$e" ] || continue
+      case ${e##*/} in *.part) continue ;; esac
+      n=${e##*/epoch-}
+      [ -e "$work/acked/epoch-$n" ] || pending=1
+    done
+    for e in "$work/repush"/epoch-*; do
+      [ -e "$e" ] || continue
+      case ${e##*/} in *.fails) continue ;; esac
+      pending=1
+    done
+    [ "$pending" = 1 ] || break
+    sleep "${VI_PUSH_SECONDS:-15}"
+  done
+}
+
+if [ "$MODE" = push ]; then
+  # One push loop per job. The train mode holds the same lock for its
+  # lifetime, so this exits quietly if a live supervisor is already pushing.
+  exec 8>>"$work/push.lock"
+  if ! flock -n 8; then
+    echo "voicetune-fresh: a push loop already holds $work/push.lock; exiting" >&2
+    exit 0
+  fi
+  echo $$ >"$work/push.pid"
+  trap 'rm -f "$work/push.pid"' EXIT
+  push_loop
+  exit 0
+fi
+
+: "${VI_RETURN_PORT:?voicetune-fresh.sh needs the worker return tunnel}" \
   "${VI_INPUT_VOICETUNE_DATA:?missing VI_INPUT_VOICETUNE_DATA}"
 
 # The prepared data folder; every manifest path inside it is relative to it, so
@@ -80,28 +205,12 @@ I'll be ready in a moment.
 LINES
 fi
 
-# Worker-side scratch inside on-worker.sh's work dir (deleted with the job): run/publish/probe live
-# here, not under VI_OUT, so epoch weights aren't re-sent over vi-out at the end.
-scratch="$(cd "$(dirname "$VI_OUT")" && pwd)/voicetune-fresh"
-run="$scratch/run"
-publish="$scratch/publish"
-probe_run="$scratch/probe-run"
-probe_publish="$scratch/probe-publish"
-mkdir -p "$scratch"
-
 train_manifest="train_with_codes.jsonl"
 val_manifest="val_with_codes.jsonl"
 replay_manifest="replay_with_codes.jsonl"
 
 title="Fine-tuned voice: is this Tali, with no reference clip?"
 question="Is this Tali with her suit and accent? Note short-line glitches or speed-ups."
-
-# push_publish DIR: push a publish dir's finished epochs (never a .part) home via
-# the vi-publish module, which on-worker.sh points at this attempt's durable dir.
-push_publish() {
-  [ -d "$1" ] || return 0
-  "$jobs_dir/worker-return.sh" push "$1" "${VI_PUBLISH:-vi-publish}" --exclude='*.part'
-}
 
 # abort_reason LOG ELAPSED_S -> the check_abort reason, or empty. Pure Python, no qwen-tts import.
 abort_reason() {
@@ -180,6 +289,14 @@ PY
 }
 
 train() {
+  # Hold the push lock for this supervisor's lifetime. A detached push loop
+  # started after a session kill holds it instead; this run then refuses
+  # rather than push twice.
+  exec 8>>"$work/push.lock"
+  if ! flock -n 8; then
+    echo "voicetune-fresh: another push loop holds $work/push.lock" >&2
+    exit 1
+  fi
   # Preflight already proved generate, so this gates VRAM/disk without the extra model load.
   check_and_gate
 
@@ -192,12 +309,13 @@ train() {
   # worker-job.sh detaches the trainer from this stage session, holds the job
   # lock, writes train.pid and restarts a crash with --resume. This script
   # stays the supervisor: it pushes finished epochs home and stops the run on
-  # the abort rules.
+  # the abort rules. 8>&- keeps the push lock from leaking into the detached
+  # trainer, so a killed supervisor really does release it.
   "$jobs_dir/worker-job.sh" --work "$(dirname "$VI_OUT")" --run "$run" \
     --publish "$publish" -- "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
     --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
     --epochs 6 --lr 2e-6 --kl 0.1 --batch 8 --accum 4 --seed 0 --speaker clip \
-    --publish "$publish" --out "$run" &
+    --publish "$publish" --out "$run" 8>&- &
   wj_pid=$!
   # If this script exits on its own (an abort, or a push failure), kill the
   # trainer. A signal that kills only the stage session must not: the detached

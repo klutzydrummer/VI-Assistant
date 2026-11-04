@@ -122,6 +122,17 @@ pub trait Vast {
     fn destroy(&self, id: u64) -> Result<()>;
     /// Account credit in dollars.
     fn credit(&self) -> Result<f64>;
+    /// Asks Vast to start a stopped instance again. The approval guards are the
+    /// caller's job (`Cloud::start`).
+    fn start(&self, _id: u64) -> Result<()> {
+        Err(Error::Worker("this client cannot start instances".into()))
+    }
+    /// The instance's container log, filtered to the worker's VI-HOSTKEY lines.
+    fn logs(&self, _id: u64) -> Result<String> {
+        Err(Error::Worker(
+            "this client cannot fetch instance logs".into(),
+        ))
+    }
 }
 
 /// The real API. The key comes from `$VAST_API_KEY` or the file the `vastai`
@@ -134,6 +145,18 @@ pub struct HttpVast {
 }
 
 impl HttpVast {
+    /// A client for an explicit base URL and key, so tests can point it at a
+    /// local server and never at the real API.
+    pub fn new(base: impl Into<String>, key: Option<String>) -> Self {
+        HttpVast {
+            agent: ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(60))
+                .build(),
+            base: base.into(),
+            key,
+        }
+    }
+
     pub fn from_env() -> Self {
         let key = std::env::var("VAST_API_KEY").ok().or_else(|| {
             let path =
@@ -225,6 +248,44 @@ impl Vast for HttpVast {
             .as_f64()
             .ok_or_else(|| Error::Api("no credit in account info".into()))
     }
+
+    fn start(&self, id: u64) -> Result<()> {
+        self.call(
+            "PUT",
+            &format!("/instances/{id}/"),
+            Some(&json!({"state": "running"})),
+        )?;
+        Ok(())
+    }
+
+    fn logs(&self, id: u64) -> Result<String> {
+        let v = self.call(
+            "PUT",
+            &format!("/instances/request_logs/{id}/"),
+            Some(&json!({"tail": 200, "filter": "VI-HOSTKEY"})),
+        )?;
+        let url = v["result_url"]
+            .as_str()
+            .ok_or_else(|| Error::Api(format!("request logs for {id}: no result_url")))?;
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(Error::Api(
+                "request logs: result_url is not an http(s) URL".into(),
+            ));
+        }
+        // The result URL is a pre-signed S3 link. It carries its own credential,
+        // so this GET is made without our Authorization header: the Vast API key
+        // must never leave for S3. The URL itself is a credential too, so it is
+        // kept out of error text as well.
+        match self.agent.request("GET", url).call() {
+            Ok(r) => r
+                .into_string()
+                .map_err(|e| Error::Api(format!("GET log download: {e}"))),
+            Err(ureq::Error::Status(code, _)) => {
+                Err(Error::Api(format!("GET log download: HTTP {code}")))
+            }
+            Err(_) => Err(Error::Api("GET log download: request failed".into())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +323,127 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(inst.endpoints().len(), 1);
+    }
+
+    /// A two-request local server for the log-download flow: a PUT that returns
+    /// a pre-signed result URL, then its GET. Returns the base URL, a receiver
+    /// with each request's headers, and the thread handle. The status strings
+    /// let a test make either leg fail.
+    fn serve_logs(
+        result_url_path: &str,
+        put_status: &'static str,
+        get_status: &'static str,
+        requests: usize,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{base}{result_url_path}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    assert!(n > 0, "client closed before sending a request");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + length {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                tx.send(head).unwrap();
+                let is_put = buf[..header_end].starts_with(b"PUT ");
+                let status = if is_put { put_status } else { get_status };
+                let body = if status == "200 OK" && is_put {
+                    format!("{{\"result_url\":\"{url}\"}}")
+                } else if status == "200 OK" {
+                    "VI-HOSTKEY 1 256 SHA256:abc comment (ED25519)\n".into()
+                } else {
+                    "server said no".into()
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        (base, rx, server)
+    }
+
+    #[test]
+    fn s3_get_carries_no_authorization_header() {
+        let (base, requests, server) = serve_logs("/logs?sig=abc", "200 OK", "200 OK", 2);
+        let vast = HttpVast::new(base, Some("sentinel-key".into()));
+        let text = vast.logs(7).unwrap();
+        assert!(text.contains("VI-HOSTKEY 1"), "{text}");
+        let put = requests.recv().unwrap();
+        let get = requests.recv().unwrap();
+        assert!(
+            put.starts_with("PUT /instances/request_logs/7/ HTTP/1.1\r\n"),
+            "{put}"
+        );
+        assert!(
+            put.to_ascii_lowercase()
+                .contains("authorization: bearer sentinel-key"),
+            "the API request must be authenticated: {put}"
+        );
+        assert!(get.starts_with("GET /logs?sig=abc HTTP/1.1\r\n"), "{get}");
+        assert!(
+            !get.to_ascii_lowercase().contains("authorization"),
+            "the S3 GET must carry no Authorization header: {get}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn api_key_never_appears_in_logs_or_errors() {
+        const KEY: &str = "SENTINEL-VAST-KEY-6d1f";
+
+        // The API leg fails: its error text carries the request line and the
+        // response body, never the Authorization header.
+        let (base, _requests, server) =
+            serve_logs("/logs", "500 Internal Server Error", "200 OK", 1);
+        let err = HttpVast::new(base, Some(KEY.into())).logs(7).unwrap_err();
+        let text = format!("{err} | {err:?}");
+        assert!(!text.contains(KEY), "the API key leaked: {text}");
+        assert!(text.contains("HTTP 500"), "the failure is reported: {text}");
+        server.join().unwrap();
+
+        // The download leg fails too.
+        let (base, _requests, server) = serve_logs("/logs", "200 OK", "403 Forbidden", 2);
+        let err = HttpVast::new(base, Some(KEY.into())).logs(7).unwrap_err();
+        let text = format!("{err} | {err:?}");
+        assert!(!text.contains(KEY), "the API key leaked: {text}");
+        assert!(text.contains("HTTP 403"), "the failure is reported: {text}");
+        server.join().unwrap();
     }
 }

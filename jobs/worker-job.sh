@@ -8,6 +8,11 @@
 # final exit code to $work/rc, so the watchdog can tell a live job from a dead
 # one even while the owning ssh session is gone.
 #
+# It also copies the checkpoint home every VI_SYNC_SECONDS (default 60) while
+# the trainer runs, and clears a $work/pending/epoch-<k> marker once the home
+# supervisor writes $work/acked/epoch-<k>. Both live here, not in the stage
+# supervisor: this runner outlives a killed stage session.
+#
 # A failed attempt is restarted with --resume from the last finished epoch
 # (resume.pt), up to VI_TRAIN_RETRIES (default 2). It is never restarted after
 # an abort-rule stop ($run/abort.json, written by voicetune-fresh.sh before it
@@ -26,6 +31,7 @@
 set -euo pipefail
 
 work= run= publish= retries=${VI_TRAIN_RETRIES:-2}
+jobs_dir=$(cd "$(dirname "$0")" && pwd)
 detached=
 if [ "${1-}" = --detached ]; then
   detached=1
@@ -85,9 +91,10 @@ has_oom=0
 [ -r "$oom_file" ] && has_oom=1
 oom_kill() { awk '$1 == "oom_kill" { print $2; exit }' "$oom_file" 2>/dev/null || true; }
 
-# A published epoch is un-acked work: mark it for the watchdog. Nothing clears
-# these in this wave; the ack is the fresh-token reproof in the home supervisor.
-watch=
+# A published epoch is un-acked work: mark it for the watchdog. The home
+# supervisor acks each epoch after it verifies the copy home; the marker goes
+# away then, and an already-acked epoch never gets a fresh marker.
+watch= sync=
 if [ -n "$publish" ]; then
   mkdir -p "$work/pending"
   (
@@ -96,14 +103,37 @@ if [ -n "$publish" ]; then
         [ -d "$e" ] || continue
         case ${e##*/} in *.part) continue ;; esac
         n=${e##*/epoch-}
-        [ -e "$work/pending/$n" ] || : >"$work/pending/$n"
+        [ -e "$work/acked/epoch-$n" ] && continue
+        [ -e "$work/pending/epoch-$n" ] || : >"$work/pending/epoch-$n"
+      done
+      for p in "$work/pending"/epoch-*; do
+        [ -e "$p" ] || continue
+        n=${p##*epoch-}
+        [ -e "$work/acked/epoch-$n" ] && rm -f "$p"
       done
       sleep 5
     done
   ) &
   watch=$!
 fi
-trap '[ -z "$watch" ] || kill "$watch" 2>/dev/null || true' EXIT
+
+# The checkpoint only grows, so --append sends the new tail instead of
+# rereading the whole file on home's busy disk. epoch-<k> weights are published
+# separately and skipped here. on-worker.sh still takes the final copy after
+# the stage ends; this loop covers a home supervisor that is paused or killed.
+sync_src=${VI_CHECKPOINT:-$work/checkpoint}
+if [ -d "$sync_src" ] && { [ -e "$work/.return-port" ] || [ -n "${VI_RETURN_PORT:-}" ]; }; then
+  (
+    while :; do
+      sleep "${VI_SYNC_SECONDS:-60}" || exit 0
+      "$jobs_dir/worker-return.sh" push "$sync_src/" vi-checkpoint \
+        --append --exclude='epoch-*/' >/dev/null 2>&1 ||
+        echo "worker-job.sh: could not copy the checkpoint home; will retry" >&2
+    done
+  ) &
+  sync=$!
+fi
+trap 'kill "${watch-}" "${sync-}" 2>/dev/null || true' EXIT
 
 cmd=("$@")
 attempt=0 resumed=0 rc=0

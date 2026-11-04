@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -206,6 +208,39 @@ class VerifyTest(unittest.TestCase):
             (ep / "SHA256SUMS").write_text("".join(lines))
             with self.assertRaises(SystemExit):
                 checkpoints.verify(run, 1)
+
+
+class VerifyEpochTest(unittest.TestCase):
+    """Row 40: the home supervisor checks one epoch at a time as it lands."""
+
+    def test_verify_epoch_checks_one_epoch(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _epoch(run, 0, {"talker.safetensors": b"aaaa", "tune.json": b"b"})
+            _epoch(run, 1, {"talker.safetensors": b"cccc", "tune.json": b"d"})
+            # Corrupt epoch 1 without changing its size; epoch 0 must still pass.
+            (run / "epoch-1" / "tune.json").write_bytes(b"D")
+            before = _snapshot(run)
+            cli = [sys.executable, str(Path(__file__).resolve().parent / "checkpoints.py")]
+            ok = subprocess.run(cli + ["verify-epoch", str(run), "0"],
+                                capture_output=True, text=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("epoch-0: ok (2 files)", ok.stdout)
+            # A single epoch writes no run-level VERIFIED: a run is verified whole.
+            self.assertFalse((run / "VERIFIED").exists())
+
+            bad = subprocess.run(cli + ["verify-epoch", str(run), "1"],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("sha256 mismatch", bad.stderr)
+            self.assertFalse((run / "VERIFIED").exists())
+            # Checking an epoch never changes a file, marker, or directory.
+            self.assertEqual(_snapshot(run), before)
+
+            missing = subprocess.run(cli + ["verify-epoch", str(run), "2"],
+                                     capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("is not a directory", missing.stderr)
 
 
 class GateTest(unittest.TestCase):

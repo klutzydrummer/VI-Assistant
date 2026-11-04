@@ -28,6 +28,9 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
     match args {
         ["offers"] => offers(&c),
         ["up", rest @ ..] => up(&c, rest, cap, until),
+        ["start", rest @ ..] => start(&c, rest, cap, until),
+        ["refresh"] => refresh(&c),
+        ["hostkey"] => hostkey(&c),
         ["down"] => down(&c, force),
         ["status"] => status(&c),
         ["reap"] => match c.reap() {
@@ -86,6 +89,38 @@ fn offers(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
     }
 }
 
+/// Parse the approval Brandon gave this run: the most it may cost, and when it
+/// expires. Renting (`up`) and restarting (`start`) both require both.
+fn approval(
+    c: &Cloud<HttpVast, SystemHost>,
+    cap: Option<&str>,
+    until: Option<&str>,
+) -> Result<(f64, u64), ExitCode> {
+    let cap: f64 = match cap {
+        Some(v) => match v.parse() {
+            Ok(cap) if cap > 0.0 => cap,
+            _ => {
+                return Err(fail(
+                    "--cap needs a positive dollar amount (the most this rental may cost)",
+                ))
+            }
+        },
+        None => return Err(fail("--cap is required: the most this rental may cost")),
+    };
+    let until = match until {
+        Some(v) => match cloud::parse_until(v, cloud::Host::now(&c.host)) {
+            Ok(t) => t,
+            Err(e) => return Err(fail(e)),
+        },
+        None => {
+            return Err(fail(
+                "--until is required: when the approval for this rental expires",
+            ))
+        }
+    };
+    Ok((cap, until))
+}
+
 fn up(
     c: &Cloud<HttpVast, SystemHost>,
     args: &[&str],
@@ -110,21 +145,9 @@ fn up(
     }
     // The approval Brandon gave this run: the most it may cost, and when it
     // expires. Both are required before anything can be rented.
-    let cap: f64 = match cap {
-        Some(v) => match v.parse() {
-            Ok(cap) if cap > 0.0 => cap,
-            _ => {
-                return fail("--cap needs a positive dollar amount (the most this rental may cost)")
-            }
-        },
-        None => return fail("--cap is required: the most this rental may cost"),
-    };
-    let until = match until {
-        Some(v) => match cloud::parse_until(v, cloud::Host::now(&c.host)) {
-            Ok(t) => t,
-            Err(e) => return fail(e),
-        },
-        None => return fail("--until is required: when the approval for this rental expires"),
+    let (cap, until) = match approval(c, cap, until) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
     let confirm = |o: &Offer, credit: Option<f64>| {
         println!("{}", describe(o));
@@ -160,6 +183,80 @@ fn up(
                 "worker {} ready: ssh -p {} root@{}  (${:.3}/hr)",
                 t.id, ep.port, ep.host, t.dph
             );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Starts the tracked worker again, behind the same approval guards as `up`.
+/// This is the recovery path when the worker was stopped or reclaimed; it never
+/// rents a different instance.
+fn start(
+    c: &Cloud<HttpVast, SystemHost>,
+    args: &[&str],
+    cap: Option<&str>,
+    until: Option<&str>,
+) -> ExitCode {
+    if let Some(arg) = args.first() {
+        eprintln!("unexpected argument {arg}\n{}", crate::USAGE);
+        return ExitCode::from(2);
+    }
+    let (cap, until) = match approval(c, cap, until) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    match c.start(cap, until) {
+        Ok(t) => {
+            match &t.endpoint {
+                Some(ep) => println!(
+                    "asked Vast to start worker {}; ssh -p {} root@{}",
+                    t.id, ep.port, ep.host
+                ),
+                None => println!("asked Vast to start worker {}", t.id),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Re-reads the tracked instance's ssh endpoint from the API without renting
+/// anything or switching instances.
+fn refresh(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
+    match c.refresh() {
+        Ok(Some(t)) => {
+            if let Some(ep) = &t.endpoint {
+                println!("worker {} endpoint {}:{}", t.id, ep.host, ep.port);
+            } else {
+                println!("worker {} has no ssh endpoint", t.id);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => fail("no worker is rented; run `vi cloud up` first"),
+        Err(e) => fail(e),
+    }
+}
+
+/// Accepts a rotated host key only when the worker's own log proves it. The
+/// caller (`on-worker.sh`) treats a nonzero exit as a refusal and halts pushes.
+fn hostkey(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
+    let wait = match std::env::var("VI_HOSTKEY_WAIT") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(wait) => wait,
+            Err(_) => return fail("VI_HOSTKEY_WAIT must be a number of seconds"),
+        },
+        Err(_) => 600,
+    };
+    match c.accept_hostkey(wait) {
+        Ok(r) => {
+            println!(
+                "accepted host-key rotation stamp {} at {}:{}",
+                r.stamp, r.endpoint.host, r.endpoint.port
+            );
+            for fingerprint in &r.fingerprints {
+                println!("{fingerprint}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
