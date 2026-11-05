@@ -471,8 +471,9 @@ class VoiceTuneTest(unittest.TestCase):
 
 
     def test_loader_respects_vi_num_workers_env(self):
-        # worker-job.sh exports VI_NUM_WORKERS=0 only on an OOM retry; the
-        # loader must pass it through and default to 0 processes.
+        # The default forks up to 4 workers, leaving two cores for the main
+        # process; worker-job.sh exports VI_NUM_WORKERS=0 only on an OOM retry
+        # (loader processes cost RAM), and that must be passed through.
         import sys
         import types
 
@@ -486,7 +487,7 @@ class VoiceTuneTest(unittest.TestCase):
 
         class _Loader:
             def __init__(self, ds, **kw):
-                calls["num_workers"] = kw.get("num_workers")
+                calls.update(kw)
 
         torch.utils.data.DataLoader = _Loader
         dataset = types.ModuleType("dataset")
@@ -501,24 +502,136 @@ class VoiceTuneTest(unittest.TestCase):
         sys.modules.update({"torch": torch, "torch.utils": torch.utils,
                             "torch.utils.data": torch.utils.data, "dataset": dataset})
         try:
-            def workers():
+            def kwargs():
                 voicetune.loader([{"ref_audio": "r.wav"}], mock.Mock(), mock.Mock(),
                                  2, False, 0, {}, "/nonexistent")
-                return calls["num_workers"]
+                return dict(calls)
 
             with mock.patch.dict(os.environ, {"VI_NUM_WORKERS": "3"}):
-                self.assertEqual(workers(), 3)
+                self.assertEqual(kwargs()["num_workers"], 3)
             with mock.patch.dict(os.environ, {"VI_NUM_WORKERS": "0"}):
-                self.assertEqual(workers(), 0)
+                kw = kwargs()
+                self.assertEqual(kw["num_workers"], 0)
+                self.assertFalse(kw["persistent_workers"])
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("VI_NUM_WORKERS", None)
-                self.assertEqual(workers(), 0)
+                with mock.patch.object(voicetune.os, "cpu_count", return_value=8):
+                    kw = kwargs()
+                self.assertEqual(kw["num_workers"], 4)
+                self.assertTrue(kw["persistent_workers"])
+                self.assertTrue(kw["pin_memory"])
+                # A small machine gets no workers rather than a negative count.
+                with mock.patch.object(voicetune.os, "cpu_count", return_value=1):
+                    self.assertEqual(kwargs()["num_workers"], 0)
         finally:
             for name, mod in saved.items():
                 if mod is None:
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = mod
+
+    def test_loader_with_workers_yields_same_batches_as_zero(self):
+        # Row 30: the sampler stays in the main process, so a given seed yields
+        # the same batch order with and without loader worker processes.
+        try:
+            import torch  # noqa: F401
+            import torch.utils.data  # noqa: F401
+        except ImportError:
+            self.skipTest("no torch")
+
+        import sys
+        import types
+
+        saved = {name: sys.modules.get(name)
+                 for name in ("torch", "torch.utils", "torch.utils.data", "dataset")}
+        dataset = types.ModuleType("dataset")
+
+        class _Dataset:
+            def __init__(self, data, processor, config):
+                self.data_list = data
+
+            def __len__(self):
+                return len(self.data_list)
+
+            def __getitem__(self, idx):
+                return {"i": self.data_list[idx]["i"]}
+
+            def collate_fn(self, batch):
+                import torch
+
+                return {"batch": torch.tensor([b["i"] for b in batch])}
+
+        dataset.TTSDataset = _Dataset
+        sys.modules["dataset"] = dataset
+        try:
+            rows = [{"ref_audio": "r.wav", "i": i, "audio": "a.wav"} for i in range(20)]
+
+            def epoch(workers):
+                with mock.patch.dict(os.environ, {"VI_NUM_WORKERS": str(workers)}):
+                    dl = voicetune.loader(rows, mock.Mock(), mock.Mock(), 4, True, 0,
+                                          {"r.wav": [0.0]}, "/nonexistent")
+                    return [batch["batch"].tolist() for batch in dl]
+
+            self.assertEqual(epoch(0), epoch(2))
+        finally:
+            for name, mod in saved.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+    def test_parse_nvidia_smi_csv(self):
+        text = (
+            "clocks.sm, clocks.max.sm, power.draw, power.limit, clocks_throttle_reasons.active\n"
+            "1980 MHz, 2100 MHz, 320.45 W, 350.00 W, 0x0000000000000001\n"
+            "1800 MHz, 2100 MHz, [N/A], 350.00 W, 0x0000000000000000\n"
+        )
+        rows = voicetune.parse_nvidia_smi_csv(text)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["sm_clock_mhz"], 1980.0)
+        self.assertEqual(rows[0]["max_sm_clock_mhz"], 2100.0)
+        self.assertEqual(rows[0]["power_draw_w"], 320.45)
+        self.assertEqual(rows[0]["power_limit_w"], 350.0)
+        self.assertEqual(rows[0]["throttle_reasons"], "0x0000000000000001")
+        self.assertIsNone(rows[1]["power_draw_w"])
+        self.assertEqual(rows[1]["throttle_reasons"], "0x0000000000000000")
+        # Garbage and a header alone are not samples.
+        self.assertEqual(voicetune.parse_nvidia_smi_csv("no usable line here\n"), [])
+        self.assertEqual(voicetune.parse_nvidia_smi_csv("clocks.sm, clocks.max.sm\n"), [])
+
+    def test_gpu_clock_gate_fails_a_throttled_card(self):
+        fine = [{"sm_clock_mhz": c, "max_sm_clock_mhz": 2000.0,
+                 "throttle_reasons": "0x0000000000000000"} for c in (1400.0, 1500.0, 1600.0)]
+        ok, message = voicetune.gpu_clock_gate(fine)
+        self.assertTrue(ok, message)
+        self.assertIn("75%", message)
+
+        throttled = [{"sm_clock_mhz": c, "max_sm_clock_mhz": 2000.0,
+                      "throttle_reasons": "0x0000000000000004"} for c in (1000.0, 1100.0, 1200.0)]
+        ok, message = voicetune.gpu_clock_gate(throttled)
+        self.assertFalse(ok, message)
+        self.assertIn("throttle reasons 0x0000000000000004", message)
+
+        # No usable sample fails closed: a paid run needs a proven card.
+        ok, message = voicetune.gpu_clock_gate([])
+        self.assertFalse(ok, message)
+        ok, message = voicetune.gpu_clock_gate([{"sm_clock_mhz": None, "max_sm_clock_mhz": None,
+                                                 "throttle_reasons": "[N/A]"}])
+        self.assertFalse(ok, message)
+
+    def test_push_gate_uses_the_steady_epoch_time(self):
+        # 2026-11-04 numbers: ~11.3 s per optimizer step, 60 steps per epoch,
+        # and a 3.9 GB epoch. The 5-step probe saw 174 s / 5 steps and would
+        # have demanded ~4x too much; the steady step time is the right basis.
+        steady_epoch_seconds = 11.3 * 60
+        epoch_bytes = 3.9e9
+        ok, required = voicetune.push_gate_from_steady_epoch_time_and_bytes(
+            steady_epoch_seconds, epoch_bytes, 2.88)
+        self.assertAlmostEqual(required, 6.9, places=2)
+        self.assertFalse(ok)
+        ok, _ = voicetune.push_gate_from_steady_epoch_time_and_bytes(
+            steady_epoch_seconds, epoch_bytes, 10.0)
+        self.assertTrue(ok)
 
     def test_resume_after_kill_continues_from_last_epoch(self):
         # A run killed mid-epoch leaves epoch-0 and resume.pt; a fresh process

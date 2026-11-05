@@ -292,6 +292,80 @@ def check_abort(log_records, elapsed_s, mem_limit_gb=44.0, time_limit_s=6300.0):
     return None
 
 
+def parse_nvidia_smi_csv(text):
+    """Parse
+    `nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,power.draw,power.limit,clocks_throttle_reasons.active --format=csv`
+    (with or without the header) into one dict per GPU. A value nvidia-smi reports as `[N/A]` (a
+    laptop GPU's power, for example) becomes None; the throttle-reasons field stays the raw string
+    because it is a hex bitmask (`0x0000000000000000` means no reason is active)."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("clocks.sm"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
+            continue
+
+        def number(s):
+            # "1980 MHz" / "320.45 W" -> the number; "[N/A]" -> None.
+            token = s.split()[0] if s.split() else s
+            try:
+                return float(token)
+            except ValueError:
+                return None
+
+        rows.append({
+            "sm_clock_mhz": number(parts[0]),
+            "max_sm_clock_mhz": number(parts[1]),
+            "power_draw_w": number(parts[2]),
+            "power_limit_w": number(parts[3]),
+            "throttle_reasons": parts[4] or None,
+        })
+    return rows
+
+
+def gpu_clock_gate(gpus, ratio=0.70):
+    """(ok, message) for row 31: under load, the median `clocks.sm` must be at least `ratio` of
+    `clocks.max.sm`. `gpus` are dicts from parse_nvidia_smi_csv, sampled while the loadbench
+    training loop is busy. Active throttle reasons are named in the message (all zeros counts as
+    no reason). With no usable sample it fails closed: a paid run must not start on an unproven
+    card."""
+    pairs = [(g["sm_clock_mhz"], g["max_sm_clock_mhz"]) for g in gpus
+             if g.get("sm_clock_mhz") is not None and g.get("max_sm_clock_mhz")]
+    if not pairs:
+        return False, "no usable nvidia-smi clock sample under load"
+    clocks = sorted(c for c, _ in pairs)
+    top = max(m for _, m in pairs)
+    sm = clocks[len(clocks) // 2]
+
+    def is_active(reason):
+        reason = str(reason).strip()
+        if not reason.lower().startswith("0x"):
+            return False
+        try:
+            return int(reason, 16) != 0
+        except ValueError:
+            return False
+
+    reasons = sorted({str(g["throttle_reasons"]).strip() for g in gpus if is_active(g.get("throttle_reasons"))})
+    active = f"; throttle reasons {', '.join(reasons)}" if reasons else ""
+    ok = sm >= ratio * top
+    return ok, f"GPU sm clock {sm:.0f}/{top:.0f} MHz ({sm / top:.0%}) under load{active}"
+
+
+def push_gate_from_steady_epoch_time_and_bytes(steady_epoch_seconds, epoch_bytes, measured_mb_s,
+                                               margin=1.2):
+    """Row 35: a push rate could keep up with an epoch's publishing if it is at least `margin`
+    times epoch_bytes / steady_epoch_seconds. MB is decimal (1e6 bytes), matching the numbers the
+    2026-11-04 run was judged on. Returns (ok, required_mb_s). The caller supplies the measured
+    rate from the row-34 dummy push measured on the worker, and `steady_epoch_seconds` from the
+    loadbench steady step time times steps per epoch (not the 5-step probe, which underestimates
+    the steady rate ~4x)."""
+    required_mb_s = margin * epoch_bytes / steady_epoch_seconds / 1e6
+    return measured_mb_s >= required_mb_s, required_mb_s
+
+
 def parse_delivery(arg):
     """A --delivery-from argument: `id=path` (the id goes in the clip's kind label), or a bare path
     (its stem is the id). Returns (id, path)."""
@@ -595,11 +669,15 @@ def loader(rows, tts, config, size, shuffle, seed, xvec, qwen_finetuning, style=
     data = [{**r, "_ref": r["ref_audio"], "ref_audio": fixed} for r in rows]
     ds = WithVoice(data, tts.processor, config)
     g = torch.Generator().manual_seed(seed) if shuffle else None
-    # Loader processes multiply the model's memory; worker-job.sh sets
-    # VI_NUM_WORKERS=0 on a retry only after the cgroup oom_kill counter rose.
-    workers = int(os.environ.get("VI_NUM_WORKERS", "0"))
+    # Worker processes keep the GPU fed while the main process collates. The
+    # sampler stays in the main process, so a given seed yields the same batch
+    # order for any worker count. worker-job.sh sets VI_NUM_WORKERS=0 on a retry
+    # only after the cgroup oom_kill counter rose (loader processes cost RAM).
+    workers = max(0, min(4, (os.cpu_count() or 1) - 2))
+    workers = int(os.environ.get("VI_NUM_WORKERS", workers))
     return DataLoader(ds, batch_size=size, shuffle=shuffle, generator=g,
-                      collate_fn=ds.collate_fn, num_workers=workers)
+                      collate_fn=ds.collate_fn, num_workers=workers,
+                      persistent_workers=workers > 0, pin_memory=True)
 
 
 def forward(model, batch, voice):
@@ -816,6 +894,62 @@ def cmd_train(a):
     log = open(a.out / "train_log.jsonl", "a")
     model.train()
     t0 = time.time()
+
+    if a.loadbench_steps:
+        # Row 35's loadbench: a short steady-state timing run at the real
+        # batch/accum/kl, so the push gate uses a steady step time rather than
+        # the 5-step probe's cold start (which read ~4x slow on 2026-11-04). It
+        # writes no checkpoint and no train_log record; nvidia-smi is sampled
+        # after each timed step, while this loop is the only real GPU load, for
+        # row 31's clock gate. `steps_per_epoch` is what the real run would do:
+        # floor(batches / accum), because an epoch ends without stepping a
+        # partial accumulation group (a ceil here would overstate the epoch
+        # time and so loosen the row-35 push gate).
+        import statistics
+        import subprocess
+
+        times = []
+        gpu_samples = []
+        opt.zero_grad()
+        for k, batch in enumerate(train_dl):
+            t_step = time.time()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, aux = her_loss(batch)
+                kl = replay_kl(next(replay_it)) if a.kl else torch.zeros((), device=model.device)
+                total = (loss + aux + a.kl * kl) / a.accum
+            total.backward()
+            if (k + 1) % a.accum == 0:
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                for g in opt.param_groups:
+                    g["lr"] = g["initial_lr"]
+                opt.step()
+                opt.zero_grad()
+                step += 1
+                times.append(time.time() - t_step)
+                try:
+                    smi = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,power.draw,"
+                         "power.limit,clocks_throttle_reasons.active", "--format=csv"],
+                        capture_output=True, text=True, timeout=15)
+                    if smi.returncode == 0:
+                        gpu_samples.extend(parse_nvidia_smi_csv(smi.stdout))
+                except Exception:  # noqa: BLE001 - no nvidia-smi is reported by the clock gate
+                    pass
+                if len(times) >= a.loadbench_steps:
+                    break
+        measured = times[a.loadbench_warmup:]
+        if not measured:
+            sys.exit(f"train: --loadbench-steps {a.loadbench_steps} left no timed step after "
+                     f"{a.loadbench_warmup} warmup steps")
+        steady = statistics.median(measured)
+        steps_per_epoch = len(train_dl) // a.accum
+        (a.out / "loadbench.json").write_text(json.dumps({
+            "steady_step_s": round(steady, 3), "steps_s": [round(t, 3) for t in times],
+            "warmup_steps": a.loadbench_warmup, "steps_per_epoch": steps_per_epoch,
+            "batch": a.batch, "accum": a.accum, "kl": a.kl, "gpu_under_load": gpu_samples}, indent=1))
+        print(f"loadbench: {steady:.2f} s/step steady, {steps_per_epoch} steps/epoch", flush=True)
+        return
+
     for epoch in range(first, a.epochs):
         opt.zero_grad()
         for k, batch in enumerate(train_dl):
@@ -1066,6 +1200,12 @@ def main(argv=None):
                    help="copy each finished epoch into this folder, hash-verified (see checkpoints.py)")
     t.add_argument("--no-resume-file", action="store_true",
                    help="skip save_resume (the ~12 GB optimizer file)")
+    t.add_argument("--loadbench-steps", type=int, default=0,
+                   help="time this many optimizer steps after model load, write loadbench.json "
+                        "(steady step time, steps per epoch, GPU samples), then exit without "
+                        "writing a checkpoint (the preflight's row-35 loadbench)")
+    t.add_argument("--loadbench-warmup", type=int, default=2,
+                   help="loadbench: optimizer steps discarded before timing")
     s = sub.add_parser("speak")
     s.add_argument("--run", type=Path, required=True)
     s.add_argument("--sentences", type=Path, required=True)

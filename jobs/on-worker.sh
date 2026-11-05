@@ -571,6 +571,25 @@ if [ -n "$checkpoint" ]; then
   mkdir -p "$durable"
 fi
 
+# Cheap checks on the worker (setsid/flock, VRAM, disk, cores, RAM, GPU facts,
+# a disk probe and a raw 100 MiB push home) before the 8 MB upload estimate or
+# any input. A reattach sends no inputs and is recovery of an already-checked
+# worker, so it skips the checks. The dummy's home copy is deleted at once,
+# before the runner ever looks at the stage output; the worker's own copy is
+# deleted by the preflight script.
+if [ "$reattach" = 0 ]; then
+  pre_rc=0
+  remote "VI_OUT=$(q "$work/out") VI_RETURN_PORT=$(q "$worker_port") VI_SETTINGS=$(q "$work/settings.json") VI_FAKE_PUSH_SECONDS=$(q "${VI_FAKE_PUSH_SECONDS:-}") bash $(q "$work/jobs/worker-preflight.sh")" || pre_rc=$?
+fi
+# The dummy is pushed home only to be timed. Delete it before the runner ever
+# looks at the stage output, and on a reattach too, in case an earlier start
+# was killed between its push and this line.
+rm -f "$VI_OUT/.speedtest"
+if [ "$reattach" = 0 ] && [ "$pre_rc" != 0 ]; then
+  echo "on-worker.sh: the worker preflight failed; nothing was uploaded" >&2
+  exit 1
+fi
+
 if [ "$reattach" = 0 ]; then
   if [ -n "$checkpoint" ]; then
     # A copy taken mid-write can end in half a line; drop it before resuming.
@@ -1010,7 +1029,20 @@ if [ "$final_ok" = 1 ]; then
     echo "on-worker.sh: could not bring the job output home; keeping the worker copy" >&2
     exit 1
   fi
-  if [ -n "$durable" ] && [ -n "$expect_epochs" ]; then
+  # A stage that publishes a durable checkpoint dir MUST say how many epochs
+  # to expect. Without that, anything it did publish was never verified home,
+  # and deleting the worker copy would destroy the only re-push source. Fail
+  # closed and keep every copy. The runner gives every stage a checkpoint dir,
+  # so an empty durable dir just means this stage publishes nothing: expect 0
+  # and let verify clear its marker.
+  if [ -n "$durable" ] && [ -z "$expect_epochs" ]; then
+    if compgen -G "$durable/epoch-*" >/dev/null; then
+      echo "on-worker.sh: $VI_STAGE published epochs but sets no expect_epochs; keeping the worker copy and failing rather than deleting an unverified result" >&2
+      exit 1
+    fi
+    expect_epochs=0
+  fi
+  if [ -n "$durable" ]; then
     if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" verify "$durable" --expect "$expect_epochs"; then
       echo "on-worker.sh: verify failed for $durable" >&2
       exit 1

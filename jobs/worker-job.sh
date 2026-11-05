@@ -52,6 +52,10 @@ if [ -z "$work" ] || [ -z "$run" ] || [ $# -eq 0 ]; then
   exit 2
 fi
 
+# Row 30: the trainer's DataLoader forks workers, so Hugging Face's tokenizer
+# would otherwise warn about (and try to manage) parallelism in each of them.
+export TOKENIZERS_PARALLELISM=false
+
 if [ -z "$detached" ]; then
   # The foreground half starts the detached runner and waits for its rc file;
   # a stage-session signal can kill this half without touching the job.
