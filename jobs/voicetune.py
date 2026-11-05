@@ -901,7 +901,10 @@ def cmd_train(a):
         # the 5-step probe's cold start (which read ~4x slow on 2026-11-04). It
         # writes no checkpoint and no train_log record; nvidia-smi is sampled
         # after each timed step, while this loop is the only real GPU load, for
-        # row 31's clock gate. `steps_per_epoch` is what the real run would do.
+        # row 31's clock gate. `steps_per_epoch` is what the real run would do:
+        # floor(batches / accum), because an epoch ends without stepping a
+        # partial accumulation group (a ceil here would overstate the epoch
+        # time and so loosen the row-35 push gate).
         import statistics
         import subprocess
 
@@ -939,7 +942,7 @@ def cmd_train(a):
             sys.exit(f"train: --loadbench-steps {a.loadbench_steps} left no timed step after "
                      f"{a.loadbench_warmup} warmup steps")
         steady = statistics.median(measured)
-        steps_per_epoch = math.ceil(len(train_dl) / a.accum)
+        steps_per_epoch = len(train_dl) // a.accum
         (a.out / "loadbench.json").write_text(json.dumps({
             "steady_step_s": round(steady, 3), "steps_s": [round(t, 3) for t in times],
             "warmup_steps": a.loadbench_warmup, "steps_per_epoch": steps_per_epoch,
