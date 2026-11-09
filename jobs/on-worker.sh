@@ -251,7 +251,7 @@ durable_for_attempt() {  # ATTEMPT
 # un-acked pending) AND progress in the job dir within STALL minutes. A
 # pending-only hold after the job wrote rc is capped by PENDING_HOLD.
 pick_attempt() {
-  local raw line all=() live=() d m t best_t=-1 best_marker= base a candidate=
+  local raw line all=() live=() failed=() d m t best_t=-1 best_marker= base a candidate=
   # The trailing `true` keeps the last attempt's "not live" status from
   # discarding the whole status block; the glob order is arbitrary.
   raw=$(remote "now=\$(date +%s)
@@ -277,12 +277,16 @@ pick_attempt() {
         fi
       fi
       [ \$live = 1 ] && echo \"VI-LIVE \$d\"
+      # A finished, failed stage with nothing un-acked has nothing to resume.
+      src=\$(cat \"\$d/stage.rc\" 2>/dev/null) || src=
+      [ -n \"\$src\" ] && [ \"\$src\" != 0 ] && [ \$p = 0 ] && echo \"VI-FAILED \$d\"
     done
     true" 2>/dev/null) || raw=
   while IFS= read -r line; do
     case $line in
       "VI-DIR "*) all+=("${line#VI-DIR }") ;;
       "VI-LIVE "*) live+=("${line#VI-LIVE }") ;;
+      "VI-FAILED "*) failed+=("${line#VI-FAILED }") ;;
     esac
   done <<<"$raw"
 
@@ -317,6 +321,11 @@ pick_attempt() {
     a=${base##*-}
     if [[ $a =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
       candidate="$root/$VI_STAGE.$key.$a"
+      for line in "${failed[@]}"; do
+        # Failed and nothing pending: start fresh so the home checkpoint is
+        # pushed. The marker stays, so the old work remains unverified (R47).
+        [ "$line" = "$candidate" ] && { attempt=$(date -u +%Y%m%dT%H%M%SZ); return 0; }
+      done
       for line in "${all[@]}"; do
         if [ "$line" = "$candidate" ]; then
           attempt=$a
