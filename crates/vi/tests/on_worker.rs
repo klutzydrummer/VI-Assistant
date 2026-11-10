@@ -41,7 +41,7 @@ fn wait_until(what: &str, seconds: u64, mut cond: impl FnMut() -> bool) {
 /// The stage session dying signals its whole process group, as sshd does.
 fn hup_group(pgid: u32) {
     let ok = Command::new("kill")
-        .args(["-HUP", &format!("-{pgid}")])
+        .args(["-s", "HUP", "--", &format!("-{pgid}")])
         .status()
         .unwrap()
         .success();
