@@ -41,7 +41,11 @@ REPO_IDS = {
 }
 
 
+_SEED = [1]  # the seed of the clip being made, for adapters that run a subprocess
+
+
 def seed_all(seed):
+    _SEED[0] = seed
     random.seed(seed)
     try:
         import torch
@@ -130,7 +134,7 @@ def load_mossnano():
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "o.wav"
             subprocess.run([sys.executable, "infer_onnx.py", "--prompt-audio-path", str(ref_wav), "--text", text,
-                            "--output", str(out)], cwd=root, check=True)
+                            "--output-audio-path", str(out), "--seed", str(_SEED[0])], cwd=root, check=True)
             x, sr = wavio.read_wav(out)
         return x, sr
     return synth
