@@ -72,6 +72,7 @@
     <div class="bar"><div id="barfill"></div></div>
   </header>
   <p id="msg" class="small muted"></p>
+  <details id="refs" class="panel hidden" open><summary>Reference clips</summary><div id="reflist"></div></details>
 
   <div id="finished" class="panel finished hidden">
     <b>&check; All clips answered</b>
@@ -150,7 +151,16 @@ function blendParts(s) {
 
 function answered(c) { return c.voice && c.mood && c.clear; }
 
+function renderRefs() {
+  const refs = session.refs || [];
+  $("refs").classList.toggle("hidden", !refs.length);
+  if ($("reflist").dataset.n === String(refs.length)) return;
+  $("reflist").dataset.n = refs.length;
+  $("reflist").innerHTML = refs.map((r) => `<div class="small" style="margin:6px 0">${esc(r.label)}<br><audio controls preload="none" src="ref/${encodeURIComponent(r.name)}"></audio></div>`).join("");
+}
+
 function render() {
+  renderRefs();
   const total = items.length, done = items.filter((x) => answered(x.clip)).length;
   $("progress").textContent = `${done} of ${total}`;
   $("barfill").style.width = `${total ? 100 * done / total : 0}%`;

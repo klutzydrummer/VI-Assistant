@@ -101,6 +101,11 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 /// A blind listening set: the `listen/` folder of a voicearms run.
 pub struct Listen {
     pub dir: PathBuf,
+    /// Where the hidden key is read from, only once every clip is answered.
+    /// Defaults to `<dir>/key.json`; `--key` may point anywhere.
+    key: PathBuf,
+    /// Labelled reference clips (top-level `*.wav` of this folder), not rated.
+    refs: Option<PathBuf>,
     header: Vec<String>,
     rows: Vec<Vec<String>>,
     /// The sheet's mtime when last read or written, to notice a new run.
@@ -136,11 +141,62 @@ impl Listen {
             })
             .collect();
         Ok(Self {
+            key: dir.join(KEY),
+            refs: None,
             dir,
             header,
             rows,
             seen: mtime(&path),
         })
+    }
+
+    /// Read the key from `key` instead of `<dir>/key.json`.
+    pub fn with_key(mut self, key: impl Into<PathBuf>) -> Self {
+        self.key = key.into();
+        self
+    }
+
+    /// Offer the top-level `*.wav` files of `dir` as reference clips.
+    pub fn with_refs(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.refs = Some(dir.into());
+        self
+    }
+
+    /// The reference clips as (file name, label), sorted. Only plain
+    /// top-level `*.wav` files with a safe name; the label is the `label`
+    /// of the stem's entry in `refs.json` if there is one, else the stem.
+    pub fn ref_clips(&self) -> Vec<(String, String)> {
+        let Some(dir) = &self.refs else {
+            return Vec::new();
+        };
+        let labels: Value = fs::read_to_string(dir.join("refs.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(Value::Null);
+        let mut out: Vec<(String, String)> = fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| safe_ref(n))
+                    .map(|n| {
+                        let stem = n.trim_end_matches(".wav").to_string();
+                        let label = labels[&stem]["label"].as_str().unwrap_or(&stem).to_string();
+                        (n, label)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    fn ref_audio(&self, name: &str) -> Option<PathBuf> {
+        let dir = self.refs.as_ref()?;
+        self.ref_clips()
+            .iter()
+            .any(|(n, _)| n == name)
+            .then(|| dir.join(name))
     }
 
     /// Whether the sheet changed on disk since we last read or wrote it.
@@ -217,6 +273,10 @@ impl Listen {
                 "example": self.example(&g).is_some(),
                 "clips": clips,
             })).collect::<Vec<_>>(),
+            "refs": self.ref_clips().into_iter().map(|(name, label)| json!({
+                "name": name,
+                "label": label,
+            })).collect::<Vec<_>>(),
             "done": done,
             "total": self.total(),
             "results": (done == self.total()).then(|| self.results().ok()).flatten(),
@@ -257,7 +317,8 @@ impl Listen {
             row[c] = v;
         }
         self.save()?;
-        if self.done() == self.total() {
+        // A set with no key (e.g. a plain sheet) just has no results table.
+        if self.done() == self.total() && self.key.is_file() {
             let table = self.results()?;
             let path = self.dir.join(RESULTS);
             fs::write(&path, table).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -279,11 +340,19 @@ impl Listen {
 
     /// The unblinded table, as `voicearms.py --unblind` writes it.
     pub fn results(&self) -> Result<String, String> {
-        let path = self.dir.join(KEY);
-        let key: BTreeMap<String, Value> = fs::read_to_string(&path)
+        let path = &self.key;
+        let mut key: BTreeMap<String, Value> = fs::read_to_string(path)
             .map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        // The TTS test key: {"groups": {group: {letter: model}}}.
+        if let Some(Value::Object(groups)) = key.remove("groups") {
+            for (g, letters) in groups {
+                for (l, model) in letters.as_object().into_iter().flatten() {
+                    key.insert(format!("{g}/{l}"), json!({"condition": model}));
+                }
+            }
+        }
         let mut by: BTreeMap<&str, Vec<(String, &Vec<String>)>> = BTreeMap::new();
         for r in &self.rows {
             if let Some(k) = key.get(&format!("{}/{}", r[0], r[1])) {
@@ -330,6 +399,17 @@ pub struct Answer {
     pub pitch: String,
 }
 
+/// A reference file name: `<letters, digits, - _>.wav`, nothing else.
+fn safe_ref(name: &str) -> bool {
+    name.strip_suffix(".wav").is_some_and(|stem| {
+        !stem.is_empty()
+            && stem.len() <= 64
+            && stem
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
 fn query(url: &str, name: &str) -> Option<String> {
     url.split_once('?')?
         .1
@@ -349,6 +429,9 @@ pub fn handle_listen(l: &mut Listen, post: bool, url: &str, body: &str) -> Reply
             (Some(g), Some(c)) => l.audio(&g, &c).map_or(Reply::NotFound, Reply::Audio),
             _ => Reply::NotFound,
         },
+        (false, p) if p.starts_with("/ref/") => l
+            .ref_audio(&crate::server::decode(&p["/ref/".len()..]))
+            .map_or(Reply::NotFound, Reply::Audio),
         (true, "/api/answer") => match serde_json::from_str::<Answer>(body) {
             Ok(a) => match l.answer(a) {
                 Ok(()) => Reply::Json(l.session()),
@@ -511,5 +594,160 @@ pub fn handle_qt(q: &mut QtCheck, post: bool, url: &str, body: &str) -> Reply {
             Err(e) => Reply::Bad(e.to_string()),
         },
         _ => Reply::NotFound,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "TOPSECRET-MODEL";
+
+    /// A set outside any `analysis/` tree, its key and refs elsewhere.
+    fn setup() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let (set, keydir, refs) = (
+            t.path().join("set"),
+            t.path().join("listen-key"),
+            t.path().join("refs"),
+        );
+        for d in [&set, &keydir, &refs] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::create_dir_all(set.join("vT/L01")).unwrap();
+        fs::write(set.join("vT/L01/A.wav"), b"RIFFa").unwrap();
+        fs::write(set.join("vT/L01/B.wav"), b"RIFFb").unwrap();
+        let mut rows = vec![["group", "clip", "sentence"]
+            .into_iter()
+            .chain(ANSWERS)
+            .map(str::to_string)
+            .collect::<Vec<_>>()];
+        for c in ["A", "B"] {
+            rows.push(vec![
+                "vT/L01".into(),
+                c.into(),
+                "Hello.".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+                "".into(),
+            ]);
+        }
+        fs::write(set.join(SHEET), write_csv(&rows)).unwrap();
+        fs::write(
+            keydir.join(KEY),
+            format!(r#"{{"groups": {{"vT/L01": {{"A": "{SECRET}", "B": "other"}}}}}}"#),
+        )
+        .unwrap();
+        fs::write(refs.join("vT.wav"), b"RIFFref").unwrap();
+        fs::write(refs.join("vP.wav"), b"RIFFref2").unwrap();
+        fs::write(refs.join("refs.json"), r#"{"vT": {"label": "Tali ref"}}"#).unwrap();
+        fs::create_dir_all(refs.join("sub")).unwrap();
+        fs::write(refs.join("sub/x.wav"), b"RIFF").unwrap();
+        fs::write(t.path().join("secret.wav"), b"RIFF").unwrap();
+        (t, set, keydir.join(KEY), refs)
+    }
+
+    fn get(l: &mut Listen, url: &str) -> Reply {
+        handle_listen(l, false, url, "")
+    }
+
+    fn text(r: Reply) -> String {
+        match r {
+            Reply::Json(v) => v.to_string(),
+            Reply::Page(p) => p.to_string(),
+            Reply::Audio(p) => p.display().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn key_stays_hidden_until_done_then_unblinds() {
+        let (_t, set, key, refs) = setup();
+        let mut l = Listen::load(&set).unwrap().with_key(&key).with_refs(&refs);
+        let keystr = key.display().to_string();
+        let leaks = |l: &mut Listen| {
+            let mut all = String::new();
+            for u in ["/", "/api/session", "/audio?g=vT/L01&c=A", "/ref/vT.wav"] {
+                all += &text(get(l, u));
+            }
+            all.contains(SECRET) || all.contains(&keystr) || all.contains("listen-key")
+        };
+        assert!(!leaks(&mut l));
+        for u in [
+            "/key.json",
+            "/listen-key/key.json",
+            "/../listen-key/key.json",
+            "/ref/key.json",
+            "/audio?g=..&c=key",
+        ] {
+            assert!(matches!(get(&mut l, u), Reply::NotFound), "{u}");
+        }
+        let ans = |c: &str| {
+            format!(r#"{{"group":"vT/L01","clip":"{c}","voice":"y","mood":"1","clear":"y"}}"#)
+        };
+        let r = handle_listen(&mut l, true, "/api/answer", &ans("A"));
+        assert!(!text(r).contains(SECRET));
+        assert!(!leaks(&mut l));
+        let r = handle_listen(&mut l, true, "/api/answer", &ans("B"));
+        let done = text(r);
+        assert!(done.contains(SECRET), "unblinds once complete");
+        assert!(!done.contains(&keystr));
+        assert!(fs::read_to_string(set.join(RESULTS))
+            .unwrap()
+            .contains(SECRET));
+        // ratings persisted in the sheet
+        assert!(fs::read_to_string(set.join(SHEET))
+            .unwrap()
+            .contains("y,1,y"));
+    }
+
+    #[test]
+    fn without_a_key_the_set_still_works() {
+        let (_t, set, _key, _refs) = setup();
+        let mut l = Listen::load(&set).unwrap();
+        for c in ["A", "B"] {
+            let b =
+                format!(r#"{{"group":"vT/L01","clip":"{c}","voice":"y","mood":"1","clear":"y"}}"#);
+            assert!(matches!(
+                handle_listen(&mut l, true, "/api/answer", &b),
+                Reply::Json(_)
+            ));
+        }
+        assert!(!set.join(RESULTS).exists());
+    }
+
+    #[test]
+    fn refs_are_listed_with_labels_and_served_read_only() {
+        let (_t, set, key, refs) = setup();
+        let mut l = Listen::load(&set).unwrap().with_key(&key).with_refs(&refs);
+        let s: Value = serde_json::from_str(&text(get(&mut l, "/api/session"))).unwrap();
+        assert_eq!(
+            s["refs"],
+            json!([{"name": "vP.wav", "label": "vP"}, {"name": "vT.wav", "label": "Tali ref"}])
+        );
+        assert!(matches!(get(&mut l, "/ref/vT.wav"), Reply::Audio(p) if p == refs.join("vT.wav")));
+        for bad in [
+            "/ref/../secret.wav",
+            "/ref/%2e%2e/secret.wav",
+            "/ref/..%2fsecret.wav",
+            "/ref/sub/x.wav",
+            "/ref/sub%2fx.wav",
+            "/ref/refs.json",
+            "/ref/",
+            "/ref/nope.wav",
+            "/ref/vT.wav/..",
+            "/ref/%2fetc%2fpasswd",
+        ] {
+            assert!(matches!(get(&mut l, bad), Reply::NotFound), "{bad}");
+        }
+        assert!(matches!(
+            handle_listen(&mut l, true, "/ref/vT.wav", ""),
+            Reply::NotFound
+        ));
+        // no --refs: nothing served, nothing listed
+        let mut none = Listen::load(&set).unwrap();
+        assert!(matches!(get(&mut none, "/ref/vT.wav"), Reply::NotFound));
+        assert_eq!(none.session()["refs"], json!([]));
     }
 }
