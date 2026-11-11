@@ -41,7 +41,7 @@ fn wait_until(what: &str, seconds: u64, mut cond: impl FnMut() -> bool) {
 /// The stage session dying signals its whole process group, as sshd does.
 fn hup_group(pgid: u32) {
     let ok = Command::new("kill")
-        .args(["-HUP", &format!("-{pgid}")])
+        .args(["-s", "HUP", "--", &format!("-{pgid}")])
         .status()
         .unwrap()
         .success();
@@ -646,6 +646,51 @@ fn durable_dir_survives_runner_error_path() {
     );
     let root = dir.path().join("home/.cache/vi/checkpoints/on-gpu");
     assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+}
+
+/// A rerun after a FAILED stage starts a fresh attempt (and keeps the old
+/// marker, so the old work stays unverified); a finished-ok stage whose output
+/// never came home is still reattached.
+#[test]
+fn rerun_after_failed_stage_is_fresh_but_finished_ok_reattaches() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let failing = format!("{}exit 3\n", publish_job(1, "w"));
+    let first = run_settings(dir.path(), &failing, "expect_epochs = 1", &[]);
+    assert!(!first.status.success());
+    let markers = || {
+        fs::read_dir(dir.path().join("state/unverified"))
+            .unwrap()
+            .count()
+    };
+    assert_eq!(markers(), 1);
+
+    std::thread::sleep(Duration::from_millis(1100));
+    let second = run_settings(dir.path(), &failing, "expect_epochs = 1", &[]);
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success(), "{err}");
+    assert!(!err.contains("reattaching to"), "{err}");
+    assert_eq!(markers(), 2, "the old unverified marker must stay");
+
+    // Pretend the newest attempt's stage finished fine but its output never
+    // came home: that one must be reattached, not restarted.
+    let newest = fs::read_dir(dir.path().join("worker"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("stage.rc").is_file())
+        .max()
+        .expect("a worker dir with stage.rc");
+    fs::write(newest.join("stage.rc"), "0\n").unwrap();
+    // The second run's marker is already the newest (>1 s younger than the first).
+    let third = run_settings(dir.path(), &failing, "expect_epochs = 1", &[]);
+    let err = String::from_utf8_lossy(&third.stderr);
+    assert!(
+        err.contains(&format!("reattaching to {}", newest.display())),
+        "{err}"
+    );
 }
 
 #[test]

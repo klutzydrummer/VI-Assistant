@@ -1,0 +1,67 @@
+[
+  {
+    "id": "L01",
+    "register": "neutral",
+    "text": "The kettle is on, and the rain hasn't stopped since morning."
+  },
+  {
+    "id": "L02",
+    "register": "questioning",
+    "text": "Did you really think nobody would notice the missing key?"
+  },
+  {
+    "id": "L03",
+    "register": "warm, happy",
+    "text": "Oh, that's wonderful news! I could hug you right now."
+  },
+  {
+    "id": "L04",
+    "register": "sad",
+    "text": "I kept the porch light on all night, but you never came."
+  },
+  {
+    "id": "L05",
+    "register": "angry",
+    "text": "Don't you dare touch that again. I won't say it twice."
+  },
+  {
+    "id": "L06",
+    "register": "fearful, hushed",
+    "text": "Shh. Something is moving in the cellar, and it isn't the cat."
+  },
+  {
+    "id": "L07",
+    "register": "tired",
+    "text": "I'm sorry, I just need a minute. It has been a very long week."
+  },
+  {
+    "id": "L08",
+    "register": "teasing",
+    "text": "Well, well. Look who finally decided to show up to their own party."
+  },
+  {
+    "id": "L09",
+    "register": "numerals",
+    "text": "The train leaves at 7:45 from platform 12, and the fare is 8 pounds 50."
+  },
+  {
+    "id": "P01",
+    "register": "multi-sentence paragraph",
+    "text": "When I first came to the harbour town, I thought it was a quiet place where nothing ever happened. Then the lanterns went out one by one, the bells began to ring without anyone pulling them, and the whole street fell silent. I stood very still, holding my breath, and waited to see who would speak first. Nobody did. After a while, the fog rolled back out to sea, and the morning came up grey and ordinary, as though none of it had ever been."
+  },
+  {
+    "id": "F01",
+    "register": "invented words",
+    "text": "The Velkarith Pass is closed until the thaw, so we'll cross at Ornibrel instead."
+  },
+  {
+    "id": "F02",
+    "register": "invented words",
+    "text": "She swore by the seven lamps of Shaedorune that the oath would hold."
+  },
+  {
+    "id": "F03",
+    "register": "invented words",
+    "text": "Bring me a vial of quorbinel root and a pinch of glimmerthyme, and don't spill either."
+  }
+]
