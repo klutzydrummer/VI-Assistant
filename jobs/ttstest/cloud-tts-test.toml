@@ -1,0 +1,22 @@
+# Config for the one rented-GPU TTS listening test. NOT the live cloud.toml.
+# Use it only for this test:  VI_CLOUD_CONFIG=jobs/ttstest/cloud-tts-test.toml vi cloud offers
+#
+# Nothing here rents anything. To rent, Brandon must approve a specific run and cap, and the offer
+# is then picked BY ID: `vi cloud offers`, choose one, `vi cloud up --cap USD --until TIME --offer ID`.
+# Never let `up` take "the cheapest" for this test, and never auto-replace a failed rental.
+# Re-query offers right before approval: the shortlist in the plan is from 2026-11-09.
+
+disk_gb = 60          # about 40 GB expected use (3.3 + 17 + 4.5 GB weights, about 11 GB venvs, image)
+idle_minutes = 15
+max_hours = 2.5       # hard limit counted from boot, enforced on the worker and from home
+boot_minutes = 15
+
+[search]
+gpu_names = ["RTX 3090", "RTX 3090 Ti", "RTX 4090", "RTX A5000"]
+min_gpu_ram_gb = 24
+max_dph = 0.30
+min_cuda = 12.8
+min_compute_cap = 860
+min_reliability = 0.99
+min_inet_down_mbps = 800
+countries = ["US", "CA", "ES", "BG", "CZ", "PL", "FR", "CH", "NO", "TW"]
