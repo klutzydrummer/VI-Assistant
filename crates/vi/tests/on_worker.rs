@@ -88,7 +88,10 @@ fn run(dir: &Path, job: &str) -> Output {
 }
 
 fn run_with(dir: &Path, job: &str, envs: &[(&str, String)]) -> Output {
-    run_settings(dir, job, "judge = \"gemma\"", envs)
+    // The runner always gives the stage a checkpoint dir, so a stage that
+    // publishes no epochs must say so: on-worker.sh fails closed when a
+    // durable dir exists and expect_epochs is missing.
+    run_settings(dir, job, "judge = \"gemma\", expect_epochs = 0", envs)
 }
 
 /// The `vi dataset run` command for a stage with a custom `settings` table.
@@ -137,6 +140,22 @@ fn leftovers(dir: &Path) -> Vec<String> {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n != ".active")
         .collect()
+}
+
+/// The one `on-gpu.*` work dir a failed run kept on the "worker".
+fn kept_work(dir: &Path) -> PathBuf {
+    let mut paths: Vec<_> = fs::read_dir(dir.join("worker"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("on-gpu.")
+        })
+        .collect();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    paths.remove(0)
 }
 
 /// The single durable publish dir the on-gpu stage created for its attempt.
@@ -707,6 +726,114 @@ pwd > "$VI_OUT/where.txt""#,
     let ran_in = fs::read_to_string(got.join("where.txt")).unwrap();
     assert!(Path::new(ran_in.trim()).starts_with(&worker), "{ran_in}");
     assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+}
+
+/// Row 34: a cheap check fails on the worker before any input is uploaded, so
+/// a bad machine is refused while nothing but the rental is billed.
+#[test]
+fn cheap_checks_run_before_any_input_upload() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // No machine has a million effective cores, so this always fails.
+    let job = "echo ran > \"$VI_OUT/ran.txt\"";
+    let out = run_settings(dir.path(), job, "min_cpu_cores = 1000000", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("worker preflight failed; nothing was uploaded"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("effective CPU cores"), "{stderr}");
+    let work = kept_work(dir.path());
+    assert_eq!(
+        fs::read_dir(work.join("inputs")).unwrap().count(),
+        0,
+        "an input reached the worker before the cheap checks passed"
+    );
+    assert_eq!(fs::read_dir(work.join("files")).unwrap().count(), 0);
+    assert!(!work.join("out/ran.txt").exists(), "the stage ran anyway");
+    assert!(
+        !work.join("out/preflight.json").exists(),
+        "a failed preflight must write no report"
+    );
+    assert!(!work.join(".preflight-disk").exists());
+    assert!(!work.join(".speedtest").exists());
+}
+
+/// Row 34: the dummy push rate is a gate, and it runs before any input.
+#[test]
+fn slow_push_fails_before_upload() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // 100 MiB in a simulated 40 s is 2.62 MB/s, under the 7 MB/s floor.
+    let envs = [("VI_FAKE_PUSH_SECONDS", "40".to_string())];
+    let job = "echo ran > \"$VI_OUT/ran.txt\"";
+    let out = run_settings(dir.path(), job, "min_push_mb_s = 7", &envs);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("worker push (MB/s)"), "{stderr}");
+    assert!(
+        stderr.contains("worker preflight failed; nothing was uploaded"),
+        "{stderr}"
+    );
+    let work = kept_work(dir.path());
+    assert_eq!(fs::read_dir(work.join("inputs")).unwrap().count(), 0);
+    assert!(!work.join("out/ran.txt").exists(), "the stage ran anyway");
+}
+
+/// Row 34: the speed test file is home only long enough to time the push; the
+/// runner's stage output must never carry it.
+#[test]
+fn speedtest_dummy_never_reaches_stage_output() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), "echo ok > \"$VI_OUT/ok.txt\"");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert!(got.join("ok.txt").is_file());
+    let files = tree_files(&dir.path().join("corpus"));
+    assert!(
+        files.iter().all(|(name, _)| !name.ends_with(".speedtest")),
+        "the speed test dummy was kept in the stage output: {:?}",
+        files
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|n| n.contains("speedtest"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+}
+
+/// The fail-closed gap: a stage that publishes a durable checkpoint but does
+/// not say how many epochs to expect has nothing verified home, so the worker
+/// copy must be kept and the stage must fail.
+#[test]
+fn durable_without_expect_epochs_keeps_worker_copy_and_fails() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_settings(dir.path(), &publish_job(1, "w"), "judge = \"gemma\"", &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("sets no expect_epochs"), "{stderr}");
+    assert!(stderr.contains("keeping the worker copy"), "{stderr}");
+    let work = kept_work(dir.path());
+    assert!(
+        work.join("out/ok.txt").is_file(),
+        "the stage output was not kept"
+    );
+    // The published epoch did reach home (the output push ran first), so the
+    // failure is about verification, not about a missing result.
+    let d = durable_dir(dir.path());
+    assert!(d.join("epoch-0/talker.safetensors").is_file());
 }
 
 #[test]
@@ -1448,8 +1575,13 @@ jobs/worker-job.sh --work "$w/wj" --run "$w/run" -- sh -c 'i=0; while [ $i -lt 2
     );
     let mut envs = poll_env();
     envs.push(("VI_SYNC_SECONDS", "1".to_string()));
-    let (mut child, _err_path) =
-        start_stage(dir.path(), "cpsync", &job, "judge = \"gemma\"", &envs);
+    let (mut child, _err_path) = start_stage(
+        dir.path(),
+        "cpsync",
+        &job,
+        "judge = \"gemma\", expect_epochs = 0",
+        &envs,
+    );
     wait_for_work(dir.path());
     let cp = home_checkpoint(dir.path());
     wait_until("the checkpoint never reached home", 30, || {
@@ -1498,7 +1630,7 @@ echo done > "$VI_OUT/done.txt""#
         dir.path(),
         "sigstop",
         &job,
-        "judge = \"gemma\"",
+        "judge = \"gemma\", expect_epochs = 0",
         &poll_env(),
     );
     let work = wait_for_work(dir.path());

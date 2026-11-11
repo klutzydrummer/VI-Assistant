@@ -10,6 +10,12 @@ Adding a delete call means adding an entry in the same change, after checking
 that its target root is safe. An unlisted call fails here. Test code
 (`jobs/test_*.py`, Rust `#[cfg(test)]` modules and `crates/*/tests/`) is out of
 scope: it deletes only temp dirs it created.
+
+Once a job has started, the only path that clears `keep_work` -- and so the
+only one that lets cleanup delete the whole worker job dir -- is the final
+success block in jobs/on-worker.sh. It requires final_ok=1 AND either no
+durable checkpoint dir or expect_epochs verified home; every failure path keeps
+the copy for a reattach or a re-push.
 """
 
 import re
@@ -31,6 +37,7 @@ ALLOWLIST = [
     ("jobs/on-worker.sh", r'rm -f "\$f\.part"', "a killed pack's debris in the bundle cache ($VI_BUNDLE_DIR)"),
     ("jobs/on-worker.sh", r'rm -f "\$path"', "the bundle cache ($VI_BUNDLE_DIR)"),
     ("jobs/on-worker.sh", r'rm -f "\$VI_OUT/\.return-token"', "the stage output dir"),
+    ("jobs/on-worker.sh", r'rm -f "\$VI_OUT/\.speedtest"', "the stage output dir's speed-test dummy (pushed home by worker-preflight.sh)"),
     ("jobs/on-worker.sh", r'rm -f "\$return_state/tunnel\.pid"', "the attempt's return state dir (its tunnel pid file only)"),
     ("jobs/on-worker.sh", r'rm -rf "\$return_state"', "the attempt's return state dir under the vi state dir"),
     ("jobs/on-worker.sh", r'rm -rf "\$return_scratch"', "the mktemp -d scratch this run created for the checkpoint module"),
@@ -50,6 +57,8 @@ ALLOWLIST = [
     ("jobs/worker-return.sh", r'rm -rf "\$tmp"', "the mktemp -d scratch the receiver_verify token push created"),
     ("jobs/worker-return.sh", r'rm -f "\$path/\.restart-token"', "the receiver module dirs: only the .restart-token this receiver itself pushed"),
     ("jobs/worker-return.sh", r'rm -f "\$state/rsyncd\.pid"', "the state dir's dead-receiver pid and per-module lock files on restart"),
+    ("jobs/worker-preflight.sh", r'rm -f "\$disk_probe"', "the worker job dir's disk-probe file"),
+    ("jobs/worker-preflight.sh", r'rm -f "\$speed_file"', "the worker job dir's speed-test dummy"),
     ("crates/cloud/src/state.rs", r"std::fs::remove_file\(path\)", "the vi state dir (markers and known_hosts)"),
     ("crates/review/src/hub.rs", r"fs::remove_file\(&path\)", "a task's TASK_DONE file under the hub dir"),
     ("crates/harvest/src/extract.rs", r"fs::remove_dir_all\(&tmp\)", "the extraction temp dir this run created"),

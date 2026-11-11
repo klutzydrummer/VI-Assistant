@@ -62,13 +62,19 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
 
 fn describe(o: &Offer) -> String {
     format!(
-        "{:>10}  {:<12} {:>3.0} GB  ${:.3}/hr  reliability {:.3}  {:>5.0} Mbps  {}",
+        "{:>10}  {:<12} {:>3.0} GB  ${:.3}/hr  reliability {:.3}  \
+         net down {:>5.0} / up {:>5.0} Mbps  {:>4.1} cores  {:.0} GB ram  \
+         disk {:.0} MB/s  {}",
         o.id,
         o.gpu_name,
         o.gpu_ram / 1024.0,
         o.dph_total,
         o.reliability2,
         o.inet_down,
+        o.inet_up,
+        o.cpu_cores_effective,
+        o.cpu_ram / 1000.0,
+        o.disk_bw,
         o.geolocation.as_deref().unwrap_or("")
     )
 }

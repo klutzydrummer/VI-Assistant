@@ -39,15 +39,18 @@ min_home_gb = 50
 home_gate_reserve_gb = 27
 
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_preflight`
-# after `vi cloud up`. jobs/voicetune-fresh.sh preflight runs check --generate,
-# gates VRAM/disk, runs a 5-step probe at the real batch/accum/kl, pushes the
-# probe checkpoint home (must beat 3 MB/s) and speaks one line from it. The
-# probe epoch is verified at home before the stage reports success.
+# after `vi cloud up`. jobs/on-worker.sh first runs jobs/worker-preflight.sh
+# (cheap card/disk/CPU/push gates before any input), then voicetune-fresh.sh
+# preflight runs check --generate, a steady-state loadbench with the under-load
+# GPU clock gate, and a 5-step probe at the real batch/accum/kl. The probe
+# checkpoint is pushed home as an integrity proof and its bytes set the derived
+# push gate; one line is spoken from it. The probe epoch is verified at home
+# before the stage reports success.
 [stage.voicetune_preflight]
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
 inputs = ["voicetune_data"]
-files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/voicetune.py",
-         "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
+         "../../jobs/voicetune.py", "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
 manual = true
 
 [stage.voicetune_preflight.settings]
@@ -55,6 +58,14 @@ expect_epochs = 1
 min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
+# jobs/worker-preflight.sh gates the worker before any input is sent. The push
+# floor covers the rate row 35 derives for a real epoch (about 6.9 MB/s from the
+# 2026-11-04 steady step time and 3.9 GB epoch); the disk floor mirrors the offer
+# search's proposed minimum, and the probe here is the real measurement.
+min_vram_gb = 44
+min_push_mb_s = 7
+min_disk_mb_s = 500
+min_cpu_cores = 8
 
 # GPU, manual: `vi dataset run characters/tali/voicetune.toml voicetune_train`
 # only after the preflight checkpoint is verified and Brandon okays the paid
@@ -65,8 +76,8 @@ max_upload_minutes = 30
 [stage.voicetune_train]
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "train"]
 inputs = ["voicetune_data"]
-files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/voicetune.py",
-         "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
+         "../../jobs/voicetune.py", "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
 manual = true
 
 [stage.voicetune_train.settings]
@@ -74,3 +85,9 @@ expect_epochs = 6
 min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
+# Same worker gates as the preflight stage: a train run must not start on a card,
+# disk, CPU allocation or push rate the preflight would have refused.
+min_vram_gb = 44
+min_push_mb_s = 7
+min_disk_mb_s = 500
+min_cpu_cores = 8

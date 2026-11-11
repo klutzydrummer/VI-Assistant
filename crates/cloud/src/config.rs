@@ -48,7 +48,17 @@ pub struct Search {
     /// Ceiling on the hourly price, in dollars.
     pub max_dph: f64,
     pub min_reliability: f64,
+    /// The worker -> home leg of a published epoch's push. Home's uplink and
+    /// download cap it (10.9 MB/s down measured at home on 2026-11-04).
+    pub min_inet_up_mbps: f64,
+    /// The home -> worker leg: inputs and the upload preflight.
     pub min_inet_down_mbps: f64,
+    pub min_cpu_cores_effective: f64,
+    /// GB; the offer field is MB, so the query multiplies by 1000 (like gpu_ram).
+    pub min_cpu_ram_gb: f64,
+    /// MB/s. A proposal from the offer's advertised figure only; the row-34
+    /// disk probe on the rented worker is the real gate.
+    pub min_disk_bw_mbps: f64,
     pub min_cuda: f64,
     /// CUDA compute capability times 100. 800 (Ampere) and up runs bf16 and
     /// flash attention, which most current TTS models expect.
@@ -81,7 +91,16 @@ impl Default for Search {
             min_gpu_ram_gb: 24.0,
             max_dph: 0.40,
             min_reliability: 0.98,
-            min_inet_down_mbps: 200.0,
+            // 100 both ways: home's measured 10.9 MB/s download (~87 Mb/s) caps
+            // the worker -> home push and its 15-36 Mb/s uplink caps the input
+            // leg, so a 200 floor would hide usable offers.
+            min_inet_up_mbps: 100.0,
+            min_inet_down_mbps: 100.0,
+            min_cpu_cores_effective: 8.0,
+            min_cpu_ram_gb: 64.0,
+            // Proposed from the advertised figure only; the row-34 disk probe on
+            // the rented worker is the real gate.
+            min_disk_bw_mbps: 500.0,
             // textscore's vLLM brings torch built for CUDA 13; older
             // drivers leave it no GPU. Newer drivers still run CUDA 12 jobs.
             min_cuda: 13.0,
@@ -131,8 +150,12 @@ impl Config {
             "num_gpus": {"eq": 1},
             "gpu_ram": {"gte": s.min_gpu_ram_gb * 1000.0},
             "dph_total": {"lte": s.max_dph},
-            "reliability2": {"gte": s.min_reliability},
+            "reliability": {"gte": s.min_reliability},
             "inet_down": {"gte": s.min_inet_down_mbps},
+            "inet_up": {"gte": s.min_inet_up_mbps},
+            "cpu_cores_effective": {"gte": s.min_cpu_cores_effective},
+            "cpu_ram": {"gte": s.min_cpu_ram_gb * 1000.0},
+            "disk_bw": {"gte": s.min_disk_bw_mbps},
             "cuda_max_good": {"gte": s.min_cuda},
             "compute_cap": {"gte": s.min_compute_cap},
             "disk_space": {"gte": self.disk_gb},
@@ -194,6 +217,57 @@ impl Config {
             out.push(format!(
                 "${:.3}/hr is over the ${:.3} maximum",
                 o.dph_total, s.max_dph
+            ));
+        }
+        // Both scores: the search filters on `reliability`, while `reliability2`
+        // is Vast's older enforcement score and some offers carry only it.
+        if o.reliability < s.min_reliability {
+            out.push(format!(
+                "reliability {:.2} is under {:.2}",
+                o.reliability, s.min_reliability
+            ));
+        }
+        if o.reliability2 < s.min_reliability {
+            out.push(format!(
+                "reliability2 {:.2} is under {:.2}",
+                o.reliability2, s.min_reliability
+            ));
+        }
+        if o.inet_down < s.min_inet_down_mbps {
+            out.push(format!(
+                "{:.0} Mb/s download is under the {:.0} Mb/s minimum",
+                o.inet_down, s.min_inet_down_mbps
+            ));
+        }
+        if o.inet_up < s.min_inet_up_mbps {
+            out.push(format!(
+                "{:.0} Mb/s upload is under the {:.0} Mb/s minimum",
+                o.inet_up, s.min_inet_up_mbps
+            ));
+        }
+        if o.cpu_cores_effective < s.min_cpu_cores_effective {
+            out.push(format!(
+                "{} effective cores is under the {:.0} minimum",
+                o.cpu_cores_effective, s.min_cpu_cores_effective
+            ));
+        }
+        if o.cpu_ram < s.min_cpu_ram_gb * 1000.0 {
+            out.push(format!(
+                "{:.0} GB of CPU ram is under the {:.0} GB minimum",
+                o.cpu_ram / 1000.0,
+                s.min_cpu_ram_gb
+            ));
+        }
+        if o.disk_bw < s.min_disk_bw_mbps {
+            out.push(format!(
+                "{:.0} MB/s of disk is under the {:.0} MB/s minimum",
+                o.disk_bw, s.min_disk_bw_mbps
+            ));
+        }
+        if o.disk_space < self.disk_gb {
+            out.push(format!(
+                "{:.0} GB of disk is under the {:.0} GB needed",
+                o.disk_space, self.disk_gb
             ));
         }
         out
@@ -433,22 +507,128 @@ mod tests {
             gpu_name: "RTX 3090".into(),
             gpu_ram: 24576.0,
             dph_total: 0.2,
+            reliability: 0.99,
             reliability2: 0.99,
             inet_down: 900.0,
+            inet_up: 500.0,
+            cpu_cores_effective: 16.0,
+            cpu_ram: 128000.0,
+            disk_bw: 1000.0,
+            disk_space: 100.0,
             geolocation: None,
             compute_cap: 800,
             cuda_max_good: 13.0,
         };
         assert!(cfg.offer_violations(&ok).is_empty());
-        let bad = Offer {
-            dph_total: 0.5,
-            compute_cap: 700,
-            cuda_max_good: 12.0,
-            ..ok
-        };
-        let reasons = cfg.offer_violations(&bad);
-        assert!(reasons.iter().any(|r| r.contains("over")), "{reasons:?}");
-        assert!(reasons.iter().any(|r| r.contains("compute")), "{reasons:?}");
-        assert!(reasons.iter().any(|r| r.contains("CUDA")), "{reasons:?}");
+        // One failing offer per limit the search applies.
+        let cases: [(Offer, &str); 12] = [
+            (
+                Offer {
+                    gpu_ram: 8000.0,
+                    ..ok.clone()
+                },
+                "ram",
+            ),
+            (
+                Offer {
+                    compute_cap: 700,
+                    ..ok.clone()
+                },
+                "compute",
+            ),
+            (
+                Offer {
+                    cuda_max_good: 12.0,
+                    ..ok.clone()
+                },
+                "CUDA",
+            ),
+            (
+                Offer {
+                    dph_total: 0.5,
+                    ..ok.clone()
+                },
+                "over",
+            ),
+            (
+                Offer {
+                    reliability: 0.95,
+                    ..ok.clone()
+                },
+                "reliability",
+            ),
+            (
+                Offer {
+                    reliability2: 0.95,
+                    ..ok.clone()
+                },
+                "reliability2",
+            ),
+            (
+                Offer {
+                    inet_down: 50.0,
+                    ..ok.clone()
+                },
+                "download",
+            ),
+            (
+                Offer {
+                    inet_up: 50.0,
+                    ..ok.clone()
+                },
+                "upload",
+            ),
+            (
+                Offer {
+                    cpu_cores_effective: 4.0,
+                    ..ok.clone()
+                },
+                "cores",
+            ),
+            (
+                Offer {
+                    cpu_ram: 32000.0,
+                    ..ok.clone()
+                },
+                "CPU ram",
+            ),
+            (
+                Offer {
+                    disk_bw: 100.0,
+                    ..ok.clone()
+                },
+                "disk",
+            ),
+            (
+                Offer {
+                    disk_space: 20.0,
+                    ..ok.clone()
+                },
+                "disk",
+            ),
+        ];
+        for (bad, want) in cases {
+            let reasons = cfg.offer_violations(&bad);
+            assert!(
+                reasons.iter().any(|r| r.contains(want)),
+                "{want} missing from {reasons:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn offer_query_uses_raw_units() {
+        let q = Config::default().offer_query(5);
+        // GB x 1000, like gpu_ram, because the offer JSON is in MB.
+        assert_eq!(q["cpu_ram"]["gte"], 64000.0);
+        assert_eq!(q["gpu_ram"]["gte"], 24000.0);
+        assert_eq!(q["disk_space"]["gte"], 60.0);
+        // The searchable score; reliability2 is only an enforcement check.
+        assert_eq!(q["reliability"]["gte"], 0.98);
+        assert!(q.get("reliability2").is_none());
+        assert_eq!(q["inet_down"]["gte"], 100.0);
+        assert_eq!(q["inet_up"]["gte"], 100.0);
+        assert_eq!(q["cpu_cores_effective"]["gte"], 8.0);
+        assert_eq!(q["disk_bw"]["gte"], 500.0);
     }
 }
