@@ -9,7 +9,9 @@
 //! `key.json`) and qtcheck folder under a stage's current output or
 //! `analysis/`, any `clips.toml` (a quick clip list a job or a Claude
 //! thread writes to play him some clips), and any `task.toml` a job leaves
-//! beside its output for a review the hub doesn't know yet. The home page rescans on every visit.
+//! beside its output for a review the hub doesn't know yet. With
+//! `--listen-sets <dir>`, each folder under `<dir>` holding `listen-blind/`
+//! (with `listen-key/key.json` and `refs/` beside it) is a listening test too. The home page rescans on every visit.
 //!
 //! When a task's state changes (finished, or reopened by new data) the
 //! hub appends it to `hub.jsonl`, so Done shows when it was finished.
@@ -108,6 +110,10 @@ pub struct Hub {
     channel: Slot<Channel>,
     /// By folder, from the corpus root.
     listens: BTreeMap<String, Listen>,
+    /// `--listen-sets`: a folder of set folders, scanned on every visit.
+    /// Its sets are in `listens` too, under their bare folder name.
+    sets: Option<PathBuf>,
+    set_names: BTreeSet<String>,
     checks: BTreeMap<String, QtCheck>,
     notes: BTreeMap<String, Note>,
     lists: BTreeMap<String, Clips>,
@@ -116,6 +122,32 @@ pub struct Hub {
     /// Problems found while scanning, shown under "Not ready".
     problems: BTreeMap<String, String>,
     log: Vec<Event>,
+}
+
+const SET_BLIND: &str = "listen-blind";
+const SET_KEY: &str = "listen-key";
+
+/// A set folder name the hub will route to: plain characters only, so it
+/// can't climb out or collide with a corpus path (those always hold a `/`).
+fn safe_set_name(n: &str) -> bool {
+    !n.is_empty()
+        && !n.starts_with('.')
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// (name, folder) of each set folder directly under `dir`, sorted.
+fn find_sets(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())))
+                .filter(|(n, p)| safe_set_name(n) && p.join(SET_BLIND).is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
 }
 
 fn slug(rel: &str) -> String {
@@ -149,6 +181,8 @@ impl Hub {
             gold: Slot::Missing(String::new()),
             channel: Slot::Missing(String::new()),
             listens: BTreeMap::new(),
+            sets: None,
+            set_names: BTreeSet::new(),
             checks: BTreeMap::new(),
             notes: BTreeMap::new(),
             lists: BTreeMap::new(),
@@ -159,6 +193,16 @@ impl Hub {
         };
         hub.scan();
         Ok(hub)
+    }
+
+    /// Also offer every listening-test set folder under `dir`: a folder
+    /// holding `listen-blind/` (the clips and `sheet.csv`), with its key in
+    /// `listen-key/key.json` and its reference clips in `refs/`. Found
+    /// again on every scan, so a new set needs no restart.
+    pub fn with_listen_sets(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.sets = Some(dir.into());
+        self.scan();
+        self
     }
 
     fn rel(&self, path: &Path) -> String {
@@ -206,8 +250,26 @@ impl Hub {
         self.problems.clear();
 
         let listens: BTreeSet<String> = found.listens.iter().map(|d| self.rel(d)).collect();
+        let sets = self.sets.as_deref().map(find_sets).unwrap_or_default();
+        let set_names: BTreeSet<String> = sets.iter().map(|(n, _)| n.clone()).collect();
         self.listens
-            .retain(|k, l| listens.contains(k) && !l.stale());
+            .retain(|k, l| (listens.contains(k) || set_names.contains(k)) && !l.stale());
+        for (name, dir) in &sets {
+            if let Entry::Vacant(slot) = self.listens.entry(name.clone()) {
+                match Listen::load(dir.join(SET_BLIND)) {
+                    Ok(l) => {
+                        slot.insert(
+                            l.with_key(dir.join(SET_KEY).join(listen::KEY))
+                                .with_refs(dir.join("refs")),
+                        );
+                    }
+                    Err(e) => {
+                        self.problems.insert(format!("listen:{name}"), e);
+                    }
+                }
+            }
+        }
+        self.set_names = set_names;
         for dir in &found.listens {
             let rel = self.rel(dir);
             if let Entry::Vacant(slot) = self.listens.entry(rel.clone()) {
@@ -389,10 +451,15 @@ impl Hub {
                 .strip_prefix("stages/")
                 .and_then(|r| r.split('/').next())
                 .unwrap_or("a listening run");
+            let is_set = self.set_names.contains(rel);
             push(
                 format!("listen:{rel}"),
                 "listen",
-                format!("Blind listening set ({from})"),
+                if is_set {
+                    format!("Listening test: {rel}")
+                } else {
+                    format!("Blind listening set ({from})")
+                },
                 "For each clip: is it still her voice, how much of the mood do you hear, are the words clear; optionally accent, suit effect, right mood and pitch. Her real example clip is beside each set.".into(),
                 rel.clone(),
                 Some(format!("/listen/{}/", slug(rel))),
@@ -670,6 +737,10 @@ pub fn handle(h: &mut Hub, post: bool, url: &str, body: &str) -> Reply {
         let Some((rel, rest)) = split_seg(rest).map(|(s, r)| (s.replace('~', "/"), r)) else {
             return Reply::Redirect(format!("{url}/"));
         };
+        // A set folder added since the last visit is found here too.
+        if !h.listens.contains_key(&rel) && h.sets.is_some() {
+            h.scan();
+        }
         let Some(l) = h.listens.get_mut(&rel) else {
             return Reply::NotFound;
         };
@@ -997,6 +1068,175 @@ mod tests {
             Reply::NotFound
         ));
         assert!(matches!(handle(&mut hub, false, "/", ""), Reply::Page(_)));
+    }
+
+    /// A sets folder holding one TTS-style set (synthetic audio only).
+    fn sets_dir() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let sets = t.path().join("sets");
+        let set = sets.join("tts-test");
+        for d in ["listen-blind/vT/L01", "listen-key", "refs"] {
+            fs::create_dir_all(set.join(d)).unwrap();
+        }
+        fs::write(set.join("listen-blind/vT/L01/A.wav"), b"RIFFa").unwrap();
+        fs::write(set.join("listen-blind/vT/L01/B.wav"), b"RIFFb").unwrap();
+        let mut rows = vec![["group", "clip", "sentence"]
+            .into_iter()
+            .chain(ANSWERS)
+            .map(str::to_string)
+            .collect::<Vec<_>>()];
+        for c in ["A", "B"] {
+            let mut r = vec!["vT/L01".to_string(), c.into(), "Hello.".into()];
+            r.resize(3 + ANSWERS.len(), String::new());
+            rows.push(r);
+        }
+        fs::write(set.join("listen-blind/sheet.csv"), write_csv(&rows)).unwrap();
+        fs::write(
+            set.join("listen-key/key.json"),
+            r#"{"groups": {"vT/L01": {"A": "SECRETMODEL", "B": "other"}}}"#,
+        )
+        .unwrap();
+        fs::write(set.join("refs/vT.wav"), b"RIFFref").unwrap();
+        fs::write(set.join("refs/vP.wav"), b"RIFFref2").unwrap();
+        // not a set: no listen-blind/
+        fs::create_dir_all(sets.join("plain")).unwrap();
+        // unsafe name
+        fs::create_dir_all(sets.join(".hidden/listen-blind")).unwrap();
+        (t, sets)
+    }
+
+    fn sets_hub(t: &tempfile::TempDir, sets: &Path) -> Hub {
+        let corpus = t.path().join("corpus");
+        fs::create_dir_all(&corpus).unwrap();
+        Hub::load(&corpus, corpus.join("no-moods.toml"))
+            .unwrap()
+            .with_listen_sets(sets)
+    }
+
+    fn body(r: Reply) -> String {
+        match r {
+            Reply::Json(v) => v.to_string(),
+            Reply::Page(p) => p.to_string(),
+            Reply::Html(p) => p,
+            Reply::Audio(p) => p.display().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn listen_sets_are_found_listed_and_new_ones_appear() {
+        let (t, sets) = sets_dir();
+        let mut hub = sets_hub(&t, &sets);
+        let v = hub.view();
+        assert_eq!(ids(&v, "pending"), ["listen:tts-test"]);
+        let task = &v["pending"][0];
+        assert_eq!(task["title"], "Listening test: tts-test");
+        assert_eq!(task["url"], "/listen/tts-test/");
+        // a new set shows up with no restart, even when opened directly
+        let new = sets.join("second");
+        fs::create_dir_all(new.join("listen-blind")).unwrap();
+        fs::copy(
+            sets.join("tts-test/listen-blind/sheet.csv"),
+            new.join("listen-blind/sheet.csv"),
+        )
+        .unwrap();
+        let r = handle(&mut hub, false, "/listen/second/", "");
+        assert!(matches!(r, Reply::Html(_)), "{:?}", hub.problems);
+        assert_eq!(ids(&hub.view(), "pending").len(), 2);
+    }
+
+    #[test]
+    fn listen_set_key_is_never_served_before_all_rated() {
+        let (t, sets) = sets_dir();
+        let mut hub = sets_hub(&t, &sets);
+        let mut all = String::new();
+        for u in [
+            "/api/tasks",
+            "/listen/tts-test/",
+            "/listen/tts-test/api/session",
+            "/api/task?id=listen:tts-test",
+        ] {
+            all += &body(handle(&mut hub, false, u, ""));
+        }
+        for u in [
+            "/key.json",
+            "/listen/tts-test/key.json",
+            "/listen/tts-test/listen-key/key.json",
+            "/listen/tts-test/../listen-key/key.json",
+            "/listen/tts-test/%2e%2e/listen-key/key.json",
+            "/listen/tts-test/ref/key.json",
+            "/listen/tts-test/ref/..%2Flisten-key%2Fkey.json",
+            "/listen/tts-test/audio?g=..&c=key",
+            "/listen/tts-test/audio?g=..%2Flisten-key&c=key",
+            "/listen/..%2Flisten-key/key.json",
+            "/listen/.hidden/",
+            "/listen/plain/",
+            "/listen/tts-test~x/",
+        ] {
+            let r = handle(&mut hub, false, u, "");
+            assert!(matches!(r, Reply::NotFound | Reply::Redirect(_)), "{u}");
+            all += &body(r);
+        }
+        // (the unrelated channel_key.jsonl file name is not the key)
+        let all = all.replace("channel_key.jsonl", "");
+        for needle in ["SECRETMODEL", "key.json"] {
+            if let Some(i) = all.find(needle) {
+                panic!(
+                    "leak {needle}: {}",
+                    &all[i.saturating_sub(80)..(i + 80).min(all.len())]
+                );
+            }
+        }
+        assert!(!all.contains("listen-key"));
+        // rate everything: now it unblinds
+        let mut last = Value::Null;
+        for c in ["A", "B"] {
+            last = json(handle(
+                &mut hub,
+                true,
+                "/listen/tts-test/api/answer",
+                &answer_body(c),
+            ));
+        }
+        assert!(last.to_string().contains("SECRETMODEL"));
+    }
+
+    fn answer_body(clip: &str) -> String {
+        json!({"group": "vT/L01", "clip": clip, "voice": "y", "mood": "2", "clear": "y"})
+            .to_string()
+    }
+
+    #[test]
+    fn listen_set_ratings_persist_and_refs_are_served() {
+        let (t, sets) = sets_dir();
+        let mut hub = sets_hub(&t, &sets);
+        let r = handle(
+            &mut hub,
+            true,
+            "/listen/tts-test/api/answer",
+            &answer_body("A"),
+        );
+        assert!(matches!(r, Reply::Json(_)), "{r:?}");
+        let sheet = fs::read_to_string(sets.join("tts-test/listen-blind/sheet.csv")).unwrap();
+        assert!(sheet.lines().nth(1).unwrap().contains(",y,2,y"), "{sheet}");
+        // a fresh hub reads it back from disk
+        let mut hub = sets_hub(&t, &sets);
+        let s = json(handle(&mut hub, false, "/listen/tts-test/api/session", ""));
+        assert_eq!(s["done"], 1);
+        // refs: listed, playable, read-only, and only plain wavs
+        let refs = s["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+        for n in ["vT", "vP"] {
+            let u = format!("/listen/tts-test/ref/{n}.wav");
+            assert!(
+                matches!(handle(&mut hub, false, &u, ""), Reply::Audio(_)),
+                "{u}"
+            );
+        }
+        assert!(matches!(
+            handle(&mut hub, true, "/listen/tts-test/ref/vT.wav", "x"),
+            Reply::NotFound
+        ));
     }
 
     #[test]
