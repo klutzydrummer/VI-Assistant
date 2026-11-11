@@ -12,7 +12,7 @@ needs Brandon's explicit approval of that run and cap, and the hardening PR #126
 | `pick_refs.py` | picks vT (label-free, seeded hash) and vP; writes `refs/` |
 | `generate.py` | one process per (model, voice, seed); writes WAVs, `manifest.sha256`, `expected-count.txt`, `run-info.json`. Model `stub` = sine WAVs for dry runs. Does not push |
 | `verify.py` | home check of pushed outputs; names the culprit file and exits nonzero |
-| `blind.py` | 24 kHz mono, level-matched, shuffled letters; writes the key |
+| `blind.py` | 24 kHz mono, level-matched, shuffled letters; writes `sheet.csv` and the key |
 | `cloud-tts-test.toml` | test-only config (offer is picked by id, never "cheapest") |
 | `reap-loop.sh` | home `vi cloud reap` every 300 s; loud if it stops |
 
@@ -23,9 +23,8 @@ Tests: `python3 -m unittest discover -s jobs -p test_ttstest.py` (standard libra
 /home/brandon/Projects/VI-Assistant-listen/tts-test-2026-11-10/
   refs/          vT.wav vP.wav refs.json ref-sources.md
   raw/           <model>__v<T|P>__s<seed>/   exactly as generated, plus manifest etc.
-  listen-blind/  v<V>/<LINE>/{A,B,C,D}.wav, refs/
+  listen-blind/  v<V>/<LINE>/{A,B,C,D}.wav, sheet.csv (ratings are saved here), refs/
   listen-key/    key.json     (do not open until ratings.csv is saved)
-  ratings.csv
 ```
 Tali audio is copyrighted: it goes only between home and the worker (as training does) and no
 permanent copy may remain off Brandon's machine.
@@ -46,5 +45,12 @@ permanent copy may remain off Brandon's machine.
    kept copy (`rm -rf /root/vi-keep` over ssh, and the job output folder), then `vi cloud down`, read the
    spend, confirm `vi cloud status` is empty and no receiver or tunnel remains. If verify fails, keep the
    copy and the worker until the files are recovered or the loss is accepted.
-6. **Blind**: `blind.py <raw> <listen root> --refs <listen root>/refs`, listen, fill `ratings.csv`
-   (`voice,line,letter,natural(1-5),voice-match(1-5),artifacts(y/n),best(y/n),notes`), then open the key.
+6. **Blind**: `blind.py <raw> <listen root> --refs <listen root>/refs` (re-run it whenever a model
+   folder is added under `raw/`, into a fresh root; it refuses to overwrite). Then listen in the browser:
+   `vi review --listen <root>/listen-blind --key <root>/listen-key/key.json --refs <root>/refs`
+   (add `--port N` / `--host ADDR` as for other review modes). The set can live in any folder. The page
+   plays each A/B/C/D clip and shows the refs (vT, vP) in a "Reference clips" box, outside the rated
+   groups. Answers save to `listen-blind/sheet.csv` as you go. The key is never served; the model names
+   appear on the page only after every clip is answered, and `results.md` is written then. The page's
+   questions are the voicearms ones (her voice y/n, mood 0-3, words clear y/n, notes): for this test
+   read "mood" as a general quality score and leave the mood-only extras blank.

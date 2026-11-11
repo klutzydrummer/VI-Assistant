@@ -218,6 +218,39 @@ class BlindTest(unittest.TestCase):
         # raw untouched, still verifies
         self.assertEqual(verify.verify_all(self.raw), {})
 
+    def test_sheet_matches_listen_format_and_hides_models(self):
+        import csv
+        out = self.root / "sheetset"
+        key = blind.build(self.raw, out)
+        with open(out / "listen-blind" / "sheet.csv", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0][:7], ["group", "clip", "sentence", "still_her_voice_y_n",
+                                      "mood_heard_0_3", "words_clear_y_n", "notes"])
+        self.assertEqual(len(rows) - 1, 2 * 13 * 4)
+        lines = {ln["id"]: ln["text"] for ln in json.loads(blind.HERE.joinpath("lines.json").read_text())}
+        for r in rows[1:]:
+            self.assertEqual(len(r), len(rows[0]))
+            self.assertEqual(r[2], lines[r[0].split("/")[1][:3]])
+            self.assertEqual(r[3:], [""] * (len(r) - 3))
+            self.assertIn(r[1], key[r[0]])
+        text = (out / "listen-blind" / "sheet.csv").read_text()
+        for m in ("omnivoice", "moss15", "qwen3base", "mossnano"):
+            self.assertNotIn(m, text)
+            self.assertNotIn(m, " ".join(str(p) for p in (out / "listen-blind").rglob("*")))
+        self.assertFalse((out / "listen-blind" / "key.json").exists())
+
+    def test_new_model_dirs_are_picked_up(self):
+        loaders = STUB
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            refs = make_refs(root)
+            for m in ("stub", "mossnano"):
+                self.assertEqual(gen(root, refs, m, "T", loaders=loaders)[0], 0)
+            key = blind.build(root / "raw", root / "two")
+            self.assertEqual(sorted(key["vT/L01"].values()), ["mossnano", "stub"])
+            self.assertEqual(sorted(p.name for p in (root / "two/listen-blind/vT/L01").glob("*.wav")),
+                             ["A.wav", "B.wav"])
+
     def test_deterministic_and_no_overwrite(self):
         a, b = self.root / "a", self.root / "b"
         ka, kb = blind.build(self.raw, a), blind.build(self.raw, b)

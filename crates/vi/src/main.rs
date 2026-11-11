@@ -30,6 +30,7 @@ pub(crate) const USAGE: &str = "usage:
   vi review --purity --demo <empty-folder> [--port N]
   vi review --gold <corpus-folder> [--moods <moods.toml>] [--port N]
   vi review --channel <corpus-folder> [--port N]
+  vi review --listen <set-folder> [--key <key.json>] [--refs <folder>] [--port N]   (blind listening set, any folder)
   (every review mode also takes --host ADDR; default 127.0.0.1)
   vi cloud offers
   vi cloud up --cap USD --until TIME [--offer ID] [--yes]
@@ -192,6 +193,9 @@ fn review(args: &[&str]) -> ExitCode {
     let mut gold = false;
     let mut channel = false;
     let mut labels = false;
+    let mut listen = false;
+    let mut key = None;
+    let mut refs = None;
     let mut moods = None;
     let mut dir = None;
     let mut args = args.iter();
@@ -202,6 +206,15 @@ fn review(args: &[&str]) -> ExitCode {
             "--gold" => gold = true,
             "--channel" => channel = true,
             "--labels" => labels = true,
+            "--listen" => listen = true,
+            "--key" | "--refs" => match args.next() {
+                Some(p) if *arg == "--key" => key = Some(PathBuf::from(p)),
+                Some(p) => refs = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("{arg} needs a path");
+                    return ExitCode::from(2);
+                }
+            },
             "--moods" => match args.next() {
                 Some(m) => moods = Some(PathBuf::from(m)),
                 None => {
@@ -260,6 +273,40 @@ fn review(args: &[&str]) -> ExitCode {
         }
     }
     let addr = format!("{host}:{port}");
+
+    if (key.is_some() || refs.is_some()) && !listen {
+        eprintln!("--key and --refs go with --listen");
+        return ExitCode::from(2);
+    }
+    if listen {
+        let mut l = match review::listen::Listen::load(&dir) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(key) = key {
+            l = l.with_key(key);
+        }
+        if let Some(refs) = refs {
+            l = l.with_refs(refs);
+        }
+        println!("{} clips to hear, {} answered so far", l.total(), l.done());
+        println!(
+            "blind listening at http://{addr}/  (Ctrl+C to stop; every answer goes to {} as you go)",
+            dir.join(review::listen::SHEET).display()
+        );
+        return match review::server::serve_with(&addr, |post, url, body| {
+            review::listen::handle_listen(&mut l, post, url, body)
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     if channel {
         let mut c = match review::channel::Channel::load(&dir) {
