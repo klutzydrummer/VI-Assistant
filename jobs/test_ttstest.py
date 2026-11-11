@@ -251,6 +251,18 @@ class BlindTest(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in (root / "two/listen-blind/vT/L01").glob("*.wav")),
                              ["A.wav", "B.wav"])
 
+    def test_nested_layout_raw_model_run_clip(self):
+        with tempfile.TemporaryDirectory() as t:
+            raw = Path(t) / "raw"
+            for m in ("modela", "modelb"):
+                d = raw / m / f"{m}__vT__s1"
+                d.mkdir(parents=True)
+                wavio.write_wav(d / f"{m}__vT__L01__s1.wav", wavio.sine(1.0, 24000, 200.0), 24000)
+                (d / "manifest.sha256").write_text("x")
+                (d / "run-info.json").write_text("{}")
+            key = blind.build(raw, Path(t) / "out")
+            self.assertEqual(sorted(key["vT/L01"].values()), ["modela", "modelb"])
+
     def test_deterministic_and_no_overwrite(self):
         a, b = self.root / "a", self.root / "b"
         ka, kb = blind.build(self.raw, a), blind.build(self.raw, b)

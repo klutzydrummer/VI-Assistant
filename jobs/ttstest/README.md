@@ -22,7 +22,7 @@ Tests: `python3 -m unittest discover -s jobs -p test_ttstest.py` (standard libra
 ```
 /home/brandon/Projects/VI-Assistant-listen/tts-test-2026-11-10/
   refs/          vT.wav vP.wav refs.json ref-sources.md
-  raw/           <model>__v<T|P>__s<seed>/   exactly as generated, plus manifest etc.
+  raw/           <model>__v<T|P>__s<seed>/ or <model>/<model>__v<T|P>__s<seed>/ (any depth), exactly as generated, plus manifest etc.
   listen-blind/  v<V>/<LINE>/{A,B,C,D}.wav, sheet.csv (ratings are saved here), refs/
   listen-key/    key.json     (do not open until ratings.csv is saved)
 ```

@@ -38,17 +38,16 @@ NAME = re.compile(r"^(?P<model>[a-z0-9]+)__v(?P<voice>[A-Za-z])__(?P<line>[A-Z]\
 
 
 def collect(raw):
-    """{(voice, line, seed): {model: path}} from every <raw>/*/ folder."""
+    """{(voice, line, seed): {model: path}} from every *.wav at any depth below <raw>."""
     groups = {}
-    for d in sorted(p for p in Path(raw).iterdir() if p.is_dir()):
-        for w in sorted(d.glob("*.wav")):
-            m = NAME.match(w.name)
-            if not m:
-                raise SystemExit(f"unexpected file name {w}")
-            key = (m["voice"], m["line"], int(m["seed"]))
-            if m["model"] in groups.setdefault(key, {}):
-                raise SystemExit(f"two clips for {key} / {m['model']}")
-            groups[key][m["model"]] = w
+    for w in sorted(Path(raw).rglob("*.wav")):
+        m = NAME.match(w.name)
+        if not m:
+            raise SystemExit(f"unexpected file name {w}")
+        key = (m["voice"], m["line"], int(m["seed"]))
+        if m["model"] in groups.setdefault(key, {}):
+            raise SystemExit(f"two clips for {key} / {m['model']}")
+        groups[key][m["model"]] = w
     return groups
 
 
