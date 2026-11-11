@@ -22,7 +22,8 @@ pub(crate) const USAGE: &str = "usage:
   vi harvest package <file.pcc>
   vi harvest tlk <file.tlk | LE1-file.pcc> [--id N]
   vi extract --character <character-folder> <LE-install-folder> [--out <folder>]
-  vi review <corpus-folder> [--moods <moods.toml>] [--port N]   (the hub: every task in one place)
+  vi review <corpus-folder> [--moods <moods.toml>] [--listen-sets <folder>] [--port N]   (the hub: every task in one place;
+      --listen-sets adds each set folder with listen-blind/, listen-key/key.json and refs/ as a Listening test)
   vi review --demo <empty-folder> [--port N]
   vi review --labels <corpus-folder> [--port N]
   vi review --labels --demo <empty-folder> [--port N]
@@ -194,6 +195,7 @@ fn review(args: &[&str]) -> ExitCode {
     let mut channel = false;
     let mut labels = false;
     let mut listen = false;
+    let mut listen_sets = None;
     let mut key = None;
     let mut refs = None;
     let mut moods = None;
@@ -212,6 +214,13 @@ fn review(args: &[&str]) -> ExitCode {
                 Some(p) => refs = Some(PathBuf::from(p)),
                 None => {
                     eprintln!("{arg} needs a path");
+                    return ExitCode::from(2);
+                }
+            },
+            "--listen-sets" => match args.next() {
+                Some(p) => listen_sets = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("--listen-sets needs a folder");
                     return ExitCode::from(2);
                 }
             },
@@ -274,6 +283,10 @@ fn review(args: &[&str]) -> ExitCode {
     }
     let addr = format!("{host}:{port}");
 
+    if listen_sets.is_some() && (listen || purity || gold || channel || labels || demo) {
+        eprintln!("--listen-sets goes with the hub (no other mode flag)");
+        return ExitCode::from(2);
+    }
     if (key.is_some() || refs.is_some()) && !listen {
         eprintln!("--key and --refs go with --listen");
         return ExitCode::from(2);
@@ -350,6 +363,9 @@ fn review(args: &[&str]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        if let Some(sets) = listen_sets {
+            hub = hub.with_listen_sets(sets);
+        }
         let view = hub.view();
         let count = |k: &str| view[k].as_array().map_or(0, Vec::len);
         println!(
