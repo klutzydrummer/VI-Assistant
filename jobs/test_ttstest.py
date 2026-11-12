@@ -2,6 +2,8 @@
 Run with `python3 -m unittest discover -s jobs`. Standard library only; no network, no GPU."""
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,9 +16,11 @@ import generate  # noqa: E402
 import pick_refs  # noqa: E402
 import verify  # noqa: E402
 import wavio  # noqa: E402
+import worker_run  # noqa: E402
 
+HERE_TT = Path(__file__).resolve().parent / "ttstest"
 LINES = json.loads((Path(__file__).resolve().parent / "ttstest" / "lines.json").read_text())
-STUB = {m: generate.load_stub for m in ("omnivoice", "moss15", "qwen3base", "mossnano", "stub")}
+STUB = {m: generate.load_stub for m in ("omnivoice", "moss15", "qwen3base", "stub")}
 
 
 def make_refs(root):
@@ -188,7 +192,7 @@ class BlindTest(unittest.TestCase):
         self._t = tempfile.TemporaryDirectory()
         self.root = Path(self._t.name)
         self.refs = make_refs(self.root)
-        for m in ("omnivoice", "moss15", "qwen3base", "mossnano"):
+        for m in ("omnivoice", "moss15", "qwen3base"):
             for v in "TP":
                 self.assertEqual(gen(self.root, self.refs, m, v)[0], 0)
         self.raw = self.root / "raw"
@@ -202,9 +206,8 @@ class BlindTest(unittest.TestCase):
         key = blind.build(self.raw, out, refs=self.refs)
         self.assertEqual(len(key), 2 * 13)
         g = out / "listen-blind" / "vT" / "L01"
-        self.assertEqual(sorted(p.name for p in g.glob("*.wav")), ["A.wav", "B.wav", "C.wav", "D.wav"])
-        self.assertEqual(sorted(key["vT/L01"].values()), ["mossnano", "moss15", "omnivoice", "qwen3base"][:0] or
-                         sorted(["omnivoice", "moss15", "qwen3base", "mossnano"]))
+        self.assertEqual(sorted(p.name for p in g.glob("*.wav")), ["A.wav", "B.wav", "C.wav"])
+        self.assertEqual(sorted(key["vT/L01"].values()), ["moss15", "omnivoice", "qwen3base"])
         rmss = []
         for p in g.glob("*.wav"):
             x, sr = wavio.read_wav(p)
@@ -214,7 +217,7 @@ class BlindTest(unittest.TestCase):
         self.assertEqual(json.loads((out / "listen-key" / "key.json").read_text())["groups"], key)
         self.assertTrue((out / "listen-blind" / "refs" / "vT.wav").is_file())
         # letters are shuffled: not the same order in every group
-        self.assertGreater(len({tuple(key[k][c] for c in "ABCD") for k in key}), 1)
+        self.assertGreater(len({tuple(key[k][c] for c in "ABC") for k in key}), 1)
         # raw untouched, still verifies
         self.assertEqual(verify.verify_all(self.raw), {})
 
@@ -226,7 +229,7 @@ class BlindTest(unittest.TestCase):
             rows = list(csv.reader(f))
         self.assertEqual(rows[0][:7], ["group", "clip", "sentence", "still_her_voice_y_n",
                                       "mood_heard_0_3", "words_clear_y_n", "notes"])
-        self.assertEqual(len(rows) - 1, 2 * 13 * 4)
+        self.assertEqual(len(rows) - 1, 2 * 13 * 3)
         lines = {ln["id"]: ln["text"] for ln in json.loads(blind.HERE.joinpath("lines.json").read_text())}
         for r in rows[1:]:
             self.assertEqual(len(r), len(rows[0]))
@@ -234,7 +237,7 @@ class BlindTest(unittest.TestCase):
             self.assertEqual(r[3:], [""] * (len(r) - 3))
             self.assertIn(r[1], key[r[0]])
         text = (out / "listen-blind" / "sheet.csv").read_text()
-        for m in ("omnivoice", "moss15", "qwen3base", "mossnano"):
+        for m in ("omnivoice", "moss15", "qwen3base"):
             self.assertNotIn(m, text)
             self.assertNotIn(m, " ".join(str(p) for p in (out / "listen-blind").rglob("*")))
         self.assertFalse((out / "listen-blind" / "key.json").exists())
@@ -244,10 +247,10 @@ class BlindTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
             refs = make_refs(root)
-            for m in ("stub", "mossnano"):
+            for m in ("stub", "qwen3base"):
                 self.assertEqual(gen(root, refs, m, "T", loaders=loaders)[0], 0)
             key = blind.build(root / "raw", root / "two")
-            self.assertEqual(sorted(key["vT/L01"].values()), ["mossnano", "stub"])
+            self.assertEqual(sorted(key["vT/L01"].values()), ["qwen3base", "stub"])
             self.assertEqual(sorted(p.name for p in (root / "two/listen-blind/vT/L01").glob("*.wav")),
                              ["A.wav", "B.wav"])
 
@@ -281,6 +284,98 @@ class BlindTest(unittest.TestCase):
         scaled, target = blind.level_match([[0.9, -0.9] * 100, [0.01, -0.01] * 100])
         self.assertLessEqual(max(abs(v) for c in scaled for v in c), blind.PEAK_MAX + 1e-9)
         self.assertAlmostEqual(wavio.rms(scaled[0]), wavio.rms(scaled[1]))
+
+
+class WorkerRunTest(unittest.TestCase):
+    def test_models_and_clip_counts(self):
+        self.assertEqual(sorted(generate.MODELS), ["moss15", "omnivoice", "qwen3base", "stub"])
+        self.assertEqual(worker_run.MODELS, ("omnivoice", "moss15", "qwen3base"))
+        self.assertEqual(len(worker_run.plan(worker_run.MODELS, False)) * len(LINES), 78)
+        self.assertEqual(len(worker_run.plan(worker_run.MODELS, True)) * len(LINES), 78 + 39)
+        self.assertEqual(sorted({(v, s) for _, v, s in worker_run.plan(worker_run.MODELS, True)}),
+                         [("P", 1), ("T", 1), ("T", 2)])
+
+    def test_vt_is_deleted_with_its_transcript(self):
+        with tempfile.TemporaryDirectory() as t:
+            refs = make_refs(t)
+            info = {}
+            worker_run.delete_vt(refs, info)
+            self.assertTrue(info["vT_deleted"])
+            self.assertFalse((refs / "vT.wav").exists())
+            self.assertTrue((refs / "vP.wav").exists())
+            self.assertNotIn("vT", json.loads((refs / "refs.json").read_text()))
+
+    def test_no_hf_token_reaches_a_model_process(self):
+        os.environ["HF_TOKEN"] = "secret"
+        try:
+            self.assertNotIn("HF_TOKEN", worker_run.clean_env(False))
+        finally:
+            del os.environ["HF_TOKEN"]
+
+    def test_download_retries_three_times_then_gives_up(self):
+        with tempfile.TemporaryDirectory() as t:
+            worker_run.BACKOFF, old = (0, 0, 0), worker_run.BACKOFF
+            try:
+                cmd = [sys.executable, "-c", "import sys; open(sys.argv[1], 'a').write('x'); sys.exit(1)", str(Path(t) / "n")]
+                with self.assertRaises(worker_run.CmdFailed):
+                    worker_run.with_retries("m", [cmd], Path(t) / "log", dict(os.environ), __import__("time").time() + 60)
+                self.assertEqual((Path(t) / "n").read_text(), "xxx")
+            finally:
+                worker_run.BACKOFF = old
+
+    def test_download_time_limit_stops_a_hung_command(self):
+        import time
+        with tempfile.TemporaryDirectory() as t:
+            t0 = time.time()
+            with self.assertRaises(worker_run.CmdFailed):
+                worker_run.with_retries("m", [[sys.executable, "-c", "import time; time.sleep(60)"]], Path(t) / "log",
+                                        dict(os.environ), time.time() + 1)
+            self.assertLess(time.time() - t0, 10)
+
+
+class ReapLoopTest(unittest.TestCase):
+    """reap-loop.sh must not need `vi` on PATH, and must fail loudly at the start when it finds none."""
+
+    def setUp(self):
+        self._t = tempfile.TemporaryDirectory()
+        self.root = Path(self._t.name)
+        (self.root / "jobs" / "ttstest").mkdir(parents=True)
+        self.script = self.root / "jobs" / "ttstest" / "reap-loop.sh"
+        self.script.write_text((HERE_TT / "reap-loop.sh").read_text())
+
+    def tearDown(self):
+        self._t.cleanup()
+
+    def fake_vi(self, path, tag):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\necho {tag} \"$@\"\nkill -TERM $PPID\n")
+        path.chmod(0o755)
+
+    def run_loop(self, **env):
+        e = {"PATH": "/usr/bin:/bin:" + os.path.dirname(sys.executable), "REAP_INTERVAL": "1", **env}
+        return subprocess.run(["bash", str(self.script)], env=e, capture_output=True, text=True, timeout=30)
+
+    def test_none_found_fails_loudly(self):
+        r = self.run_loop()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no usable `vi`", r.stderr)
+        self.assertNotIn("reaping", r.stdout)
+
+    def test_repo_release_binary_is_used(self):
+        self.fake_vi(self.root / "target" / "release" / "vi", "RELEASE")
+        r = self.run_loop()
+        self.assertIn("RELEASE cloud reap", r.stdout)
+
+    def test_vi_bin_wins(self):
+        self.fake_vi(self.root / "target" / "release" / "vi", "RELEASE")
+        self.fake_vi(self.root / "elsewhere" / "myvi", "ENVBIN")
+        r = self.run_loop(VI_BIN=str(self.root / "elsewhere" / "myvi"))
+        self.assertIn("ENVBIN cloud reap", r.stdout)
+        self.assertNotIn("RELEASE", r.stdout)
+
+    def test_bad_vi_bin_fails_loudly(self):
+        r = self.run_loop(VI_BIN=str(self.root / "nope"))
+        self.assertEqual(r.returncode, 2)
 
 
 class PickRefsTest(unittest.TestCase):

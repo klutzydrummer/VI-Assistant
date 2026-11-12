@@ -8,8 +8,8 @@ Writes `<out>/<model>__v<voice>__s<seed>/` holding 13 WAVs named
 exits nonzero WITHOUT a manifest, so the home verifier names the culprit. Each (model, voice, seed)
 folder is self-contained so it can be pushed home on its own. Pushing is NOT done here.
 
-Models: omnivoice, moss15, qwen3base, mossnano (real adapters, imported only when selected) and
-`stub` (sine WAVs, for dry runs; needs no GPU, no network). The four real adapters were written
+Models: omnivoice, moss15, qwen3base (real adapters, imported only when selected) and
+`stub` (sine WAVs, for dry runs; needs no GPU, no network). The three real adapters were written
 from the vendors' public READMEs and have NOT been run: the per-model smoke test on the worker
 (line L01 only: `--only L01`) is what proves them. Voices: T (Tali clip) and P (public control),
 reference files `<refs>/v<voice>.wav` and transcripts in `<refs>/refs.json`.
@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import sys
 import time
 import traceback
@@ -30,13 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wavio  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-MODELS = ("omnivoice", "moss15", "qwen3base", "mossnano", "stub")
+MODELS = ("omnivoice", "moss15", "qwen3base", "stub")
 VOICES = ("T", "P")
 REPO_IDS = {
     "omnivoice": "k2-fsa/OmniVoice",
     "moss15": "OpenMOSS-Team/MOSS-TTS-v1.5",
     "qwen3base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    "mossnano": "OpenMOSS-Team/MOSS-TTS-Nano-100M",
     "stub": "stub",
 }
 
@@ -121,27 +121,46 @@ def load_moss15():
     return synth
 
 
-def load_mossnano():
-    """MOSS-TTS-Nano on CPU through the ONNX script in MOSS_NANO_DIR (a checkout of its repo)."""
-    import subprocess
-    import tempfile
-
-    root = os.environ.get("MOSS_NANO_DIR")
-    if not root:
-        raise RuntimeError("set MOSS_NANO_DIR to the MOSS-TTS-Nano checkout")
-
-    def synth(text, ref_wav, ref_text):
-        with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "o.wav"
-            subprocess.run([sys.executable, "infer_onnx.py", "--prompt-audio-path", str(ref_wav), "--text", text,
-                            "--output-audio-path", str(out), "--seed", str(_SEED[0])], cwd=root, check=True)
-            x, sr = wavio.read_wav(out)
-        return x, sr
-    return synth
-
-
 LOADERS = {"stub": load_stub, "omnivoice": load_omnivoice, "moss15": load_moss15,
-           "qwen3base": load_qwen3base, "mossnano": load_mossnano}
+           "qwen3base": load_qwen3base}
+
+
+# --- test-only fault injection (TTSTEST_STUB=1) ----------------------------------------------------
+# With TTSTEST_STUB=1 every model name runs the sine stub, so jobs/ttstest/worker_run.py can be
+# exercised end to end with no GPU, network or weights (see test_inject.py). Optional faults, each
+# naming ONE model: TTSTEST_STUB_FAIL (MemoryError while loading), TTSTEST_STUB_CORRUPT (flip a byte
+# in a WAV after the manifest is written), TTSTEST_STUB_DELETE (delete the finished folder),
+# TTSTEST_STUB_DELAY (seconds per clip, so a test can kill the job halfway).
+
+def stub_active():
+    return os.environ.get("TTSTEST_STUB") == "1"
+
+
+def stub_loader(model):
+    def load():
+        if os.environ.get("TTSTEST_STUB_FAIL") == model:
+            raise MemoryError("injected by TTSTEST_STUB_FAIL")
+        base = load_stub()
+        delay = float(os.environ.get("TTSTEST_STUB_DELAY") or 0)
+
+        def synth(text, ref_wav, ref_text):
+            time.sleep(delay)
+            return base(text, ref_wav, ref_text)
+        return synth
+    return load
+
+
+def stub_faults_after(model, folder, only):
+    """Damage a finished folder, as TTSTEST_STUB_CORRUPT / TTSTEST_STUB_DELETE ask (full runs only)."""
+    if only:
+        return
+    if os.environ.get("TTSTEST_STUB_CORRUPT") == model:
+        w = sorted(folder.glob("*.wav"))[0]
+        b = bytearray(w.read_bytes())
+        b[200] ^= 0xFF
+        w.write_bytes(bytes(b))
+    if os.environ.get("TTSTEST_STUB_DELETE") == model:
+        shutil.rmtree(folder)
 
 
 # --- run ------------------------------------------------------------------------------------------
@@ -221,20 +240,46 @@ def generate(model, voice, seed, out, refs, lines, only=None, loaders=None):
     return code, info
 
 
+def download_weights(model):
+    """Fetch the model's weights into the Hugging Face cache (no token is ever used or needed)."""
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(REPO_IDS[model])
+    print(f"downloaded {REPO_IDS[model]} to {path}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", required=True, choices=MODELS)
-    ap.add_argument("--voice", required=True, choices=VOICES)
+    ap.add_argument("--voice", choices=VOICES)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--refs", type=Path, required=True)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--refs", type=Path)
     ap.add_argument("--lines", type=Path, default=HERE / "lines.json")
     ap.add_argument("--only", help="comma-separated line ids (smoke test: L01)")
+    ap.add_argument("--venv", metavar="REQUIREMENTS",
+                    help="worker only: re-run inside the virtualenv built from jobs/<file> (vi_job.ensure_venv)")
+    ap.add_argument("--download-only", action="store_true", help="fetch the weights, then stop")
     a = ap.parse_args(argv)
+    if a.venv:
+        sys.path.insert(0, str(HERE.parent))
+        import vi_job
+
+        vi_job.ensure_venv(a.venv)  # re-executes this command inside the venv when it is not in it yet
+    if a.download_only:
+        if not stub_active():
+            download_weights(a.model)
+        return 0
+    if not (a.voice and a.out and a.refs):
+        ap.error("--voice, --out and --refs are required unless --download-only")
     lines = json.loads(a.lines.read_text())
     only = set(a.only.split(",")) if a.only else None
-    code, _ = generate(a.model, a.voice, a.seed, a.out, a.refs, lines, only)
-    print(("OK " if code == 0 else "FAILED ") + str(run_dir(a.out, a.model, a.voice, a.seed)))
+    loaders = {m: stub_loader(m) for m in MODELS} if stub_active() else None
+    code, _ = generate(a.model, a.voice, a.seed, a.out, a.refs, lines, only, loaders)
+    d = run_dir(a.out, a.model, a.voice, a.seed)
+    if code == 0 and stub_active():
+        stub_faults_after(a.model, d, only)
+    print(("OK " if code == 0 else "FAILED ") + str(d))
     return code
 
 
