@@ -44,6 +44,13 @@ MODELS = ("omnivoice", "moss15", "qwen3base")
 CACHE = Path(os.environ.get("TTSTEST_CACHE") or Path.home() / ".cache" / "ttstest")
 BACKOFF = (10, 30, 90)  # seconds before download retries 2 and 3 (a 4th wait is never used)
 TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
+# uv is installed from PyPI with the image's own pip (no curl|sh of "latest"), pinned to a release range, into
+# its own small venv; it then fetches a managed Python 3.12 with `uv python install 3.12`.
+# UNVERIFIED against the docs: this was written without network access. Check before the rental:
+#   https://docs.astral.sh/uv/getting-started/installation/   ("pip install uv"; version pinning)
+#   https://docs.astral.sh/uv/guides/install-python/          (`uv python install 3.12`)
+#   https://docs.astral.sh/uv/reference/environment/          (UV_PYTHON_INSTALL_DIR)
+UV_SPEC = os.environ.get("TTSTEST_UV_SPEC") or "uv>=0.9,<0.10"
 
 
 def log(msg):
@@ -135,9 +142,38 @@ def make_venv(venv, system_site):
     return cmd + ["--clear", str(venv)]
 
 
+def provision_py312(logdir, env, deadline):
+    """Make sure a Python 3.12 can be had. Returns the uv executable to use, or None when a system
+    `python3.12` exists. Raises CmdFailed with a clear message if neither can be provisioned. Only public
+    package/Python downloads happen here; no credentials of any kind are passed (env is clean_env's)."""
+    if shutil.which("uv"):
+        uv = shutil.which("uv")
+    elif shutil.which("python3.12"):
+        return None
+    else:
+        uvenv = CACHE / "venv-uv"
+        uv = str(uvenv / "bin" / "uv")
+        if not Path(uv).exists():
+            try:
+                with_retries("uv-install", [make_venv(uvenv, False),
+                                            [uvenv / "bin" / "python", "-m", "pip", "install", "-q", UV_SPEC]],
+                             logdir / "uv-setup.log", env, deadline)
+            except CmdFailed as e:
+                raise CmdFailed(f"moss15 needs Python 3.12 and could not install uv ({UV_SPEC}): {e}")
+    env["UV_PYTHON_INSTALL_DIR"] = str(CACHE / "uv-python")
+    try:
+        with_retries("python3.12", [[uv, "python", "install", "3.12"]], logdir / "uv-setup.log", env, deadline)
+    except CmdFailed as e:
+        raise CmdFailed(f"moss15 needs Python 3.12 and `uv python install 3.12` failed: {e}")
+    return uv
+
+
 def prepare(model, stub, logdir, env, deadline):
     """Build the model's environment and download its weights. Returns (python, generate-args-prefix)."""
     gen = str(HERE / "generate.py")
+    if stub and model == "moss15" and os.environ.get("TTSTEST_STUB_NO312") == "1":
+        # Test hook (stub runs only): behave as if Python 3.12 could not be provisioned.
+        raise CmdFailed("moss15 needs Python 3.12: it could not be provisioned (injected by TTSTEST_STUB_NO312)")
     if stub:
         return sys.executable, []
     if model == "qwen3base":
@@ -155,14 +191,13 @@ def prepare(model, stub, logdir, env, deadline):
         else:
             # MOSS-TTS-v1.5: its own Python 3.12 + torch 2.9.1 + transformers 5.0.0 (the MOSS README). No flash-attn.
             req = HERE / "requirements-moss15.txt"
-            if shutil.which("uv"):
-                steps = [["uv", "venv", "--python", "3.12", "--clear", venv],
-                         ["uv", "pip", "install", "--python", py, "--torch-backend", "cu128", "-r", req]]
-            elif shutil.which("python3.12"):
+            uv = provision_py312(logdir, env, deadline)  # raises CmdFailed -> model dropped, exit 3
+            if uv:
+                steps = [[uv, "venv", "--python", "3.12", "--clear", venv],
+                         [uv, "pip", "install", "--python", py, "--torch-backend", "cu128", "-r", req]]
+            else:
                 steps = [["python3.12", "-m", "venv", "--clear", venv],
                          [py, "-m", "pip", "install", "-q", "--extra-index-url", TORCH_INDEX, "-r", req]]
-            else:
-                raise CmdFailed("moss15 needs Python 3.12: neither `uv` nor `python3.12` is on the worker")
         with_retries(model, steps, logdir / f"{model}-setup.log", env, deadline)
         ready.touch()
     with_retries(model, [[py, gen, "--model", model, "--download-only"]],
@@ -471,7 +506,8 @@ def main(argv=None):
     ap.add_argument("--out", default=os.environ.get("VI_OUT"))
     ap.add_argument("--refs", default=os.environ.get("VI_INPUT_REFS"))
     ap.add_argument("--keep", default=os.environ.get("TTSTEST_KEEP", "/root/vi-keep"))
-    ap.add_argument("--models", default=os.environ.get("TTSTEST_MODELS", ",".join(MODELS)))
+    ap.add_argument("--models", default=os.environ.get("TTSTEST_MODELS", ",".join(MODELS)),
+                    help="comma list; `--models moss15 --seed2` is the 39-clip moss15-only run (P s1, T s1, T s2)")
     ap.add_argument("--seed2", action="store_true", default=os.environ.get("TTSTEST_SEED2") == "1",
                     help="also run voice T with seed 2")
     ap.add_argument("--stub", action="store_true", help="sine-WAV stand-ins: no venvs, no downloads, no GPU")

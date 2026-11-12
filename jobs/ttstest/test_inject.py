@@ -86,9 +86,9 @@ class Harness:
     out = property(lambda self: self.tmp / "out")
     keep = property(lambda self: self.tmp / "keep")
 
-    def start(self):
+    def start(self, *args):
         self.log = open(self.tmp / "on-worker.log", "wb")
-        self.proc = subprocess.Popen(["bash", str(JOBS / "on-worker.sh"), "python3", "jobs/ttstest/worker_run.py"],
+        self.proc = subprocess.Popen(["bash", str(JOBS / "on-worker.sh"), "python3", "jobs/ttstest/worker_run.py", *args],
                                      env=self.env, stdout=self.log, stderr=subprocess.STDOUT, cwd=self.tmp,
                                      start_new_session=True)
         return self.proc
@@ -110,8 +110,8 @@ class Harness:
         found = sorted((self.tmp / "wroot").glob("ttstest.ttstest.*"))
         return found[-1] if found else None
 
-    def verify(self):
-        r = subprocess.run([sys.executable, "-I", str(HERE / "verify.py"), str(self.out), "--expect", EXPECT],
+    def verify(self, expect=EXPECT):
+        r = subprocess.run([sys.executable, "-I", str(HERE / "verify.py"), str(self.out), "--expect", expect],
                            capture_output=True, text=True)
         return r.returncode, r.stdout
 
@@ -284,6 +284,31 @@ class Injection(unittest.TestCase):
             subprocess.run(["bash", str(JOBS / "worker-return.sh"), "stop", str(state)])
         code, out = h.verify()
         self.assertEqual((code, out.strip()), (0, "VERIFY OK"), out)
+
+    def test_g_moss15_only_run(self):
+        """`--models moss15 --seed2`: exactly the moss15 slice, 13 lines x (P s1, T s1, T s2) = 39 clips."""
+        h = self.harness()
+        h.start("--models", "moss15", "--seed2")
+        self.assertEqual(h.finish(), 0, h.text()[-2500:])
+        code, out = h.verify("moss15:P:1,moss15:T:1,moss15:T:2")
+        self.assertEqual((code, out.strip()), (0, "VERIFY OK"), out)
+        self.assertEqual(len(list(h.out.glob("*/*.wav"))), 39)
+        self.assertEqual((h.out / "expected-count.txt").read_text().strip(), "39")
+        self.assertEqual(sorted(p.name for p in h.out.iterdir() if p.is_dir()),
+                         ["moss15__vP__s1", "moss15__vT__s1", "moss15__vT__s2"])
+
+    def test_h_moss15_fails_fast_without_python312(self):
+        h = self.harness(TTSTEST_STUB_NO312="1")
+        h.start("--models", "moss15", "--seed2")
+        rc = h.finish()
+        self.assert_failed_but_kept(h, rc)
+        info = json.loads((h.out / "run-info.json").read_text())
+        self.assertEqual(info["dropped"], ["moss15"])
+        self.assertIn("needs Python 3.12", info["models"]["moss15"]["reason"])
+        self.assertNotIn("smoke", info["models"]["moss15"], "must fail before any smoke test")
+        self.assertIn("moss15: DROPPED", h.text())
+        self.assertEqual(len(list(h.out.glob("*/*.wav"))), 0)
+        self.assert_vt_gone(h)
 
 
 if __name__ == "__main__":

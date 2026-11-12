@@ -50,11 +50,19 @@ permanent copy may remain off Brandon's machine.
    inputs = ["refs"]
    settings = { expect_epochs = 0, min_vram_gb = 22 }
    ```
-   `TTSTEST_SEED2=1` adds the seed-2 pass for vT. What the job does, per model and each in its own process:
+   `--seed2` adds the seed-2 pass for vT (`TTSTEST_SEED2=1` set at home does NOT reach the worker, which only
+   gets `VI_*` variables: put the flag in the command). `--models moss15 --seed2` is the **moss15-only run**:
+   13 lines x (vP s1, vT s1, vT s2) = **39 clips**, expected-count 39; verify with
+   `verify.py <raw> --expect moss15:P:1,moss15:T:1,moss15:T:2`.
+   **Run notes**: `export VI_BIN=<path to the vi binary>` first (`on-worker.sh` and `reap-loop.sh` call bare `vi`
+   otherwise); `vi cloud up --until` needs a full RFC3339 time (`2026-11-12T19:15:00Z`, not `19:15Z`); `vi cloud down`
+   refuses the empty placeholder checkpoint dir of this job, so first run `python3 jobs/checkpoints.py verify --expect 0 <that dir>`
+   (usage: `checkpoints.py verify --expect 0 <dir>`), then `down` works without `--force`.
+   What the job does, per model and each in its own process:
    - **Environment**: Qwen3 in the venv `vi_job.ensure_venv` builds from `jobs/requirements-tune.txt`;
      OmniVoice in a venv that reuses the image's torch (`pip install omnivoice`); MOSS-TTS-v1.5 in its own
-     Python 3.12 venv with torch 2.9.1 and transformers 5.0.0 (`uv` if the image has it, else `python3.12`;
-     no flash-attn build). No Hugging Face token is used or passed. Downloads are retried 3 times with
+     Python 3.12 venv with torch 2.9.1 and transformers 5.0.0 (`uv` or `python3.12` if the image has one; otherwise the job `pip install`s a pinned uv into its own venv and runs
+     `uv python install 3.12`; if that fails the model is dropped at once, exit 3, before any weights; no flash-attn build). No Hugging Face token is used or passed. Downloads are retried 3 times with
      backoff and a model whose setup/download is still unfinished after 20 minutes is dropped.
    - **Smoke first**: line L01, voice P, seed 1, 15 minutes at most, checked with `verify.py`'s WAV
      checks. Failing twice drops the model; the reason is recorded in `run-info.json`. Other models go on.
@@ -105,6 +113,6 @@ permanent copy may remain off Brandon's machine.
 Cases: a clean baseline (78 clips, `VERIFY OK`); (a) the job SIGKILLed halfway; (b) the return port
 occupied and the receiver killed so pushes fail; (c) a WAV byte flipped after the manifest; (d)
 `MemoryError` in one model (it is dropped after two smoke tries, the others finish); (e) one model's
-output deleted; and a re-push check. Each failure case must give a nonzero exit, a kept worker folder
+output deleted; a re-push check, a moss15-only run (39 clips) and moss15 failing fast when Python 3.12 cannot be provisioned. Each failure case must give a nonzero exit, a kept worker folder
 and keep dir, `vT.wav` gone from the worker, and a `verify.py` result naming the right folder or file.
 A single case: `... test_inject.py Injection.test_d_memory_error_in_one_model`.
