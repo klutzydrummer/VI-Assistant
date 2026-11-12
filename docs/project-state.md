@@ -126,6 +126,15 @@ The full plan lives in a private Claude page, "Tali voice plan". Here is a summa
 - **Inference:** `--speaker style` with `speak --style-from <clip>` uses a clip's style code. The style code is 16 numbers in the speaker slot.
 - **Weights must come home:** any next run must bring its weights home and confirm them before the rental is destroyed.
 
+## Zero-shot TTS blind listening tally (2026-11-12)
+
+Brandon finished rating the two-model blind set (omnivoice against qwen3base, two seeds per line, two reference voices). Counts are per clip; the sample is small and results often flip from seed to seed.
+
+- **vT reference (26 clips per model):** her voice, omnivoice 13 and qwen3base 11. Accent heard (partial or full), 13 and 8. Suit effect, 5 and 1. Mood right on L01-L08, 12 of 16 each. Words clear and pitch correct on every clip.
+- **vP reference (13 clips per model):** her voice, omnivoice 0 and qwen3base 1. No accent or suit effect for either. vP is unusable as a reference.
+- **Mood:** counted only on lines with a tone target. L06 (fearful, hushed) failed for both models on both seeds; L05 and L07 each failed once per model, on different seeds.
+- **Reading:** omnivoice has a slight edge on Tali-likeness with the vT reference, and there is no clear winner on mood. Nothing here was used to pick data or models in code.
+
 ## Next steps and decisions waiting on Brandon
 
 1. **The training-code fix** is in review. Next is a fresh short run from Base (about 300 steps, checkpoints every 50, all brought home and verified, then pruned to the chosen one and the next; the job refuses to start under 50 GB free on `/home`), which needs his go and budget.
