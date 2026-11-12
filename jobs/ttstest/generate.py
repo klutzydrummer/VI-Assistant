@@ -41,6 +41,8 @@ REPO_IDS = {
 }
 
 
+EXTRA_REPOS = {"moss15": ("OpenMOSS-Team/MOSS-Audio-Tokenizer",)}
+
 _SEED = [1]  # the seed of the clip being made, for adapters that run a subprocess
 
 
@@ -244,8 +246,11 @@ def download_weights(model):
     """Fetch the model's weights into the Hugging Face cache (no token is ever used or needed)."""
     from huggingface_hub import snapshot_download
 
-    path = snapshot_download(REPO_IDS[model])
-    print(f"downloaded {REPO_IDS[model]} to {path}")
+    # MOSS-TTS-v1.5's processor also loads a second repo, the audio tokenizer (7.1 GB): fetch it now, so the
+    # whole download happens here and not inside the smoke test.
+    for rid in (REPO_IDS[model], *EXTRA_REPOS.get(model, ())):
+        path = snapshot_download(rid)
+        print(f"downloaded {rid} to {path}")
 
 
 def main(argv=None):

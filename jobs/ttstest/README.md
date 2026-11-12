@@ -12,7 +12,9 @@ needs Brandon's explicit approval of that run and cap, and the hardening PR #126
 | `pick_refs.py` | picks vT (label-free, seeded hash) and vP; writes `refs/` |
 | `generate.py` | one process per (model, voice, seed); writes WAVs, `manifest.sha256`, `expected-count.txt`, `run-info.json`. Model `stub` = sine WAVs for dry runs. Does not push |
 | `worker_run.py` | the whole job on the worker (venvs, smoke, generation, per-model push home, keep copy); run by `on-worker.sh` |
-| `requirements-moss15.txt` | pins for MOSS-TTS-v1.5's own Python 3.12 venv |
+| `requirements-moss15.txt` | full pins for MOSS-TTS-v1.5's own Python 3.12 venv (official pyproject + torchcodec) |
+| `moss15_check.py` | import + WAV round-trip check run in that venv before any weights are fetched |
+| `smoke_moss15_local.py` | free CPU-only home proof that the venv is complete (see below) |
 | `test_inject.py` | local injection test of the job, with stub models (see "Injection test") |
 | `verify.py` | home check of pushed outputs; names the culprit file and exits nonzero |
 | `blind.py` | 24 kHz mono, level-matched, shuffled letters; writes `sheet.csv` and the key |
@@ -62,7 +64,11 @@ permanent copy may remain off Brandon's machine.
    - **Environment**: Qwen3 in the venv `vi_job.ensure_venv` builds from `jobs/requirements-tune.txt`;
      OmniVoice in a venv that reuses the image's torch (`pip install omnivoice`); MOSS-TTS-v1.5 in its own
      Python 3.12 venv with torch 2.9.1 and transformers 5.0.0 (`uv` or `python3.12` if the image has one; otherwise the job `pip install`s a pinned uv into its own venv and runs
-     `uv python install 3.12`; if that fails the model is dropped at once, exit 3, before any weights; no flash-attn build). No Hugging Face token is used or passed. Downloads are retried 3 times with
+     `uv python install 3.12`; if that fails the model is dropped at once, exit 3, before any weights; no flash-attn build).
+     torchaudio 2.9 reads and writes audio through **torchcodec 0.8.1, which needs FFmpeg shared libraries** (4-8): the job
+     `apt-get install`s `ffmpeg` if `ldconfig` shows none, builds the venv, then runs `moss15_check.py` (every import the
+     model's code uses plus a save/load/resample of a tiny WAV). A failed check drops moss15 at once, exit 3, before the
+     ~24 GB download (TTS 17.0 GB + the separate `MOSS-Audio-Tokenizer` repo 7.1 GB). No Hugging Face token is used or passed. Downloads are retried 3 times with
      backoff and a model whose setup/download is still unfinished after 20 minutes is dropped.
    - **Smoke first**: line L01, voice P, seed 1, 15 minutes at most, checked with `verify.py`'s WAV
      checks. Failing twice drops the model; the reason is recorded in `run-info.json`. Other models go on.
@@ -116,3 +122,10 @@ occupied and the receiver killed so pushes fail; (c) a WAV byte flipped after th
 output deleted; a re-push check, a moss15-only run (39 clips) and moss15 failing fast when Python 3.12 cannot be provisioned. Each failure case must give a nonzero exit, a kept worker folder
 and keep dir, `vT.wav` gone from the worker, and a `verify.py` result naming the right folder or file.
 A single case: `... test_inject.py Injection.test_d_memory_error_in_one_model`.
+
+## moss15 local smoke (free, CPU, no weights)
+    LD_LIBRARY_PATH=<dir with FFmpeg .so files> nice -n 19 ionice -c2 -n7 python3 -I jobs/ttstest/smoke_moss15_local.py
+
+Builds the worker's venv (uv, Python 3.12, the same pins, CPU torch wheels) in a new temp dir and runs `moss15_check.py`.
+It proves the pins resolve together, every import works and torchaudio/torchcodec can save, load and resample a WAV.
+It cannot prove CUDA, flash-attn, the real model forward, or that the Vast image's apt gives working FFmpeg libs.

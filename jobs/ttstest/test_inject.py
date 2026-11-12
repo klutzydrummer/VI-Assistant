@@ -310,6 +310,19 @@ class Injection(unittest.TestCase):
         self.assertEqual(len(list(h.out.glob("*/*.wav"))), 0)
         self.assert_vt_gone(h)
 
+    def test_i_moss15_dropped_by_failed_env_check_before_smoke(self):
+        """A venv missing something (torchcodec) drops moss15 right after the build, before any smoke or weights."""
+        h = self.harness(TTSTEST_STUB_BADENV="1")
+        h.start("--models", "moss15", "--seed2")
+        rc = h.finish()
+        self.assert_failed_but_kept(h, rc)
+        info = json.loads((h.out / "run-info.json").read_text())
+        self.assertEqual(info["dropped"], ["moss15"])
+        self.assertIn("torchcodec_is_missing_for_this_test", info["models"]["moss15"]["reason"])
+        self.assertNotIn("smoke", info["models"]["moss15"], "must fail before any smoke test")
+        self.assertEqual(len(list(h.out.glob("*/*.wav"))), 0)
+        self.assert_vt_gone(h)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

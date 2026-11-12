@@ -1,14 +1,27 @@
 # MOSS-TTS-v1.5 on the worker, in its own Python 3.12 venv (worker_run.py builds it; no flash-attn).
-# From the MOSS-TTS README: Transformers 5.0.0 in an isolated env, torch 2.9.1+cu128 (the pyproject pin).
-# Installed with the cu128 index (uv --torch-backend cu128, or pip --extra-index-url). The rest are the
-# usual runtime packages for its remote-code processor; the smoke test shows if one is missing.
+# Source: the official OpenMOSS/MOSS-TTS pyproject.toml (base dependencies + the `torch-runtime` extra),
+# read 2026-11-12: https://github.com/OpenMOSS/MOSS-TTS/blob/main/pyproject.toml
+# Installed with the cu128 index (uv --torch-backend cu128, or pip --extra-index-url).
+# torchcodec 0.8.1 pairs with torch 2.9 on Python 3.10-3.13 (https://github.com/meta-pytorch/torchcodec#compatibility-with-torch-versions).
+# It needs FFmpeg 4-8 SHARED libraries on the system (worker_run.py installs them with apt before this venv is built).
+# torchaudio 2.9 load()/save() go through torchcodec, which is what the failed 2026-11-12 rental tripped on.
+# Left out on purpose: gradio (demo UI), ninja/wheel/setuptools (flash-attn build only), wandb/deepspeed (fine-tuning).
 torch==2.9.1
 torchaudio==2.9.1
+torchcodec==0.8.1
 transformers==5.0.0
-accelerate
-safetensors
+accelerate>=1.10.1
+safetensors==0.6.2
 huggingface_hub
-numpy
+numpy==2.1.0
+orjson==3.11.4
+tqdm==4.67.1
+PyYAML==6.0.3
+einops==0.8.1
+scipy==1.16.2
+librosa==0.11.0
+tiktoken==0.12.0
+psutil
+packaging
 soundfile
-librosa
 sentencepiece

@@ -168,12 +168,40 @@ def provision_py312(logdir, env, deadline):
     return uv
 
 
+def ensure_ffmpeg_libs(logdir, env, deadline):
+    """torchcodec (used by torchaudio 2.9 load/save) needs FFmpeg SHARED libraries (4-8 for torchcodec 0.8.1).
+    The Vast image may not have them, so install Ubuntu's `ffmpeg` package with apt when libavcodec/libavutil
+    are not in the linker cache. Needs root (the worker is root). Raises CmdFailed so moss15 is dropped early."""
+    try:
+        cache = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        cache = ""
+    if "libavcodec.so" in cache and "libavutil.so" in cache and "libswresample.so" in cache:
+        return
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise CmdFailed("moss15 needs FFmpeg shared libraries (torchcodec) and this user cannot apt-get install them")
+    aenv = dict(env, DEBIAN_FRONTEND="noninteractive")
+    with_retries("ffmpeg-apt", [["apt-get", "update", "-qq"],
+                                ["apt-get", "install", "-y", "-qq", "--no-install-recommends", "ffmpeg"]],
+                 logdir / "moss15-ffmpeg.log", aenv, deadline)
+
+
+def check_moss15_env(py, logdir, env, deadline):
+    """Import everything the moss15 path needs and round-trip a tiny WAV (moss15_check.py), BEFORE the ~24 GB of
+    weights are fetched. Raises CmdFailed (model dropped, exit 3) with the check's own message."""
+    run_cmd([py, HERE / "moss15_check.py"], min(deadline - time.time(), 600), logdir / "moss15-check.log", env,
+            cwd=HERE.parent)
+
+
 def prepare(model, stub, logdir, env, deadline):
     """Build the model's environment and download its weights. Returns (python, generate-args-prefix)."""
     gen = str(HERE / "generate.py")
     if stub and model == "moss15" and os.environ.get("TTSTEST_STUB_NO312") == "1":
         # Test hook (stub runs only): behave as if Python 3.12 could not be provisioned.
         raise CmdFailed("moss15 needs Python 3.12: it could not be provisioned (injected by TTSTEST_STUB_NO312)")
+    if stub and model == "moss15" and os.environ.get("TTSTEST_STUB_BADENV") == "1":
+        # Test hook (stub runs only): the environment check fails, as it does when torchcodec is missing.
+        run_cmd([sys.executable, "-c", "import torchcodec_is_missing_for_this_test"], 60, logdir / "moss15-check.log", env)
     if stub:
         return sys.executable, []
     if model == "qwen3base":
@@ -191,6 +219,7 @@ def prepare(model, stub, logdir, env, deadline):
         else:
             # MOSS-TTS-v1.5: its own Python 3.12 + torch 2.9.1 + transformers 5.0.0 (the MOSS README). No flash-attn.
             req = HERE / "requirements-moss15.txt"
+            ensure_ffmpeg_libs(logdir, env, deadline)  # raises CmdFailed -> model dropped, exit 3
             uv = provision_py312(logdir, env, deadline)  # raises CmdFailed -> model dropped, exit 3
             if uv:
                 steps = [[uv, "venv", "--python", "3.12", "--clear", venv],
@@ -199,7 +228,11 @@ def prepare(model, stub, logdir, env, deadline):
                 steps = [["python3.12", "-m", "venv", "--clear", venv],
                          [py, "-m", "pip", "install", "-q", "--extra-index-url", TORCH_INDEX, "-r", req]]
         with_retries(model, steps, logdir / f"{model}-setup.log", env, deadline)
+        if model == "moss15":
+            check_moss15_env(py, logdir, env, deadline)  # fail fast, before any weights; .ready is not set on failure
         ready.touch()
+    elif model == "moss15":
+        check_moss15_env(py, logdir, env, deadline)  # a reused venv is checked again (a few seconds)
     with_retries(model, [[py, gen, "--model", model, "--download-only"]],
                  logdir / f"{model}-download.log", env, deadline)
     return str(py), []
