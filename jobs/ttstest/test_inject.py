@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import signal
+import http.server
 import socket
 import subprocess
 import sys
@@ -122,6 +123,43 @@ class Harness:
         subprocess.run(["pkill", "-f", str(self.tmp)], capture_output=True)
         self.log.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class SpeedServer:
+    """A local HTTP server that sends `size` bytes at about `mbps` MB/s (0 = as fast as it can). Stands in for
+    the public speed-test file; no real network is involved."""
+
+    def __init__(self, mbps, size=40 << 20):
+        outer = self
+        self.hits = 0
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                outer.hits += 1
+                self.send_response(206)
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                chunk = b"\0" * (100 << 10)
+                sent = 0
+                try:
+                    while sent < size:
+                        self.wfile.write(chunk)
+                        sent += len(chunk)
+                        if mbps:
+                            time.sleep(len(chunk) / (mbps * 1048576))
+                except OSError:
+                    pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/f"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
 
 
 class Injection(unittest.TestCase):
@@ -322,6 +360,79 @@ class Injection(unittest.TestCase):
         self.assertNotIn("smoke", info["models"]["moss15"], "must fail before any smoke test")
         self.assertEqual(len(list(h.out.glob("*/*.wav"))), 0)
         self.assert_vt_gone(h)
+
+    # --- Phase 7: speed gate, destroy path, keepalive --------------------------------------------------
+
+    def speed_server(self, mbps):
+        s = SpeedServer(mbps)
+        self.addCleanup(s.close)
+        return s
+
+    def test_j_slow_download_stops_before_setup_and_the_worker_is_destroyed(self):
+        """1 MB/s against a 5 MB/s floor: exit 5 before any venv/weights step, then run-or-release.sh runs
+        `vi cloud down` (a fake vi records it) and clears the empty placeholder checkpoint."""
+        srv = self.speed_server(1)
+        h = self.harness(TTSTEST_SPEED_URLS=srv.url, TTSTEST_MIN_MBPS="5", TTSTEST_SPEED_SECONDS="2",
+                         TTSTEST_SPEED_MB="20", TTSTEST_STUB_SLOWSETUP="30")
+        fake = h.tmp / "fakevi"
+        fake.write_text(f"#!/bin/bash\necho \"$@\" >> {h.tmp}/vi.calls\nexit 0\n")
+        fake.chmod(0o755)
+        h.env.update(VI_BIN=str(fake), TTSTEST_STAGE="ttstest")  # the harness stage is named ttstest; the real one is tts
+        t0 = time.time()
+        h.log = open(h.tmp / "on-worker.log", "wb")
+        h.proc = subprocess.Popen(["bash", str(HERE / "run-or-release.sh"), "bash", str(JOBS / "on-worker.sh"), "python3",
+                                   "jobs/ttstest/worker_run.py", "--models", "moss15", "--seed2"],
+                                  env=h.env, stdout=h.log, stderr=subprocess.STDOUT, cwd=h.tmp, start_new_session=True)
+        rc = h.finish()
+        self.assertEqual(rc, 5, h.text()[-2500:])
+        self.assertLess(time.time() - t0, 25, "the gate must fail fast, not after the 30 s setup hook")
+        self.assertIn("DOWNLOAD TOO SLOW", h.text())
+        info = json.loads((h.out / "run-info.json").read_text())
+        self.assertEqual(info["exit"], 5)
+        self.assertNotIn("moss15_setup", info["timings_s"], "no setup step may have started")
+        self.assertFalse((h.work() / "ttstest-work" / "logs" / "moss15-setup.log").exists())
+        self.assertEqual(len(list(h.out.glob("*/*.wav"))), 0)
+        self.assertEqual((h.tmp / "vi.calls").read_text().strip().splitlines(), ["cloud down"])
+        self.assertEqual(list((h.tmp / "state" / "unverified").glob("ttstest-*")), [], "marker not cleared")
+        self.assert_vt_gone(h)
+
+    def test_k_normal_speed_passes_the_gate(self):
+        srv = self.speed_server(0)
+        h = self.harness(TTSTEST_SPEED_URLS=srv.url, TTSTEST_MIN_MBPS="1", TTSTEST_SPEED_SECONDS="2",
+                         TTSTEST_SPEED_MB="20")
+        h.start("--models", "moss15", "--seed2")
+        self.assertEqual(h.finish(), 0, h.text()[-2500:])
+        info = json.loads((h.out / "run-info.json").read_text())
+        self.assertGreaterEqual(info["speed_gate"]["mbps"], 1)
+        self.assertEqual(info["exit"], 0)
+        self.assertEqual(len(list(h.out.glob("*/*.wav"))), 39)
+
+    def test_l_long_silent_setup_is_never_idle_for_the_worker_watchdog(self):
+        """A 6 s silent setup command, 1 s idle window: the watchdog's own test (worker-onstart.sh line 41,
+        `find $R -mindepth 2 -newermt @now-IDLE`) must succeed on every sample while the setup runs."""
+        h = self.harness(TTSTEST_STUB_SLOWSETUP="6", TTSTEST_KEEPALIVE_SECONDS="0.2")
+        h.start("--models", "moss15")
+        root = h.tmp / "wroot"
+        samples = []
+
+        def sample():
+            if h.proc.poll() is not None:
+                return True
+            if not list(root.glob("ttstest.ttstest.*/ttstest-work/logs/moss15-setup.log")):
+                return False
+            for _ in range(20):
+                if h.proc.poll() is not None:
+                    return True
+                r = subprocess.run(f'find {root} -mindepth 2 -newermt "@$(( $(date +%s) - 1 ))" -print -quit | grep -q .',
+                                   shell=True)
+                samples.append(r.returncode == 0)
+                time.sleep(0.2)
+            return True
+
+        wait_for("the setup command to start", 60, sample)
+        self.assertEqual(h.finish(), 0, h.text()[-2000:])
+        self.assertGreaterEqual(len(samples), 10)
+        self.assertTrue(all(samples), f"the watchdog would have seen idle: {samples}")
 
 
 if __name__ == "__main__":

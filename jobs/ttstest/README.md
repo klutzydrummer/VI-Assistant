@@ -15,6 +15,8 @@ needs Brandon's explicit approval of that run and cap, and the hardening PR #126
 | `requirements-moss15.txt` | full pins for MOSS-TTS-v1.5's own Python 3.12 venv (official pyproject + torchcodec) |
 | `moss15_check.py` | import + WAV round-trip check run in that venv before any weights are fetched |
 | `smoke_moss15_local.py` | free CPU-only home proof that the venv is complete (see below) |
+| `smoke-gate.sh` | pre-rental gate: runs the smoke and FAILS without FFmpeg libs or without the `MOSS15 CHECK OK` line; on NixOS finds `ffmpeg.lib` itself |
+| `run-or-release.sh` | wraps `vi dataset run`; on job exit 5 (download too slow) or 6 (every model failed setup) clears the empty checkpoint and runs `vi cloud down` |
 | `test_inject.py` | local injection test of the job, with stub models (see "Injection test") |
 | `verify.py` | home check of pushed outputs; names the culprit file and exits nonzero |
 | `blind.py` | 24 kHz mono, level-matched, shuffled letters; writes `sheet.csv` and the key |
@@ -123,7 +125,25 @@ output deleted; a re-push check, a moss15-only run (39 clips) and moss15 failing
 and keep dir, `vT.wav` gone from the worker, and a `verify.py` result naming the right folder or file.
 A single case: `... test_inject.py Injection.test_d_memory_error_in_one_model`.
 
+## Idle keepalive, speed gate and download budget (worker_run.py)
+- Keepalive: while any setup/download/generation command runs, the job touches `<job dir>/.keepalive` every 30 s
+  (`TTSTEST_KEEPALIVE_SECONDS`). The worker watchdog (`worker-onstart.sh`) counts a file change under the job dir as
+  activity, so a long quiet venv build or weight download is not idle. It stops when the command ends or is killed.
+- Speed gate: right after boot a few-second timed Range read of public files (`TTSTEST_SPEED_URLS`, default a GPT-2
+  weight file on Hugging Face and the cu128 torch wheel; at most `TTSTEST_SPEED_MB`=150 MB / `TTSTEST_SPEED_SECONDS`=6
+  each; the slowest counts). Below `TTSTEST_MIN_MBPS` (default 10) the job exits **5** before any venv or weights.
+- Budget per model = GB x 1024 / measured MB/s x 1.25 + 300 s, at least 20 min, at most `TTSTEST_DOWNLOAD_MAX_MINUTES` (75).
+  moss15 = 32 GB: 10 MB/s gives 73.3 min. Without a measurement (stub runs) `TTSTEST_DOWNLOAD_MINUTES` (20) applies.
+- Exit **6** = every model failed setup/smoke. Run the stage through `run-or-release.sh` so 5 and 6 destroy the worker.
+
 ## moss15 local smoke (free, CPU, no weights)
+Pre-rental gate (fails if FFmpeg libs are missing; on NixOS it looks for `ffmpeg.lib` already in the store, or set
+`TTSTEST_GATE_ALLOW_NIX_FETCH=1` to let nix fetch it):
+
+    nice -n 19 ionice -c2 -n7 jobs/ttstest/smoke-gate.sh
+
+The bare smoke, if the libs are already on `LD_LIBRARY_PATH`:
+
     LD_LIBRARY_PATH=<dir with FFmpeg .so files> nice -n 19 ionice -c2 -n7 python3 -I jobs/ttstest/smoke_moss15_local.py
 
 Builds the worker's venv (uv, Python 3.12, the same pins, CPU torch wheels) in a new temp dir and runs `moss15_check.py`.

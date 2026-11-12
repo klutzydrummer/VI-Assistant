@@ -15,12 +15,15 @@ run-info.json, pushed last. vT.wav is deleted from the worker at the very end (f
 
 Exit 0 only when every planned folder was made, verified and pushed. 3: a model was dropped or a
 folder failed its check (the culprits are printed under "CULPRITS"). 4: a push failed (every copy
-is kept). 2: bad setup. Failures never stop the other models. No Hugging Face token is used.
+is kept). 2: bad setup. 5: the timed download was too slow, nothing was installed or fetched. 6: every
+model failed setup (python/ffmpeg/venv/env check/weights). 5 and 6 mean there is nothing to wait for:
+jobs/ttstest/run-or-release.sh then destroys the worker. Failures never stop the other models. No Hugging Face token is used.
 
     worker_run.py --repush [KEEP]    re-send the kept copy through an open return path (README).
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -29,8 +32,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -74,6 +79,40 @@ class CmdFailed(RuntimeError):
     pass
 
 
+# The worker's own watchdog (jobs/worker-onstart.sh) only counts a job as alive while some file under the job
+# dir changed within idle_minutes. Venv builds and weight downloads write elsewhere and are quiet, so while ANY
+# command run through run_cmd() is alive, a thread touches this file. Set by run_job(); None = no keepalive.
+KEEPALIVE = {"path": None, "every": 30.0}
+
+
+@contextlib.contextmanager
+def keepalive():
+    """Touch the keepalive file every KEEPALIVE['every'] seconds for as long as the with-block (a real running
+    process) lasts. The touching stops with the block, so a hung or finished job is still released as idle."""
+    path = KEEPALIVE["path"]
+    if path is None:
+        yield
+        return
+    stop = threading.Event()
+
+    def beat():
+        while True:
+            try:
+                Path(path).touch()
+            except OSError:
+                pass
+            if stop.wait(KEEPALIVE["every"]):
+                return
+
+    t = threading.Thread(target=beat, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=5)
+
+
 def run_cmd(cmd, timeout, logfile, env=None, cwd=None):
     """Run cmd, its output appended to logfile. Raises CmdFailed (with the log tail) on failure/timeout."""
     logfile = Path(logfile)
@@ -84,7 +123,8 @@ def run_cmd(cmd, timeout, logfile, env=None, cwd=None):
         p = subprocess.Popen([str(c) for c in cmd], stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd,
                              start_new_session=True)
         try:
-            rc = p.wait(timeout=max(timeout, 1))
+            with keepalive():
+                rc = p.wait(timeout=max(timeout, 1))
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)
             p.wait()
@@ -117,6 +157,72 @@ def with_retries(label, steps, logfile, env, deadline):
             if attempt < 2:
                 time.sleep(min(BACKOFF[attempt], max(deadline - time.time(), 0)))
     raise CmdFailed(f"{label}: failed 3 times: {last}")
+
+
+# --- download speed gate and time budget ---------------------------------------------------------------
+
+EXIT_SLOW = 5       # the measured download speed is too low for the job; nothing was installed or fetched
+EXIT_SETUP = 6      # every model failed setup (python, ffmpeg, venv, env check, weights); nothing to generate
+# Public, non-copyrighted files that accept a Range request, used ONLY to time the network (a prefix is read and
+# thrown away). Overridable: TTSTEST_SPEED_URLS (comma separated). HF: openai-community/gpt2 (MIT, 548 MB);
+# PyTorch: the cu128 torch wheel the moss15 venv really installs (901 MB). The slowest of them counts, because
+# the 2026-11-12 worker measured only 6.5 MB/s to the wheel hosts, far below its advertised 830 Mbps.
+SPEED_URLS = ("https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors",
+              "https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl")
+# Approximate bytes each model needs from the network (GB). moss15: torch/CUDA wheels ~8 + weights 17.0 + audio
+# tokenizer 7.1 = ~32 (measured sizes from the 2026-11-12 runs). The others are rough estimates.
+MODEL_GB = {"moss15": 32.0, "omnivoice": 6.0, "qwen3base": 10.0}
+MARGIN = 1.25            # slack on the byte/speed estimate
+OVERHEAD_S = 300         # venv build, apt, unpacking, retries' backoff
+
+
+def download_seconds(gb, mbps, margin=MARGIN, overhead=OVERHEAD_S):
+    """Time the setup of `gb` gigabytes needs at `mbps` MB/s (1 GB = 1024 MB), with margin and fixed overhead."""
+    return gb * 1024 / max(mbps, 1e-6) * margin + overhead
+
+
+def download_budget(gb, mbps, cap_s, floor_s=1200):
+    """Allowance in seconds: derived from the measured speed, never below floor_s and never above cap_s."""
+    return min(max(download_seconds(gb, mbps), floor_s), cap_s)
+
+
+def measure_speed(urls, seconds, max_bytes, opener=urllib.request.urlopen):
+    """MB/s of each URL: read up to max_bytes or `seconds` of a Range request, whichever comes first. Returns
+    the slowest as (mbps, per-url dict). A URL that cannot be read counts as 0 MB/s (the gate then fails)."""
+    per = {}
+    for u in urls:
+        got = 0
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(u, headers={"Range": f"bytes=0-{int(max_bytes) - 1}",
+                                                     "User-Agent": "vi-ttstest-speedgate"})
+            with opener(req, timeout=20) as r:
+                while got < max_bytes and time.time() - t0 < seconds:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+        except Exception as e:
+            log(f"speed gate: {u}: {type(e).__name__}: {str(e)[:120]}")
+            got = 0
+        per[u] = round(got / max(time.time() - t0, 1e-3) / 1048576, 2)
+    return (min(per.values()) if per else 0.0), per
+
+
+def speed_gate(models, info):
+    """Returns True when the job may go on. Skipped (True) for stub runs without TTSTEST_SPEED_URLS."""
+    urls = [u for u in (os.environ.get("TTSTEST_SPEED_URLS") or "").split(",") if u] or list(SPEED_URLS)
+    if info["stub"] and not os.environ.get("TTSTEST_SPEED_URLS"):
+        return True
+    need = [m for m in models if m != "__none__"]
+    gb = sum(MODEL_GB.get(m, 10.0) for m in need)
+    min_mbps = env_num("TTSTEST_MIN_MBPS", 10)
+    with keepalive():
+        mbps, per = measure_speed(urls, env_num("TTSTEST_SPEED_SECONDS", 6), env_num("TTSTEST_SPEED_MB", 150) * 1048576)
+    info["speed_gate"] = {"mbps": mbps, "per_url": per, "min_mbps": min_mbps, "expected_gb": gb,
+                          "estimated_download_min": round(download_seconds(gb, mbps) / 60, 1)}
+    log(f"speed gate: slowest {mbps} MB/s ({per}); need >= {min_mbps} MB/s for ~{gb:g} GB")
+    return mbps >= min_mbps
 
 
 # --- per-model environment ------------------------------------------------------------------------------
@@ -202,6 +308,10 @@ def prepare(model, stub, logdir, env, deadline):
     if stub and model == "moss15" and os.environ.get("TTSTEST_STUB_BADENV") == "1":
         # Test hook (stub runs only): the environment check fails, as it does when torchcodec is missing.
         run_cmd([sys.executable, "-c", "import torchcodec_is_missing_for_this_test"], 60, logdir / "moss15-check.log", env)
+    if stub and os.environ.get("TTSTEST_STUB_SLOWSETUP"):
+        # Test hook (stub runs only): a long, silent setup command, like a venv build or a weight download.
+        run_cmd([sys.executable, "-c", f"import time; time.sleep({float(os.environ['TTSTEST_STUB_SLOWSETUP'])})"],
+                deadline - time.time(), logdir / f"{model}-setup.log", env)
     if stub:
         return sys.executable, []
     if model == "qwen3base":
@@ -394,17 +504,35 @@ def run_job(a):
             "culprits": [], "timings_s": {}}
     smoke_limit = env_num("TTSTEST_SMOKE_SECONDS", 900)
     gen_limit = env_num("TTSTEST_GEN_SECONDS", 1800)
-    dl_limit = env_num("TTSTEST_DOWNLOAD_MINUTES", 20) * 60
+    dl_fixed = env_num("TTSTEST_DOWNLOAD_MINUTES", 20) * 60  # only when no speed was measured (stub runs)
+    dl_cap = env_num("TTSTEST_DOWNLOAD_MAX_MINUTES", 75) * 60
+    # The job dir (out.parent) is what the worker watchdog scans for activity; see keepalive().
+    KEEPALIVE["path"] = out.parent / ".keepalive"
+    KEEPALIVE["every"] = env_num("TTSTEST_KEEPALIVE_SECONDS", 30)
     # After one push has failed, the others wait only briefly: generation goes on, the end retries them all.
     short_wait = int(min(30, env_num("VI_PUSH_WAIT", 300)))
     for m in models:
         info["models"][m] = {"status": "planned"}
 
+    # Phase 0: timed download. Too slow -> nothing is installed or fetched, exit 5, home destroys the worker.
+    gate_ok = speed_gate(models, info)
+    if not gate_ok:
+        sg = info["speed_gate"]
+        for m in models:
+            info["models"][m].update(status="dropped", reason=f"download too slow: {sg['mbps']} MB/s measured, "
+                                     f"{sg['min_mbps']:g} MB/s needed; nothing was installed or downloaded")
+        log(f"DOWNLOAD TOO SLOW: {sg['mbps']} MB/s < {sg['min_mbps']:g} MB/s; stopping before any venv or weights")
+
     # Phase 1: environment, download, smoke, one model at a time.
     pys = {}
-    for m in models:
+    for m in models if gate_ok else []:
         t0 = time.time()
         rec = info["models"][m]
+        if "speed_gate" in info:
+            dl_limit = download_budget(MODEL_GB.get(m, 10.0), info["speed_gate"]["mbps"], dl_cap)
+            info["models"][m]["download_budget_min"] = round(dl_limit / 60, 1)
+        else:
+            dl_limit = dl_fixed
         try:
             py, prefix = prepare(m, stub, root / "logs", env, time.time() + dl_limit)
         except (CmdFailed, OSError) as e:
@@ -490,7 +618,9 @@ def run_job(a):
     info["found_wavs"] = len(lines)
     dropped = [m for m, r in info["models"].items() if r["status"] == "dropped"]
     info["dropped"] = dropped
-    info["exit"] = 4 if info["failed_push"] else 3 if (dropped or info["culprits"]) else 0
+    info["exit"] = (4 if info["failed_push"] else EXIT_SLOW if not gate_ok
+                    else EXIT_SETUP if models and not pys
+                    else 3 if (dropped or info["culprits"]) else 0)
     (out / "run-info.json").write_text(json.dumps(info, indent=2) + "\n")
     (out / "manifest.sha256").write_text("".join(lines))
     (out / "expected-count.txt").write_text(f"{info['expected_wavs']}\n")

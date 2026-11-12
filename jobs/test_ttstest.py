@@ -340,6 +340,263 @@ class WorkerRunTest(unittest.TestCase):
             self.assertLess(time.time() - t0, 10)
 
 
+class SpeedGateAndKeepaliveTest(unittest.TestCase):
+    """Phase 7 fixes: the idle keepalive, the download budget and the timed speed gate (no network, no GPU)."""
+
+    def setUp(self):
+        self.saved = dict(worker_run.KEEPALIVE)
+        self.env = dict(os.environ)
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        worker_run.KEEPALIVE.update(self.saved)
+        os.environ.clear()
+        os.environ.update(self.env)
+
+    def test_budget_arithmetic(self):
+        # 32 GB at 10 MB/s: 32*1024/10*1.25 + 300 s = 4396 s = 73.3 min, inside the 75 min cap
+        self.assertAlmostEqual(worker_run.download_seconds(32, 10), 4396.0, places=0)
+        self.assertEqual(worker_run.download_budget(32, 10, 75 * 60), 4396.0)
+        # 6.5 MB/s (the failed rental): 6600 s, capped at 75 min
+        self.assertEqual(worker_run.download_budget(32, 6.5, 75 * 60), 75 * 60)
+        # very fast: never below the 20 min floor
+        self.assertEqual(worker_run.download_budget(32, 500, 75 * 60), 1200)
+
+    def test_measure_speed_uses_the_slowest_url_and_counts_failures_as_zero(self):
+        class Body:
+            def __init__(self, n, delay):
+                self.left, self.delay = n, delay
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self, n):
+                import time
+                time.sleep(self.delay)
+                k = min(n, self.left, 1 << 20)
+                self.left -= k
+                return b"x" * k
+
+        def opener(req, timeout):
+            u = req.full_url
+            if "boom" in u:
+                raise OSError("down")
+            return Body(8 << 20, 0.0 if "fast" in u else 0.2)
+
+        mbps, per = worker_run.measure_speed(["http://x/fast", "http://x/slow"], 3, 8 << 20, opener=opener)
+        self.assertEqual(mbps, min(per.values()))
+        self.assertGreater(per["http://x/fast"], per["http://x/slow"] * 5)
+        mbps, per = worker_run.measure_speed(["http://x/fast", "http://x/boom"], 3, 8 << 20, opener=opener)
+        self.assertEqual(mbps, 0.0)
+
+    def test_keepalive_is_emitted_during_a_long_command_and_stops_after(self):
+        import time
+        with tempfile.TemporaryDirectory() as t:
+            ka = Path(t) / ".keepalive"
+            worker_run.KEEPALIVE.update(path=ka, every=0.05)
+            seen = []
+            import threading
+            stop = threading.Event()
+
+            def watch():
+                last = None
+                while not stop.is_set():
+                    if ka.exists():
+                        m = ka.stat().st_mtime_ns
+                        if m != last:
+                            seen.append(m)
+                            last = m
+                    time.sleep(0.01)
+
+            w = threading.Thread(target=watch)
+            w.start()
+            # A quiet command that writes nothing for 1.5 s: with a 0.05 s beat the file must refresh many times,
+            # i.e. an idle limit of even a few beats could never be reached.
+            worker_run.run_cmd([sys.executable, "-c", "import time; time.sleep(1.5)"], 30, Path(t) / "log")
+            n_during = len(seen)
+            time.sleep(0.3)
+            n_after = len(seen)
+            stop.set()
+            w.join()
+            self.assertGreaterEqual(n_during, 10, seen)
+            self.assertLessEqual(n_after - n_during, 1, "the keepalive must stop when the command ends")
+            age = time.time() - ka.stat().st_mtime
+            self.assertGreater(age, 0.2)
+
+    def test_keepalive_stops_when_a_hung_command_is_killed_at_the_deadline(self):
+        import time
+        with tempfile.TemporaryDirectory() as t:
+            ka = Path(t) / ".keepalive"
+            worker_run.KEEPALIVE.update(path=ka, every=0.05)
+            with self.assertRaises(worker_run.CmdFailed):
+                worker_run.run_cmd([sys.executable, "-c", "import time; time.sleep(60)"], 1, Path(t) / "log")
+            m = ka.stat().st_mtime_ns
+            time.sleep(0.3)
+            self.assertEqual(ka.stat().st_mtime_ns, m)
+
+    def run_job_with(self, mbps, **env):
+        """run_job in stub mode with a faked speed measurement; returns (rc, prepare calls, run-info)."""
+        import io
+        os.environ.update(TTSTEST_SPEED_URLS="http://example.invalid/x", TTSTEST_MIN_MBPS="10", **env)
+        calls = []
+        orig_m, orig_p = worker_run.measure_speed, worker_run.prepare
+        worker_run.measure_speed = lambda *a, **k: (mbps, {"http://example.invalid/x": mbps})
+        worker_run.prepare = lambda *a, **k: calls.append(a[0]) or (sys.executable, [])
+        try:
+            with tempfile.TemporaryDirectory() as t:
+                refs = make_refs(t)
+                out = Path(t) / "job" / "out"
+                a = worker_run.argparse.Namespace(out=str(out), refs=str(refs), keep=str(Path(t) / "keep"),
+                                                  models="moss15", seed2=False, stub=True)
+                orig_push = worker_run.push_folder, worker_run.push_top
+                worker_run.push_folder = lambda *a, **k: None
+                worker_run.push_top = lambda *a, **k: None
+                try:
+                    rc = worker_run.run_job(a)
+                finally:
+                    worker_run.push_folder, worker_run.push_top = orig_push
+                info = json.loads((out / "run-info.json").read_text())
+        finally:
+            worker_run.measure_speed, worker_run.prepare = orig_m, orig_p
+        return rc, calls, info
+
+    def test_slow_download_fails_fast_before_any_venv_or_weights(self):
+        rc, calls, info = self.run_job_with(6.5)
+        self.assertEqual(rc, worker_run.EXIT_SLOW)
+        self.assertEqual(rc, 5)
+        self.assertEqual(calls, [], "prepare() (venv + weights) must not start")
+        self.assertIn("too slow", info["models"]["moss15"]["reason"])
+        self.assertEqual(info["speed_gate"]["mbps"], 6.5)
+        self.assertEqual(info["exit"], 5)
+
+    def test_unreadable_speed_url_also_fails_the_gate(self):
+        rc, calls, info = self.run_job_with(0.0)
+        self.assertEqual((rc, calls), (5, []))
+
+    def test_normal_speed_passes_and_sets_a_derived_budget(self):
+        rc, calls, info = self.run_job_with(20.0)
+        self.assertEqual(calls, ["moss15"])
+        self.assertNotEqual(rc, 5)
+        # 32 GB at 20 MB/s: 32*1024/20*1.25 + 300 = 2348 s = 39.1 min
+        self.assertEqual(info["models"]["moss15"]["download_budget_min"], 39.1)
+
+    def test_every_model_failing_setup_exits_6(self):
+        import io
+        os.environ.update(TTSTEST_SPEED_URLS="http://example.invalid/x", TTSTEST_MIN_MBPS="10")
+        orig_m, orig_p = worker_run.measure_speed, worker_run.prepare
+
+        def boom(*a, **k):
+            raise worker_run.CmdFailed("torchcodec import failed")
+
+        worker_run.measure_speed = lambda *a, **k: (50.0, {})
+        worker_run.prepare = boom
+        try:
+            with tempfile.TemporaryDirectory() as t:
+                refs = make_refs(t)
+                out = Path(t) / "job" / "out"
+                a = worker_run.argparse.Namespace(out=str(out), refs=str(refs), keep=str(Path(t) / "keep"),
+                                                  models="moss15", seed2=False, stub=True)
+                orig_push = worker_run.push_folder, worker_run.push_top
+                worker_run.push_folder = lambda *a, **k: None
+                worker_run.push_top = lambda *a, **k: None
+                try:
+                    rc = worker_run.run_job(a)
+                finally:
+                    worker_run.push_folder, worker_run.push_top = orig_push
+        finally:
+            worker_run.measure_speed, worker_run.prepare = orig_m, orig_p
+        self.assertEqual(rc, 6)
+
+
+class RunOrReleaseTest(unittest.TestCase):
+    """jobs/ttstest/run-or-release.sh with a fake `vi`: only exits 5 and 6 destroy the worker."""
+    SCRIPT = Path(__file__).resolve().parent / "ttstest" / "run-or-release.sh"
+
+    def run_with(self, job_rc, down_rc=0):
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            (t / "state" / "unverified").mkdir(parents=True)
+            ck = t / "state" / "ck"
+            ck.mkdir()
+            (t / "state" / "unverified" / "tts-abc").write_text(str(ck) + "\n")
+            other = t / "state" / "other"
+            other.mkdir()
+            (t / "state" / "unverified" / "voicetune-xyz").write_text(str(other) + "\n")
+            fake = t / "vi"
+            fake.write_text(f"#!/bin/bash\necho \"$@\" >> {t}/vi.calls\nexit {down_rc}\n")
+            fake.chmod(0o755)
+            env = dict(os.environ, VI_BIN=str(fake), VI_STATE_DIR=str(t / "state"))
+            r = subprocess.run(["bash", str(self.SCRIPT), "bash", "-c", f"exit {job_rc}"], env=env,
+                               capture_output=True, text=True)
+            calls = (t / "vi.calls").read_text().strip().splitlines() if (t / "vi.calls").exists() else []
+            return (r.returncode, calls, (ck / "VERIFIED").exists(), (other / "VERIFIED").exists(),
+                    (t / "state" / "unverified" / "tts-abc").exists(), r.stderr)
+
+    def test_exit_5_and_6_destroy_the_worker(self):
+        for rc in (5, 6):
+            code, calls, verified, other, marker, err = self.run_with(rc)
+            self.assertEqual((code, calls), (rc, ["cloud down"]), err)
+            self.assertTrue(verified)
+            self.assertFalse(marker)
+            self.assertFalse(other, "another stage's checkpoint must be left alone")
+
+    def test_other_exit_codes_never_destroy(self):
+        for rc in (0, 2, 3, 4, 1):
+            code, calls, *_ = self.run_with(rc)
+            self.assertEqual((code, calls), (rc, []))
+
+    def test_failed_release_is_loud(self):
+        code, calls, *_ , err = self.run_with(5, down_rc=1)
+        self.assertEqual(code, 70)
+        self.assertIn("FAILED", err)
+
+
+class SmokeGateTest(unittest.TestCase):
+    """jobs/ttstest/smoke-gate.sh must fail without FFmpeg libs and never accept a smoke without its OK line."""
+    SCRIPT = Path(__file__).resolve().parent / "ttstest" / "smoke-gate.sh"
+
+    def run_gate(self, smoke_cmd, with_libs, extra=None):
+        with tempfile.TemporaryDirectory() as t:
+            libs = Path(t) / "lib"
+            libs.mkdir()
+            if with_libs:
+                for n in ("libavcodec.so.61", "libavutil.so.59", "libswresample.so.5"):
+                    (libs / n).write_text("")
+            env = dict(os.environ, LD_LIBRARY_PATH=str(libs), SMOKE_CMD=smoke_cmd, TTSTEST_GATE_NO_NIX="1")
+            env.update(extra or {})
+            r = subprocess.run(["bash", str(self.SCRIPT)], env=env, capture_output=True, text=True)
+            return r.returncode, r.stdout + r.stderr
+
+    def ldconfig_has_ffmpeg(self):
+        try:
+            c = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+        except OSError:
+            return False
+        return all(x in c for x in ("libavcodec.so", "libavutil.so", "libswresample.so"))
+
+    def test_fails_without_ffmpeg_libs_and_does_not_start_the_smoke(self):
+        if self.ldconfig_has_ffmpeg():
+            self.skipTest("this host has FFmpeg libs in the linker cache")
+        with tempfile.TemporaryDirectory() as t:
+            mark = Path(t) / "started"
+            code, out = self.run_gate(f"touch {mark}; echo MOSS15 CHECK OK", with_libs=False)
+            self.assertEqual(code, 3, out)
+            self.assertIn("DO NOT RENT", out)
+            self.assertFalse(mark.exists(), "the smoke must not run without the libs")
+
+    def test_passes_with_libs_and_the_ok_line(self):
+        code, out = self.run_gate("echo MOSS15 CHECK OK", with_libs=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASSED", out)
+
+    def test_fails_when_the_smoke_fails_or_lacks_the_ok_line(self):
+        code, out = self.run_gate("echo boom; exit 1", with_libs=True)
+        self.assertEqual(code, 1, out)
+        code, out = self.run_gate("echo all fine", with_libs=True)
+        self.assertEqual(code, 1, out)
+        self.assertIn("DO NOT RENT", out)
+
+
 class ReapLoopTest(unittest.TestCase):
     """reap-loop.sh must not need `vi` on PATH, and must fail loudly at the start when it finds none."""
 
