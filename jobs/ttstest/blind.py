@@ -33,7 +33,9 @@ PEAK_MAX = 0.97
 HERE = Path(__file__).resolve().parent
 # Sheet columns, as crates/review/src/listen.rs expects (ANSWERS, then EXTRA).
 SHEET_COLUMNS = ["group", "clip", "sentence", "still_her_voice_y_n", "mood_heard_0_3",
-                 "words_clear_y_n", "notes", "accent", "suit_effect", "mood_right", "pitch"]
+                 "words_clear_y_n", "notes", "accent", "suit_effect", "mood_right", "pitch",
+                 "intended_tone"]
+NO_TONE = "no tone target"
 NAME = re.compile(r"^(?P<model>[a-z0-9]+)__v(?P<voice>[A-Za-z])__(?P<line>[A-Z]\d\d)__s(?P<seed>\d+)\.wav$")
 
 
@@ -66,7 +68,10 @@ def level_match(clips):
 
 def build(raw, root, seed=1, refs=None, lines=None):
     groups = collect(raw)
-    text = {ln["id"]: ln["text"] for ln in json.loads(Path(lines or HERE / "lines.json").read_text())}
+    script = json.loads(Path(lines or HERE / "lines.json").read_text())
+    text = {ln["id"]: ln["text"] for ln in script}
+    # Shown to the listener only (sheet column and page); never used to pick, weight or score anything.
+    tone = {ln["id"]: NO_TONE if ln.get("tone_target") is False else ln.get("register", "") for ln in script}
     for (_, line, _) in groups:
         if line not in text:
             raise SystemExit(f"no sentence for line {line} in the lines file")
@@ -97,7 +102,8 @@ def build(raw, root, seed=1, refs=None, lines=None):
             letter = chr(ord("A") + i)
             wavio.write_wav(gdir / f"{letter}.wav", x, SR)
             key[group_name(voice, line, sd)][letter] = m
-            sheet.append([group_name(voice, line, sd), letter, text[line]] + [""] * (len(SHEET_COLUMNS) - 3))
+            sheet.append([group_name(voice, line, sd), letter, text[line]] + [""] * (len(SHEET_COLUMNS) - 4)
+                         + [tone[line]])
     if refs:
         (blind / "refs").mkdir()
         for r in sorted(Path(refs).glob("v*.wav")):

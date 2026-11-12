@@ -234,8 +234,15 @@ class BlindTest(unittest.TestCase):
         for r in rows[1:]:
             self.assertEqual(len(r), len(rows[0]))
             self.assertEqual(r[2], lines[r[0].split("/")[1][:3]])
-            self.assertEqual(r[3:], [""] * (len(r) - 3))
+            self.assertEqual(r[3:-1], [""] * (len(r) - 4))
             self.assertIn(r[1], key[r[0]])
+            line = r[0].split("/")[1][:3]
+            want = {"L05": "angry", "L01": "neutral"}.get(line, "no tone target" if line in
+                                                          ("L09", "P01", "F01", "F02", "F03") else None)
+            if want:
+                self.assertEqual(r[-1], want)
+            self.assertTrue(r[-1])
+        self.assertEqual(rows[0][-1], "intended_tone")
         text = (out / "listen-blind" / "sheet.csv").read_text()
         for m in ("omnivoice", "moss15", "qwen3base"):
             self.assertNotIn(m, text)

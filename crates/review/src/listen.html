@@ -72,7 +72,13 @@
     <div class="bar"><div id="barfill"></div></div>
   </header>
   <p id="msg" class="small muted"></p>
-  <details id="refs" class="panel hidden" open><summary>Reference clips</summary><div id="reflist"></div></details>
+  <div id="instructions" class="panel small">
+    <b>What to rate</b>
+    <p>The voice references (vP and vT) are the voice to match. They are neutral, and the same clip is used for every line. The models were given no mood instruction, only the text.</p>
+    <p>For lines with a tone target, rate two things: (a) how much the voice sounds like the references (accent, timbre), and (b) whether the delivery sounds natural and fits the line's intended tone. Do not compare the clip's mood to the references' mood.</p>
+    <p>Lines with no tone target (numbers, the long paragraph, invented words): rate the voice and whether the words are clear only.</p>
+  </div>
+  <details id="refs" class="panel hidden" open><summary>Reference clips</summary><div class="small muted">Voice reference - same for every line</div><div id="reflist"></div></details>
 
   <div id="finished" class="panel finished hidden">
     <b>&check; All clips answered</b>
@@ -87,22 +93,27 @@
       <div class="small muted">Her real clip in this mood, for comparison</div>
       <audio id="example" controls preload="none"></audio>
     </div>
+    <div class="small" id="tone" style="margin:4px 0"></div>
     <div class="say" id="sentence"></div>
     <audio id="clip" controls preload="auto"></audio>
 
     <div class="q">Still her voice?</div>
     <div class="seg" id="voice"></div>
+    <div id="moodwrap">
     <div class="q" id="moodq">How much of the mood do you hear?</div>
     <div id="mood"></div>
+    </div>
     <div class="q">Words clear?</div>
     <div class="seg" id="clear"></div>
     <div class="q">Accent present?</div>
     <div class="seg" id="accent"></div>
     <div class="q">Suit effect present?</div>
     <div class="seg" id="suit"></div>
+    <div id="rightwrap">
     <div class="q" id="rightq">Right mood?</div>
     <div class="small muted">"Copies the example" is for a clip that sounds like her example clip in pitch, inflection or timbre but doesn't carry the mood.</div>
     <div class="seg" id="right"></div>
+    </div>
     <div class="q">Pitch?</div>
     <div class="seg" id="pitch"></div>
     <div class="q">Notes</div>
@@ -149,6 +160,10 @@ function blendParts(s) {
   return out;
 }
 
+// Lines with no tone target (numbers, paragraph, invented words): the page
+// records "na" for the mood answer so the clip can still count as answered.
+function noTone(g) { return !!(g.tone && g.tone.target == null); }
+
 function answered(c) { return c.voice && c.mood && c.clear; }
 
 function renderRefs() {
@@ -179,6 +194,11 @@ function render() {
   const ex = `audio?g=${encodeURIComponent(group)}&c=her_example`;
   if (g.example && $("example").getAttribute("src") !== ex) $("example").setAttribute("src", ex);
   $("sentence").textContent = clip.sentence;
+  const nt = noTone(g);
+  $("moodwrap").classList.toggle("hidden", nt);
+  $("rightwrap").classList.toggle("hidden", nt);
+  if (nt && !answer.mood) answer.mood = "na";
+  $("tone").textContent = !g.tone ? "" : nt ? "No tone target: rate voice and clarity only" : `Intended tone: ${g.tone.target}`;
   const src = `audio?g=${encodeURIComponent(group)}&c=${encodeURIComponent(clip.clip)}`;
   if ($("clip").getAttribute("src") !== src) $("clip").setAttribute("src", src);
   seg($("voice"), [["y", "Yes"], ["n", "No"]], answer.voice, (v) => { answer.voice = v; render(); });

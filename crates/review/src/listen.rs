@@ -39,6 +39,25 @@ pub const EXTRA: [(&str, &[&str]); 4] = [
 /// Where qtcheck answers go, beside its report.
 pub const HEARD: &str = "heard.jsonl";
 
+/// The TTS test script, compiled in. Used only to show the listener what each
+/// line was meant to sound like (display); never to select, weight or score.
+const TTS_LINES: &str = include_str!("../../../jobs/ttstest/lines.json");
+
+/// The listener's view of a group's line: `None` if the group name carries no
+/// known line id (an older or different set), else the intended tone, or
+/// `Some(None)` inside when the line has no tone target (numbers, a long
+/// paragraph, invented words). Display only.
+pub fn tone_for(group: &str) -> Option<Option<String>> {
+    let last = group.rsplit('/').next()?;
+    let id = last.split('_').next()?;
+    let lines: Vec<Value> = serde_json::from_str(TTS_LINES).ok()?;
+    let line = lines.iter().find(|l| l["id"] == id)?;
+    if line["tone_target"] == false {
+        return Some(None);
+    }
+    Some(line["register"].as_str().map(str::to_string))
+}
+
 const LISTEN_PAGE: &str = include_str!("listen.html");
 const QT_PAGE: &str = include_str!("qtcheck.html");
 
@@ -268,6 +287,8 @@ impl Listen {
         let done = self.done();
         json!({
             "groups": groups.into_iter().map(|(g, clips)| json!({
+                // Display only: what the test script meant the line to sound like.
+                "tone": tone_for(&g).map(|t| json!({"target": t})),
                 "group": g,
                 "moods": g.split('+').collect::<Vec<_>>(),
                 "example": self.example(&g).is_some(),
@@ -299,7 +320,11 @@ impl Listen {
         }
         let blend = a.group.contains('+');
         if !blend {
-            check(&a.mood, &["0", "1", "2", "3"], "mood")?;
+            // "na" only for a line with no tone target.
+            if a.mood == "na" && tone_for(&a.group) == Some(None) {
+            } else {
+                check(&a.mood, &["0", "1", "2", "3"], "mood")?;
+            }
         }
         if a.mood.len() > 120 || a.notes.len() > 2000 || a.mood.contains('\n') {
             return Err("answer too long".into());
@@ -659,6 +684,43 @@ mod tests {
             Reply::Audio(p) => p.display().to_string(),
             _ => String::new(),
         }
+    }
+
+    #[test]
+    fn tone_comes_from_the_test_script_for_display() {
+        assert_eq!(tone_for("vT/L05"), Some(Some("angry".into())));
+        assert_eq!(tone_for("vP/L05_s2"), Some(Some("angry".into())));
+        assert_eq!(tone_for("vT/L01"), Some(Some("neutral".into())));
+        for id in ["L09", "P01", "F01", "F02", "F03"] {
+            assert_eq!(tone_for(&format!("vT/{id}")), Some(None), "{id}");
+        }
+        assert_eq!(tone_for("happy+sad"), None);
+        assert_eq!(tone_for("vT/Z99"), None);
+    }
+
+    #[test]
+    fn session_carries_tone_and_na_mood_only_for_no_target_lines() {
+        let (_t, set, _key, _refs) = setup();
+        let mut l = Listen::load(&set).unwrap();
+        // Old sheet (no tone column) still loads; tone comes from the line id.
+        assert_eq!(l.session()["groups"][0]["tone"]["target"], json!("neutral"));
+        l.rows[0][0] = "vT/L09".into();
+        let s = l.session();
+        assert!(s["groups"][0]["tone"]["target"].is_null());
+        assert!(l.session()["groups"][0]["tone"].is_object());
+        let ok = Answer { group: "vT/L09".into(), clip: "A".into(), voice: "y".into(), mood: "na".into(), clear: "y".into(), notes: String::new(), accent: String::new(), suit: String::new(), mood_right: String::new(), pitch: String::new() };
+        assert!(l.answer(ok).is_ok());
+        let bad = Answer { group: "vT/L09".into(), clip: "B".into(), voice: String::new(), mood: "na".into(), clear: String::new(), notes: String::new(), accent: String::new(), suit: String::new(), mood_right: String::new(), pitch: String::new() };
+        let mut l2 = Listen::load(&set).unwrap();
+        let bad = Answer { group: "vT/L01".into(), clip: "B".into(), ..bad };
+        assert!(l2.answer(bad).is_err());
+    }
+
+    #[test]
+    fn page_has_instructions_and_ref_caption() {
+        assert!(LISTEN_PAGE.contains("Voice reference - same for every line"));
+        assert!(LISTEN_PAGE.contains("No tone target: rate voice and clarity only"));
+        assert!(LISTEN_PAGE.contains("no mood instruction"));
     }
 
     #[test]
