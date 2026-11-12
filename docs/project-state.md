@@ -115,6 +115,7 @@ The full plan lives in a private Claude page, "Tali voice plan". Here is a summa
 - **Projector input states:** the Claude pass-2 mood scores scaled 0–1, intoxication 0–3, and energy measured from the audio, with neutral as all zeros.
 - **Chat-model track:** run the 27B strength sweep, then a linearity test. A learned vector map comes only if the blends prove non-linear.
 - **Fallbacks:** if the fine-tune route fails, the options include an IndexTTS-2 bake-off, which needs his yes.
+- **MOSS-TTS-Nano: rejected by ear** (2026-11-11), with both reference clips (vP and vT). Listening set: `/home/brandon/Projects/VI-Assistant-listen/tts-test-2026-11-10`. It is not a fallback.
 
 ## Voice fine-tune history
 
