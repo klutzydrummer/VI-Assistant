@@ -4,8 +4,22 @@
 #   VI_CLOUD_CONFIG=jobs/ttstest/cloud-tts-test.toml jobs/ttstest/reap-loop.sh
 # Stop it with Ctrl-C only after `vi cloud status` shows no worker. If it exits for ANY reason
 # it says so loudly (terminal bell + message), because the backstop is then gone.
+# The `vi` binary is VI_BIN if set, else `vi` on PATH, else this repo's target/release/vi.
 set -u
 INTERVAL="${REAP_INTERVAL:-300}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+if [ -n "${VI_BIN:-}" ]; then
+  VI=$VI_BIN
+elif command -v vi >/dev/null 2>&1; then
+  VI=vi
+else
+  VI=$HERE/../../target/release/vi
+fi
+if ! { [ -f "$VI" ] && [ -x "$VI" ]; } && ! command -v "$VI" >/dev/null 2>&1; then
+  printf '\a!!! reap-loop.sh: no usable `vi` (tried VI_BIN, PATH, %s). The backstop cannot run; nothing started. !!!\n' "$HERE/../../target/release/vi" >&2
+  exit 2
+fi
 
 loud() {
   printf '\a\n!!! reap-loop.sh STOPPED (%s). The home backstop is OFF. Check `vi cloud status` NOW. !!!\n\n' "$1" >&2
@@ -15,7 +29,7 @@ trap 'rc=$?; [ "$rc" -eq 130 ] || loud "exit $rc"' EXIT
 
 while true; do
   date -u +"%Y-%m-%dT%H:%M:%SZ reaping"
-  if ! vi cloud reap; then
+  if ! "$VI" cloud reap; then
     printf '\a!!! `vi cloud reap` FAILED at %s; will retry in %s s. Check `vi cloud status`.\n' "$(date -u +%H:%M:%SZ)" "$INTERVAL" >&2
   fi
   sleep "$INTERVAL"

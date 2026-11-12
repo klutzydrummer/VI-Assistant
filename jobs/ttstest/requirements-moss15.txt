@@ -1,0 +1,14 @@
+# MOSS-TTS-v1.5 on the worker, in its own Python 3.12 venv (worker_run.py builds it; no flash-attn).
+# From the MOSS-TTS README: Transformers 5.0.0 in an isolated env, torch 2.9.1+cu128 (the pyproject pin).
+# Installed with the cu128 index (uv --torch-backend cu128, or pip --extra-index-url). The rest are the
+# usual runtime packages for its remote-code processor; the smoke test shows if one is missing.
+torch==2.9.1
+torchaudio==2.9.1
+transformers==5.0.0
+accelerate
+safetensors
+huggingface_hub
+numpy
+soundfile
+librosa
+sentencepiece
