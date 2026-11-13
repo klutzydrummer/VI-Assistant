@@ -1,0 +1,11 @@
+# Environment used for the CPU smoke test (python 3.12, venv created with uv; no GPU).
+#   uv venv --python 3.12 /tmp/ovsmoke-venv
+#   uv pip install --python /tmp/ovsmoke-venv/bin/python -r requirements-omnistyle.txt \
+#       --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu
+transformers==5.22.2
+accelerate==1.15.0
+omnivoice==0.2.1   # pip release; the cached upstream master is newer (adds LoRA), not needed here
+tensorboard==2.21.0  # OmniTrainer logs with log_with="tensorboard"
+safetensors
+pytest==9.2.0
