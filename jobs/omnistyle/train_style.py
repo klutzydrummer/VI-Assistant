@@ -204,8 +204,9 @@ def run_training(
     The guard probes the style code every `guard_every` steps after a `guard_warmup` warm start: if
     sep_ratio = between-centroid distance / within-style spread stays below `guard_min_sep` for
     `guard_patience` consecutive probes, the attempt is abandoned and retrained from scratch with the
-    deterministic new seed `seed + attempt`.  (The collapsed seed-4 run held sep_ratio at 0.01-0.16;
-    healthy runs are above 2 after pretraining and above 0.8 from scratch.)  Returns (trainer, model) of the successful attempt; the
+    deterministic new seed `seed + attempt`.  (Final-measurement sep_ratio on seed 4 was 0.01-0.19 for the
+    collapsed lr-1e-3 arms and 2.34-5.49 for the non-collapsing runs, so 0.5 sits between the two modes;
+    see `workers/smoke/contin-fix-report.md`.)  Returns (trainer, model) of the successful attempt; the
     trainer also carries `.guard_log` and `.guard_attempts`.
 
     `inject_collapse_at` (micro-step, attempt 0 only) zeroes and freezes the encoder's `to_code` layer from

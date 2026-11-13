@@ -20,6 +20,7 @@ Nothing in upstream `omnivoice.training` is patched. `StyleOmniVoice`, the proce
 | `bench_kl.py` | measures the cost of the KL guard (parameters, peak RSS, step time) |
 | `sweep_init.py` | seed x output-init sweep used to diagnose the style merge (see "Known defect") |
 | `sweep_fsq.py` | bound x levels x init sweep for the FSQ fix (checks (a) and (b), saturation metrics) |
+| `sweep_contin.py` | arm sweep for the continuous-bottleneck seed-4 collapse + the five-seed gate table |
 | `requirements-omnistyle.txt` | pinned versions of the venv used |
 
 ## Running
@@ -33,6 +34,9 @@ nice -n 19 python bench_kl.py --out /tmp/bench_kl.json
 nice -n 19 python sweep_init.py --out /tmp/sweep_init.json
 nice -n 19 python sweep_fsq.py --out /tmp/sweep_fsq.json          # the FSQ fix sweep, 5 seeds
 nice -n 19 python sweep_fsq.py --mode none --out /tmp/fallback_none.json   # continuous-bottleneck fallback check
+nice -n 19 python sweep_contin.py --arms BASE NOISE_02 NOISE_03 PRE_600 PRE_900 OUT_FANIN \
+    --seeds 4 --out /tmp/contin_arms.json                          # collapse arm screen on seed 4
+nice -n 19 python sweep_contin.py --arms DEFAULT --seeds 0 1 2 3 4 --out /tmp/contin_default.json
 ```
 
 Check (f) downloads the public `k2-fsa/OmniVoice` weights (about 2.3 GB) from Hugging Face. It needs about 6 GB
@@ -104,7 +108,25 @@ The five-seed confirmation with those defaults (seeds 0-4, no overrides) passes 
 but fails on seeds 0 and 3: on seed 3 two styles share the same modal code (`b_distinct=3`), and on seed 0
 the modal codes of styles 0 and 1 decode toward other styles. Modal-code purity on the failing seeds is
 0.12-0.52. So the fix is not seed-robust; FSQ check (b) remains a 3/5 result (the old configuration passed
-2/5). The continuous-bottleneck fallback (`sweep_fsq.py --mode none`) passes its tightness and leakage gates
-on seeds 0-3 but collapses on seed 4 (centroid purity 0.586, check (a) fails), so it is not 5/5 either.
-`workers/smoke/fsq-fix-report.md` has the per-seed tables, the purity details and the fallback numbers.
-Whether to accept 3/5, switch the default quantiser or widen the fix space is the owner's call.
+2/5). `workers/smoke/fsq-fix-report.md` has the per-seed tables and the purity details.
+
+## Continuous bottleneck (shipped default, 2026-11-13)
+
+The continuous route (`style_quantizer="none"`: unit-RMS `z` plus noise, no quantiser) was adopted as the
+default because the FSQ check-(b) result is seed-fragile. Its own first measurement failed on seed 4 at the
+old phase-2 lr 1e-3 (the continuous fallback: centroid purity 0.586, check (a) fails, all styles decode
+alike). The arm sweep in `sweep_contin.py` showed that this collapse is learning-rate-dependent: more
+training noise and a longer pretraining warm start still leave the code merged at 1e-3, and the fan-in
+output init separates it but still leaves one style decoding mixed. At lr 5e-4 every gate passes on all
+five seeds:
+
+| seeds | purity | sep_ratio | (a) margin | probe acc | decode own-share min |
+|---|---|---|---|---|---|
+| 0-4 | 0.984-1.000 | 3.76-5.49 | +1.00-+1.15 | 0.172-0.222 | 0.988-0.995 |
+
+Phase-2 lr 5e-4 and `style_quantizer="none"` are the defaults in `smoke_style.train_reference_model` and
+`train_style.run_training`. `train_style.py` also carries a training-time collapse guard: it probes the
+code's between/within separation every 100 micro-steps after a 200-step warm start, and if the ratio stays
+below 0.5 for two consecutive probes it abandons the attempt and retrains from scratch with seed + attempt
+(up to three attempts). `workers/smoke/contin-fix-report.md` has the arm table, the five-seed table, the
+guard details and the environment notes.
