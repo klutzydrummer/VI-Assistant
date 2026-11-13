@@ -79,7 +79,9 @@ def bound_stats(model, ds, n: int = 64) -> dict:
 
 
 def run(arm: str, seed: int, steps: int) -> dict:
-    model, ds, rows, secs = S.train_reference_model("fsq", steps=steps, seed=seed, **ARMS[arm])
+    # lr is pinned to 1e-3, the phase-2 rate every FSQ table in the reports was measured at (the shipped
+    # continuous recipe uses 5e-4; see sweep_contin.py).
+    model, ds, rows, secs = S.train_reference_model("fsq", steps=steps, seed=seed, lr=1e-3, **ARMS[arm])
     a = S.check_a_prefix_helps(model, ds)
     b = S.check_b_decode_bias(model, ds)
     return {
@@ -96,58 +98,8 @@ def run(arm: str, seed: int, steps: int) -> dict:
 # Fallback: continuous bottleneck + noise (style_quantizer="none")
 # ---------------------------------------------------------------------------
 
-N_BOTTLENECK_CLIPS = 64
 TEXT_PROBE_SAMPLES = 800
 TEXT_PROBE_STEPS = 300
-
-
-@torch.no_grad()
-def style_centroids_none(model, ds, n: int = N_BOTTLENECK_CLIPS) -> torch.Tensor:
-    """Per-style centroids of the continuous code z, shape [K, n_vec, d]."""
-    model.eval()
-    enc = model.style_encoder
-    mus = []
-    for k in range(S.N_STYLES):
-        crops = ds.clips_of_style(k, n)
-        z = enc.encode_z(crops, torch.ones(n, crops.shape[2], dtype=torch.bool)).float()
-        mus.append(z.mean(0))
-    return torch.stack(mus)
-
-
-@torch.no_grad()
-def bottleneck_stats(model, ds, n: int = N_BOTTLENECK_CLIPS) -> dict:
-    """Tightness of the continuous code: within-style spread vs centroid separation, centroid purity.
-
-    Spread is the RMS distance of a sample to its own style centroid; separation is the distance between
-    style centroids (min and mean over pairs).  Purity assigns every sample to its nearest centroid; the
-    leave-one-out variant rebuilds the own centroid without the sample so it is not optimistically biased.
-    """
-    model.eval()
-    enc = model.style_encoder
-    V = []
-    for k in range(S.N_STYLES):
-        crops = ds.clips_of_style(k, n)
-        z = enc.encode_z(crops, torch.ones(n, crops.shape[2], dtype=torch.bool)).float()
-        V.append(z.reshape(n, -1))
-    V = torch.stack(V)  # [K, n, D]
-    K, _, D = V.shape
-    mu = V.mean(1)  # [K, D]
-    within = (V - mu[:, None]).pow(2).sum(-1).mean().sqrt()
-    dist = torch.cdist(mu, mu)
-    off = dist[~torch.eye(K, dtype=torch.bool)]
-    pts, ids = V.reshape(K * n, D), torch.arange(K * n)
-    own = ids // n
-    d_plain = torch.cdist(pts, mu)
-    d_loo = d_plain.clone()
-    d_loo[ids, own] = (V - (V.sum(1, keepdim=True) - V) / (n - 1)).reshape(K * n, D).norm(dim=-1)
-    return {
-        "within_rms": round(float(within), 3),
-        "between_min": round(float(off.min()), 3),
-        "between_mean": round(float(off.mean()), 3),
-        "sep_ratio": round(float(off.min() / within), 2),
-        "centroid_purity": round(float((d_loo.argmin(-1) == own).float().mean()), 3),
-        "centroid_purity_plain": round(float((d_plain.argmin(-1) == own).float().mean()), 3),
-    }
 
 
 def text_probe(model, ds, n: int = TEXT_PROBE_SAMPLES, seed: int = 0) -> dict:
@@ -186,52 +138,20 @@ def text_probe(model, ds, n: int = TEXT_PROBE_SAMPLES, seed: int = 0) -> dict:
             "text_probe_chance": round(1 / len(classes), 3), "text_probe_n_test": len(te)}
 
 
-@torch.no_grad()
-def decode_bias_from_vectors(model, vecs, n_clips: int = 24, target_len: int = 16, seed: int = 0) -> list:
-    """Share of decoded tokens in each style's preferred blocks for one style's prefix vectors [n, hidden].
+def run_none(seed: int, steps: int, lr: float = 1e-3) -> dict:
+    """Continuous bottleneck + noise: tightness and leakage checks (the `--mode none` fallback table).
 
-    The continuous analogue of `check_b_decode_bias`, which decodes from FSQ code indices.
+    `lr` is pinned to the historical 1e-3 so the archived `fallback_none.json` stays reproducible; the
+    shipped continuous recipe uses 5e-4 (`sweep_contin.py`).
     """
-    g = torch.Generator().manual_seed(seed)
-    text = S.FakeTextTokenizer()("<|text_start|>abcdef<|text_end|>").input_ids[0]
-    counts = torch.zeros(S.N_STYLES)
-    total = 0
-    for _ in range(n_clips):
-        toks = model.generate_tokens(
-            text, target_len, style_vectors=vecs, num_step=8, guidance_text=0.0, guidance_style=0.0,
-            class_temperature=0.5, generator=g,
-        )
-        for s in range(S.N_STYLES):
-            for cb in (0, 1):
-                blk = S.style_block(s, cb, S.N_STYLES)
-                counts[s] += ((toks[cb] >= blk.start) & (toks[cb] < blk.stop)).sum()
-        total += 2 * toks.shape[1]
-    return (counts / total).tolist()
-
-
-def vec_decode_pass(shares: list) -> bool:
-    """Same per-style criterion as check (b), applied to the continuous decode-bias shares."""
-    return all(
-        max(range(S.N_STYLES), key=lambda j: sh[j]) == k
-        and sh[k] >= 0.5
-        and sh[k] > 2 * max(sh[j] for j in range(S.N_STYLES) if j != k)
-        for k, sh in enumerate(shares)
-    )
-
-
-def run_none(seed: int, steps: int) -> dict:
-    """Continuous bottleneck + noise: tightness and leakage checks (fallback when the FSQ fix is fragile)."""
-    model, ds, rows, secs = S.train_reference_model("none", steps=steps, seed=seed)
+    model, ds, rows, secs = S.train_reference_model("none", steps=steps, seed=seed, lr=lr)
     a = S.check_a_prefix_helps(model, ds)
-    enc = model.style_encoder
-    vecs = enc.vectors_from_z(style_centroids_none(model, ds))  # [K, n_vec, hidden]
-    shares = [decode_bias_from_vectors(model, vecs[k]) for k in range(S.N_STYLES)]
+    b = S.check_b_continuous(model, ds)
     return {
         "mode": "none", "seed": seed, "steps": steps, "secs": round(secs),
         "a_true": round(a["ce_true"], 3), "a_shuffled": round(a["ce_shuffled"], 3), "a_pass": a["pass"],
-        "vec_b_shares": [[round(x, 3) for x in sh] for sh in shares],
-        "vec_b_pass": bool(vec_decode_pass(shares)),
-        **bottleneck_stats(model, ds),
+        "vec_b_shares": b["vec_b_shares"], "vec_b_pass": b["pass"],
+        **S.bottleneck_stats(model, ds),
         **text_probe(model, ds),
     }
 
@@ -243,6 +163,8 @@ if __name__ == "__main__":
     ap.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument("--lr", type=float, default=1e-3,
+                    help="phase-2 lr; 1e-3 reproduces the archived tables (sweep_contin.py has the 5e-4 fix)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     results = []
@@ -251,7 +173,7 @@ if __name__ == "__main__":
     else:
         jobs = [(arm, seed) for seed in a.seeds for arm in a.arms]
     for arm, seed in jobs:
-        r = run_none(seed, a.steps) if arm is None else run(arm, seed, a.steps)
+        r = run_none(seed, a.steps, lr=a.lr) if arm is None else run(arm, seed, a.steps)
         results.append(r)
         print(json.dumps(r), flush=True)
         if a.out:

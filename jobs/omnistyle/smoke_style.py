@@ -3,8 +3,9 @@
 Each `check_*` function returns a dict (with a boolean "pass") so that both pytest and the CLI report
 use the same code.  CLI:  nice -n 19 python smoke_style.py [--skip-real] [--out results.json]
 
-Quantizer: the default is FSQ.  The VQ path is kept only so that its measured collapse stays reproducible
-(`--quantizer vq`); `--quantizer none` is the continuous diagnosis baseline.
+Quantizer: the default is "none" (continuous tight bottleneck: unit-RMS code plus noise).  The FSQ path is
+still selectable (`--quantizer fsq`) but is seed-fragile on check (b); the VQ path is kept only so that its
+measured collapse stays reproducible (`--quantizer vq`).
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ def tiny_config(**kw) -> StyleOmniVoiceConfig:
         style_enc_heads=4,
         style_code_dim=8,
         style_codebook_size=16,
-        style_quantizer="fsq",
+        style_quantizer="none",  # shipped default; the checks pass "fsq"/"vq" explicitly when needed
         style_noise_std=0.1,
     )
     defaults.update(kw)
@@ -201,9 +202,15 @@ def pretrain_base(model, steps: int = 300, lr: float = 1e-3, log=None, seed: int
     return rows, secs
 
 
-def train_reference_model(quantizer: str = "fsq", pre_steps: int = 300, steps: int = 1000, lr: float = 1e-3,
+def train_reference_model(quantizer: str = "none", pre_steps: int = 300, steps: int = 1000, lr: float = 5e-4,
                           log=None, seed: int = 0, **kw):
-    """Phase 1 (base without prefix) + phase 2 (encoder + prefix).  Returns (model, dataset, rows, seconds)."""
+    """Phase 1 (base without prefix) + phase 2 (encoder + prefix).  Returns (model, dataset, rows, seconds).
+
+    The default quantiser is the shipped continuous bottleneck (config default) and phase 2 trains at
+    lr 5e-4: at the old 1e-3 the continuous code collapses on seed 4 (`sweep_contin.py` has the evidence).
+    Phase 1 (`pretrain_base`) keeps its own lr; the FSQ tables in the reports were measured at phase-2
+    lr 1e-3, which `sweep_fsq.py` still pins explicitly.
+    """
     ds, _, loader = build_loader(seed=seed)
     model = build_model(seed=seed, style_quantizer=quantizer, **kw)
     pretrain_base(model, pre_steps, log=log, seed=seed)
@@ -238,6 +245,114 @@ def check_b_decode_bias(model, ds, min_own: float = 0.5) -> dict:
                           "shares": [round(x, 3) for x in shares], "pass": good})
     distinct = len({tuple(r["code"]) for r in per_style})
     return {"check": "b", "per_style": per_style, "distinct_codes": distinct, "pass": bool(ok and distinct == N_STYLES)}
+
+
+# ---------------------------------------------------------------------------
+# Continuous bottleneck (style_quantizer="none"): check (b) analogue and tightness
+# ---------------------------------------------------------------------------
+
+N_BOTTLENECK_CLIPS = 64
+
+
+@torch.no_grad()
+def style_centroids(model, ds, n: int = N_BOTTLENECK_CLIPS) -> torch.Tensor:
+    """Per-style centroids of the continuous code z, shape [K, n_vec, code_dim]."""
+    model.eval()
+    enc = model.style_encoder
+    mus = []
+    for k in range(N_STYLES):
+        crops = ds.clips_of_style(k, n)
+        z = enc.encode_z(crops, torch.ones(n, crops.shape[2], dtype=torch.bool)).float()
+        mus.append(z.mean(0))
+    return torch.stack(mus)
+
+
+@torch.no_grad()
+def bottleneck_stats(model, ds, n: int = N_BOTTLENECK_CLIPS) -> dict:
+    """Tightness of the continuous code: within-style spread vs centroid separation, centroid purity.
+
+    Spread is the RMS distance of a sample to its own style centroid; separation is the distance between
+    style centroids (min and mean over pairs).  Purity assigns every sample to its nearest centroid (the
+    leave-one-out variant rebuilds the own centroid without the sample, so it is not optimistically biased).
+    """
+    model.eval()
+    enc = model.style_encoder
+    V = []
+    for k in range(N_STYLES):
+        crops = ds.clips_of_style(k, n)
+        z = enc.encode_z(crops, torch.ones(n, crops.shape[2], dtype=torch.bool)).float()
+        V.append(z.reshape(n, -1))
+    V = torch.stack(V)  # [K, n, D]
+    K, _, D = V.shape
+    mu = V.mean(1)  # [K, D]
+    within = (V - mu[:, None]).pow(2).sum(-1).mean().sqrt()
+    dist = torch.cdist(mu, mu)
+    off = dist[~torch.eye(K, dtype=torch.bool)]
+    pts, ids = V.reshape(K * n, D), torch.arange(K * n)
+    own = ids // n
+    d_plain = torch.cdist(pts, mu)
+    d_loo = d_plain.clone()
+    d_loo[ids, own] = (V - (V.sum(1, keepdim=True) - V) / (n - 1)).reshape(K * n, D).norm(dim=-1)
+    # A fully collapsed code (every sample the same z) has within == between == 0; define its ratio as 0
+    # (collapsed) instead of 0/0.  The cap keeps the value finite for JSON logs.
+    sep = float(off.min() / within) if float(within) > 0 else (0.0 if float(off.min()) == 0 else 1e9)
+    return {
+        "within_rms": round(float(within), 3),
+        "between_min": round(float(off.min()), 3),
+        "between_mean": round(float(off.mean()), 3),
+        "sep_ratio": round(min(sep, 1e9), 2),
+        "centroid_purity": round(float((d_loo.argmin(-1) == own).float().mean()), 3),
+        "centroid_purity_plain": round(float((d_plain.argmin(-1) == own).float().mean()), 3),
+    }
+
+
+@torch.no_grad()
+def decode_bias_from_vectors(model, vecs, n_clips: int = 24, target_len: int = 16, seed: int = 0) -> list:
+    """Share of decoded tokens in each style's preferred blocks for one style's prefix vectors [n, hidden].
+
+    The continuous analogue of `check_b_decode_bias`, which decodes from FSQ code indices.
+    """
+    g = torch.Generator().manual_seed(seed)
+    text = FakeTextTokenizer()("<|text_start|>abcdef<|text_end|>").input_ids[0]
+    counts = torch.zeros(N_STYLES)
+    total = 0
+    for _ in range(n_clips):
+        toks = model.generate_tokens(
+            text, target_len, style_vectors=vecs, num_step=8, guidance_text=0.0, guidance_style=0.0,
+            class_temperature=0.5, generator=g,
+        )
+        for s in range(N_STYLES):
+            for cb in (0, 1):
+                blk = style_block(s, cb, N_STYLES)
+                counts[s] += ((toks[cb] >= blk.start) & (toks[cb] < blk.stop)).sum()
+        total += 2 * toks.shape[1]
+    return (counts / total).tolist()
+
+
+def vec_decode_pass(shares: list, min_own: float = 0.5) -> bool:
+    """Same per-style criterion as check (b), applied to the continuous decode-bias shares."""
+    return all(
+        max(range(N_STYLES), key=lambda j: sh[j]) == k
+        and sh[k] >= min_own
+        and sh[k] > 2 * max(sh[j] for j in range(N_STYLES) if j != k)
+        for k, sh in enumerate(shares)
+    )
+
+
+def check_b_continuous(model, ds, min_own: float = 0.5) -> dict:
+    """Check (b) for the continuous bottleneck: decode from each style's centroid vectors.
+
+    There are no discrete codes to decode from, so the prefix of a style is the vector decoded from its
+    centroid z.  Criterion: per style, own-share >= min_own and > 2x the best other style.
+    """
+    model.eval()
+    enc = model.style_encoder
+    vecs = enc.vectors_from_z(style_centroids(model, ds))
+    shares = [decode_bias_from_vectors(model, vecs[k]) for k in range(N_STYLES)]
+    return {"check": "b_continuous", "per_style": [{"style": k, "shares": [round(x, 3) for x in sh]}
+                                                   for k, sh in enumerate(shares)],
+            "vec_b_shares": [[round(x, 3) for x in sh] for sh in shares],
+            "pass": bool(vec_decode_pass(shares, min_own))}
 
 
 def _fixed_batch(n: int = 8, seed: int = 5, style_drop: float = 0.0, replay_fraction: float = 0.0, mask=(1.0, 1.0)):
@@ -279,7 +394,7 @@ def check_c_roundtrip(model, workdir: str | None = None) -> dict:
             "pass": bool(not missing and not extra and max_diff_all == 0.0 and logit_diff == 0.0 and cfg_ok)}
 
 
-def check_d_style_dropped_grads(quantizer: str = "fsq") -> dict:
+def check_d_style_dropped_grads(quantizer: str = "none") -> dict:
     """(d) A step where every sample dropped its prefix still gives a finite gradient to ALL encoder parameters."""
     out = {"check": "d", "quantizer": quantizer}
     ok = True
@@ -300,7 +415,7 @@ def check_d_style_dropped_grads(quantizer: str = "fsq") -> dict:
     return out
 
 
-def check_e_resume(workdir: str, quantizer: str = "fsq") -> dict:
+def check_e_resume(workdir: str, quantizer: str = "none") -> dict:
     """(e) Train 6 steps with save_steps=3, then resume from checkpoint-3 with the unmodified OmniTrainer."""
     from safetensors.torch import load_file
 
@@ -335,8 +450,12 @@ def check_g_cfg_and_scale(model, ds) -> dict:
     """(g) 3-branch CFG decoding and prefix scaling run; CFG reduces to upstream's form when g_text == g_style."""
     model.eval()
     text = FakeTextTokenizer()("<|text_start|>abcdef<|text_end|>").input_ids[0]
-    code, _ = modal_codes(model, ds, 1)
-    vecs = model.style_encoder.vectors_from_codes(torch.tensor(code)).view(len(code), -1)
+    enc = model.style_encoder
+    if enc.use_vq or enc.use_fsq:
+        code, _ = modal_codes(model, ds, 1)
+        vecs = enc.vectors_from_codes(torch.tensor(code)).view(len(code), -1)
+    else:  # continuous: use style 1's centroid prefix
+        vecs = enc.vectors_from_z(style_centroids(model, ds))[1]
     g = torch.Generator().manual_seed(0)
     runs, ok = {}, True
     for name, kw in {
@@ -380,7 +499,7 @@ def check_g_cfg_and_scale(model, ds) -> dict:
 
 def check_kl_guard() -> dict:
     """KL-to-Base: exactly 0 for an untouched model on a no-slot replay batch, > 0 once the model has been trained."""
-    model = build_model(style_quantizer="fsq")
+    model = build_model()
     model.attach_reference(StyleOmniVoice.reference_from(model))
     model.configure_training(kl_weight=1.0)
     model.train()
@@ -482,7 +601,7 @@ def collapse_log_sample(rows, k: int = 6):
     return [{kk: r.get(kk) for kk in keys} for r in pick]
 
 
-def run_all(steps: int = 1000, quantizer: str = "fsq", log=print, skip_real: bool = False) -> dict:
+def run_all(steps: int = 1000, quantizer: str = "none", log=print, skip_real: bool = False) -> dict:
     res: dict = {}
     t0 = time.time()
     model, ds, rows, secs = train_reference_model(quantizer, steps=steps, log=None)
@@ -513,7 +632,7 @@ def run_all(steps: int = 1000, quantizer: str = "fsq", log=print, skip_real: boo
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=1000)
-    ap.add_argument("--quantizer", default="fsq", choices=["fsq", "vq", "none"])
+    ap.add_argument("--quantizer", default="none", choices=["fsq", "vq", "none"])
     ap.add_argument("--skip-real", action="store_true")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

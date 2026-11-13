@@ -50,12 +50,15 @@ class StyleOmniVoiceConfig(OmniVoiceConfig):
         style_enc_heads: int = 4,
         style_code_dim: int = 16,  # bottleneck width for "vq" / "none" (FSQ uses len(style_fsq_levels))
         style_codebook_size: int = 64,  # VQ codebook size (only for style_quantizer="vq")
+        # "none": continuous tight bottleneck: z is unit-RMS per vector, no quantiser.  Shipped default:
+        #         the FSQ route failed check (b) on 2 of 5 seeds even after the fix sweep
+        #         (`workers/smoke/fsq-fix-report.md`), while the continuous route passes every gate on
+        #         5 of 5 seeds at phase-2 lr 5e-4 (`workers/smoke/contin-fix-report.md`).
         # "fsq": finite scalar quantisation (Mentzer et al. 2023, arXiv 2309.15505): each of the d code
         #        dimensions is bounded with floor(L/2)*tanh(z), rounded (straight-through), no auxiliary
-        #        loss, no reseeding.  Default.
+        #        loss, no reseeding.  Kept selectable; seed-fragile check (b).
         # "vq" : learned codebook (kept to document its collapse in the smoke test).
-        # "none": continuous tight bottleneck (diagnosis baseline).
-        style_quantizer: str = "fsq",
+        style_quantizer: str = "none",
         style_fsq_levels: Optional[list] = None,  # odd levels per dimension, paper advice L_i >= 5, d < 10
         # FSQ bound.  "tanh" is the paper's bound and saturates (its slope goes to 0 in the corners, so a style
         # stuck on an outermost level gets no straight-through gradient).  On the [7, 7, 5, 5] grid it passed
