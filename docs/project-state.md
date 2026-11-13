@@ -135,6 +135,23 @@ Brandon finished rating the two-model blind set (omnivoice against qwen3base, tw
 - **Mood:** counted only on lines with a tone target. L06 (fearful, hushed) failed for both models on both seeds; L05 and L07 each failed once per model, on different seeds.
 - **Reading:** omnivoice has a slight edge on Tali-likeness with the vT reference, and there is no clear winner on mood. Nothing here was used to pick data or models in code.
 
+## Blind verdict: omnivoice against moss15 (2026-11-13)
+
+Brandon rated a blind set of omnivoice against moss15 (26 line groups, two models, vT reference only). Counts are per clip, from the hub ratings.
+
+| Measure (26 clips per model unless noted) | omnivoice | moss15 |
+|---|---|---|
+| Her voice = yes | 20 | 5 |
+| Accent heard (partial or full) | 16 (4 full) | 2 |
+| Suit effect (partial) | 5 | 3 |
+| Mood right on L01-L08 (16 clips each) | 7 | 10 (plus 2 rated "mimic") |
+| Words clear | 26 | 26 |
+| Pitch correct | 26 | 26 |
+
+- **Notes:** moss15 L07 and L07_s2 had a strange cadence, and their mood was rated "mimic". Both models fail P01 (her voice was "no" on all four clips). Mood strength heard is mostly 0-1 on L04-L08 for both.
+- **Winner:** omnivoice, by a wide margin on voice identity and accent. moss15 is ahead only on mood right (10 against 7).
+- **Decision:** omnivoice gets the full fine-tune, as one model for all moods and voice traits (not a per-mood LoRA). Its weights are CC-BY-NC, which is fine for non-commercial personal use.
+
 ## Next steps and decisions waiting on Brandon
 
 1. **The training-code fix** is in review. Next is a fresh short run from Base (about 300 steps, checkpoints every 50, all brought home and verified, then pruned to the chosen one and the next; the job refuses to start under 50 GB free on `/home`), which needs his go and budget.
