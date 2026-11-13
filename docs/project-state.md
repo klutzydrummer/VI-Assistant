@@ -71,7 +71,7 @@ A conversational assistant that feels like a friend and an executive assistant w
   - `on-worker.sh`, `worker-onstart.sh` and `check-worker.sh`: the rental worker scripts.
 - `characters/tali/`: the character pack. It holds `character.toml`, `persona.md`, `examples.md`, `states.toml`, `states/` and `drones.toml`. Voice clips are extracted locally and never committed.
 - `models.toml`: which models each stage uses.
-- `docs/`: how-tos (`cloud-worker.md`, `extracting-game-audio.md`, `vectors.md`, `tali-naming.md`) and `docs/design/` (plans and research, including `qwen3tts-finetune-guide.md`, `labelling-run-plan.md`, `must-have-moods.md`, `voice-consistency-check.md`, `after-labels-plan.md`, `steering-builder-*.md` and `review-page.md`).
+- `docs/`: how-tos (`cloud-worker.md`, `extracting-game-audio.md`, `vectors.md`, `tali-naming.md`) and `docs/design/` (plans and research, including `qwen3tts-finetune-guide.md`, `finetune-support.md`, `labelling-run-plan.md`, `must-have-moods.md`, `voice-consistency-check.md`, `after-labels-plan.md`, `steering-builder-*.md` and `review-page.md`).
 
 ## How the work runs
 
