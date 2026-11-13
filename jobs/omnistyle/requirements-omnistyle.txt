@@ -3,6 +3,7 @@
 #   uv pip install --python /tmp/ovsmoke-venv/bin/python -r requirements-omnistyle.txt \
 #       --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.8.0+cpu
+torchaudio==2.8.0+cpu  # must match torch exactly: a newer torchaudio fails to import against 2.8.0+cpu (undefined symbol)
 transformers==5.22.2
 accelerate==1.15.0
 omnivoice==0.2.1   # pip release; the cached upstream master is newer (adds LoRA), not needed here

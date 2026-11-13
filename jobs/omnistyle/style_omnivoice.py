@@ -57,6 +57,15 @@ class StyleOmniVoiceConfig(OmniVoiceConfig):
         # "none": continuous tight bottleneck (diagnosis baseline).
         style_quantizer: str = "fsq",
         style_fsq_levels: Optional[list] = None,  # odd levels per dimension, paper advice L_i >= 5, d < 10
+        # FSQ bound.  "tanh" is the paper's bound and saturates (its slope goes to 0 in the corners, so a style
+        # stuck on an outermost level gets no straight-through gradient).  On the [7, 7, 5, 5] grid it passed
+        # the three previously failing screened seeds (1, 2, 4) but still failed the five-seed confirmation on
+        # seeds 0 and 3 (3/5).  "clip" is a scaled linear bound whose value is clipped but whose gradient passes
+        # straight through the clip, and "softsign" is z/(1+|z|), bounded with a gradient that stays positive.
+        # `sweep_fsq.py` has the evidence; `workers/smoke/fsq-fix-report.md` has the five-seed table.
+        style_fsq_bound: str = "tanh",
+        style_fsq_scale: float = 1.0,  # z multiplier before the bound (>1 saturates sooner, <1 keeps z in range)
+        style_code_init_std: Optional[float] = None,  # FSQ to_code init (None = fan-in); small keeps z off the corners
         style_noise_std: float = 0.1,  # Gaussian noise on the code during training
         style_commit_beta: float = 0.25,  # VQ commitment weight (codebook loss weight is 1)
         style_scale: float = 1.0,  # default prefix-strength multiplier (training and inference)
@@ -78,9 +87,13 @@ class StyleOmniVoiceConfig(OmniVoiceConfig):
         self.style_codebook_size = style_codebook_size
         assert style_quantizer in ("fsq", "vq", "none"), style_quantizer
         self.style_quantizer = style_quantizer
-        levels = list(style_fsq_levels) if style_fsq_levels is not None else [7, 5, 5]
+        levels = list(style_fsq_levels) if style_fsq_levels is not None else [7, 7, 5, 5]
         assert all(l >= 3 and l % 2 == 1 for l in levels), "FSQ levels must be odd (symmetric bound)"
         self.style_fsq_levels = levels
+        assert style_fsq_bound in ("tanh", "clip", "softsign"), style_fsq_bound
+        self.style_fsq_bound = style_fsq_bound
+        self.style_fsq_scale = style_fsq_scale
+        self.style_code_init_std = style_code_init_std
         self.style_noise_std = style_noise_std
         self.style_commit_beta = style_commit_beta
         self.style_scale = style_scale
@@ -170,6 +183,9 @@ class StyleEncoder(nn.Module):
         self.use_vq = self.quantizer == "vq"
         self.use_fsq = self.quantizer == "fsq"
         self.fsq_levels = list(cfg.style_fsq_levels)
+        self.fsq_bound = cfg.style_fsq_bound
+        self.fsq_scale = cfg.style_fsq_scale
+        self.code_init_std = cfg.style_code_init_std
         code_dim = len(self.fsq_levels) if self.use_fsq else cfg.style_code_dim
         self.code_dim = code_dim
         # Constants are plain Python values turned into tensors on use.  Non-persistent buffers are NOT restored by
@@ -228,8 +244,11 @@ class StyleEncoder(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-        if self.use_fsq:  # unit-variance pre-bound values so the rounding grid is used from step 0
-            nn.init.normal_(self.to_code.weight, std=self.to_code.in_features ** -0.5)
+        if self.use_fsq:
+            # Fan-in (style_code_init_std=None) is the shipped default on the [7, 7, 5, 5] grid; a small init
+            # keeps z in the linear part of the bound instead of on the outer levels.
+            std = self.to_code.in_features ** -0.5 if self.code_init_std is None else self.code_init_std
+            nn.init.normal_(self.to_code.weight, std=std)
         # Output MLP init.  The Linear loop above used std 0.02; fan-in scaling (style_out_init_std=None) gives a
         # unit-variance output, a fixed std overrides it.  Measured in the smoke report: it changes FSQ training.
         for lin in (self.to_out[0], self.to_out[2]):
@@ -291,10 +310,27 @@ class StyleEncoder(nn.Module):
         # Unit-RMS per vector: the commitment loss can no longer shrink the whole code space to a point.
         return F.layer_norm(z.float(), (z.shape[-1],))
 
-    def _fsq(self, z: torch.Tensor):
-        """FSQ: round(floor(L/2) * tanh(z)) per dimension, straight-through; returns (zq in [-1,1], flat code index)."""
+    def _bounded(self, z: torch.Tensor) -> torch.Tensor:
+        """Map the pre-quantisation code z onto the FSQ bound (values in [-half, half] per dimension).
+
+        `tanh` is the paper's saturating bound.  `clip` is a scaled linear bound: the value is clipped to
+        the bound but the gradient is passed straight through the clip (the usual straight-through trick),
+        so a style pushed onto an outer level can still be moved back.  `softsign` never zeroes the
+        gradient at all.  See README "Known defect" and the sweep report for the measurements.
+        """
+        u = z.float() * self.fsq_scale
         half = self._half(z.device)
-        b = half * torch.tanh(z)
+        if self.fsq_bound == "tanh":
+            return half * torch.tanh(u)
+        if self.fsq_bound == "softsign":
+            return half * u / (1.0 + u.abs())
+        clipped = u.clamp(-1.0, 1.0)
+        return half * (u + (clipped - u).detach())  # value clipped, gradient 1 through the clip
+
+    def _fsq(self, z: torch.Tensor):
+        """FSQ: round the bounded z per dimension, straight-through; returns (zq in [-1,1], flat code index)."""
+        half = self._half(z.device)
+        b = self._bounded(z)
         q = b + (torch.round(b) - b).detach()  # STE: gradient of the rounding is 1
         idx = ((torch.round(b.detach()) + half).long() * self._radix(z.device)).sum(-1)
         return q / half, idx

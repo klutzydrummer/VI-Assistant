@@ -23,10 +23,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import smoke_style as S  # noqa: E402
 
+# The old FSQ defaults are pinned here so this sweep keeps reproducing the original defect.
+LEGACY = dict(style_fsq_levels=[7, 5, 5], style_fsq_bound="tanh", style_code_init_std=None)
 ARMS = {
-    "OLD": dict(style_out_init_std=0.02, style_out_ln_eps=1e-5),
-    "OLD_EPS": dict(style_out_init_std=0.02, style_out_ln_eps=1e-10),
-    "NEW": dict(style_out_init_std=None, style_out_ln_eps=1e-5),
+    "OLD": dict(LEGACY, style_out_init_std=0.02, style_out_ln_eps=1e-5),
+    "OLD_EPS": dict(LEGACY, style_out_init_std=0.02, style_out_ln_eps=1e-10),
+    "NEW": dict(LEGACY, style_out_init_std=None, style_out_ln_eps=1e-5),
 }
 
 

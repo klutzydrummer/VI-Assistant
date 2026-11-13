@@ -64,7 +64,6 @@ def tiny_config(**kw) -> StyleOmniVoiceConfig:
         style_code_dim=8,
         style_codebook_size=16,
         style_quantizer="fsq",
-        style_fsq_levels=[7, 5, 5],
         style_noise_std=0.1,
     )
     defaults.update(kw)
@@ -270,6 +269,9 @@ def check_c_roundtrip(model, workdir: str | None = None) -> dict:
     logit_diff = float((la - lb).abs().max())
     cfg_ok = (loaded.config.style_quantizer == model.config.style_quantizer
               and loaded.config.style_fsq_levels == model.config.style_fsq_levels
+              and loaded.config.style_fsq_bound == model.config.style_fsq_bound
+              and loaded.config.style_fsq_scale == model.config.style_fsq_scale
+              and loaded.config.style_code_init_std == model.config.style_code_init_std
               and loaded.config.style_n_vectors == model.config.style_n_vectors)
     return {"check": "c", "files": files, "n_encoder_tensors": len(enc_keys), "missing": missing, "unexpected": extra,
             "max_abs_diff_encoder": max_diff_enc, "max_abs_diff_all": max_diff_all, "max_abs_logit_diff": logit_diff,

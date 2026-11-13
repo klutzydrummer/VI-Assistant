@@ -107,10 +107,17 @@ if __name__ == "__main__":
     ap.add_argument("--replay-fraction", type=float, default=0.0)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--quantizer", default="fsq", choices=["fsq", "vq", "none"])
+    ap.add_argument("--fsq-levels", type=int, nargs="+", default=None, help="odd levels per FSQ dimension")
+    ap.add_argument("--fsq-bound", default=None, choices=["tanh", "clip", "softsign"])
     a = ap.parse_args()
     if not a.synthetic:
         sys.exit("only --synthetic data is wired in this smoke job")
+    kwargs = {}
+    if a.fsq_levels is not None:
+        kwargs["style_fsq_levels"] = a.fsq_levels
+    if a.fsq_bound is not None:
+        kwargs["style_fsq_bound"] = a.fsq_bound
     run_training(
         a.output_dir, a.steps, a.save_steps, a.resume_from, a.init_from, lr=a.lr, kl_weight=a.kl_weight,
-        replay_fraction=a.replay_fraction, style_quantizer=a.quantizer,
+        replay_fraction=a.replay_fraction, style_quantizer=a.quantizer, **kwargs,
     )

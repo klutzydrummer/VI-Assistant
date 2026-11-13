@@ -36,6 +36,18 @@ def test_b_decode_bias(trained):
     assert r["pass"], r
 
 
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_b_decode_bias_all_seeds(seed):
+    """Check (b) on all five seeds with the shipped FSQ defaults ([7, 7, 5, 5], tanh bound, fan-in init).
+    The old [7, 5, 5] tanh configuration passed on 2 of 5 seeds but merged every style onto one code on the
+    others (see README "Known defect"), so a single-seed test missed it.  Measured on 2026-11-13: the
+    shipped defaults pass seeds 1, 2 and 4 and fail seeds 0 and 3, so this test is expected red on those two
+    seeds until the owner picks a follow-up (see workers/smoke/fsq-fix-report.md)."""
+    model, ds, _, _ = S.train_reference_model("fsq", pre_steps=300, steps=1000, seed=seed)
+    r = S.check_b_decode_bias(model, ds)
+    assert r["pass"], r
+
+
 def test_c_save_load_roundtrip(trained, tmp_path):
     r = S.check_c_roundtrip(trained[0], workdir=str(tmp_path))
     assert r["pass"], r
