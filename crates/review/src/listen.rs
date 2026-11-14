@@ -708,11 +708,37 @@ mod tests {
         let s = l.session();
         assert!(s["groups"][0]["tone"]["target"].is_null());
         assert!(l.session()["groups"][0]["tone"].is_object());
-        let ok = Answer { group: "vT/L09".into(), clip: "A".into(), voice: "y".into(), mood: "na".into(), clear: "y".into(), notes: String::new(), accent: String::new(), suit: String::new(), mood_right: String::new(), pitch: String::new() };
+        let ok = Answer {
+            group: "vT/L09".into(),
+            clip: "A".into(),
+            voice: "y".into(),
+            mood: "na".into(),
+            clear: "y".into(),
+            notes: String::new(),
+            accent: String::new(),
+            suit: String::new(),
+            mood_right: String::new(),
+            pitch: String::new(),
+        };
         assert!(l.answer(ok).is_ok());
-        let bad = Answer { group: "vT/L09".into(), clip: "B".into(), voice: String::new(), mood: "na".into(), clear: String::new(), notes: String::new(), accent: String::new(), suit: String::new(), mood_right: String::new(), pitch: String::new() };
+        let bad = Answer {
+            group: "vT/L09".into(),
+            clip: "B".into(),
+            voice: String::new(),
+            mood: "na".into(),
+            clear: String::new(),
+            notes: String::new(),
+            accent: String::new(),
+            suit: String::new(),
+            mood_right: String::new(),
+            pitch: String::new(),
+        };
         let mut l2 = Listen::load(&set).unwrap();
-        let bad = Answer { group: "vT/L01".into(), clip: "B".into(), ..bad };
+        let bad = Answer {
+            group: "vT/L01".into(),
+            clip: "B".into(),
+            ..bad
+        };
         assert!(l2.answer(bad).is_err());
     }
 
