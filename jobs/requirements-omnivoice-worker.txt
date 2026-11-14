@@ -1,0 +1,12 @@
+# Worker-only deps for the OmniVoice fine-tune, installed on top of the rental
+# image's CUDA torch in a `python3 -m venv --system-site-packages` venv — the
+# same shape jobs/ttstest/worker_run.py uses for omnivoice. jobs/voicetune-fresh.sh
+# names the venv after this file's sha256 so a changed list gets a fresh venv.
+#
+# jobs/omnistyle/requirements-omnistyle.txt is the HOME CPU smoke set (it pins
+# +cpu wheels); it is NOT used on the worker.
+accelerate
+omnivoice
+tensorboard
+webdataset
+soundfile

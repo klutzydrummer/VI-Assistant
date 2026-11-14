@@ -13,8 +13,9 @@
 # supervisor writes $work/acked/epoch-<k>. Both live here, not in the stage
 # supervisor: this runner outlives a killed stage session.
 #
-# A failed attempt is restarted with --resume from the last finished epoch
-# (resume.pt), up to VI_TRAIN_RETRIES (default 2). It is never restarted after
+# A failed attempt is restarted with --resume-from-checkpoint from the newest
+# checkpoint-<step> with its SHA256SUMS (a checkpoint is complete only once its
+# manifest exists), up to VI_TRAIN_RETRIES (default 2). It is never restarted after
 # an abort-rule stop ($run/abort.json, written by voicetune-fresh.sh before it
 # kills the trainer), on ENOSPC, or on a lock collision (exit 75). Exit code
 # 137 alone is not taken as OOM: the cgroup v2 oom_kill counter must have risen
@@ -27,7 +28,7 @@
 # make that relaunch safe.
 #
 #   worker-job.sh --work DIR --run DIR [--publish DIR] [--retries N] --
-#     python3 jobs/voicetune.py train ...
+#     accelerate launch --num_processes 1 jobs/omnivoice-ft/train_ft.py ...
 set -euo pipefail
 
 work= run= publish= retries=${VI_TRAIN_RETRIES:-2}
@@ -174,9 +175,22 @@ while :; do
     fi
   fi
   attempt=$((attempt + 1))
-  if [ $resumed = 0 ] && [ -s "$run/resume.pt" ]; then
-    cmd+=(--resume)
-    resumed=1
+  if [ $resumed = 0 ]; then
+    # The newest checkpoint-<step> whose SHA256SUMS exists (the manifest is written
+    # last, so a dir without one is a partial save). Every loop body ends with a
+    # zero status: under set -euo pipefail a failing substitution would kill this
+    # runner before it writes rc.
+    resume_ckpt=$({
+      for c in "$run"/checkpoint-*; do
+        if [ -d "$c" ] && [ -f "$c/SHA256SUMS" ]; then
+          printf '%s\n' "$c"
+        fi
+      done
+    } | sort -V | tail -n1) || resume_ckpt=""
+    if [ -n "$resume_ckpt" ]; then
+      cmd+=(--resume-from-checkpoint "$resume_ckpt")
+      resumed=1
+    fi
   fi
   echo "worker-job.sh: retry $attempt/$retries" >&2
 done

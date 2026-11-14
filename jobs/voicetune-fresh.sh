@@ -1,25 +1,39 @@
 #!/usr/bin/env bash
-# Fresh voice-quality fine-tune (stage 5): one preflight job, then one train job, run on the GPU
-# worker by jobs/on-worker.sh. Preflight proves the card, disk, generate path and a 5-step probe
-# and pushes the probe checkpoint home; train runs 6 epochs from Base, pushes each finished epoch
-# home as it lands, aborts on bad loss/memory/time, then builds the unblinded listening set and
-# pushes it plus the run files home.
+# OmniVoice full fine-tune with the learned style prefix (stage 5): one preflight job, then one
+# train job, run on the GPU worker by jobs/on-worker.sh. Preflight proves the card, disk and
+# generate path with a 5-step probe and pushes the probe checkpoint home; train runs 5000 steps
+# from the public Base, pushes each finished checkpoint-<step> home as it lands, aborts on NaN
+# loss or a fired collapse guard, then builds the labelled listening sets at steps 1000/2500/5000
+# (before home can prune them away) and pushes them plus the run files home.
 #
 # `push` runs only the publish-push loop. The train mode holds $work/push.lock while it runs, so
 # when a killed session leaves the detached trainer alive, the home supervisor starts `push`
-# under the same lock: finished epochs keep going home, and epochs home found corrupt are re-sent
-# with --checksum while the receiver moves the old copy aside (nothing is deleted).
+# under the same lock: finished checkpoints keep going home, and checkpoints home found corrupt
+# are re-sent with --checksum while the receiver moves the old copy aside (nothing is deleted).
+#
+# A checkpoint is published only once its SHA256SUMS exists: train_ft.py writes the manifest
+# last and atomically, so "a checkpoint only exists once its manifest does". The collapse guard
+# removes its attempt's checkpoint dirs when it restarts with a new seed, so the publish mirror
+# tracks the run dir (hard links; a replaced checkpoint is re-copied and re-pushed).
+#
+# Home acks (jobs/on-worker.sh ack_epochs) still speak epoch-<k> and are out of this task's
+# scope, so the push loop keeps its own local $work/pushed/checkpoint-<step> markers instead of
+# waiting for acks, and still honors $work/acked/checkpoint-<step> if a future on-worker.sh
+# writes them.
 #
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
-#   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home by the
-#                                           voicetune_data stage, holding
-#     train_with_codes.jsonl                 prepared train manifest (id, audio, text, ref_audio, audio_codes)
-#     val_with_codes.jsonl                   held-out manifest, same shape
-#     replay_with_codes.jsonl                replay lines for the KL term, same shape
-#     sentences.txt                          the 3 fixed listening lines (optional; defaults below)
-#     wav/ voices/                           the clips' and replay voices' audio, beside the manifests
-# Every audio/ref_audio path is relative to that folder, so this script runs with it as the working
-# directory. The 6 delivery clips are picked from the train manifest by seed 0 alone — never a label.
+#   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home, holding
+#     data_config.json                       OmniVoice data config (manifest_path -> data.lst)
+#     style_manifest.jsonl                   style-source rows (id, audio_path, text) for the
+#                                            listening sets and the probe line
+#     audio_tokenizer/                       the Higgs v2 tokenizer (optional when the Base
+#                                            snapshot below already carries it)
+#     <the shards named by data_config.json> beside the config, in the same folder
+#   VI_BASE_MODEL                            local snapshot of k2-fsa/OmniVoice, used as
+#                                            --init-from and --base-model; no hub download
+# Every manifest path inside the data folder is relative to it, so this script runs with it as
+# the working directory. Listening lines come from jobs/ttstest/lines.json (infer_listening's
+# default) — the hub's established lines, the same every checkpoint.
 set -euo pipefail
 
 jobs_dir=$(cd "$(dirname "$0")" && pwd)
@@ -27,9 +41,9 @@ MODE=${1:-}
 
 usage() {
   echo "usage: voicetune-fresh.sh preflight|train|push" >&2
-  echo "  preflight  check --generate, gate VRAM/disk, run a 5-step probe, push it home, speak one line" >&2
-  echo "  train      6 epochs from Base, push each epoch home, abort on bad loss/mem/time, build the platter" >&2
-  echo "  push       only push finished epochs and repairs home (started by the home supervisor)" >&2
+  echo "  preflight  gate VRAM/disk, run a 5-step probe, push it home, speak one line" >&2
+  echo "  train      5000 steps from Base, push each checkpoint home, abort on NaN/guard fire, build the listening sets" >&2
+  echo "  push       only push finished checkpoints and repairs home (started by the home supervisor)" >&2
 }
 
 case "$MODE" in
@@ -40,7 +54,7 @@ esac
 : "${VI_OUT:?voicetune-fresh.sh runs through jobs/on-worker.sh}"
 
 # Worker-side scratch inside on-worker.sh's work dir (deleted with the job): run/publish/probe live
-# here, not under VI_OUT, so epoch weights aren't re-sent over vi-out at the end.
+# here, not under VI_OUT, so checkpoint weights aren't re-sent over vi-out at the end.
 scratch="$(cd "$(dirname "$VI_OUT")" && pwd)/voicetune-fresh"
 run="$scratch/run"
 publish="$scratch/publish"
@@ -49,93 +63,146 @@ probe_publish="$scratch/probe-publish"
 mkdir -p "$scratch"
 work="$(cd "$(dirname "$VI_OUT")" && pwd)"
 
-# Which finished epochs still need to go home. `ack_epochs` in on-worker.sh
-# writes $work/acked/epoch-<k> only after the copy home verifies, so an acked
-# epoch is never re-sent; everything else is, every pass.
-acked_epochs() {
-  local e n acked=()
-  for e in "$publish"/epoch-*; do
-    [ -d "$e" ] || continue
-    case ${e##*/} in *.part) continue ;; esac
-    n=${e##*/epoch-}
-    [ -e "$work/acked/epoch-$n" ] || continue
-    acked+=("--exclude=/${e##*/}")
+# publish_sync SRC DST: mirror every finished checkpoint from SRC into DST as hard links (so the
+# copy costs no disk), and drop published checkpoints the trainer removed again. Only a
+# checkpoint with its SHA256SUMS counts; a replaced same-name checkpoint (collapse guard
+# restart) is detected by its manifest and re-copied, and its pushed marker cleared so it is
+# re-sent home.
+publish_sync() {
+  local src=$1 dst=$2 ck d n
+  for ck in "$src"/checkpoint-*; do
+    [ -d "$ck" ] || continue
+    [ -f "$ck/SHA256SUMS" ] || continue
+    d="$dst/${ck##*/}"
+    if [ -e "$d" ]; then
+      if [ -f "$d/SHA256SUMS" ] && cmp -s "$ck/SHA256SUMS" "$d/SHA256SUMS"; then
+        continue
+      fi
+      n=${ck##*/checkpoint-}
+      case $n in ''|*[!0-9]*) ;; *) rm -f "$work/pushed/checkpoint-$n" ;; esac
+      rm -rf "$d"
+    fi
+    cp -al "$ck" "$d"
+  done
+  for d in "$dst"/checkpoint-*; do
+    [ -d "$d" ] || continue
+    [ -d "$src/${d##*/}" ] || rm -rf "$d"
+  done
+}
+
+# Which finished checkpoints still need to go home. Home acks ($work/acked/checkpoint-<step>)
+# or this script's own pushed markers ($work/pushed/checkpoint-<step>) exclude a checkpoint from
+# the whole-directory push; everything else is re-sent (rsync skips unchanged files) every pass.
+acked_checkpoints() {
+  local c n acked=()
+  for c in "$publish"/checkpoint-*; do
+    [ -d "$c" ] || continue
+    case ${c##*/} in *.part) continue ;; esac
+    n=${c##*/checkpoint-}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    if [ -e "$work/acked/checkpoint-$n" ] || [ -e "$work/pushed/checkpoint-$n" ]; then
+      acked+=("--exclude=/${c##*/}")
+    fi
   done
   [ ${#acked[@]} -eq 0 ] || printf '%s\n' "${acked[@]}"
 }
 
-mark_bad() {  # N
-  mkdir -p "$work/bad"
-  : >"$work/bad/epoch-$1"
-  rm -f "$work/repush/epoch-$1" "$work/repush/epoch-$1.fails"
-  echo "voicetune-fresh: ALERT: epoch $1 failed three repair pushes; marked $work/bad/epoch-$1 and no longer retried (the corrupt copy stays home beside the repaired files)" >&2
+# A whole-directory push only marks checkpoints pushed when it succeeds, so a failed pass is
+# retried next loop; a fresh checkpoint that appears after the last successful push is unmarked
+# and goes out with the next pass.
+mark_pushed() {
+  local c n
+  mkdir -p "$work/pushed"
+  for c in "$publish"/checkpoint-*; do
+    [ -d "$c" ] || continue
+    n=${c##*/checkpoint-}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    : >"$work/pushed/checkpoint-$n"
+  done
 }
 
-# push_repairs: re-send epochs home found corrupt. --checksum ignores size and
+mark_bad() {  # N
+  mkdir -p "$work/bad"
+  : >"$work/bad/checkpoint-$1"
+  rm -f "$work/repush/checkpoint-$1" "$work/repush/checkpoint-$1.fails" "$work/pushed/checkpoint-$1"
+  echo "voicetune-fresh: ALERT: checkpoint $1 failed three repair pushes; marked $work/bad/checkpoint-$1 and no longer retried (the corrupt copy stays home beside the repaired files)" >&2
+}
+
+# push_repairs: re-send checkpoints home found corrupt. --checksum ignores size and
 # mtime (a flipped byte keeps both), --backup moves the bad copy into
 # .rsync-replaced-<attempt>/ instead of overwriting it, and --relative keeps
-# the epoch-<k>/ layout the whole-directory push uses. After three failed
-# pushes the epoch is marked bad, loudly, and never retried.
+# the checkpoint-<step>/ layout the whole-directory push uses. After three failed
+# pushes the checkpoint is marked bad, loudly, and never retried.
 push_repairs() {
   local rp n fails f
-  for rp in "$work/repush"/epoch-*; do
+  for rp in "$work/repush"/checkpoint-*; do
     [ -e "$rp" ] || continue
     case ${rp##*/} in *.fails) continue ;; esac
-    n=${rp##*/epoch-}
+    n=${rp##*/checkpoint-}
     case $n in ''|*[!0-9]*) continue ;; esac
-    f="$work/repush/epoch-$n.fails"
+    f="$work/repush/checkpoint-$n.fails"
     fails=$(cat "$f" 2>/dev/null || true)
     case $fails in ''|*[!0-9]*) fails=0 ;; esac
     if [ "$fails" -ge 3 ]; then mark_bad "$n"; continue; fi
-    if [ ! -d "$publish/epoch-$n" ]; then
+    if [ ! -d "$publish/checkpoint-$n" ]; then
       printf '%s\n' "$((fails + 1))" >"$f"
-      echo "voicetune-fresh: epoch $n not found in $publish; cannot repair it" >&2
+      echo "voicetune-fresh: checkpoint $n not found in $publish; cannot repair it" >&2
       [ "$((fails + 1))" -lt 3 ] || mark_bad "$n"
       continue
     fi
-    if "$jobs_dir/worker-return.sh" push "$publish/./epoch-$n" "${VI_PUBLISH:-vi-publish}" \
+    if "$jobs_dir/worker-return.sh" push "$publish/./checkpoint-$n" "${VI_PUBLISH:-vi-publish}" \
          --relative --checksum --backup --backup-dir=".rsync-replaced-$((fails + 1))" --exclude='*.part'; then
       rm -f "$rp" "$f"
-      echo "voicetune-fresh: epoch $n re-sent; the copy it replaced is under .rsync-replaced-$((fails + 1))/" >&2
+      mkdir -p "$work/pushed"
+      : >"$work/pushed/checkpoint-$n"
+      echo "voicetune-fresh: checkpoint $n re-sent; the copy it replaced is under .rsync-replaced-$((fails + 1))/" >&2
     else
       fails=$((fails + 1))
       printf '%s\n' "$fails" >"$f"
-      echo "voicetune-fresh: epoch $n repair push failed ($fails/3)" >&2
+      echo "voicetune-fresh: checkpoint $n repair push failed ($fails/3)" >&2
       [ "$fails" -lt 3 ] || mark_bad "$n"
     fi
   done
 }
 
-# push_publish DIR: push a publish dir's finished epochs (never a .part) home
+# push_publish DIR: push a publish dir's finished checkpoints (never a .part) home
 # via the vi-publish module, which on-worker.sh points at this attempt's
 # durable dir. Repairs go first, then the ordinary push.
 push_publish() {
   local dir=$1 acked=()
   [ -d "$dir" ] || return 0
   push_repairs
-  mapfile -t acked < <(acked_epochs)
-  "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' "${acked[@]}"
+  mapfile -t acked < <(acked_checkpoints)
+  if "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' "${acked[@]}"; then
+    mark_pushed
+  else
+    return 1
+  fi
 }
 
 push_loop() {
-  local e n pending
+  local c n pending
   while :; do
+    publish_sync "$run" "$publish"
     push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
-    # A live trainer can still publish another epoch: keep going.
+    # A live trainer can still publish another checkpoint: keep going.
     if [ -s "$work/train.pid" ] && kill -0 "$(cat "$work/train.pid" 2>/dev/null)" 2>/dev/null; then
       sleep "${VI_PUSH_SECONDS:-15}"
       continue
     fi
     pending=0
-    for e in "$publish"/epoch-*; do
-      [ -d "$e" ] || continue
-      case ${e##*/} in *.part) continue ;; esac
-      n=${e##*/epoch-}
-      [ -e "$work/acked/epoch-$n" ] || pending=1
+    for c in "$publish"/checkpoint-*; do
+      [ -d "$c" ] || continue
+      case ${c##*/} in *.part) continue ;; esac
+      n=${c##*/checkpoint-}
+      case $n in ''|*[!0-9]*) continue ;; esac
+      if [ ! -e "$work/acked/checkpoint-$n" ] && [ ! -e "$work/pushed/checkpoint-$n" ]; then
+        pending=1
+      fi
     done
-    for e in "$work/repush"/epoch-*; do
-      [ -e "$e" ] || continue
-      case ${e##*/} in *.fails) continue ;; esac
+    for rp in "$work/repush"/checkpoint-*; do
+      [ -e "$rp" ] || continue
+      case ${rp##*/} in *.fails) continue ;; esac
       pending=1
     done
     [ "$pending" = 1 ] || break
@@ -158,22 +225,24 @@ if [ "$MODE" = push ]; then
 fi
 
 : "${VI_RETURN_PORT:?voicetune-fresh.sh needs the worker return tunnel}" \
-  "${VI_INPUT_VOICETUNE_DATA:?missing VI_INPUT_VOICETUNE_DATA}"
+  "${VI_INPUT_VOICETUNE_DATA:?missing VI_INPUT_VOICETUNE_DATA}" \
+  "${VI_BASE_MODEL:?missing VI_BASE_MODEL (the local k2-fsa/OmniVoice snapshot)}"
 
 # The prepared data folder; every manifest path inside it is relative to it, so
 # run with it as the working directory for the job (all other paths are absolute).
 data_dir="$VI_INPUT_VOICETUNE_DATA"
 cd "$data_dir"
 
-# qwen-tts pins an older transformers, so voicetune runs in its own venv — the same one
-# vi_job.ensure_venv("requirements-tune.txt") builds (sha256[:16] of the requirements file).
-# QWEN_TTS_PYTHON overrides for a pre-built environment.
-tune_python() {
-  if [ -n "${QWEN_TTS_PYTHON:-}" ]; then
-    printf '%s\n' "$QWEN_TTS_PYTHON"
+# The OmniVoice venv: the image's CUDA torch is reused through --system-site-packages, only the
+# training deps are installed — the same shape jobs/ttstest/worker_run.py uses for omnivoice.
+# The venv is named after the requirements file's sha256, so a changed list gets a fresh venv.
+# OVFT_PYTHON overrides for a pre-built environment.
+ovft_python() {
+  if [ -n "${OVFT_PYTHON:-}" ]; then
+    printf '%s\n' "$OVFT_PYTHON"
     return
   fi
-  local req="$jobs_dir/requirements-tune.txt" venv
+  local req="$jobs_dir/requirements-omnivoice-worker.txt" venv
   venv="$HOME/.cache/vi/venv-$(sha256sum "$req" | cut -c1-16)"
   if [ ! -x "$venv/bin/python" ]; then
     python3 -m venv --system-site-packages "$venv"
@@ -181,118 +250,60 @@ tune_python() {
   fi
   printf '%s\n' "$venv/bin/python"
 }
-PY=$(tune_python)
+PY=$(ovft_python)
+ACCELERATE="$(dirname "$PY")/accelerate"
 
-# The official recipe's finetuning/ folder (dataset.py), pinned to the commit the guide was
-# read at (docs/design/qwen3tts-finetune-guide.md). voicetune.py's loader imports it.
-qwen_rev=022e286b98fbec7e1e916cb940cdf532cd9f488e
-qwen_ft="$HOME/.cache/vi/Qwen3-TTS-$qwen_rev/finetuning"
-if [ ! -f "$qwen_ft/dataset.py" ]; then
-  mkdir -p "$HOME/.cache/vi"
-  curl -fsSL "https://codeload.github.com/QwenLM/Qwen3-TTS/tar.gz/$qwen_rev" | tar xz -C "$HOME/.cache/vi"
-fi
-
-# The 3 fixed listening lines: plain neutral sentences, not from any labelled set. The same three
-# every epoch, so a line is generated the same across checkpoints and only the checkpoint differs.
-if [ -s "$data_dir/sentences.txt" ]; then
-  lines="$data_dir/sentences.txt"
-else
-  lines="$VI_OUT/sentences.txt"
-  cat >"$lines" <<'LINES'
-Let me check the readings.
-The system is holding steady.
-I'll be ready in a moment.
-LINES
-fi
-
-train_manifest="train_with_codes.jsonl"
-val_manifest="val_with_codes.jsonl"
-replay_manifest="replay_with_codes.jsonl"
-
-title="Fine-tuned voice: is this Tali, with no reference clip?"
-question="Is this Tali with her suit and accent? Note short-line glitches or speed-ups."
-
-# abort_reason LOG ELAPSED_S -> the check_abort reason, or empty. Pure Python, no qwen-tts import.
+# abort_reason METRICS_JSONL GUARD_JSONL FT_CONFIG_JSON -> the abort reason, or empty.
+# Pure stdlib python (jobs/omnivoice_abort.py): NaN in style_metrics.jsonl, or a collapse-guard
+# fire in the latest attempt. `-I` keeps the data folder's files off sys.path.
 abort_reason() {
-  [ -f "$1" ] || return 0
-  PYTHONPATH="$jobs_dir" "$PY" -c '
-import json, sys, voicetune
-recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-print(voicetune.check_abort(recs, float(sys.argv[2])) or "")
-' "$1" "$2"
+  python3 -I "$jobs_dir/omnivoice_abort.py" "$1" "$2" "$3"
 }
 
-# check_and_gate [--generate]: run check (writing check.json under VI_OUT), then gate VRAM and disk.
+# check_and_gate: report VRAM and disk (check.json under VI_OUT), then gate them against the
+# stage's floors (characters/tali/*.toml numbers arrive later; VI_MIN_VRAM_GB/VI_MIN_DISK_GB
+# override). Pure stdlib python, no venv.
 check_and_gate() {
-  local gen=()
-  [ "${1:-}" = "--generate" ] && gen=(--generate)
-  "$PY" "$jobs_dir/voicetune.py" check --out "$VI_OUT/check" --work-dir "$scratch" "${gen[@]}"
-  "$PY" - "$VI_OUT/check/check.json" <<'PY'
-import json, sys
-c = json.load(open(sys.argv[1]))
-vram, disk = c.get("vram_gb"), c.get("free_disk_gb")
-if vram is None or vram < 44:
-    print(f"check: VRAM {vram} GB < 44 GB", file=sys.stderr)
+  mkdir -p "$VI_OUT/check"
+  python3 - "$VI_OUT/check/check.json" <<'PY'
+import json, os, subprocess, sys
+min_vram = float(os.environ.get("VI_MIN_VRAM_GB", "24"))
+min_disk = float(os.environ.get("VI_MIN_DISK_GB", "100"))
+try:
+    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total,memory.used",
+                          "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    total, used = (float(x) for x in out.split(",")[:2])
+except Exception as e:
+    print(f"check: nvidia-smi failed: {e}", file=sys.stderr)
     sys.exit(1)
-if disk is None or disk < 60:
-    print(f"check: worker disk {disk} GB free < 60 GB", file=sys.stderr)
+st = os.statvfs(os.getcwd())
+disk = st.f_bavail * st.f_frsize / 2**30
+json.dump({"vram_total_gb": round(total / 1024, 1), "vram_free_gb": round((total - used) / 1024, 1),
+           "free_disk_gb": round(disk, 1)}, open(sys.argv[1], "w"), indent=1, sort_keys=True)
+if total / 1024 < min_vram:
+    print(f"check: VRAM {total / 1024:.0f} GB < {min_vram:.0f} GB", file=sys.stderr)
     sys.exit(1)
-print(f"check: VRAM {vram} GB, disk {disk} GB free")
+if disk < min_disk:
+    print(f"check: worker disk {disk:.0f} GB free < {min_disk:.0f} GB", file=sys.stderr)
+    sys.exit(1)
+print(f"check: VRAM {total / 1024:.0f} GB, disk {disk:.0f} GB free")
 PY
 }
 
 preflight() {
-  check_and_gate --generate
+  check_and_gate
 
-  # Row 35's loadbench: a short steady-state timing run at the real batch/accum/kl, after the venv
-  # and model load and before the 5-step probe. The probe starts cold (it read ~4x slow on
-  # 2026-11-04), so its time is not what the push gate uses. The loop also samples nvidia-smi after
-  # each timed step: that is the only honest load for row 31's clock gate. Warmup steps are dropped.
-  local steady_step steps_per_epoch steady_epoch
-  "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
-    --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
-    --kl 0.1 --batch 8 --accum 4 --epochs 1 --seed 0 --speaker clip \
-    --no-resume-file --loadbench-steps 6 --loadbench-warmup 2 --out "$scratch/loadbench-run"
-  read -r steady_step steps_per_epoch < <(PYTHONPATH="$jobs_dir" "$PY" - "$scratch/loadbench-run/loadbench.json" <<'PY'
-import json, sys
-lb = json.load(open(sys.argv[1]))
-print(lb["steady_step_s"], lb["steps_per_epoch"])
-PY
-)
-  steady_epoch=$(python3 -c 'import sys; print(round(float(sys.argv[1]) * int(sys.argv[2]), 3))' "$steady_step" "$steps_per_epoch")
+  # Five real steps at the full batch (--steps 5 --save-steps 5 writes checkpoint-5), published
+  # and pushed home as an end-to-end integrity proof, timed for the record. The Qwen3 loadbench
+  # and push-rate gate are gone: they were voicetune.py internals with no OmniVoice counterpart.
+  "$ACCELERATE" launch --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
+    --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
+    --output-dir "$probe_run" --steps 5 --save-steps 5 \
+    --num-workers "${VI_NUM_WORKERS:-2}"
+  [ -d "$probe_run/checkpoint-5" ] || { echo "preflight: no $probe_run/checkpoint-5 produced" >&2; exit 1; }
+  publish_sync "$probe_run" "$probe_publish"
 
-  # Row 31: a throttled card cannot finish the run on time. Fail when the median sm clock under
-  # load is below 70% of clocks.max.sm; active throttle reasons are named in the message.
-  PYTHONPATH="$jobs_dir" "$PY" - "$scratch/loadbench-run/loadbench.json" <<'PY'
-import json, sys, voicetune
-gpus = json.load(open(sys.argv[1])).get("gpu_under_load", [])
-ok, message = voicetune.gpu_clock_gate(gpus)
-print(f"check: {message}")
-if not ok:
-    print(f"worker preflight: {message}", file=sys.stderr)
-sys.exit(0 if ok else 1)
-PY
-
-  # Five optimizer steps at the full batch/accum/kl, published into the probe dir, to measure the
-  # peak memory of the real run before the paid one.
-  "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
-    --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
-    --kl 0.1 --batch 8 --accum 4 --epochs 1 --max-steps 5 --seed 0 --speaker clip \
-    --no-resume-file --publish "$probe_publish" --out "$probe_run"
-
-  "$PY" - "$probe_run/train_log.jsonl" <<'PY'
-import json, sys
-peak = max((r.get("peak_gb", 0) or 0) for r in (json.loads(l) for l in open(sys.argv[1]) if l.strip()))
-print(f"probe peak memory: {peak} GB")
-if peak > 44:
-    print(f"probe peak memory {peak} GB > 44 GB", file=sys.stderr)
-    sys.exit(1)
-PY
-
-  # Push the probe checkpoint home as an end-to-end integrity proof, timed for the record. It no
-  # longer gates on its own speed: row 35 derives the rate a real epoch needs from the probe's byte
-  # count and the loadbench steady step time, and compares it with the row-34 dummy push rate
-  # recorded in preflight.json (the probe's 5 cold steps underestimate the steady rate ~4x).
   local bytes seconds mb_s t0 t1
   bytes=$(du -sb "$probe_publish" | cut -f1)
   t0=$(date +%s%N)
@@ -301,40 +312,27 @@ PY
   seconds=$(( (t1 - t0) / 1000000000 ))
   [ "$seconds" -gt 0 ] || seconds=1
   mb_s=$(python3 -c 'import sys; print(round(int(sys.argv[1]) / int(sys.argv[2]) / 1e6, 2))' "$bytes" "$seconds")
-  PYTHONPATH="$jobs_dir" "$PY" - "$VI_OUT/preflight.json" "$bytes" "$seconds" "$mb_s" "$steady_epoch" "$steady_step" "$steps_per_epoch" <<'PY'
-import json, sys, voicetune
-
-path, epoch_bytes, seconds, mb_s = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
-steady_epoch, steady_step, steps_per_epoch = float(sys.argv[5]), float(sys.argv[6]), int(sys.argv[7])
+  python3 - "$VI_OUT/preflight.json" "$bytes" "$seconds" "$mb_s" <<'PY'
+import json, sys
+path, probe_bytes, seconds, mb_s = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
 try:
     report = json.load(open(path))
 except (OSError, ValueError):
     report = {}
-measured = float(report.get("push_mb_s") or 0)
-ok, required = voicetune.push_gate_from_steady_epoch_time_and_bytes(steady_epoch, epoch_bytes, measured)
-report.update({
-    "probe_bytes": epoch_bytes, "seconds": seconds, "mb_s": mb_s,
-    "steady_step_s": steady_step, "steps_per_epoch": steps_per_epoch,
-    "steady_epoch_seconds": round(steady_epoch, 3), "epoch_bytes": epoch_bytes,
-    "measured_push_mb_s": measured,
-    # Row 24 hook: this gate should later also require the projected end (steady epoch time times
-    # the epochs left, under the deadline) to fit. That belongs to a later wave; not implemented.
-    "push_gate": {"ok": ok, "required_mb_s": round(required, 2), "measured_mb_s": measured},
-})
+report.update({"probe_bytes": probe_bytes, "seconds": seconds, "mb_s": mb_s})
 json.dump(report, open(path, "w"), indent=1, sort_keys=True)
-print(f"probe push {mb_s} MB/s; an epoch of {epoch_bytes / 1e9:.1f} GB at {steady_epoch:.0f} s "
-      f"needs {required:.2f} MB/s, measured {measured} MB/s")
-if not ok:
-    print(f"probe push gate: {measured} MB/s < {required:.2f} MB/s needed to publish an epoch "
-          f"within its {steady_epoch:.0f} s", file=sys.stderr)
-sys.exit(0 if ok else 1)
+print(f"probe push {mb_s} MB/s ({probe_bytes} bytes in {seconds} s)")
 PY
 
-  # Speak one line from the probe epoch, so a real checkpoint's generate path is exercised too.
-  head -n1 "$lines" >"$scratch/one-line.txt"
-  "$PY" "$jobs_dir/voicetune.py" speak --run "$probe_run" --epoch 0 \
-    --sentences "$scratch/one-line.txt" --seed 0 --out "$VI_OUT/probe-speak"
-  rm -rf "$probe_run/voice-epoch-0"
+  # Speak one line from the probe checkpoint, so a real checkpoint's generate path is exercised
+  # too (infer_listening refuses an unverifiable checkpoint, so this also re-checks the contract).
+  mkdir -p "$VI_OUT/probe-speak"
+  "$PY" "$jobs_dir/omnivoice-ft/infer_listening.py" \
+    --checkpoint "$probe_run/checkpoint-5" --out "$VI_OUT/probe-speak" \
+    --base-model "$VI_BASE_MODEL" \
+    ${VI_AUDIO_TOKENIZER:+--audio-tokenizer "$VI_AUDIO_TOKENIZER"} \
+    --style-manifest "$data_dir/style_manifest.jsonl" \
+    --max-styles 1 --max-lines 1 --device "${VI_INFER_DEVICE:-cuda}"
 
   echo "preflight: ok"
 }
@@ -358,15 +356,17 @@ train() {
   # which the watchdog scans), not under --run.
   pid_file="$(dirname "$VI_OUT")/train.pid"
   # worker-job.sh detaches the trainer from this stage session, holds the job
-  # lock, writes train.pid and restarts a crash with --resume. This script
-  # stays the supervisor: it pushes finished epochs home and stops the run on
-  # the abort rules. 8>&- keeps the push lock from leaking into the detached
+  # lock, writes train.pid and restarts a crash with --resume-from-checkpoint
+  # (its resume flag change is part of this task). This script stays the
+  # supervisor: it pushes finished checkpoints home and stops the run on the
+  # abort rules. 8>&- keeps the push lock from leaking into the detached
   # trainer, so a killed supervisor really does release it.
   "$jobs_dir/worker-job.sh" --work "$(dirname "$VI_OUT")" --run "$run" \
-    --publish "$publish" -- "$PY" "$jobs_dir/voicetune.py" train --qwen-finetuning "$qwen_ft" \
-    --data "$train_manifest" --val "$val_manifest" --replay "$replay_manifest" \
-    --epochs 6 --lr 2e-6 --kl 0.1 --batch 8 --accum 4 --seed 0 --speaker clip \
-    --publish "$publish" --out "$run" 8>&- &
+    --publish "$publish" -- "$ACCELERATE" launch --num_processes 1 \
+    "$jobs_dir/omnivoice-ft/train_ft.py" \
+    --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
+    --output-dir "$run" --steps "${VI_TRAIN_STEPS:-5000}" --save-steps "${VI_SAVE_STEPS:-500}" \
+    --num-workers "${VI_NUM_WORKERS:-2}" 8>&- &
   wj_pid=$!
   # If this script exits on its own (an abort, or a push failure), kill the
   # trainer. A signal that kills only the stage session must not: the detached
@@ -377,19 +377,20 @@ train() {
   trap 'dying=1; exit 143' HUP TERM
   trap '[ "$dying" = 1 ] || [ "${rc:-0}" -eq 75 ] || kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true' EXIT
 
-  # Watchdog: push each finished epoch home as it appears, and stop the run on the abort rules.
+  # Watchdog: push each finished checkpoint home as it appears, and stop the run on the abort
+  # rules (NaN loss; collapse guard fired in the latest attempt).
   reason=""
   while [ ! -s "$rc_file" ]; do
+    publish_sync "$run" "$publish"
     # A loop push failure must not orphan the running train, so it is non-fatal
     # here; the final push below is the one that decides success.
     push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
-    elapsed=$(( $(date +%s) - start ))
-    reason=$(abort_reason "$run/train_log.jsonl" "$elapsed")
+    reason=$(abort_reason "$run/style_metrics.jsonl" "$run/collapse_guard.jsonl" "$run/ft_config.json")
     if [ -n "$reason" ]; then
       echo "train abort: $reason" >&2
       # Written before the kill: worker-job.sh sees it and never restarts an
       # aborted run.
-      "$PY" -c 'import json, sys; print(json.dumps({"reason": sys.argv[1]}))' "$reason" >"$run/abort.json"
+      python3 -c 'import json, sys; print(json.dumps({"reason": sys.argv[1]}))' "$reason" >"$run/abort.json"
       kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
       break
     fi
@@ -400,50 +401,39 @@ train() {
   rc=$?
   set -e
   trap - EXIT HUP TERM
-  push_publish "$publish"  # push what exists (the final epochs, or the ones before an abort)
+  publish_sync "$run" "$publish"
+  push_publish "$publish"  # push what exists (the final checkpoints, or the ones before an abort)
   if [ -n "$reason" ]; then
     echo "train aborted: $reason" >&2
     exit 1
   fi
   [ "$rc" -eq 0 ] || { echo "train failed: exit $rc" >&2; exit "$rc"; }
 
-  # The 6 delivery clips, chosen from the train manifest by seed 0 alone (never a label/mood tag).
-  mapfile -t deliveries < <(PYTHONPATH="$jobs_dir" "$PY" -c '
-import json, sys, voicetune
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-for cid, path in voicetune.delivery_clips(rows, 0, 6):
-    print(cid + "=" + path)
-' "$train_manifest")
-  [ "${#deliveries[@]}" -eq 6 ] || { echo "train: expected 6 delivery clips, got ${#deliveries[@]}" >&2; exit 1; }
-
-  # Unblinded listening set: 3 fixed lines at every epoch (18 clips), plus 3 delivery clips at each
-  # of the last two epochs, each speaking line 0 with that clip's own x-vector in the slot (6 clips).
-  local platter="$VI_OUT/platter" epoch one delivery_args dv
+  # Labelled listening sets at steps 1000/2500/5000 (decision Q1b), built from those checkpoints
+  # BEFORE home can prune them away: prune keeps only the two newest plus the exempt 1000/2500,
+  # so the sets must exist by the time the run ends. infer_listening writes listening.jsonl and a
+  # README.txt stating the rule — human listening decides voice quality; there is no automatic
+  # score. The sets land in the platter, which the hub presents as the one listening place.
+  local platter="$VI_OUT/platter" step
   mkdir -p "$platter"
-  for epoch in 0 1 2 3 4 5; do
-    "$PY" "$jobs_dir/voicetune.py" speak --run "$run" --epoch "$epoch" \
-      --sentences "$lines" --seed 0 --unblind --title "$title" --question "$question" \
-      --out "$platter"
-    if [ "$epoch" -ge 4 ]; then
-      one="$scratch/line0.txt"
-      head -n1 "$lines" >"$one"
-      delivery_args=()
-      case "$epoch" in
-        4) for dv in "${deliveries[0]}" "${deliveries[1]}" "${deliveries[2]}"; do delivery_args+=(--delivery-from "$dv"); done ;;
-        5) for dv in "${deliveries[3]}" "${deliveries[4]}" "${deliveries[5]}"; do delivery_args+=(--delivery-from "$dv"); done ;;
-      esac
-      "$PY" "$jobs_dir/voicetune.py" speak --run "$run" --epoch "$epoch" \
-        --sentences "$one" --seed 0 --unblind --title "$title" --question "$question" \
-        --no-plain "${delivery_args[@]}" --out "$platter"
+  for step in 1000 2500 5000; do
+    if [ ! -d "$run/checkpoint-$step" ]; then
+      echo "train: checkpoint-$step missing; skipping its listening set" >&2
+      continue
     fi
-    rm -rf "$run/voice-epoch-$epoch"  # the ~3.4 GB voice-model copy, deleted after speaking
+    "$PY" "$jobs_dir/omnivoice-ft/infer_listening.py" \
+      --checkpoint "$run/checkpoint-$step" --out "$platter/step-$step" \
+      --base-model "$VI_BASE_MODEL" \
+      ${VI_AUDIO_TOKENIZER:+--audio-tokenizer "$VI_AUDIO_TOKENIZER"} \
+      --style-manifest "$data_dir/style_manifest.jsonl" \
+      --max-styles "${VI_MAX_STYLES:-6}" --device "${VI_INFER_DEVICE:-cuda}"
   done
 
   # Run files for the record, beside the platter (check.json is already under VI_OUT/check).
-  cp "$run/voice.json" "$run/xvectors.json" "$run/train_log.jsonl" "$VI_OUT/"
+  cp "$run/ft_config.json" "$run/style_metrics.jsonl" "$run/collapse_guard.jsonl" "$VI_OUT/"
   cp "$VI_OUT/check/check.json" "$VI_OUT/" 2>/dev/null || true
 
-  echo "train: done; listening set in $platter"
+  echo "train: done; listening sets in $platter"
 }
 
 case "$MODE" in
