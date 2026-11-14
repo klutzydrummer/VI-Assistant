@@ -257,7 +257,10 @@ lr 5e-3 vs 1e-3 vs 5e-4 on the tiny continuous probe.
 
 Not run here (and therefore unverified): the real Base checkpoint on GPU, the real
 `extract_audio_tokens` -> shard loader path, real-audio inference with the Higgs decoder, and the
-real-data `z_spread` guard threshold. The claimed `k2-fsa/OmniVoice` HF cache was not found on
-this host (`~/.cache/huggingface` does not exist), so all model code paths were exercised with the
-tiny synthetic model only. On this NixOS host the venv needs the `LD_LIBRARY_PATH` above before
+real-data `z_spread` guard threshold. The `k2-fsa/OmniVoice` HF cache does exist on the host at
+`/home/brandon/.cache/huggingface/hub/models--k2-fsa--OmniVoice`; this sandbox's HOME differs, so
+it was not visible here and the real Base was not loaded (no downloads are allowed in-sandbox).
+All model code paths were therefore exercised with the tiny synthetic model only. A future
+environment can reuse the cache with `HF_HOME=/home/brandon/.cache/huggingface` and
+`HF_HUB_OFFLINE=1`. On this NixOS host the venv needs the `LD_LIBRARY_PATH` above before
 `numpy`/`omnivoice` can be imported.
