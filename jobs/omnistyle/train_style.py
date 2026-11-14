@@ -112,7 +112,7 @@ def _run_training_once(
     os.makedirs(output_dir, exist_ok=True)
     metrics_path = os.path.join(output_dir, "style_metrics.jsonl")
     guard_path = os.path.join(output_dir, "collapse_guard.jsonl")
-    counter = {"n": 0, "strikes": 0}
+    counter = {"n": 0, "strikes": 0, "injected": False}
     can_probe = guard and hasattr(ds, "clips_of_style")
 
     def guard_check(step: int):
@@ -136,17 +136,21 @@ def _run_training_once(
         if counter["n"] % logging_steps == 0 or counter["n"] == 1:
             with open(metrics_path, "a") as f:
                 f.write(json.dumps({"micro_step": counter["n"], **row}) + "\n")
-        if inject_collapse_at is not None and attempt == 0 and counter["n"] >= inject_collapse_at:
-            # Injection test hook: force the exact collapse mode seen on seed 4 (a style-blind code).  The
-            # layer is frozen after zeroing so the straight-through gradient through the layer norm cannot
-            # nudge it back before the next probe.
+        if (inject_collapse_at is not None and attempt == 0 and not counter["injected"]
+                and counter["n"] >= inject_collapse_at):
+            # Injection test hook: force the exact collapse mode seen on seed 4 (a style-blind code).
+            # `metrics_sink` runs inside the model's forward, after the autograd graph is built but before
+            # backward.  Zeroing the live weight in place would bump the version of the transposed weight
+            # view that the Linear's backward saved, which raises "a variable needed for gradient
+            # computation has been modified by an inplace operation".  Swapping in fresh zeroed, frozen
+            # Parameters leaves the tensors of this step's graph (and the optimizer's original parameters)
+            # untouched, so this backward is valid and every later forward uses the zeroed layer.
             with torch.no_grad():
-                model.style_encoder.to_code.weight.zero_()
-                if model.style_encoder.to_code.bias is not None:
-                    model.style_encoder.to_code.bias.zero_()
-            model.style_encoder.to_code.weight.requires_grad_(False)
-            if model.style_encoder.to_code.bias is not None:
-                model.style_encoder.to_code.bias.requires_grad_(False)
+                lin = model.style_encoder.to_code
+                lin.weight = torch.nn.Parameter(torch.zeros_like(lin.weight), requires_grad=False)
+                if lin.bias is not None:
+                    lin.bias = torch.nn.Parameter(torch.zeros_like(lin.bias), requires_grad=False)
+            counter["injected"] = True
         if can_probe and counter["n"] >= guard_warmup and counter["n"] % guard_every == 0:
             guard_check(counter["n"])
 
@@ -209,10 +213,12 @@ def run_training(
     see `workers/smoke/contin-fix-report.md`.)  Returns (trainer, model) of the successful attempt; the
     trainer also carries `.guard_log` and `.guard_attempts`.
 
-    `inject_collapse_at` (micro-step, attempt 0 only) zeroes and freezes the encoder's `to_code` layer from
-    that step on, forcing the exact collapse mode seen on seed 4 (a style-blind code); it exists for the
-    guard's injection test.  Resuming from a checkpoint disables retries (the same checkpoint would
-    reproduce the same run), so a collapse there raises.
+    `inject_collapse_at` (micro-step, attempt 0 only) swaps the encoder's `to_code` layer for a zeroed,
+    frozen copy from that step on, forcing the exact collapse mode seen on seed 4 (a style-blind code); it
+    exists for the guard's injection test.  The swap (rather than an in-place zero) keeps the autograd graph
+    of the step that triggers it valid, because the metrics sink runs inside the model's forward.  Resuming
+    from a checkpoint disables retries (the same checkpoint would reproduce the same run), so a collapse
+    there raises.
     """
     attempts = guard_attempts if (guard and resume_from is None and model is None) else 1
     guard_log: list = []
