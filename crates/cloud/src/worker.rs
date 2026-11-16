@@ -112,6 +112,84 @@ impl Host for SystemHost {
     }
 }
 
+/// Whether the worker is in use right now. `reap` consults this before
+/// releasing a worker for idleness; tests inject a fixed answer.
+pub trait Activity {
+    /// `Ok(true)` when an interactive session or another ssh connection is
+    /// using the worker, `Ok(false)` when it is idle. `Err` when that cannot be
+    /// established, in which case `reap` keeps the worker.
+    fn busy(&self, ep: &Endpoint, known_hosts: &Path) -> Result<bool>;
+}
+
+/// The real activity probe: one ssh command on the worker. `who` lists
+/// interactive sessions (a non-interactive ssh command leaves no utmp entry,
+/// so the probe's own connection does not count), and an established inbound
+/// ssh connection beyond the probe's own also counts as use.
+pub struct SshActivity;
+
+/// The remote side of [`SshActivity`]: exit 10 when `who` shows an interactive
+/// session, 11 when `ss` shows more than one established inbound ssh
+/// connection (the probe's own is the one), 0 when idle. A missing `who` or
+/// `ss` exits 3 or 4, which the probe treats as a failed check.
+const ACTIVITY_CHECK: &str = r#"who_out=$(who) || exit 3
+ss_out=$(ss -Htn state established '( sport = :22 )') || exit 4
+[ -z "$who_out" ] || exit 10
+newline='
+'
+case "$ss_out" in *"$newline"*) exit 11 ;; esac
+exit 0"#;
+
+impl Activity for SshActivity {
+    fn busy(&self, ep: &Endpoint, known_hosts: &Path) -> Result<bool> {
+        use std::time::{Duration, Instant};
+
+        /// How long the whole probe may take before its ssh child is killed.
+        const TIMEOUT: Duration = Duration::from_secs(15);
+
+        // BatchMode=yes (from ssh_args) keeps the probe from prompting.
+        let mut child = Command::new("ssh")
+            .args(ssh_args(ep, known_hosts))
+            .args(["-o", "ConnectTimeout=5"])
+            .arg(format!("root@{}", ep.host))
+            .arg(ACTIVITY_CHECK)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::Worker(format!("could not run the activity check: {e}")))?;
+
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() >= TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::Worker(
+                        "the activity check timed out after 15 seconds".into(),
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => {
+                    return Err(Error::Worker(format!(
+                        "could not wait for the activity check: {e}"
+                    )))
+                }
+            }
+        };
+        match status.code() {
+            Some(0) => Ok(false),
+            Some(10 | 11) => Ok(true),
+            Some(code) => Err(Error::Worker(format!(
+                "the activity check failed (ssh exited with status {code})"
+            ))),
+            None => Err(Error::Worker(
+                "the activity check was killed by a signal".into(),
+            )),
+        }
+    }
+}
+
 /// The ssh options every connection to the worker uses (no user or host).
 pub fn ssh_args(ep: &Endpoint, known_hosts: &Path) -> Vec<String> {
     vec![
@@ -726,8 +804,10 @@ impl<V: Vast, H: Host> Cloud<V, H> {
     }
 
     /// Releases the worker if it has been idle for `idle_minutes` or up for
-    /// `max_hours`. Returns why, if it did.
-    pub fn reap(&self) -> Result<Option<String>> {
+    /// `max_hours`. Returns why, if it did. An idle release only happens when
+    /// `activity` says the worker is idle; a busy worker, or one whose activity
+    /// can't be checked, is kept (the `max_hours` backstop still applies).
+    pub fn reap(&self, activity: &dyn Activity) -> Result<Option<String>> {
         let Some(t) = self.state.load()? else {
             return Ok(None);
         };
@@ -735,7 +815,8 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         let idle = now.saturating_sub(t.last_used) / 60;
         let up = now.saturating_sub(t.created) / 60;
         let max = self.cfg.max_minutes();
-        let why = if idle >= self.cfg.idle_minutes {
+        let idle_release = idle >= self.cfg.idle_minutes && self.idle_confirmed(&t, activity);
+        let why = if idle_release {
             format!("idle for {idle} minutes")
         } else if max > 0 && up >= max {
             format!("up for {up} minutes, the max_hours limit")
@@ -746,6 +827,27 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         // checkpoint must still be released rather than kept billing.
         self.destroy()?;
         Ok(Some(why))
+    }
+
+    /// True only when the probe says the worker is idle. A busy worker, or one
+    /// whose activity cannot be checked (including one with no endpoint yet),
+    /// is never released for idleness: reaping on a guess can kill a live
+    /// session.
+    fn idle_confirmed(&self, t: &Tracked, activity: &dyn Activity) -> bool {
+        let Some(ep) = &t.endpoint else {
+            return false;
+        };
+        match activity.busy(ep, &self.state.known_hosts(t.id)) {
+            Ok(false) => true,
+            Ok(true) => false,
+            Err(e) => {
+                self.host.log(&format!(
+                    "vi cloud reap: keeping worker {}; its activity could not be checked: {e}",
+                    t.id
+                ));
+                false
+            }
+        }
     }
 
     /// Marks the worker as in use now. Returns it, if there is one.
@@ -964,6 +1066,25 @@ mod tests {
         fn log(&self, _: &str) {}
     }
 
+    /// The fixed answer the reap tests inject instead of the real ssh probe.
+    enum Answer {
+        Idle,
+        Busy,
+        Failed,
+    }
+
+    struct FakeActivity(Answer);
+
+    impl Activity for FakeActivity {
+        fn busy(&self, _: &Endpoint, _: &Path) -> Result<bool> {
+            match self.0 {
+                Answer::Idle => Ok(false),
+                Answer::Busy => Ok(true),
+                Answer::Failed => Err(Error::Worker("probe unavailable".into())),
+            }
+        }
+    }
+
     fn offer(id: u64, machine: u64, dph: f64) -> Offer {
         Offer {
             id,
@@ -1104,14 +1225,80 @@ mod tests {
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
 
         host.now.set(1000 + 19 * 60);
-        assert_eq!(c.reap().unwrap(), None);
+        assert_eq!(c.reap(&FakeActivity(Answer::Idle)).unwrap(), None);
         c.touch().unwrap();
         host.now.set(1000 + 38 * 60);
-        assert_eq!(c.reap().unwrap(), None);
+        assert_eq!(c.reap(&FakeActivity(Answer::Idle)).unwrap(), None);
         host.now.set(1000 + 39 * 60);
-        assert_eq!(c.reap().unwrap().unwrap(), "idle for 20 minutes");
+        assert_eq!(
+            c.reap(&FakeActivity(Answer::Idle)).unwrap().unwrap(),
+            "idle for 20 minutes"
+        );
         assert_eq!(*vast.destroyed.borrow(), vec![100]);
-        assert_eq!(c.reap().unwrap(), None);
+        assert_eq!(c.reap(&FakeActivity(Answer::Idle)).unwrap(), None);
+    }
+
+    #[test]
+    fn reap_keeps_a_worker_the_probe_sees_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+
+        host.now.set(1000 + 21 * 60);
+        assert_eq!(c.reap(&FakeActivity(Answer::Busy)).unwrap(), None);
+        assert!(vast.destroyed.borrow().is_empty());
+        assert!(c.state.load().unwrap().is_some());
+    }
+
+    #[test]
+    fn reap_releases_a_worker_the_probe_sees_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+
+        host.now.set(1000 + 21 * 60);
+        assert_eq!(
+            c.reap(&FakeActivity(Answer::Idle)).unwrap().unwrap(),
+            "idle for 21 minutes"
+        );
+        assert_eq!(*vast.destroyed.borrow(), vec![100]);
+        assert_eq!(c.state.load().unwrap(), None);
+    }
+
+    #[test]
+    fn reap_keeps_a_worker_when_the_probe_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+
+        host.now.set(1000 + 21 * 60);
+        assert_eq!(c.reap(&FakeActivity(Answer::Failed)).unwrap(), None);
+        assert!(vast.destroyed.borrow().is_empty());
+        assert!(c.state.load().unwrap().is_some());
     }
 
     #[test]
@@ -1129,7 +1316,33 @@ mod tests {
             host.now.set(host.now.get() + 10 * 60);
             c.touch().unwrap();
         }
-        assert!(c.reap().unwrap().unwrap().contains("max_hours"));
+        assert!(c
+            .reap(&FakeActivity(Answer::Idle))
+            .unwrap()
+            .unwrap()
+            .contains("max_hours"));
+    }
+
+    #[test]
+    fn max_hours_releases_even_when_the_probe_sees_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        };
+        let host = FakeHost { now: Cell::new(0) };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+
+        host.now.set(24 * 60 * 60);
+        assert!(c
+            .reap(&FakeActivity(Answer::Busy))
+            .unwrap()
+            .unwrap()
+            .contains("max_hours"));
+        assert_eq!(*vast.destroyed.borrow(), vec![100]);
+        assert_eq!(c.state.load().unwrap(), None);
     }
 
     #[test]

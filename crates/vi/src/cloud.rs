@@ -3,7 +3,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::{Command, ExitCode};
 
-use cloud::worker::ssh_args;
+use cloud::worker::{ssh_args, SshActivity};
 use cloud::{Cloud, Config, HttpVast, Offer, StateDir, SystemHost};
 
 fn fail(e: impl std::fmt::Display) -> ExitCode {
@@ -33,7 +33,7 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
         ["hostkey"] => hostkey(&c),
         ["down"] => down(&c, force),
         ["status"] => status(&c),
-        ["reap"] => match c.reap() {
+        ["reap"] => match c.reap(&SshActivity) {
             Ok(Some(why)) => {
                 println!("released the worker: {why}");
                 ExitCode::SUCCESS
