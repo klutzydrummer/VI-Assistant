@@ -49,7 +49,7 @@ ALLOWLIST = [
     ("jobs/voicetune_data.py", r"\.unlink\(missing_ok=True\)", "out/: the raw manifest replaced by the coded one"),
     ("jobs/voicetune-fresh.sh", r'rm -rf "\$d"', "a stale published checkpoint copy this script made in its publish dir (guard-removed or replaced)"),
     ("jobs/voicetune-fresh.sh", r'rm -f "\$work/pushed/checkpoint-\$n"', "the worker job dir's pushed marker for a checkpoint the trainer replaced"),
-    ("jobs/voicetune-fresh.sh", r'rm -f "\$work/repush/checkpoint-\$1"', "the worker job dir's repush marker and fail counter"),
+    ("jobs/voicetune-fresh.sh", r'rm -f "\$work/repush/\$1"', "the worker job dir's repush marker and fail counter"),
     ("jobs/voicetune-fresh.sh", r'rm -f "\$rp" "\$f"', "the worker job dir's repush marker and fail counter"),
     ("jobs/voicetune-fresh.sh", r'rm -f "\$work/push\.pid"', "the worker job dir's push-loop pid file"),
     ("jobs/worker-job.sh", r'rm -f "\$p"', "the worker job dir's pending marker once its epoch is acked"),

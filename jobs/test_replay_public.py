@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
+import unittest
 from pathlib import Path
-
-import pytest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 for _p in (HERE / "omnivoice-ft", HERE / "ttstest"):
@@ -83,102 +84,108 @@ def _precreate_wavs(out: Path, *ns):
 # ---------------------------------------------------------------------------
 
 
-def test_manifest_schema_ids_and_label_blind(tmp_path):
-    texts = ['"Or like Sancho Panza\'s island," said North.', "A second line."]
-    _write_texts(tmp_path / "texts.jsonl", texts)
-    voices_dir = tmp_path / "voices"
-    _write_voices(voices_dir, 2)
-    calls = []
-    manifest = RP.generate(tmp_path / "out", texts,
-                           sorted(voices_dir.glob("*.wav")), synth=_stub(calls))
-    rows = _read_jsonl(manifest)
-    assert [r["id"] for r in rows] == ["replay-0000", "replay-0001"]
-    for i, row in enumerate(rows):
-        # exact schema: these five fields and nothing else (no mood/rating/... leak)
-        assert set(row) == {"id", "audio_path", "text", "language_id", "replay"}
-        assert row["text"] == texts[i]
-        assert row["language_id"] == "en"
-        assert row["replay"] is True
-        p = Path(row["audio_path"])
-        assert p.is_absolute() and p.is_file() and p.stat().st_size > 44
-        assert p == (tmp_path / "out" / "replay-wavs" / f"replay-{i:04d}.wav").resolve()
-    # the stub saw the exact texts and two different refs (round-robin over 2 voices)
-    assert [c[0] for c in calls] == texts
-    assert len({c[1] for c in calls}) == 2
+class ReplayPublicTest(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.tmp_path = Path(td.name)
+
+    def test_manifest_schema_ids_and_label_blind(self):
+        texts = ['"Or like Sancho Panza\'s island," said North.', "A second line."]
+        _write_texts(self.tmp_path / "texts.jsonl", texts)
+        voices_dir = self.tmp_path / "voices"
+        _write_voices(voices_dir, 2)
+        calls = []
+        manifest = RP.generate(self.tmp_path / "out", texts,
+                               sorted(voices_dir.glob("*.wav")), synth=_stub(calls))
+        rows = _read_jsonl(manifest)
+        assert [r["id"] for r in rows] == ["replay-0000", "replay-0001"]
+        for i, row in enumerate(rows):
+            # exact schema: these five fields and nothing else (no mood/rating/... leak)
+            assert set(row) == {"id", "audio_path", "text", "language_id", "replay"}
+            assert row["text"] == texts[i]
+            assert row["language_id"] == "en"
+            assert row["replay"] is True
+            p = Path(row["audio_path"])
+            assert p.is_absolute() and p.is_file() and p.stat().st_size > 44
+            assert p == (self.tmp_path / "out" / "replay-wavs" / f"replay-{i:04d}.wav").resolve()
+        # the stub saw the exact texts and two different refs (round-robin over 2 voices)
+        assert [c[0] for c in calls] == texts
+        assert len({c[1] for c in calls}) == 2
+
+    def test_round_robin_and_voice_flag(self):
+        texts = ["a", "b", "c", "d"]
+        voices_dir = self.tmp_path / "voices"
+        _write_voices(voices_dir, 3)
+        voices = sorted(voices_dir.glob("*.wav"))
+        calls = []
+        RP.generate(self.tmp_path / "out", texts, voices, synth=_stub(calls))
+        assert [Path(c[1]).name for c in calls] == ["0.wav", "1.wav", "2.wav", "0.wav"]
+        calls2 = []
+        RP.generate(self.tmp_path / "out2", texts, voices, synth=_stub(calls2), voice=1)
+        assert [Path(c[1]).name for c in calls2] == ["1.wav"] * 4
+
+    def test_read_texts_only_field_and_limit(self):
+        p = self.tmp_path / "texts.jsonl"
+        _write_texts(p, ["one", "two", "three"])
+        assert RP.read_texts(p) == ["one", "two", "three"]
+        assert RP.read_texts(p, 2) == ["one", "two"]
+        bad = self.tmp_path / "bad.jsonl"
+        bad.write_text(json.dumps({"no_text": "x"}) + "\n", encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            RP.read_texts(bad)
+
+    def test_main_only_wiring_never_loads_model(self):
+        # Both wavs already exist, so main() must not touch the real adapter even for --only 1.
+        out = self.tmp_path / "out"
+        _precreate_wavs(out, 0, 1)
+        _write_texts(self.tmp_path / "texts.jsonl", ["one", "two"])
+        voices_dir = self.tmp_path / "voices"
+        _write_voices(voices_dir, 1)
+        with mock.patch.object(
+                RP, "load_omnivoice",
+                side_effect=lambda *a, **k: self.fail("real adapter must not load when wavs exist")):
+            code = RP.main(["--out-dir", str(out), "--texts", str(self.tmp_path / "texts.jsonl"),
+                            "--voices", str(voices_dir), "--device", "cpu", "--only", "1"])
+        assert code == 0
+        rows = _read_jsonl(out / "replay_public.jsonl")
+        assert [r["id"] for r in rows] == ["replay-0000"]
+
+    def test_resume_skips_existing_wavs(self):
+        texts = ["one", "two", "three"]
+        out = self.tmp_path / "out"
+        pre = _precreate_wavs(out, 0)  # only line 0 exists
+        pre_bytes = (pre / "replay-0000.wav").read_bytes()
+        voices_dir = self.tmp_path / "voices"
+        _write_voices(voices_dir, 2)
+        calls = []
+        manifest = RP.generate(out, texts, sorted(voices_dir.glob("*.wav")), synth=_stub(calls))
+        assert [c[0] for c in calls] == ["two", "three"]  # line 0 skipped
+        assert (pre / "replay-0000.wav").read_bytes() == pre_bytes  # untouched
+        assert [r["id"] for r in _read_jsonl(manifest)] == ["replay-0000", "replay-0001", "replay-0002"]
+
+    def test_manifest_consumable_by_data_manifest(self):
+        # End-to-end schema check: data_manifest.py --replay-jsonl accepts the produced manifest.
+        texts = ["A replay line."]
+        voices_dir = self.tmp_path / "voices"
+        _write_voices(voices_dir, 1)
+        calls = []
+        manifest = RP.generate(self.tmp_path / "replays", texts,
+                               sorted(voices_dir.glob("*.wav")), synth=_stub(calls))
+        pool = self.tmp_path / "pool"
+        pool.mkdir()
+        wavio.write_wav(pool / "main.wav", wavio.sine(0.02, 24000, 300.0), 24000)
+        texts_p = pool / "texts.jsonl"
+        texts_p.write_text(json.dumps({"id": "main", "text": "A main line."}) + "\n", encoding="utf-8")
+        out = self.tmp_path / "built.jsonl"
+        summary = DM.build_manifest(pool_dir=str(pool), texts_jsonls=[str(texts_p)],
+                                    replay_jsonls=[str(manifest)], out=str(out))
+        rows = _read_jsonl(out)
+        assert summary["n_replay"] == 1 and summary["n_rows"] == 2
+        assert {r["id"] for r in rows} == {"main", "replay-0000"}
+        replay_row = next(r for r in rows if r["id"] == "replay-0000")
+        assert replay_row["replay"] is True and replay_row["text"] == texts[0]
 
 
-def test_round_robin_and_voice_flag(tmp_path):
-    texts = ["a", "b", "c", "d"]
-    voices_dir = tmp_path / "voices"
-    _write_voices(voices_dir, 3)
-    voices = sorted(voices_dir.glob("*.wav"))
-    calls = []
-    RP.generate(tmp_path / "out", texts, voices, synth=_stub(calls))
-    assert [Path(c[1]).name for c in calls] == ["0.wav", "1.wav", "2.wav", "0.wav"]
-    calls2 = []
-    RP.generate(tmp_path / "out2", texts, voices, synth=_stub(calls2), voice=1)
-    assert [Path(c[1]).name for c in calls2] == ["1.wav"] * 4
-
-
-def test_read_texts_only_field_and_limit(tmp_path):
-    p = tmp_path / "texts.jsonl"
-    _write_texts(p, ["one", "two", "three"])
-    assert RP.read_texts(p) == ["one", "two", "three"]
-    assert RP.read_texts(p, 2) == ["one", "two"]
-    bad = tmp_path / "bad.jsonl"
-    bad.write_text(json.dumps({"no_text": "x"}) + "\n", encoding="utf-8")
-    with pytest.raises(SystemExit):
-        RP.read_texts(bad)
-
-
-def test_main_only_wiring_never_loads_model(tmp_path, monkeypatch):
-    # Both wavs already exist, so main() must not touch the real adapter even for --only 1.
-    out = tmp_path / "out"
-    _precreate_wavs(out, 0, 1)
-    _write_texts(tmp_path / "texts.jsonl", ["one", "two"])
-    voices_dir = tmp_path / "voices"
-    _write_voices(voices_dir, 1)
-    monkeypatch.setattr(RP, "load_omnivoice",
-                        lambda *a, **k: pytest.fail("real adapter must not load when wavs exist"))
-    code = RP.main(["--out-dir", str(out), "--texts", str(tmp_path / "texts.jsonl"),
-                    "--voices", str(voices_dir), "--device", "cpu", "--only", "1"])
-    assert code == 0
-    rows = _read_jsonl(out / "replay_public.jsonl")
-    assert [r["id"] for r in rows] == ["replay-0000"]
-
-
-def test_resume_skips_existing_wavs(tmp_path):
-    texts = ["one", "two", "three"]
-    out = tmp_path / "out"
-    pre = _precreate_wavs(out, 0)  # only line 0 exists
-    pre_bytes = (pre / "replay-0000.wav").read_bytes()
-    voices_dir = tmp_path / "voices"
-    _write_voices(voices_dir, 2)
-    calls = []
-    manifest = RP.generate(out, texts, sorted(voices_dir.glob("*.wav")), synth=_stub(calls))
-    assert [c[0] for c in calls] == ["two", "three"]  # line 0 skipped
-    assert (pre / "replay-0000.wav").read_bytes() == pre_bytes  # untouched
-    assert [r["id"] for r in _read_jsonl(manifest)] == ["replay-0000", "replay-0001", "replay-0002"]
-
-
-def test_manifest_consumable_by_data_manifest(tmp_path):
-    # End-to-end schema check: data_manifest.py --replay-jsonl accepts the produced manifest.
-    texts = ["A replay line."]
-    voices_dir = tmp_path / "voices"
-    _write_voices(voices_dir, 1)
-    calls = []
-    manifest = RP.generate(tmp_path / "replays", texts,
-                           sorted(voices_dir.glob("*.wav")), synth=_stub(calls))
-    pool = tmp_path / "pool"
-    pool.mkdir()
-    wavio.write_wav(pool / "main.wav", wavio.sine(0.02, 24000, 300.0), 24000)
-    texts_p = pool / "texts.jsonl"
-    texts_p.write_text(json.dumps({"id": "main", "text": "A main line."}) + "\n", encoding="utf-8")
-    out = tmp_path / "built.jsonl"
-    summary = DM.build_manifest(pool_dir=str(pool), texts_jsonls=[str(texts_p)],
-                                replay_jsonls=[str(manifest)], out=str(out))
-    rows = _read_jsonl(out)
-    assert summary["n_replay"] == 1 and summary["n_rows"] == 2
-    assert {r["id"] for r in rows} == {"main", "replay-0000"}
-    replay_row = next(r for r in rows if r["id"] == "replay-0000")
-    assert replay_row["replay"] is True and replay_row["text"] == texts[0]
+if __name__ == "__main__":
+    unittest.main()
