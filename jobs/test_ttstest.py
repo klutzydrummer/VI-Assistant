@@ -3,6 +3,7 @@ Run with `python3 -m unittest discover -s jobs`. Standard library only; no netwo
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -616,8 +617,17 @@ class ReapLoopTest(unittest.TestCase):
         path.chmod(0o755)
 
     def run_loop(self, **env):
-        e = {"PATH": "/usr/bin:/bin:" + os.path.dirname(sys.executable), "REAP_INTERVAL": "1", **env}
-        return subprocess.run(["bash", str(self.script)], env=e, capture_output=True, text=True, timeout=30)
+        # Hermetic PATH: an empty dir, so no system `vi` (e.g. /usr/bin/vi on the CI runner) can be found
+        # and send the by-design infinite loop into the timeout. Tests that need a vi pass VI_BIN or
+        # place one under the script's tree. bash is resolved to an absolute path here in the parent;
+        # the few coreutils the script itself calls are symlinked in (it needs dirname to find its tree).
+        empty = self.root / "emptybin"
+        empty.mkdir(exist_ok=True)
+        for tool in ("dirname", "date", "sleep"):
+            if not (empty / tool).exists():
+                (empty / tool).symlink_to(shutil.which(tool))
+        e = {"PATH": str(empty), "REAP_INTERVAL": "1", **env}
+        return subprocess.run([shutil.which("bash"), str(self.script)], env=e, capture_output=True, text=True, timeout=30)
 
     def test_none_found_fails_loudly(self):
         r = self.run_loop()
