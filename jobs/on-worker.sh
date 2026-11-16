@@ -72,6 +72,12 @@ vi=${VI_BIN:-vi}
 min_home_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("min_home_gb",""))' "$VI_SETTINGS")
 reserve_gb=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("home_gate_reserve_gb",""))' "$VI_SETTINGS")
 expect_epochs=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("expect_epochs",""))' "$VI_SETTINGS")
+# The checkpoint layout this stage publishes. checkpoints.py defaults to the
+# omnivoice checkpoint-<step> layout, but this runner's acks, globs and
+# expect_epochs count speak the legacy epoch-<k> layout, so that stays the
+# default here; a stage opts in with checkpoint_format = "omnivoice".
+ckpt_format=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("checkpoint_format","epoch"))' "$VI_SETTINGS")
+case $ckpt_format in epoch|omnivoice) ;; *) echo "on-worker.sh: checkpoint_format must be epoch or omnivoice, got '$ckpt_format'" >&2; exit 1 ;; esac
 stage_upload=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("max_upload_minutes",""))' "$VI_SETTINGS")
 case $stage_upload in ''|*[!0-9]*) stage_upload=30 ;; esac
 upload_limit=${VI_MAX_UPLOAD_MINUTES:-$stage_upload}
@@ -87,14 +93,14 @@ watchdog_log=${VI_WATCHDOG_LOG:-/var/log/vi-watchdog.log}
 
 gate_ok() {
   [ -z "$min_home_gb" ] && return 0
-  python3 "$jobs_dir/checkpoints.py" gate "$HOME" --min-gb "$min_home_gb" --reserve-gb "${reserve_gb:-0}" >/dev/null 2>&1
+  python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" gate "$HOME" --min-gb "$min_home_gb" --reserve-gb "${reserve_gb:-0}" >/dev/null 2>&1
 }
 
 # Refuse to start under the floor plus the reserve before anything is packed or
 # a worker looked up, so the GPU is never billed with too little home disk to
 # hold the result.
 if [ -n "$min_home_gb" ]; then
-  python3 "$jobs_dir/checkpoints.py" gate "$HOME" --min-gb "$min_home_gb" --reserve-gb "${reserve_gb:-0}"
+  python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" gate "$HOME" --min-gb "$min_home_gb" --reserve-gb "${reserve_gb:-0}"
 fi
 
 # Pack each large input into one zstd'd tar at home before touching the
@@ -776,7 +782,7 @@ ack_epochs() {  # ACKED REPUSH BAD
     case $repush in *" epoch-$n "*) continue ;; esac
     case $bad in *" epoch-$n "*) continue ;; esac
     [ -f "$ep/SHA256SUMS" ] || continue
-    if python3 "$jobs_dir/checkpoints.py" verify-epoch "$durable" "$n" >/dev/null 2>&1; then
+    if python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify-epoch "$durable" "$n" >/dev/null 2>&1; then
       if remote "mkdir -p $(q "$work/acked") && : > $(q "$work/acked/epoch-$n")"; then
         echo "on-worker.sh: epoch $n verified home and acked" >&2
       else
@@ -1052,7 +1058,7 @@ if [ "$final_ok" = 1 ]; then
     expect_epochs=0
   fi
   if [ -n "$durable" ]; then
-    if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" verify "$durable" --expect "$expect_epochs"; then
+    if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify "$durable" --expect "$expect_epochs"; then
       echo "on-worker.sh: verify failed for $durable" >&2
       exit 1
     fi

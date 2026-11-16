@@ -1323,6 +1323,59 @@ fn wj_reduces_workers_only_when_oom_kill_counter_rises() {
     );
 }
 
+/// Stand-ins for the OmniVoice worker environment that `voicetune-fresh.sh train`
+/// needs: a python that does nothing, an `accelerate` beside it that is the
+/// long-running trainer (`sleep SECS`), and an `nvidia-smi` that passes the
+/// VRAM gate. Returns the stub dir (put it first on PATH) and the python path.
+fn omnivoice_train_stubs(dir: &Path, trainer_secs: u32) -> (PathBuf, PathBuf) {
+    let stubs = dir.join("stubs");
+    fs::create_dir_all(&stubs).unwrap();
+    let write_exe = |name: &str, body: String| {
+        let p = stubs.join(name);
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_exe("python", "#!/bin/sh\nexit 0\n".to_string());
+    write_exe(
+        "accelerate",
+        format!("#!/bin/sh\nexec sleep {trainer_secs}\n"),
+    );
+    write_exe("nvidia-smi", "#!/bin/sh\necho '81920, 0'\n".to_string());
+    let py = stubs.join("python");
+    (stubs, py)
+}
+
+/// Env for `bash voicetune-fresh.sh train` against `omnivoice_train_stubs`.
+fn omnivoice_train_cmd(
+    vf: &Path,
+    stubs: &Path,
+    py: &Path,
+    out_dir: &Path,
+    data: &Path,
+    home: &Path,
+) -> Command {
+    let mut cmd = Command::new("bash");
+    cmd.arg(vf)
+        .arg("train")
+        .env("VI_OUT", out_dir)
+        .env("VI_RETURN_PORT", "1")
+        .env("VI_INPUT_VOICETUNE_DATA", data)
+        .env("VI_BASE_MODEL", data)
+        .env("OVFT_PYTHON", py)
+        .env("VI_MIN_DISK_GB", "0")
+        .env("VI_TRAIN_RETRIES", "0")
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stubs.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    cmd
+}
+
 /// Row 38: voicetune-fresh.sh dying (HUP from the stage session, then its own
 /// abort/teardown) must not kill the trainer; worker-job.sh keeps it running
 /// and records the exit. The home supervisor's relaunch is a later task.
@@ -1331,46 +1384,17 @@ fn trainer_survives_vf_kill() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let vf = jobs_file("voicetune-fresh.sh");
-    let text = fs::read_to_string(&vf).unwrap();
-    let rev = text
-        .lines()
-        .find_map(|l| l.strip_prefix("qwen_rev="))
-        .expect("voicetune-fresh.sh names the qwen revision")
-        .trim();
-    let ft = home.join(format!(".cache/vi/Qwen3-TTS-{rev}/finetuning"));
-    fs::create_dir_all(&ft).unwrap();
-    fs::write(ft.join("dataset.py"), "").unwrap();
     let data = dir.path().join("data");
     fs::create_dir_all(&data).unwrap();
     let work = dir.path().join("work");
     let out_dir = work.join("out");
     fs::create_dir_all(&out_dir).unwrap();
 
-    // A stand-in for the qwen-tts venv: passes the check gate, then is the
-    // long-running trainer.
-    let py = dir.path().join("py");
-    fs::write(
-        &py,
-        "#!/bin/sh\ncase \"$*\" in\n\
-         *'voicetune.py train'*) exec sleep 30 ;;\n\
-         *'voicetune.py check'*)\n\
-         out=; prev=; for a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
-         mkdir -p \"$out\"; echo '{\"vram_gb\": 80, \"free_disk_gb\": 500}' > \"$out/check.json\"\n\
-         exit 0 ;;\n\
-         *) exit 0 ;;\nesac\n",
-    )
-    .unwrap();
-    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+    // Stand-ins for the OmniVoice venv: the accelerate stub is the
+    // long-running trainer, the rest pass the VRAM gate.
+    let (stubs, py) = omnivoice_train_stubs(dir.path(), 30);
 
-    let mut child = Command::new("bash")
-        .arg(&vf)
-        .arg("train")
-        .env("VI_OUT", &out_dir)
-        .env("VI_RETURN_PORT", "1")
-        .env("VI_INPUT_VOICETUNE_DATA", &data)
-        .env("QWEN_TTS_PYTHON", &py)
-        .env("VI_TRAIN_RETRIES", "0")
-        .env("HOME", &home)
+    let mut child = omnivoice_train_cmd(&vf, &stubs, &py, &out_dir, &data, &home)
         .process_group(0)
         .spawn()
         .unwrap();
@@ -1435,34 +1459,13 @@ fn vf_exit_75_does_not_kill_the_surviving_trainer() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let vf = jobs_file("voicetune-fresh.sh");
-    let text = fs::read_to_string(&vf).unwrap();
-    let rev = text
-        .lines()
-        .find_map(|l| l.strip_prefix("qwen_rev="))
-        .expect("voicetune-fresh.sh names the qwen revision")
-        .trim();
-    let ft = home.join(format!(".cache/vi/Qwen3-TTS-{rev}/finetuning"));
-    fs::create_dir_all(&ft).unwrap();
-    fs::write(ft.join("dataset.py"), "").unwrap();
     let data = dir.path().join("data");
     fs::create_dir_all(&data).unwrap();
     let work = dir.path().join("work");
     let out_dir = work.join("out");
     fs::create_dir_all(&out_dir).unwrap();
 
-    let py = dir.path().join("py");
-    fs::write(
-        &py,
-        "#!/bin/sh\ncase \"$*\" in\n\
-         *'voicetune.py train'*) exec sleep 60 ;;\n\
-         *'voicetune.py check'*)\n\
-         out=; prev=; for a in \"$@\"; do [ \"$prev\" = --out ] && out=$a; prev=$a; done\n\
-         mkdir -p \"$out\"; echo '{\"vram_gb\": 80, \"free_disk_gb\": 500}' > \"$out/check.json\"\n\
-         exit 0 ;;\n\
-         *) exit 0 ;;\nesac\n",
-    )
-    .unwrap();
-    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+    let (stubs, py) = omnivoice_train_stubs(dir.path(), 60);
 
     // Another attempt is alive and holds the job lock; its wrapper recorded
     // its trainer's pid before this relaunch arrived.
@@ -1485,15 +1488,7 @@ fn vf_exit_75_does_not_kill_the_surviving_trainer() {
     });
     fs::write(work.join("train.pid"), holder.id().to_string()).unwrap();
 
-    let out = Command::new("bash")
-        .arg(&vf)
-        .arg("train")
-        .env("VI_OUT", &out_dir)
-        .env("VI_RETURN_PORT", "1")
-        .env("VI_INPUT_VOICETUNE_DATA", &data)
-        .env("QWEN_TTS_PYTHON", &py)
-        .env("VI_TRAIN_RETRIES", "0")
-        .env("HOME", &home)
+    let out = omnivoice_train_cmd(&vf, &stubs, &py, &out_dir, &data, &home)
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);

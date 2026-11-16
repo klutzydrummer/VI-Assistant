@@ -16,10 +16,10 @@
 # removes its attempt's checkpoint dirs when it restarts with a new seed, so the publish mirror
 # tracks the run dir (hard links; a replaced checkpoint is re-copied and re-pushed).
 #
-# Home acks (jobs/on-worker.sh ack_epochs) still speak epoch-<k> and are out of this task's
-# scope, so the push loop keeps its own local $work/pushed/checkpoint-<step> markers instead of
-# waiting for acks, and still honors $work/acked/checkpoint-<step> if a future on-worker.sh
-# writes them.
+# Home acks (jobs/on-worker.sh ack_epochs) still speak epoch-<k>, so the push loop serves both
+# layouts: epoch-<k> dirs are acked and repaired through home's acks, while checkpoint-<step>
+# dirs keep a local $work/pushed/checkpoint-<step> marker instead of waiting for acks (and still
+# honor $work/acked/checkpoint-<step> if a future on-worker.sh writes them).
 #
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
 #   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home, holding
@@ -90,18 +90,26 @@ publish_sync() {
   done
 }
 
-# Which finished checkpoints still need to go home. Home acks ($work/acked/checkpoint-<step>)
-# or this script's own pushed markers ($work/pushed/checkpoint-<step>) exclude a checkpoint from
-# the whole-directory push; everything else is re-sent (rsync skips unchanged files) every pass.
+# The publish dir holds checkpoint-<step> dirs (the omnivoice layout, train_ft.py) and, for a
+# stage on the legacy epoch layout, epoch-<k> dirs. Home's acks and repair requests use the
+# same names ($work/acked/<name>, $work/repush/<name>), so every loop below walks both. Only
+# checkpoint-<step> also gets this script's own pushed markers; an epoch is re-sent every pass
+# until home acks it.
+#
+# Which finished checkpoints still need to go home. Home acks ($work/acked/<name>) or, for a
+# checkpoint-<step>, this script's own pushed markers ($work/pushed/checkpoint-<step>) exclude
+# a checkpoint from the whole-directory push; everything else is re-sent (rsync skips
+# unchanged files) every pass.
 acked_checkpoints() {
-  local c n acked=()
-  for c in "$publish"/checkpoint-*; do
+  local c name n acked=()
+  for c in "$publish"/checkpoint-* "$publish"/epoch-*; do
     [ -d "$c" ] || continue
-    case ${c##*/} in *.part) continue ;; esac
-    n=${c##*/checkpoint-}
+    name=${c##*/}
+    case $name in *.part) continue ;; esac
+    n=${name#*-}
     case $n in ''|*[!0-9]*) continue ;; esac
-    if [ -e "$work/acked/checkpoint-$n" ] || [ -e "$work/pushed/checkpoint-$n" ]; then
-      acked+=("--exclude=/${c##*/}")
+    if [ -e "$work/acked/$name" ] || { [ "${name%%-*}" = checkpoint ] && [ -e "$work/pushed/$name" ]; }; then
+      acked+=("--exclude=/$name")
     fi
   done
   [ ${#acked[@]} -eq 0 ] || printf '%s\n' "${acked[@]}"
@@ -121,11 +129,11 @@ mark_pushed() {
   done
 }
 
-mark_bad() {  # N
+mark_bad() {  # NAME (checkpoint-<step> or epoch-<k>)
   mkdir -p "$work/bad"
-  : >"$work/bad/checkpoint-$1"
-  rm -f "$work/repush/checkpoint-$1" "$work/repush/checkpoint-$1.fails" "$work/pushed/checkpoint-$1"
-  echo "voicetune-fresh: ALERT: checkpoint $1 failed three repair pushes; marked $work/bad/checkpoint-$1 and no longer retried (the corrupt copy stays home beside the repaired files)" >&2
+  : >"$work/bad/$1"
+  rm -f "$work/repush/$1" "$work/repush/$1.fails" "$work/pushed/$1"
+  echo "voicetune-fresh: ALERT: ${1%%-*} ${1#*-} failed three repair pushes; marked $work/bad/$1 and no longer retried (the corrupt copy stays home beside the repaired files)" >&2
 }
 
 # push_repairs: re-send checkpoints home found corrupt. --checksum ignores size and
@@ -134,33 +142,37 @@ mark_bad() {  # N
 # the checkpoint-<step>/ layout the whole-directory push uses. After three failed
 # pushes the checkpoint is marked bad, loudly, and never retried.
 push_repairs() {
-  local rp n fails f
-  for rp in "$work/repush"/checkpoint-*; do
+  local rp name kind n fails f
+  for rp in "$work/repush"/checkpoint-* "$work/repush"/epoch-*; do
     [ -e "$rp" ] || continue
-    case ${rp##*/} in *.fails) continue ;; esac
-    n=${rp##*/checkpoint-}
+    name=${rp##*/}
+    case $name in *.fails) continue ;; esac
+    kind=${name%%-*}
+    n=${name#*-}
     case $n in ''|*[!0-9]*) continue ;; esac
-    f="$work/repush/checkpoint-$n.fails"
+    f="$work/repush/$name.fails"
     fails=$(cat "$f" 2>/dev/null || true)
     case $fails in ''|*[!0-9]*) fails=0 ;; esac
-    if [ "$fails" -ge 3 ]; then mark_bad "$n"; continue; fi
-    if [ ! -d "$publish/checkpoint-$n" ]; then
+    if [ "$fails" -ge 3 ]; then mark_bad "$name"; continue; fi
+    if [ ! -d "$publish/$name" ]; then
       printf '%s\n' "$((fails + 1))" >"$f"
-      echo "voicetune-fresh: checkpoint $n not found in $publish; cannot repair it" >&2
-      [ "$((fails + 1))" -lt 3 ] || mark_bad "$n"
+      echo "voicetune-fresh: $kind $n not found in $publish; cannot repair it" >&2
+      [ "$((fails + 1))" -lt 3 ] || mark_bad "$name"
       continue
     fi
-    if "$jobs_dir/worker-return.sh" push "$publish/./checkpoint-$n" "${VI_PUBLISH:-vi-publish}" \
+    if "$jobs_dir/worker-return.sh" push "$publish/./$name" "${VI_PUBLISH:-vi-publish}" \
          --relative --checksum --backup --backup-dir=".rsync-replaced-$((fails + 1))" --exclude='*.part'; then
       rm -f "$rp" "$f"
-      mkdir -p "$work/pushed"
-      : >"$work/pushed/checkpoint-$n"
-      echo "voicetune-fresh: checkpoint $n re-sent; the copy it replaced is under .rsync-replaced-$((fails + 1))/" >&2
+      if [ "$kind" = checkpoint ]; then
+        mkdir -p "$work/pushed"
+        : >"$work/pushed/$name"
+      fi
+      echo "voicetune-fresh: $kind $n re-sent; the copy it replaced is under .rsync-replaced-$((fails + 1))/" >&2
     else
       fails=$((fails + 1))
       printf '%s\n' "$fails" >"$f"
-      echo "voicetune-fresh: checkpoint $n repair push failed ($fails/3)" >&2
-      [ "$fails" -lt 3 ] || mark_bad "$n"
+      echo "voicetune-fresh: $kind $n repair push failed ($fails/3)" >&2
+      [ "$fails" -lt 3 ] || mark_bad "$name"
     fi
   done
 }
@@ -181,7 +193,7 @@ push_publish() {
 }
 
 push_loop() {
-  local c n pending
+  local c name n rp pending
   while :; do
     publish_sync "$run" "$publish"
     push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
@@ -191,16 +203,19 @@ push_loop() {
       continue
     fi
     pending=0
-    for c in "$publish"/checkpoint-*; do
+    for c in "$publish"/checkpoint-* "$publish"/epoch-*; do
       [ -d "$c" ] || continue
-      case ${c##*/} in *.part) continue ;; esac
-      n=${c##*/checkpoint-}
+      name=${c##*/}
+      case $name in *.part) continue ;; esac
+      n=${name#*-}
       case $n in ''|*[!0-9]*) continue ;; esac
-      if [ ! -e "$work/acked/checkpoint-$n" ] && [ ! -e "$work/pushed/checkpoint-$n" ]; then
-        pending=1
+      if [ ! -e "$work/acked/$name" ]; then
+        if [ "${name%%-*}" = epoch ] || [ ! -e "$work/pushed/$name" ]; then
+          pending=1
+        fi
       fi
     done
-    for rp in "$work/repush"/checkpoint-*; do
+    for rp in "$work/repush"/checkpoint-* "$work/repush"/epoch-*; do
       [ -e "$rp" ] || continue
       case ${rp##*/} in *.fails) continue ;; esac
       pending=1
