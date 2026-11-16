@@ -7,6 +7,8 @@ Everything runs on hardware you control: a rented GPU today, your own later. No 
 ## Status
 Stage 1 in progress: Tali replies in character, with voice, from typed text.
 
+Future direction, under consideration and not current work: fine-tuning the Haru speech model on synthetic Tali data, and possibly swapping the interim chat model for a smaller one that acts as a thin personality layer over a stronger AI. See `docs/design/haru-future-direction.md`.
+
 ## Character packs
 A character is a folder under `characters/` (see `characters/tali/`):
 - `character.toml`: names, file paths, and voice reference clips per emotion

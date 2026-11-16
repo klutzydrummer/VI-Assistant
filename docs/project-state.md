@@ -22,6 +22,7 @@ A conversational assistant that feels like a friend and an executive assistant w
   1. **Target:** a fine-tuned TTS that needs no RVC and no reference clips, where the app's mood state drives the mood directly.
   2. No reference clips, with RVC at the end for a consistent voice.
   3. **Worst case:** a library of her reference clips plus RVC. This is roughly the interim voice.
+- **Future direction (Brandon, 2026-11-16; under consideration, not current work):** once Tali's voice and chat model work, generate a large synthetic dataset and fine-tune the Haru speech model with a KL penalty against forgetting. He also wants to consider a smaller chat model, with a thin personality layer over a stronger AI as a possible end goal. This may change the "Later" plans and the model choices below. Details, verified Haru facts and open questions: `docs/design/haru-future-direction.md`.
 - **Cheap character swaps:** zero-shot voice cloning plus a persona pack. Fine-tuning is an optional upgrade per character.
 
 ## Core design (Brandon's decisions; don't change without his explicit yes)
@@ -33,7 +34,7 @@ A conversational assistant that feels like a friend and an executive assistant w
 - **Full fine-tune of the voice model, not a LoRA** (decided 2026-10-30). One model covers all moods, trained on her real clips to keep her voice, accent and suit effect. A KL term on public LibriTTS-R replay lines guards against forgetting. There is no separate strength knob, because the mood state vector, through a projector, controls strength and mixing.
 - **No mood is dropped** on the strength of pre-fine-tune results. Every mood stays until the fine-tuned model has been tested.
 - **The suit effect** (her helmet filter) is removed only for analysis and clustering. The cloned voice keeps it.
-- **Models:** chat is Qwen3.8-27B Q8_0 with thinking on, and it must stay easy to swap. Voice is Qwen3-TTS 1.7B Base. Chat vectors come from our own builder (`vi vectors`, see `docs/vectors.md`).
+- **Models:** chat is Qwen3.8-27B Q8_0 with thinking on, and it must stay easy to swap (a smaller replacement is now under consideration; see the future-direction note above). Voice is Qwen3-TTS 1.7B Base. Chat vectors come from our own builder (`vi vectors`, see `docs/vectors.md`).
 - **RVC:** Collige01 (a fan-made RVC model) is the default and the quality bar. It beat AI-Wheelz in Brandon's blind A/B. It is unlicensed, so it can't ship. Our own RVC model is planned.
 
 ## Ground rules
@@ -163,7 +164,8 @@ Brandon rated a blind set of omnivoice against moss15 (26 line groups, two model
 5. **Home cloning checks on the real model** (cpu-f32, then vk-q8), on his go. These must respect the home memory limits.
 6. **Cluster purity review** (0 of 10 done on the hub): is it still wanted? The suggestion is to retire it, since the Claude labels replaced it and the clusters found no missing mood.
 7. **The one-page goals doc** (`what-brandon-wants.md`) needs a final read with the answered questions folded in.
-8. **Leftover listening sets** are on the hub but no longer needed: 14 refscreen lists, and a 128-clip voicearms set stopped at 35.
+8. **Not scheduled, for later thought:** the Haru fine-tune and smaller-chat-model ideas in `docs/design/haru-future-direction.md`. They wait until Tali's voice and chat model work, and need no action now.
+9. **Leftover listening sets** are on the hub but no longer needed: 14 refscreen lists, and a 128-clip voicearms set stopped at 35.
 
 ## Pull requests
 
