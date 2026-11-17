@@ -679,6 +679,31 @@ class AbandonTest(unittest.TestCase):
             self.assertTrue((marker_dir / "stage-parent").exists())
             self.assertTrue((marker_dir / "stage-other").exists())
 
+    def test_abandon_missing_dir_clears_only_its_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            state = root / "state"
+            gone = root / "runs" / "gone"
+            other = root / "runs" / "other"
+            other.mkdir(parents=True)
+            marker_dir = state / "unverified"
+            marker_dir.mkdir(parents=True)
+            (marker_dir / "stage-gone").write_text(f"{gone}\n")
+            (marker_dir / "stage-other").write_text(f"{other}\n")
+            with mock.patch.dict(os.environ, {"VI_STATE_DIR": str(state)}):
+                checkpoints.abandon(gone, "dir was never created")
+            self.assertFalse((marker_dir / "stage-gone").exists())
+            self.assertTrue((marker_dir / "stage-other").exists())
+            self.assertFalse(gone.exists())
+
+    def test_abandon_existing_non_directory_still_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "file"
+            f.write_text("x")
+            with mock.patch.dict(os.environ, {"VI_STATE_DIR": str(Path(d) / "s")}):
+                with self.assertRaises(SystemExit):
+                    checkpoints.abandon(f, "x")
+
 
 if __name__ == "__main__":
     unittest.main()

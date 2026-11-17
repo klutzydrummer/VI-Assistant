@@ -25,7 +25,7 @@ exactly the expected count) and writes VERIFIED; `verify-epoch` checks one
 numbered checkpoint and writes nothing, so the home supervisor can ack each
 checkpoint as it arrives; `prune` keeps at most two verified checkpoints (the
 two newest) plus the exempt steps; `abandon` marks a run dir as given up on and
-clears its unverified marker while keeping every file; `audit` lists runs
+clears its unverified marker while keeping every file (a run dir that no longer exists just has its marker cleared); `audit` lists runs
 holding more than two.
 
 In omnivoice mode every file inside a checkpoint dir must be listed in its
@@ -402,6 +402,12 @@ def abandon(dir, reason):
     the files."""
     dir = Path(dir)
     vf = dir / "VERIFIED"
+    if not os.path.lexists(dir):
+        # Nothing on disk to protect: the marker only blocks `vi cloud down`
+        # and `up` over a checkpoint that no longer exists. Clear it.
+        _clear_markers(dir)
+        print(f"abandoned: {dir} does not exist; cleared its marker (reason: {reason})")
+        return
     if not dir.is_dir():
         sys.exit(f"abandon: {dir} is not a directory")
     if vf.is_file() or vf.is_symlink():
