@@ -1,0 +1,86 @@
+# Tali's OmniVoice full fine-tune with the learned style prefix. Home builds one data folder, then
+# the rented GPU worker runs two manual stages over it:
+#   vi dataset run characters/tali/omnivoice-ft.toml omnivoice_data
+#   vi cloud up
+#   vi dataset run characters/tali/omnivoice-ft.toml omnivoice_preflight
+#   vi dataset run characters/tali/omnivoice-ft.toml omnivoice_train
+# Both GPU stages run jobs/voicetune-fresh.sh; the mode argument picks preflight or train.
+# Preflight tokenises the clips and generates the public replay set (both need CUDA), proves the
+# card with a 5-step probe, rehearses a kill and resume on the real GPU stack, and pushes the probe
+# checkpoint home. Train runs 5000 steps from the public Base, pushes each checkpoint-<step> home
+# as it lands and builds the labelled listening sets. Pipeline details: jobs/omnivoice-ft/README.md.
+# Settings are read by the home runner from the settings JSON; the worker never reads this file.
+
+corpus = "../../corpus/tali"
+
+# Home, CPU. jobs/omnivoice_data.py builds the folder both GPU stages read through
+# VI_INPUT_VOICETUNE_DATA: data_config.json, the train/dev manifests, style_manifest.jsonl, her
+# clips in wav/ (hard-linked) and the public reference voices. It is label-blind: the split comes
+# from jobs/buildset.py (game and conversation ids only) and no mood label or hand-labelled set is
+# read. files lists every corpus file buildset.py reads, so a corpus change marks the stage stale.
+[stage.omnivoice_data]
+command = ["nice", "-n", "19", "ionice", "-c2", "-n7", "python3", "../../jobs/omnivoice_data.py"]
+files = ["../../jobs/omnivoice_data.py", "../../jobs/buildset.py", "../../jobs/checkpoints.py",
+         "../../jobs/omnivoice-ft/data_manifest.py",
+         "corpus:stages/harvest/current",
+         "corpus:stages/harvest/9dcac666ce3a58935d4c6e83a22b5f95a13d173b39b38cd31e068e1fd5063d46/out/lines.jsonl",
+         "corpus:stages/clean/current",
+         "corpus:stages/clean/d2edacdd862ba5f0b3fd00edb38ff5b0fb71a5f41850cfb71a4eda2af8729858/out/clips.jsonl",
+         "corpus:analysis/after_labels/voice_sets.json",
+         "dataset.toml"]
+
+[stage.omnivoice_data.settings]
+min_home_gb = 50
+home_gate_reserve_gb = 27
+
+# GPU, manual, after `vi cloud up`. jobs/on-worker.sh first runs jobs/worker-preflight.sh (cheap
+# card/disk/CPU/push gates before any input), then voicetune-fresh.sh preflight runs steps 0a
+# (extract_audio_tokens) and 0b (replay_public.py --device cuda), the 5-step probe and the
+# 20-step kill/resume rehearsal. checkpoint-5 is pushed home and verified before the stage
+# reports success.
+[stage.omnivoice_preflight]
+command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
+inputs = ["omnivoice_data"]
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
+         "../../jobs/omnivoice_abort.py", "../../jobs/checkpoints.py",
+         "../../jobs/requirements-omnivoice-worker.txt", "../../jobs/omnivoice-ft/train_ft.py",
+         "../../jobs/omnivoice-ft/ft_data.py", "../../jobs/omnivoice-ft/infer_listening.py",
+         "../../jobs/omnivoice-ft/replay_public.py"]
+manual = true
+
+[stage.omnivoice_preflight.settings]
+checkpoint_format = "omnivoice"
+# The preflight's one pushed checkpoint (checkpoint-5) stays home.
+expect_epochs = 1
+min_home_gb = 50
+home_gate_reserve_gb = 27
+max_upload_minutes = 30
+# The OmniVoice backbone trains in bf16 on a 24 GB card; the push floor covers one checkpoint
+# in max_upload_minutes.
+min_vram_gb = 24
+min_push_mb_s = 5
+
+# GPU, manual, only after the preflight checkpoint is verified and Brandon okays the paid run.
+# Runs 5000 steps through worker-job.sh (survives the stage session dying, restarts a crash with
+# --resume-from-checkpoint), pushes each checkpoint-<step> home, aborts on NaN loss or a fired
+# collapse guard, then builds the listening sets at steps 1000/2500/5000.
+[stage.omnivoice_train]
+command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "train"]
+inputs = ["omnivoice_data"]
+files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
+         "../../jobs/omnivoice_abort.py", "../../jobs/checkpoints.py",
+         "../../jobs/requirements-omnivoice-worker.txt", "../../jobs/omnivoice-ft/train_ft.py",
+         "../../jobs/omnivoice-ft/ft_data.py", "../../jobs/omnivoice-ft/infer_listening.py",
+         "../../jobs/omnivoice-ft/replay_public.py"]
+manual = true
+
+[stage.omnivoice_train.settings]
+checkpoint_format = "omnivoice"
+# Home keeps the two newest checkpoints plus the exempt 1000 and 2500 at the end of the run:
+# 4500, 5000, 1000 and 2500. (jobs/checkpoints.py --format omnivoice prune.)
+expect_epochs = 4
+min_home_gb = 50
+home_gate_reserve_gb = 27
+max_upload_minutes = 30
+min_vram_gb = 24
+min_push_mb_s = 5

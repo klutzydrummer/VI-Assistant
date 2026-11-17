@@ -77,6 +77,13 @@ collapse guard still runs, but the anti-drift guard does not.
 The builder writes `<out>.summary.json` next to the manifest with row counts, the input sources,
 `fields_read`, `audio_copied: false` and the manifest's sha256.
 
+For the real run, jobs/omnivoice_data.py (stage omnivoice_data in
+characters/tali/omnivoice-ft.toml) does this step and builds the whole data folder at home:
+manifests, style_manifest.jsonl, data_config.json, hard-linked clips, the public reference
+voices and an audio_tokenizer/ placeholder. voicetune-fresh.sh preflight then runs the
+tokenisation (section 2) and the replay generation on the GPU worker (steps 0a/0b) and rehearses
+a kill and resume.
+
 ## 2. Tokenise into WebDataset shards
 
 One upstream command does tokenisation, sharding and `data.lst`:

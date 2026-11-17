@@ -21,6 +21,11 @@
 # dirs keep a local $work/pushed/checkpoint-<step> marker instead of waiting for acks (and still
 # honor $work/acked/checkpoint-<step> if a future on-worker.sh writes them).
 #
+# Preflight also prepares the data folder (step 0a: extract_audio_tokens into shards/, step 0b:
+# replay_public.py --device cuda into replay/ and shards/replay/; both need CUDA) and rehearses a
+# real kill and resume: a 20-step run saving every 10 steps is SIGKILLed after checkpoint-10 and
+# resumed from it. The train mode reruns the data steps, which do nothing when their output exists.
+#
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
 #   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home, holding
 #     data_config.json                       OmniVoice data config (manifest_path -> data.lst)
@@ -28,7 +33,10 @@
 #                                            listening sets and the probe line
 #     audio_tokenizer/                       the Higgs v2 tokenizer (optional when the Base
 #                                            snapshot below already carries it)
-#     <the shards named by data_config.json> beside the config, in the same folder
+#     train_manifest.jsonl, dev_manifest.jsonl, replay_texts.jsonl, voices/
+#                                            what steps 0a/0b read (jobs/omnivoice_data.py)
+#     shards/{train,dev,replay}/             the shards named by data_config.json, written by
+#                                            steps 0a/0b into the same folder
 #   VI_BASE_MODEL                            local snapshot of k2-fsa/OmniVoice, used as
 #                                            --init-from and --base-model; no hub download
 # Every manifest path inside the data folder is relative to it, so this script runs with it as
@@ -41,7 +49,7 @@ MODE=${1:-}
 
 usage() {
   echo "usage: voicetune-fresh.sh preflight|train|push" >&2
-  echo "  preflight  gate VRAM/disk, run a 5-step probe, push it home, speak one line" >&2
+  echo "  preflight  gate VRAM/disk, tokenise the clips, generate the replay set, run a 5-step probe, push it home, speak one line, rehearse kill and resume" >&2
   echo "  train      5000 steps from Base, push each checkpoint home, abort on NaN/guard fire, build the listening sets" >&2
   echo "  push       only push finished checkpoints and repairs home (started by the home supervisor)" >&2
 }
@@ -307,8 +315,138 @@ print(f"check: VRAM {total / 1024:.0f} GB, disk {disk:.0f} GB free")
 PY
 }
 
+# audio_tokenizer_dir: the Higgs v2 tokenizer folder, in order of preference: $VI_AUDIO_TOKENIZER,
+# the data folder's audio_tokenizer/ (when jobs/omnivoice_data.py bundled a real one; a
+# PLACEHOLDER-only folder does not count), then the Base snapshot's own audio_tokenizer/.
+audio_tokenizer_dir() {
+  if [ -n "${VI_AUDIO_TOKENIZER:-}" ]; then
+    printf '%s\n' "$VI_AUDIO_TOKENIZER"
+  elif [ -f "$data_dir/audio_tokenizer/config.json" ]; then
+    printf '%s\n' "$data_dir/audio_tokenizer"
+  elif [ -d "$VI_BASE_MODEL/audio_tokenizer" ]; then
+    printf '%s\n' "$VI_BASE_MODEL/audio_tokenizer"
+  else
+    echo "no audio tokenizer: set VI_AUDIO_TOKENIZER, bundle one in the data folder, or use a Base snapshot that carries audio_tokenizer/" >&2
+    return 1
+  fi
+}
+
+# tokenise NAME MANIFEST: upstream extract_audio_tokens turns the manifest into WebDataset shards
+# under shards/NAME/ (tars, jsonl metadata and data.lst, the file data_config.json names). A
+# shard set that already has a non-empty data.lst is kept, so a rerun after a reattach or the
+# train mode does not redo GPU work.
+tokenise() {
+  local name=$1 manifest=$2 tok lst="$data_dir/shards/$1/data.lst"
+  if [ -s "$lst" ]; then
+    echo "tokenise: shards/$name already built; keeping them"
+    return 0
+  fi
+  tok=$(audio_tokenizer_dir) || return 1
+  [ -s "$manifest" ] || { echo "tokenise: $manifest missing or empty" >&2; return 1; }
+  mkdir -p "$data_dir/shards/$name"
+  "$PY" -m omnivoice.scripts.extract_audio_tokens \
+    --input_jsonl "$manifest" \
+    --tar_output_pattern "$data_dir/shards/$name/audios/shard-%06d.tar" \
+    --jsonl_output_pattern "$data_dir/shards/$name/txts/shard-%06d.jsonl" \
+    --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors
+  [ -s "$lst" ] || { echo "tokenise: $lst was not written for $name" >&2; return 1; }
+}
+
+# prepare_data: steps 0a and 0b, both need CUDA and both write into the data folder.
+#   0a  tokenise the train and dev manifests into shards/train and shards/dev
+#   0b  generate the public replay set with Base (replay_public.py --device cuda) into replay/,
+#       then tokenise it into shards/replay. Without replay rows the KL-to-Base guard has nothing
+#       to act on (omnivoice-ft/README.md), so a missing replay set fails here, not at step 4000.
+# Every piece is skipped when its output already exists (replay_public.py also resumes per line).
+prepare_data() {
+  echo "preflight 0a: tokenise train and dev clips"
+  tokenise train "$data_dir/train_manifest.jsonl"
+  tokenise dev "$data_dir/dev_manifest.jsonl"
+  echo "preflight 0b: generate and tokenise the replay set"
+  if [ ! -s "$data_dir/shards/replay/data.lst" ]; then
+    "$PY" "$jobs_dir/omnivoice-ft/replay_public.py" \
+      --out-dir "$data_dir/replay" --base-model "$VI_BASE_MODEL" \
+      --voices "$data_dir/voices" --texts "$data_dir/replay_texts.jsonl" --device cuda
+  fi
+  tokenise replay "$data_dir/replay/replay_public.jsonl"
+}
+
+# rehearse_kill_resume: the real-GPU kill/resume proof. A 20-step run saving every 10 steps is
+# SIGKILLed a few micro-steps after checkpoint-10 lands (about step 15), then resumed from
+# checkpoint-10; both checkpoints must pass --verify-checkpoint. A run that finishes before the
+# kill, or never reaches checkpoint-10, fails the rehearsal rather than passing it vacuously.
+rehearse_kill_resume() {
+  local rr="$scratch/rehearse-run-$(date +%s)" pidfile pgid bg waited=0 m0 m
+  local limit=${VI_REHEARSE_TIMEOUT:-900} trainer=("$jobs_dir/omnivoice-ft/train_ft.py")
+  local args=(--init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json"
+              --output-dir "$rr" --steps 20 --save-steps 10 --logging-steps 1
+              --num-workers "${VI_NUM_WORKERS:-2}")
+  mkdir -p "$rr"
+  pidfile="$rr/trainer.pgid"
+  # setsid makes the launcher its own process group, so one kill -9 takes the accelerate
+  # process and every dataloader worker with it.
+  setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$pidfile" \
+    "$ACCELERATE" launch --num_processes 1 "${trainer[@]}" "${args[@]}" &
+  bg=$!
+  while [ ! -s "$pidfile" ]; do sleep 0.2; done
+  pgid=$(cat "$pidfile")
+  last_micro() {
+    python3 -c '
+import json, sys
+last = 0
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        last = max(last, int(json.loads(line)["micro_step"]))
+    except (ValueError, KeyError, TypeError):
+        pass
+print(last)' "$rr/style_metrics.jsonl" 2>/dev/null || echo 0
+  }
+  while [ ! -f "$rr/checkpoint-10/SHA256SUMS" ]; do
+    kill -0 "$bg" 2>/dev/null || { echo "rehearsal: trainer exited before checkpoint-10" >&2; return 1; }
+    [ "$waited" -lt "$((limit * 5))" ] || { kill -9 -- "-$pgid" 2>/dev/null || true; echo "rehearsal: no checkpoint-10 in ${limit}s" >&2; return 1; }
+    sleep 0.2; waited=$((waited + 1))
+  done
+  m0=$(last_micro)
+  while :; do
+    if [ -d "$rr/checkpoint-20" ]; then
+      kill -9 -- "-$pgid" 2>/dev/null || true
+      echo "rehearsal: the run finished before it could be killed; no kill was proven" >&2
+      return 1
+    fi
+    m=$(last_micro)
+    [ "$m" -ge "$((m0 + ${VI_REHEARSE_KILL_AFTER:-3}))" ] && break
+    kill -0 "$bg" 2>/dev/null || { echo "rehearsal: trainer exited before the kill point" >&2; return 1; }
+    sleep 0.2
+  done
+  kill -9 -- "-$pgid" 2>/dev/null || true
+  wait "$bg" 2>/dev/null || true
+  echo "rehearsal: SIGKILL at micro-step $m (checkpoint-10 was written at $m0)"
+  # Give the GPU memory back before the resume starts.
+  for _ in $(seq 1 60); do
+    kill -0 -- "-$pgid" 2>/dev/null || break
+    sleep 0.5
+  done
+  [ ! -d "$rr/checkpoint-20" ] || { echo "rehearsal: checkpoint-20 exists after the kill; the kill proved nothing" >&2; return 1; }
+  "$ACCELERATE" launch --num_processes 1 "${trainer[@]}" "${args[@]}" \
+    --resume-from-checkpoint "$rr/checkpoint-10"
+  "$PY" "${trainer[@]}" --verify-checkpoint "$rr/checkpoint-10" "$rr/checkpoint-20" \
+    || { echo "rehearsal: resumed run failed checkpoint verification" >&2; return 1; }
+  python3 - "$VI_OUT/preflight.json" "$m" <<'PY'
+import json, sys
+path, killed = sys.argv[1], int(sys.argv[2])
+try:
+    report = json.load(open(path))
+except (OSError, ValueError):
+    report = {}
+report["kill_resume"] = {"killed_at_micro_step": killed, "resumed_from": "checkpoint-10", "verified": ["checkpoint-10", "checkpoint-20"]}
+json.dump(report, open(path, "w"), indent=1, sort_keys=True)
+PY
+  echo "rehearsal: resumed from checkpoint-10 and verified checkpoint-20"
+}
+
 preflight() {
   check_and_gate
+  prepare_data
 
   # Five real steps at the full batch (--steps 5 --save-steps 5 writes checkpoint-5), published
   # and pushed home as an end-to-end integrity proof, timed for the record. The Qwen3 loadbench
@@ -350,6 +488,8 @@ PY
     --style-manifest "$data_dir/style_manifest.jsonl" \
     --max-styles 1 --max-lines 1 --device "${VI_INFER_DEVICE:-cuda}"
 
+  rehearse_kill_resume
+
   echo "preflight: ok"
 }
 
@@ -364,6 +504,9 @@ train() {
   fi
   # Preflight already proved generate, so this gates VRAM/disk without the extra model load.
   check_and_gate
+  # The shards and replay set live in the data folder. Preflight built them there; if this stage
+  # received a fresh copy of the folder instead, build them again (a no-op when they exist).
+  prepare_data
 
   local start reason elapsed rc wj_pid rc_file pid_file
   start=$(date +%s)
