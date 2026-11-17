@@ -106,7 +106,14 @@ STUB = textwrap.dedent('''\
             if r != "nolisten":
                 for s in (1000, 2500, 5000):
                     p = Path(os.environ["VI_PLATTER_DIR"]) / f"step-{s}"; p.mkdir(parents=True, exist_ok=True)
-                    (p / "listening.jsonl").write_text("{}"); (p / "README.txt").write_text("human listening decides")
+                    (p / "wav").mkdir(exist_ok=True)
+                    rows = []
+                    for n in range(2):
+                        lab = f"styleA__line{n}__s1__step{s}"
+                        if not (r == "nowav" and s == 2500): (p / "wav" / f"{lab}.wav").write_bytes(b"RIFF")
+                        rows.append({"label": lab, "text": f'say "this" {n}', "file": f"/worker/{lab}.wav"})
+                    (p / "listening.jsonl").write_text("".join(json.dumps(x) + "\\n" for x in rows))
+                    (p / "README.txt").write_text("human listening decides")
             print("train: done")
     else:
         print("stub: unknown", args, file=sys.stderr); sys.exit(2)
@@ -229,6 +236,14 @@ class Flow(Base):
         self.assertIn("#1 offer 1", self.out)
         self.assertIn(str(self.tmp / "platter"), self.out)
         self.assertEqual(self.state()["status"], "done")
+        for step in (1000, 2500, 5000):  # each set is made listable in the hub (clips.toml)
+            toml = (self.tmp / "platter" / f"step-{step}" / "clips.toml").read_text()
+            self.assertIn(f"step {step}", toml)
+            self.assertIn(f'path = "wav/styleA__line1__s1__step{step}.wav"', toml)
+            self.assertNotIn("blind = true", toml)
+            if sys.version_info >= (3, 11):
+                import tomllib
+                self.assertEqual(len(tomllib.loads(toml)["clip"]), 2)
 
     def test_2_push_gate_fails_once_then_passes(self):
         self.scenario([dict(preflight="push", spent=0.30, hours=1.0), dict(spent=0.90, hours=2.0)])
@@ -314,6 +329,7 @@ class Flow(Base):
             ("unverified marker left", dict(train="marker", spent=0.1), 7, 1),
             ("wrong checkpoint set", dict(train="extra", spent=0.1), 7, 1),
             ("listening sets missing", dict(train="nolisten", spent=0.1), 7, 1),
+            ("listening set audio missing", dict(train="nowav", spent=0.1), 7, 1),
         ]
         for name, att, code, nups in cases:
             with self.subTest(name):

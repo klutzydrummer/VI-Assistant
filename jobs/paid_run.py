@@ -500,12 +500,44 @@ class PaidRun:
                     problems.append(f"unverified marker {m} still names {d}")
         for step in LISTENING_STEPS:
             s = Path(self.a.platter) / f"step-{step}"
-            for need in ("listening.jsonl", "README.txt"):
-                if not (s / need).is_file():
-                    problems.append(f"listening set step {step}: {s / need} is missing")
+            gone = [need for need in ("listening.jsonl", "README.txt") if not (s / need).is_file()]
+            problems += [f"listening set step {step}: {s / need} is missing" for need in gone]
+            if not gone:
+                problems += self.write_clip_list(step, s)
         if not problems:
             say(f"verified: checkpoints {steps} in {d}; listening sets in {self.a.platter}")
         return problems
+
+    def write_clip_list(self, step, s):
+        """Make step-N listable in the review hub: write `clips.toml` beside its wav files.
+
+        The hub (`vi review corpus/tali`) already finds any `clips.toml` under a stage's current
+        output (crates/review/src/hub.rs `walk`, depth 4) and plays its clips unblinded, with a
+        label and the line text, saving his answers beside it. A single-model set has nothing to
+        blind against, so `blind` stays off. Only local files are written; returns problems."""
+        wavs = []
+        try:
+            rows = [json.loads(ln) for ln in (s / "listening.jsonl").read_text().splitlines() if ln.strip()]
+        except ValueError as e:
+            return [f"listening set step {step}: listening.jsonl is not valid JSON lines ({e})"]
+        for row in rows:
+            label = row.get("label") if isinstance(row, dict) else None
+            # The row's `file` is a worker path; the wav came home beside the set under wav/.
+            wav = s / "wav" / f"{label}.wav" if isinstance(label, str) and label else None
+            if wav is None or Path(label).name != label or not wav.is_file():
+                return [f"listening set step {step}: no audio {wav or row} for a row in listening.jsonl"]
+            wavs.append((label, str(row.get("text") or "")))
+        if not wavs:
+            return [f"listening set step {step}: listening.jsonl has no clips"]
+        q = json.dumps  # a JSON string is a valid TOML basic string
+        toml = (f"title = {q(f'OmniVoice fine-tune, step {step} (run {self.a.run_id})')}\n"
+                f"question = {q('Does this sound like her? Listen for the voice; nothing here is scored.')}\n"
+                f"answers = [\"her\", \"partly\", \"not her\"]\n"
+                f"asked_by = \"paid_run.py\"\n")
+        for label, text in wavs:
+            toml += f"\n[[clip]]\npath = {q(f'wav/{label}.wav')}\nlabel = {q(label)}\ntext = {q(text)}\n"
+        (s / "clips.toml").write_text(toml)
+        return []
 
     # ----- main ----------------------------------------------------------------------------
     def signal_handler(self, signum, _frame):
