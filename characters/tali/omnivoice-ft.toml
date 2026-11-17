@@ -14,7 +14,7 @@
 corpus = "../../corpus/tali"
 
 # Home, CPU. jobs/omnivoice_data.py builds the folder both GPU stages read through
-# VI_INPUT_VOICETUNE_DATA: data_config.json, the train/dev manifests, style_manifest.jsonl, her
+# VI_INPUT_OMNIVOICE_DATA: data_config.json, the train/dev manifests, style_manifest.jsonl, her
 # clips in wav/ (hard-linked) and the public reference voices. It is label-blind: the split comes
 # from jobs/buildset.py (game and conversation ids only) and no mood label or hand-labelled set is
 # read. files lists every corpus file buildset.py reads, so a corpus change marks the stage stale.
@@ -55,10 +55,10 @@ expect_epochs = 1
 min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
-# The OmniVoice backbone trains in bf16 on a 24 GB card; the push floor covers one checkpoint
-# in max_upload_minutes.
-min_vram_gb = 24
-min_push_mb_s = 5
+# The OmniVoice backbone trains in bf16 on a 24 GB card; min_vram_gb is in GiB, so that card
+# reads 23.9. The push floor covers one checkpoint in max_upload_minutes.
+min_vram_gb = 23.5
+min_push_mb_s = 4.5
 
 # GPU, manual, only after the preflight checkpoint is verified and Brandon okays the paid run.
 # Runs 5000 steps through worker-job.sh (survives the stage session dying, restarts a crash with
@@ -82,5 +82,5 @@ expect_epochs = 4
 min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
-min_vram_gb = 24
-min_push_mb_s = 5
+min_vram_gb = 23.5
+min_push_mb_s = 4.5

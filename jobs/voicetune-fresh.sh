@@ -28,7 +28,10 @@
 # The train mode does not rebuild them: it needs the shards preflight wrote into the data folder.
 #
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
-#   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home, holding
+#   VI_INPUT_OMNIVOICE_DATA/                 one prepared folder, built at home, holding
+#                                            (the omnivoice_data stage; the older voicetune.toml
+#                                            stages name theirs VI_INPUT_VOICETUNE_DATA, which is
+#                                            read when the first is unset)
 #     data_config.json                       OmniVoice data config (manifest_path -> data.lst)
 #     style_manifest.jsonl                   style-source rows (id, audio_path, text) for the
 #                                            listening sets and the probe line
@@ -39,7 +42,12 @@
 #     shards/{train,dev,replay}/             the shards named by data_config.json, written by
 #                                            steps 0a/0b into the same folder
 #   VI_BASE_MODEL                            local snapshot of k2-fsa/OmniVoice, used as
-#                                            --init-from and --base-model; no hub download
+#                                            --init-from and --base-model. Unset on a rented
+#                                            worker: the script then downloads the public Base
+#                                            (VI_BASE_MODEL_REPO at VI_BASE_MODEL_REVISION) into
+#                                            ~/.cache/vi/base-model and sets it. The Base is a
+#                                            public model, not game data, so it comes from the
+#                                            hub, not from home.
 # Every manifest path inside the data folder is relative to it, so this script runs with it as
 # the working directory. Listening lines come from jobs/ttstest/lines.json (infer_listening's
 # default) — the hub's established lines, the same every checkpoint.
@@ -249,13 +257,13 @@ if [ "$MODE" = push ]; then
   exit 0
 fi
 
-: "${VI_RETURN_PORT:?voicetune-fresh.sh needs the worker return tunnel}" \
-  "${VI_INPUT_VOICETUNE_DATA:?missing VI_INPUT_VOICETUNE_DATA}" \
-  "${VI_BASE_MODEL:?missing VI_BASE_MODEL (the local k2-fsa/OmniVoice snapshot)}"
+: "${VI_RETURN_PORT:?voicetune-fresh.sh needs the worker return tunnel}"
 
 # The prepared data folder; every manifest path inside it is relative to it, so
 # run with it as the working directory for the job (all other paths are absolute).
-data_dir="$VI_INPUT_VOICETUNE_DATA"
+# on-worker.sh names the variable after the stage input: omnivoice_data -> OMNIVOICE_DATA.
+data_dir=${VI_INPUT_OMNIVOICE_DATA:-${VI_INPUT_VOICETUNE_DATA:-}}
+[ -n "$data_dir" ] || { echo "voicetune-fresh: missing VI_INPUT_OMNIVOICE_DATA (or VI_INPUT_VOICETUNE_DATA)" >&2; exit 1; }
 cd "$data_dir"
 
 # The OmniVoice venv: the image's CUDA torch is reused through --system-site-packages, only the
@@ -278,6 +286,20 @@ ovft_python() {
 PY=$(ovft_python)
 ACCELERATE="$(dirname "$PY")/accelerate"
 
+# Base model: use VI_BASE_MODEL when given, otherwise fetch the public k2-fsa/OmniVoice snapshot
+# at a pinned revision (the one replay_public.py's home default points at). The folder is kept
+# under ~/.cache/vi so a reattach or the train mode does not download it again; HF tokens are
+# never passed on.
+if [ -z "${VI_BASE_MODEL:-}" ]; then
+  VI_BASE_MODEL=$(env -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN -u HUGGINGFACE_HUB_TOKEN -u HF_HUB_OFFLINE \
+    "$PY" "$jobs_dir/omnivoice-ft/fetch_base_model.py" \
+    "${VI_BASE_MODEL_REPO:-k2-fsa/OmniVoice}" \
+    "${VI_BASE_MODEL_REVISION:-c5fdb5ccb189668d56333f77ba2629f4cd7535f4}" \
+    "$HOME/.cache/vi/base-model") || { echo "voicetune-fresh: could not fetch the Base model" >&2; exit 1; }
+  echo "voicetune-fresh: Base model at $VI_BASE_MODEL"
+fi
+export VI_BASE_MODEL
+
 # abort_reason METRICS_JSONL GUARD_JSONL FT_CONFIG_JSON -> the abort reason, or empty.
 # Pure stdlib python (jobs/omnivoice_abort.py): NaN in style_metrics.jsonl, or a collapse-guard
 # fire in the latest attempt. `-I` keeps the data folder's files off sys.path.
@@ -286,13 +308,21 @@ abort_reason() {
 }
 
 # check_and_gate: report VRAM and disk (check.json under VI_OUT), then gate them against the
-# stage's floors (characters/tali/*.toml numbers arrive later; VI_MIN_VRAM_GB/VI_MIN_DISK_GB
+# stage's floors (min_vram_gb from the settings JSON; VI_MIN_VRAM_GB/VI_MIN_DISK_GB
 # override). Pure stdlib python, no venv.
 check_and_gate() {
   mkdir -p "$VI_OUT/check"
   python3 - "$VI_OUT/check/check.json" <<'PY'
 import json, os, subprocess, sys
-min_vram = float(os.environ.get("VI_MIN_VRAM_GB", "24"))
+# GiB, the unit nvidia-smi's MiB gives (a "24 GB" card reads 23.9). The floor comes from
+# VI_MIN_VRAM_GB, else the stage's min_vram_gb in the settings JSON, else 23.5.
+settings = {}
+if os.environ.get("VI_SETTINGS"):
+    try:
+        settings = json.load(open(os.environ["VI_SETTINGS"]))
+    except (OSError, ValueError):
+        pass
+min_vram = float(os.environ.get("VI_MIN_VRAM_GB") or settings.get("min_vram_gb") or 23.5)
 min_disk = float(os.environ.get("VI_MIN_DISK_GB", "100"))
 try:
     out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total,memory.used",
@@ -307,12 +337,12 @@ disk = st.f_bavail * st.f_frsize / 2**30
 json.dump({"vram_total_gb": round(total / 1024, 1), "vram_free_gb": round((total - used) / 1024, 1),
            "free_disk_gb": round(disk, 1)}, open(sys.argv[1], "w"), indent=1, sort_keys=True)
 if total / 1024 < min_vram:
-    print(f"check: VRAM {total / 1024:.0f} GB < {min_vram:.0f} GB", file=sys.stderr)
+    print(f"check: VRAM {total / 1024:.1f} GiB < {min_vram:.1f} GiB", file=sys.stderr)
     sys.exit(1)
 if disk < min_disk:
     print(f"check: worker disk {disk:.0f} GB free < {min_disk:.0f} GB", file=sys.stderr)
     sys.exit(1)
-print(f"check: VRAM {total / 1024:.0f} GB, disk {disk:.0f} GB free")
+print(f"check: VRAM {total / 1024:.1f} GiB, disk {disk:.0f} GB free")
 PY
 }
 

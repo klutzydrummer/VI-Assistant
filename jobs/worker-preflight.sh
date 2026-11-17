@@ -6,7 +6,7 @@
 # stage (jobs/voicetune-fresh.sh merges the probe push and loadbench into it).
 #
 # The gates come from the stage settings JSON (the home side's $VI_SETTINGS):
-#   min_vram_gb       card memory, GiB (nvidia-smi)
+#   min_vram_gb       card memory, GiB (nvidia-smi MiB / 1024; a "24 GB" card reads 23.9, so use 23.5)
 #   min_disk_mb_s     sequential disk read AND write, MB/s (decimal, dd)
 #   min_cpu_cores     effective cores (nproc capped by a cgroup cpu.max quota)
 #   min_push_mb_s     worker -> home rate measured by a raw 100 MiB dummy push
@@ -94,7 +94,7 @@ PY
 fi
 if [ -n "$min_vram" ]; then
   [ -n "$vram_gb" ] || fail "min_vram_gb is set but nvidia-smi reported no memory"
-  at_least "$vram_gb" "$min_vram" "VRAM (GB)"
+  at_least "$vram_gb" "$min_vram" "VRAM (GiB)"
 fi
 
 # Sequential disk probe. O_DIRECT when the filesystem takes it, buffered
@@ -175,4 +175,4 @@ for item in sys.argv[2:]:
         d[key] = value
 json.dump(d, open(sys.argv[1], "w"), indent=1, sort_keys=True)
 PY
-echo "worker-preflight: ok (VRAM ${vram_gb:-?} GB, disk ${disk_write_mb_s:-?}/${disk_read_mb_s:-?} MB/s, push $push_mb_s MB/s, $cpu_eff cores, $ram_gb GB RAM)" >&2
+echo "worker-preflight: ok (VRAM ${vram_gb:-?} GiB, disk ${disk_write_mb_s:-?}/${disk_read_mb_s:-?} MB/s, push $push_mb_s MB/s, $cpu_eff cores, $ram_gb GB RAM)" >&2

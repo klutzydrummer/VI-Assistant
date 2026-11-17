@@ -1,7 +1,7 @@
 """Build the OmniVoice fine-tune's data folder at home, label-blind (stage omnivoice_data).
 
 One home CPU job (no GPU, no codec) that produces the one folder both GPU stages
-(omnivoice_preflight / omnivoice_train) read through VI_INPUT_VOICETUNE_DATA:
+(omnivoice_preflight / omnivoice_train) read through VI_INPUT_OMNIVOICE_DATA:
 
   train_manifest.jsonl   her clips as upstream OmniVoice rows (id, audio_path, text, language_id)
   dev_manifest.jsonl     the held-out conversations, same shape

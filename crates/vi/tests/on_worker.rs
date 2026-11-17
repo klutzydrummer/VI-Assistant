@@ -769,10 +769,10 @@ fn slow_push_fails_before_upload() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    // 100 MiB in a simulated 40 s is 2.62 MB/s, under the 7 MB/s floor.
+    // 100 MiB in a simulated 40 s is 2.62 MB/s, under the 4.5 MB/s floor.
     let envs = [("VI_FAKE_PUSH_SECONDS", "40".to_string())];
     let job = "echo ran > \"$VI_OUT/ran.txt\"";
-    let out = run_settings(dir.path(), job, "min_push_mb_s = 7", &envs);
+    let out = run_settings(dir.path(), job, "min_push_mb_s = 4.5", &envs);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "{stderr}");
     assert!(stderr.contains("worker push (MB/s)"), "{stderr}");

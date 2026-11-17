@@ -79,6 +79,17 @@ with open(os.path.join(a.out_dir, "replay_public.jsonl"), "w") as f:
                         "language_id": "en", "replay": True}) + "\n")
 '''
 
+HUB_STUB = r'''
+import os
+def snapshot_download(repo, revision=None, local_dir=None):
+    open(os.environ["CALLS"], "a").write(
+        f"snapshot_download {repo} {revision} offline={os.environ.get('HF_HUB_OFFLINE')} "
+        f"token={os.environ.get('HF_TOKEN')}\n")
+    os.makedirs(os.path.join(local_dir, "audio_tokenizer"), exist_ok=True)
+    open(os.path.join(local_dir, "config.json"), "w").write("{}")
+    return local_dir
+'''
+
 
 class PreflightHarness(unittest.TestCase):
     def setUp(self):
@@ -88,6 +99,7 @@ class PreflightHarness(unittest.TestCase):
         jobs = root / "jobs"
         (jobs / "omnivoice-ft").mkdir(parents=True)
         shutil.copy(JOBS / "voicetune-fresh.sh", jobs / "voicetune-fresh.sh")
+        shutil.copy(JOBS / "omnivoice-ft" / "fetch_base_model.py", jobs / "omnivoice-ft" / "fetch_base_model.py")
         self._exe(jobs / "worker-return.sh", "exit 0")
         (jobs / "omnivoice-ft" / "train_ft.py").write_text(TRAIN_STUB)
         (jobs / "omnivoice-ft" / "replay_public.py").write_text(REPLAY_STUB)
@@ -98,6 +110,7 @@ class PreflightHarness(unittest.TestCase):
         (root / "pylib" / "omnivoice" / "__init__.py").write_text("")
         (pylib / "__init__.py").write_text("")
         (pylib / "extract_audio_tokens.py").write_text(TOKENISE_STUB)
+        (root / "pylib" / "huggingface_hub.py").write_text(HUB_STUB)
         bindir = root / "bin"
         bindir.mkdir()
         self._exe(bindir / "python", 'exec python3 "$@"')
@@ -126,10 +139,13 @@ class PreflightHarness(unittest.TestCase):
         env = dict(os.environ, CALLS=str(self.calls), OVFT_PYTHON=str(self.root / "bin" / "python"),
                    PATH=f"{self.root / 'bin'}:{os.environ['PATH']}",
                    PYTHONPATH=str(self.root / "pylib"), VI_OUT=str(self.work / "out"),
-                   VI_RETURN_PORT="1", VI_INPUT_VOICETUNE_DATA=str(self.data),
+                   VI_RETURN_PORT="1", VI_INPUT_OMNIVOICE_DATA=str(self.data),
+                   HOME=str(self.root / "home"),
                    VI_BASE_MODEL=str(self.base), VI_MIN_DISK_GB="0", VI_PUSH_SECONDS="0",
                    VI_REHEARSE_TIMEOUT="30")
+        env.pop("VI_INPUT_VOICETUNE_DATA", None)
         env.update(extra)
+        env = {k: v for k, v in env.items() if v is not None}
         return env
 
     def preflight(self, **extra):
@@ -197,6 +213,99 @@ class PrepareDataTest(PreflightHarness):
         r = self.preflight()
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn("train_ft", [l.split()[0] for l in self.log()])
+
+
+class InputNameTest(PreflightHarness):
+    def test_the_omnivoice_data_input_name_is_the_one_on_worker_exports(self):
+        r = self.preflight()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_older_voicetune_data_name_still_works(self):
+        r = self.preflight(VI_INPUT_OMNIVOICE_DATA=None, VI_INPUT_VOICETUNE_DATA=str(self.data))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_no_data_input_fails_with_a_clear_message(self):
+        r = self.preflight(VI_INPUT_OMNIVOICE_DATA=None)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("VI_INPUT_OMNIVOICE_DATA", r.stderr)
+        self.assertEqual(self.log(), [])
+
+
+class BaseModelFetchTest(PreflightHarness):
+    def test_unset_base_model_is_downloaded_once_and_passed_on(self):
+        r = self.preflight(VI_BASE_MODEL=None, HF_TOKEN="secret", HF_HUB_OFFLINE="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        dl = [l for l in self.log() if l.startswith("snapshot_download")]
+        self.assertEqual(len(dl), 1, dl)
+        self.assertEqual(dl[0], "snapshot_download k2-fsa/OmniVoice "
+                         "c5fdb5ccb189668d56333f77ba2629f4cd7535f4 offline=None token=None")
+        snap = self.root / "home" / ".cache" / "vi" / "base-model" / "k2-fsa--OmniVoice-c5fdb5ccb189"
+        self.assertTrue((snap / "config.json").is_file())
+        replay = next(l for l in self.log() if l.startswith("replay_public"))
+        self.assertIn(f"base={snap}", replay)
+        self.assertIn(f"--init-from {snap}", next(l for l in self.log() if l.startswith("train_ft")))
+        self.preflight(VI_BASE_MODEL=None)  # a rerun reuses the folder
+        self.assertEqual(len([l for l in self.log() if l.startswith("snapshot_download")]), 1)
+
+    def test_a_given_base_model_is_not_downloaded(self):
+        r = self.preflight()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l for l in self.log() if l.startswith("snapshot_download")], [])
+
+
+class VramGateTest(PreflightHarness):
+    def gate(self, mib, settings_gb=None, env_gb=None):
+        self._exe(self.root / "bin" / "nvidia-smi", f'echo "{mib}, 0"')
+        extra = {}
+        if settings_gb is not None:
+            sj = self.root / "settings.json"
+            sj.write_text(json.dumps({"min_vram_gb": settings_gb}))
+            extra["VI_SETTINGS"] = str(sj)
+        if env_gb is not None:
+            extra["VI_MIN_VRAM_GB"] = str(env_gb)
+        return self.preflight(**extra)
+
+    def test_a_24_gb_card_passes_the_23_5_floor_from_the_settings(self):
+        r = self.gate(24467, settings_gb=23.5)  # reads 23.9 GiB
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("VRAM 23.9 GiB", r.stdout)
+
+    def test_the_settings_floor_is_enforced(self):
+        r = self.gate(24467, settings_gb=24)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("VRAM 23.9 GiB < 24.0 GiB", r.stderr)
+
+    def test_the_env_floor_overrides_the_settings(self):
+        r = self.gate(24467, settings_gb=24, env_gb=23.5)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_default_floor_is_23_5(self):
+        self.assertEqual(self.gate(24467).returncode, 0)
+        r = self.gate(20480)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("< 23.5 GiB", r.stderr)
+
+
+class FloorsInConfigTest(unittest.TestCase):
+    def test_every_stage_uses_the_4_5_push_floor_and_omnivoice_the_23_5_vram_floor(self):
+        import tomllib
+        chars = JOBS.parent / "characters" / "tali"
+        for name, stages in (("voicetune.toml", ("voicetune_preflight", "voicetune_train")),
+                             ("omnivoice-ft.toml", ("omnivoice_preflight", "omnivoice_train"))):
+            cfg = tomllib.loads((chars / name).read_text())
+            for stage in stages:
+                st = cfg["stage"][stage]["settings"]
+                self.assertEqual(st["min_push_mb_s"], 4.5, (name, stage))
+                if name == "omnivoice-ft.toml":
+                    self.assertEqual(st["min_vram_gb"], 23.5, (name, stage))
+
+    def test_omnivoice_stage_input_matches_the_scripts_variable(self):
+        import tomllib
+        cfg = tomllib.loads((JOBS.parent / "characters" / "tali" / "omnivoice-ft.toml").read_text())
+        script = (JOBS / "voicetune-fresh.sh").read_text()
+        for stage in ("omnivoice_preflight", "omnivoice_train"):
+            for inp in cfg["stage"][stage]["inputs"]:
+                self.assertIn("VI_INPUT_" + inp.upper(), script)
 
 
 class RehearsalTest(PreflightHarness):
