@@ -24,7 +24,8 @@
 # Preflight also prepares the data folder (step 0a: extract_audio_tokens into shards/, step 0b:
 # replay_public.py --device cuda into replay/ and shards/replay/; both need CUDA) and rehearses a
 # real kill and resume: a 20-step run saving every 10 steps is SIGKILLed after checkpoint-10 and
-# resumed from it. The train mode reruns the data steps, which do nothing when their output exists.
+# resumed from it.
+# The train mode does not rebuild them: it needs the shards preflight wrote into the data folder.
 #
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
 #   VI_INPUT_VOICETUNE_DATA/                 one prepared folder, built at home, holding
@@ -504,9 +505,6 @@ train() {
   fi
   # Preflight already proved generate, so this gates VRAM/disk without the extra model load.
   check_and_gate
-  # The shards and replay set live in the data folder. Preflight built them there; if this stage
-  # received a fresh copy of the folder instead, build them again (a no-op when they exist).
-  prepare_data
 
   local start reason elapsed rc wj_pid rc_file pid_file
   start=$(date +%s)
