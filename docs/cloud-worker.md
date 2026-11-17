@@ -83,3 +83,20 @@ The receiver has separate `vi-out`, `vi-checkpoint`, and `vi-publish` modules ro
 **If the worker dies part way.** Jobs save each clip's results in `VI_CHECKPOINT` as they go, and the worker pushes that folder home every `VI_SYNC_SECONDS` (default 60) and once more when the job ends, however it ends. If the instance is lost, the watchdog or `max_hours` ends it, or the credit runs out, the stage fails with its checkpoint at home in `stages/<stage>/.checkpoint-<key>/`. Run `vi cloud up` and `vi dataset run` again: the checkpoint goes up to the new worker and the job skips clips already done. At most about a minute of work is lost. Editing the job's code or settings in between starts the stage over.
 
 For tests, `VI_WORKER_HOST=local` with `VI_WORKER_ROOT=<folder>` runs the "worker" in a local folder; `crates/vi/tests/on_worker.rs` does this, so CI needs no GPU or rented machine.
+
+## One command for the paid OmniVoice fine-tune
+`jobs/paid_run.py` runs the whole paid flow unattended, driving the `vi` binary (`$VI_BIN`, default `vi`). It rents the cheapest offer that has not failed yet, runs the `omnivoice_preflight` stage (tunnel, receiver, token push, worker gates), then `omnivoice_train`, checks what came home, and releases the worker. Start it only with Brandon's approval of the cap and hours for that run.
+
+```sh
+python3 -I jobs/paid_run.py --run-id omnivoice-ft-1 --cap 5.00 --max-hours 8 \
+    --config jobs/paid-run/omnivoice-run-cloud.toml [--countries "US,DE" | --countries eu] [--max-attempts 3]
+```
+
+- `--cap` and `--max-hours` cover all attempts together. Each attempt gets the remaining cap on `vi cloud up --cap` and a config copy whose `max_hours` is the hours left.
+- Only a push-speed gate failure (stderr contains `worker push (MB/s)`) is retried: the worker is released, that offer and any relisting of the same machine (same GPU, place, cores, RAM and uplink; `vi cloud offers` does not print machine ids) is excluded, and the next cheapest is rented, up to `--max-attempts`. Any other failure releases the worker and stops.
+- `--plan` prints the effective plan and exits without calling `vi`.
+- State is kept in `~/.local/state/vi/paid-run/<run-id>.json` (`$VI_PAID_RUN_STATE_DIR` overrides). A killed run is started again with the same `--run-id` and the same limits: a worker still up whose train stage had started is adopted (the stage reattaches); any other leftover worker is destroyed first, so a second rental is never made on top of a billing one.
+- SIGINT and SIGTERM stop the child stage and release the worker (`down`, then `down --force` if it refuses).
+- Exit codes: 0 done, 2 bad arguments, 3 `up` failed, 4 other preflight failure, 5 push gate failed on all attempts, 6 train failed, 7 home results did not verify, 8 interrupted, 9 worker could not be released (check `vi cloud status`), 10 no offer or budget left, 1 unexpected.
+- After training it checks that home holds checkpoints 1000, 2500, 4500 and 5000 with `VERIFIED` and no unverified marker, and that `step-1000`, `step-2500` and `step-5000` listening sets (with `listening.jsonl` and `README.txt`) are in the stage's `platter` (`--platter`, default `corpus/tali/stages/omnivoice_train/current/out/platter`). Human listening decides voice quality.
+- Tests: `jobs/test_paid_run.py` (stub `vi`, no Vast, no network).

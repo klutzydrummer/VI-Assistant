@@ -1,0 +1,13 @@
+disk_gb = 100
+max_hours = 8
+[search]
+min_gpu_ram_gb = 24
+min_compute_cap = 800
+min_cuda = 12.8
+min_reliability = 0.99
+min_cpu_cores_effective = 4
+min_cpu_ram_gb = 30
+min_inet_up_mbps = 500
+min_inet_down_mbps = 100
+min_disk_bw_mbps = 0
+max_dph = 0.31
