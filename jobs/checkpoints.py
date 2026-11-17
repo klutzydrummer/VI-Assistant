@@ -446,12 +446,25 @@ def _rmtree_guarded(dir, p, prefix):
     shutil.rmtree(p)
 
 
-def prune(dir, keep=None, yes=False, fmt="omnivoice", exempt=EXEMPT_STEPS):
+def prune(dir, keep=None, yes=False, fmt="omnivoice", exempt=EXEMPT_STEPS, refresh_verified=False):
     """Keep at most two verified checkpoints, deleting the rest. Dry run unless `yes`.
     Omnivoice mode keeps the two newest steps plus `exempt`; epoch mode keeps
     `keep` plus its neighbour."""
     dir = Path(dir)
     vf = dir / "VERIFIED"
+    if refresh_verified:
+        # Mid-run pruning: no whole-run verify has happened yet, so check every
+        # checkpoint now and record it. Any problem (corrupt, half-arrived,
+        # symlink) exits before anything is written or deleted. The unverified
+        # marker is left alone; the end-of-run verify still clears it.
+        problems, found = _check(dir, fmt)
+        if problems:
+            for p in problems:
+                print(p, file=sys.stderr)
+            sys.exit(1)
+        if vf.is_symlink():
+            sys.exit(f"prune: {vf} is a symlink")
+        _write_verified(dir, found, fmt)
     if vf.is_symlink() or not vf.is_file():
         sys.exit(f"prune: no {vf} (run verify first)")
     field = "epochs" if fmt == "epoch" else "checkpoints"
@@ -554,7 +567,7 @@ def cmd_prune(a):
             sys.exit("prune: --keep is required in epoch mode")
         if a.exempt_step:
             sys.exit("prune: --exempt-step is omnivoice-mode only")
-    prune(a.dir, a.keep, a.yes, a.format, exempt)
+    prune(a.dir, a.keep, a.yes, a.format, exempt, a.refresh_verified)
 
 
 def cmd_abandon(a):
@@ -590,6 +603,8 @@ def main(argv=None):
     p.add_argument("dir", type=Path)
     p.add_argument("--keep", type=int, default=None, help="epoch mode only: the pivot epoch to keep")
     p.add_argument("--yes", action="store_true", help="delete instead of printing")
+    p.add_argument("--refresh-verified", action="store_true",
+                   help="verify every checkpoint and write VERIFIED first (mid-run pruning); never clears markers")
     p.add_argument("--exempt-step", type=int, action="append", default=None,
                    help="omnivoice mode only: a step exempt from pruning (default 1000, 2500)")
     b = sub.add_parser("abandon", help="mark a run dir as given up on; keep every file")

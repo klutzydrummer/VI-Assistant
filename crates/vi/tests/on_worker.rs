@@ -2067,6 +2067,440 @@ echo done > "$VI_OUT/stage-done.txt""#,
     );
 }
 
+/// Shell helpers for a stub OmniVoice trainer: `mk STEP BYTES` writes a complete
+/// `checkpoint-STEP` (every required file category, SHA256SUMS last) into the
+/// trainer's run dir, and `wait_ack STEP` waits for home's ack marker.
+const CKPT_SHELL: &str = r#"
+mk() {
+  d=voicetune-fresh/run/checkpoint-$1
+  mkdir -p "$d"
+  for f in config.json optimizer.bin scheduler.bin random_states_0.pkl train_config.json ft_config.json tokenizer.json; do
+    printf '%s-%s' "$f" "$1" > "$d/$f"
+  done
+  head -c "$2" /dev/zero | tr '\0' 'a' > "$d/model.safetensors"
+  printf 'step-%s' "$1" >> "$d/model.safetensors"
+  ( cd "$d" && sha256sum $(ls) > ../S.$1 ) && mv "voicetune-fresh/run/S.$1" "$d/SHA256SUMS"
+}
+wait_ack() {
+  n=0
+  while [ ! -e "acked/checkpoint-$1" ]; do
+    sleep 0.2
+    n=$((n + 1))
+    [ "$n" -lt 900 ] || { echo "no ack for $1" >&2; exit 1; }
+  done
+}
+mkdir -p voicetune-fresh/run voicetune-fresh/publish
+echo "$VI_RETURN_PORT" > "$VI_OUT/port"
+echo $$ > train.pid
+"#;
+
+fn ckpt_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("checkpoint-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Gap A/B/C: with `checkpoint_format = "omnivoice"` the home supervisor acks
+/// each `checkpoint-<step>` as it arrives and prunes the home copy to the two
+/// newest plus steps 1000/2500, while the stage keeps running.
+#[test]
+fn omnivoice_checkpoints_are_acked_mid_run_and_pruned() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = String::from("set -e\n");
+    job += CKPT_SHELL;
+    for step in [500, 1000, 1500, 2000, 2500, 3000] {
+        job += &format!("mk {step} 64\nwait_ack {step}\n");
+    }
+    job += "echo done > \"$VI_OUT/done.txt\"\n";
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "prune",
+        &job,
+        "checkpoint_format = \"omnivoice\", expect_epochs = 3",
+        &envs,
+    );
+    let status = wait_stage(&mut child, 240);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    for step in [500, 1000, 1500, 2000, 2500, 3000] {
+        assert!(
+            err.contains(&format!("checkpoint {step} verified home and acked")),
+            "{err}"
+        );
+    }
+    assert!(err.contains("prune: deleted checkpoint-500"), "{err}");
+    assert!(!err.contains("failed verification"), "{err}");
+    let durable = maybe_durable(dir.path()).expect("no durable dir");
+    assert_eq!(
+        ckpt_names(&durable),
+        vec!["checkpoint-1000", "checkpoint-2500", "checkpoint-3000"],
+        "{err}"
+    );
+    assert!(durable.join("VERIFIED").is_file());
+    assert_eq!(
+        fs::read_dir(dir.path().join("state/unverified"))
+            .unwrap()
+            .count(),
+        0
+    );
+    // The worker keeps every checkpoint; only home prunes.
+    let work = kept_or_gone(dir.path());
+    assert!(
+        work.is_none()
+            || work
+                .unwrap()
+                .join("voicetune-fresh/run/checkpoint-500")
+                .is_dir()
+    );
+}
+
+/// The work dir the run left behind, if any (a successful run removes it).
+fn kept_or_gone(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir.join("worker"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("on-gpu.")
+        })
+}
+
+/// Gap A: a same-size byte flip in a `checkpoint-<step>` home copy is found by
+/// the mid-run verify, repaired by the worker's checksum push, then acked once.
+/// A later checkpoint's ack prunes the repaired one only after it is intact.
+#[test]
+fn omnivoice_corrupt_same_size_checkpoint_is_repaired_and_acked() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = String::from("set -e\n");
+    job += CKPT_SHELL;
+    job += r#"
+# First push the checkpoint without its manifest, so home cannot ack it yet.
+mk 500 64
+rm voicetune-fresh/run/checkpoint-500/SHA256SUMS
+jobs/worker-return.sh push voicetune-fresh/run vi-publish
+while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done
+( cd voicetune-fresh/run/checkpoint-500 && sha256sum $(ls) > ../S.500 ) && mv voicetune-fresh/run/S.500 voicetune-fresh/run/checkpoint-500/SHA256SUMS
+wait_ack 500
+mk 1500 64
+wait_ack 1500
+mk 2000 64
+wait_ack 2000
+echo done > "$VI_OUT/done.txt"
+"#;
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "ov-repair",
+        &job,
+        "checkpoint_format = \"omnivoice\", expect_epochs = 2",
+        &envs,
+    );
+    let work = wait_for_work(dir.path());
+    wait_until("the checkpoint never arrived home", 60, || {
+        maybe_durable(dir.path())
+            .and_then(|d| fs::read(d.join("checkpoint-500/model.safetensors")).ok())
+            .is_some_and(|b| b.ends_with(b"step-500"))
+    });
+    let durable = maybe_durable(dir.path()).unwrap();
+    let target = durable.join("checkpoint-500/model.safetensors");
+    let keep = dir.path().join("original-copy");
+    fs::copy(&target, &keep).unwrap();
+    assert!(Command::new("touch")
+        .arg("-r")
+        .arg(&target)
+        .arg(&keep)
+        .status()
+        .unwrap()
+        .success());
+    let mut bytes = fs::read(&target).unwrap();
+    bytes[0] ^= 0xff;
+    fs::write(&target, &bytes).unwrap();
+    assert!(Command::new("touch")
+        .arg("-r")
+        .arg(&keep)
+        .arg(&target)
+        .status()
+        .unwrap()
+        .success());
+    fs::write(work.join("out/release"), "").unwrap();
+
+    let status = wait_stage(&mut child, 240);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("checkpoint 500 failed verification; asked the worker to re-send it"),
+        "{err}"
+    );
+    assert!(err.contains("checkpoint 500 re-sent"), "{err}");
+    assert_eq!(
+        err.matches("checkpoint 500 verified home and acked")
+            .count(),
+        1,
+        "{err}"
+    );
+    // The corrupt copy was kept under .rsync-replaced-1 while it was repaired.
+    let files = tree_files(&durable);
+    let backup = files
+        .iter()
+        .find(|(p, _)| {
+            p.starts_with(".rsync-replaced-1/") && p.ends_with("checkpoint-500/model.safetensors")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no corrupt copy kept: {:?}",
+                files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(backup.1, bytes);
+    // Only the intact 1500 and 2000 are left once 500 was repaired and pruned.
+    assert_eq!(
+        ckpt_names(&durable),
+        vec!["checkpoint-1500", "checkpoint-2000"],
+        "{err}"
+    );
+    assert!(durable.join("VERIFIED").is_file());
+}
+
+/// Gap A: while home is below its disk floor the supervisor acks and prunes
+/// nothing for a `checkpoint-<step>` run; training continues, and the checkpoint
+/// is acked once space returns. A fake python3 fails only the gate.
+#[test]
+fn omnivoice_hs_pauses_acks_below_disk_floor_and_resumes() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("home")).unwrap();
+    let gate_fail = dir.path().join("gate-fail");
+    let real_python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    let real_python = String::from_utf8_lossy(&real_python.stdout)
+        .trim()
+        .to_string();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let py = bin.join("python3");
+    // The gate is answered here (fail while the flag exists, pass otherwise), so
+    // the real gate's omnivoice retention term never depends on the CI disk.
+    fs::write(
+        &py,
+        format!(
+            "#!/bin/sh\n\
+             script= cmd=\n\
+             for a in \"$@\"; do\n\
+             case $a in */checkpoints.py) script=1;; gate) cmd=1;; esac\n\
+             done\n\
+             if [ \"$script$cmd\" = 11 ]; then [ -e {gate} ] && exit 1; exit 0; fi\n\
+             exec {real} \"$@\"\n",
+            gate = gate_fail.display(),
+            real = real_python,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut job = format!("set -e\n: > {}\n", gate_fail.display());
+    job += CKPT_SHELL;
+    job += r#"
+mk 500 64
+jobs/worker-return.sh push voicetune-fresh/run vi-publish
+echo done > "$VI_OUT/stage-done.txt"
+"#;
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    envs.push((
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "ov-disk-floor",
+        &job,
+        "checkpoint_format = \"omnivoice\", expect_epochs = 1, min_home_gb = 0",
+        &envs,
+    );
+    let work = wait_for_work(dir.path());
+    wait_until(
+        "the stage never finished while the floor was low",
+        60,
+        || work.join("out/stage-done.txt").is_file(),
+    );
+    wait_until("the supervisor never reported the paused gate", 20, || {
+        err_text(&err_path).contains("ALERT: home disk is below the floor; training continues")
+    });
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the run ended while acks were paused"
+    );
+    assert!(
+        !work.join("acked/checkpoint-500").exists(),
+        "acked below the disk floor"
+    );
+
+    fs::remove_file(&gate_fail).unwrap();
+    let status = wait_stage(&mut child, 60);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("home disk is above the floor again; resuming acks and pushes"),
+        "{err}"
+    );
+    assert!(
+        err.contains("checkpoint 500 verified home and acked"),
+        "{err}"
+    );
+    let durable = maybe_durable(dir.path()).expect("no durable dir after the run");
+    assert!(durable.join("VERIFIED").is_file(), "{err}");
+    assert_eq!(ckpt_names(&durable), vec!["checkpoint-500"]);
+}
+
+/// Gap A: kill -9 of the worker's rsync halfway through the second checkpoint.
+/// The first one is already acked and marked pushed, so the next pass skips it
+/// and re-sends only the unmarked one. A wrapper rsync throttles the push so
+/// there is a half-sent file to kill, and logs every invocation.
+#[test]
+fn omnivoice_kill9_of_worker_rsync_mid_push_resends_only_the_unmarked_checkpoint() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real_rsync = Command::new("sh")
+        .args(["-c", "command -v rsync"])
+        .output()
+        .unwrap();
+    let real_rsync = String::from_utf8_lossy(&real_rsync.stdout)
+        .trim()
+        .to_string();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let slow = dir.path().join("slow");
+    let log = dir.path().join("rsync.log");
+    let wrapper = bin.join("rsync");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+             *rsync://*) echo \"$*\" >> {log}\n\
+               if [ -e {slow} ]; then exec {real} --bwlimit=200 \"$@\"; fi;;\n\
+             esac\n\
+             exec {real} \"$@\"\n",
+            log = log.display(),
+            slow = slow.display(),
+            real = real_rsync,
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut job = String::from("set -e\n");
+    job += CKPT_SHELL;
+    job += &format!(
+        "mk 500 64\nwait_ack 500\n: > {slow}\nmk 1500 3000000\nwait_ack 1500\necho done > \"$VI_OUT/done.txt\"\n",
+        slow = slow.display()
+    );
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    envs.push((
+        "PATH",
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    ));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "ov-kill",
+        &job,
+        "checkpoint_format = \"omnivoice\", expect_epochs = 2",
+        &envs,
+    );
+    let work = wait_for_work(dir.path());
+    // Half of the second checkpoint's big file is home (a temp or partial file).
+    wait_until("the second checkpoint never started arriving", 120, || {
+        maybe_durable(dir.path()).is_some_and(|d| {
+            let found = Command::new("find")
+                .arg(&d)
+                .args([
+                    "-path",
+                    "*checkpoint-1500*",
+                    "-name",
+                    "*model.safetensors*",
+                    "-size",
+                    "+0",
+                ])
+                .output()
+                .unwrap();
+            !found.stdout.is_empty()
+        })
+    });
+    assert!(work.join("pushed/checkpoint-500").is_file());
+    let before_kill = fs::read_to_string(&log).unwrap().lines().count();
+    let pattern = format!("{}/voicetune-fresh/publish/ rsync://", work.display());
+    let victims = pgrep_f(&pattern);
+    assert!(!victims.is_empty(), "no worker rsync to kill");
+    for pid in &victims {
+        assert!(send_signal(*pid, "-KILL"));
+    }
+    fs::remove_file(&slow).unwrap();
+
+    let status = wait_stage(&mut child, 240);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(err.contains("publish push failed; will retry"), "{err}");
+    let log_text = fs::read_to_string(&log).unwrap();
+    let after: Vec<&str> = log_text.lines().skip(before_kill).collect();
+    let resends: Vec<&&str> = after
+        .iter()
+        .filter(|l| l.contains("/voicetune-fresh/publish/"))
+        .collect();
+    assert!(!resends.is_empty(), "no push after the kill: {log_text}");
+    for l in &resends {
+        assert!(
+            l.contains("--exclude=/checkpoint-500"),
+            "re-sent the marked checkpoint: {l}"
+        );
+    }
+    // The first pass after the kill still sends the unmarked one.
+    assert!(
+        !resends[0].contains("--exclude=/checkpoint-1500"),
+        "skipped the unmarked checkpoint: {}",
+        resends[0]
+    );
+    // The manifest goes after the files, so home never saw it half-arrived.
+    assert!(!err.contains("failed verification"), "{err}");
+    let durable = maybe_durable(dir.path()).expect("no durable dir");
+    assert_eq!(
+        ckpt_names(&durable),
+        vec!["checkpoint-1500", "checkpoint-500"]
+    );
+    assert!(durable.join("VERIFIED").is_file());
+}
+
 /// Row 3: a worker that cannot be polled is retried; only after
 /// VI_LOST_MINUTES does the supervisor give up, and it keeps the worker copy
 /// so a reattach is still possible.

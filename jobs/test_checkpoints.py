@@ -523,6 +523,53 @@ class PruneOmnivoiceTest(unittest.TestCase):
                 checkpoints.prune(run, yes=True)
             self.assertEqual(_snapshot(run), before)
 
+    def test_refresh_verified_prunes_an_unverified_mid_run_dir(self):
+        # Mid-run there is no VERIFIED yet: --refresh-verified checks every
+        # checkpoint, writes the record, then prunes.
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for step in (500, 1000, 1500, 2000, 2500, 3000):
+                _ckpt(run, step)
+            checkpoints.prune(run, yes=True, refresh_verified=True)
+            self.assertEqual(_ckpt_names(run),
+                             ["checkpoint-1000", "checkpoint-2500", "checkpoint-3000"])
+            self.assertTrue((run / "VERIFIED").is_file())
+
+    def test_refresh_verified_never_prunes_next_to_a_corrupt_checkpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for step in (500, 1000, 1500, 2000):
+                _ckpt(run, step)
+            (run / "checkpoint-1500" / "model.safetensors").write_bytes(b"flipped")
+            before = _snapshot(run)
+            with self.assertRaises(SystemExit):
+                checkpoints.prune(run, yes=True, refresh_verified=True)
+            self.assertEqual(_snapshot(run), before)
+            self.assertFalse((run / "VERIFIED").exists())
+
+    def test_refresh_verified_refuses_a_half_arrived_checkpoint(self):
+        # No SHA256SUMS yet means the checkpoint is still arriving.
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for step in (500, 1000, 1500):
+                _ckpt(run, step)
+            (run / "checkpoint-1500" / "SHA256SUMS").unlink()
+            before = _snapshot(run)
+            with self.assertRaises(SystemExit):
+                checkpoints.prune(run, yes=True, refresh_verified=True)
+            self.assertEqual(_snapshot(run), before)
+
+    def test_cli_prune_refresh_verified(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for step in (500, 1000, 1500):
+                _ckpt(run, step)
+            r = subprocess.run(CLI + ["--format", "omnivoice", "prune", str(run),
+                                      "--refresh-verified", "--yes"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(_ckpt_names(run), ["checkpoint-1000", "checkpoint-1500"])
+
     def test_cli_prune_rejects_keep_in_omnivoice_mode(self):
         with tempfile.TemporaryDirectory() as d:
             run = _verified_ckpt_run(Path(d), [500, 1000, 1500])

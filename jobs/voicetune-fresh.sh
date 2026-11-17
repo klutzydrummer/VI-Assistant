@@ -70,6 +70,7 @@ work="$(cd "$(dirname "$VI_OUT")" && pwd)"
 # re-sent home.
 publish_sync() {
   local src=$1 dst=$2 ck d n
+  mkdir -p "$dst"
   for ck in "$src"/checkpoint-*; do
     [ -d "$ck" ] || continue
     [ -f "$ck/SHA256SUMS" ] || continue
@@ -185,7 +186,11 @@ push_publish() {
   [ -d "$dir" ] || return 0
   push_repairs
   mapfile -t acked < <(acked_checkpoints)
-  if "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' "${acked[@]}"; then
+  # rsync sends SHA256SUMS before the files it lists (uppercase sorts first), and home treats
+  # a present SHA256SUMS as "checkpoint complete". So send everything else first, then the
+  # manifests, and home never sees a half-arrived checkpoint as corrupt.
+  if "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' --exclude=SHA256SUMS "${acked[@]}" \
+     && "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' "${acked[@]}"; then
     mark_pushed
   else
     return 1

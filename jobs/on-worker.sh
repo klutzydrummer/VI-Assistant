@@ -767,47 +767,64 @@ render_log() {
   printf '%s\n' "$new" >"$cursor"
 }
 
-# Verify each epoch home found on the worker's publish path (SHA256SUMS is
-# pushed last, so its presence means the epoch is complete) and ack it, or ask
-# the worker to re-send it with --checksum.
+# The published-checkpoint name prefix for this stage's layout: epoch-<k> (legacy)
+# or checkpoint-<step> (omnivoice). Acks, repush requests and the verify-epoch key
+# all use the same <prefix>-<n> name.
+ckpt_prefix=epoch
+[ "$ckpt_format" = omnivoice ] && ckpt_prefix=checkpoint
+
+# Verify each checkpoint home found on the worker's publish path (SHA256SUMS is
+# pushed last, so its presence means the checkpoint is complete) and ack it, or ask
+# the worker to re-send it with --checksum. In omnivoice mode, once a pass has acked
+# something, prune the home copy to the two newest plus the exempt steps; prune
+# re-verifies every checkpoint first, so a corrupt or half-arrived one blocks it.
 ack_epochs() {  # ACKED REPUSH BAD
-  local acked=" $1 " repush=" $2 " bad=" $3 " ep n
+  local acked=" $1 " repush=" $2 " bad=" $3 " ep n name newly=0
   [ -n "$durable" ] || return 0
-  for ep in "$durable"/epoch-*; do
+  for ep in "$durable/$ckpt_prefix"-*; do
     [ -d "$ep" ] || continue
     case ${ep##*/} in *'.part') continue ;; esac
-    n=${ep##*/epoch-}
+    n=${ep##*/"$ckpt_prefix"-}
     case $n in ''|*[!0-9]*) continue ;; esac
-    case $acked in *" epoch-$n "*) continue ;; esac
-    case $repush in *" epoch-$n "*) continue ;; esac
-    case $bad in *" epoch-$n "*) continue ;; esac
+    name=$ckpt_prefix-$n
+    case $acked in *" $name "*) continue ;; esac
+    case $repush in *" $name "*) continue ;; esac
+    case $bad in *" $name "*) continue ;; esac
     [ -f "$ep/SHA256SUMS" ] || continue
     if python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify-epoch "$durable" "$n" >/dev/null 2>&1; then
-      if remote "mkdir -p $(q "$work/acked") && : > $(q "$work/acked/epoch-$n")"; then
-        echo "on-worker.sh: epoch $n verified home and acked" >&2
+      if remote "mkdir -p $(q "$work/acked") && : > $(q "$work/acked/$name")"; then
+        echo "on-worker.sh: $ckpt_prefix $n verified home and acked" >&2
+        newly=1
       else
-        echo "on-worker.sh: ALERT: epoch $n verified home but could not be acked; it will be checked again" >&2
+        echo "on-worker.sh: ALERT: $ckpt_prefix $n verified home but could not be acked; it will be checked again" >&2
       fi
     else
-      if remote "mkdir -p $(q "$work/repush") && : > $(q "$work/repush/epoch-$n")"; then
-        echo "on-worker.sh: ALERT: epoch $n failed verification; asked the worker to re-send it" >&2
+      if remote "mkdir -p $(q "$work/repush") && : > $(q "$work/repush/$name")"; then
+        echo "on-worker.sh: ALERT: $ckpt_prefix $n failed verification; asked the worker to re-send it" >&2
       else
-        echo "on-worker.sh: ALERT: epoch $n failed verification and the re-send request could not be sent" >&2
+        echo "on-worker.sh: ALERT: $ckpt_prefix $n failed verification and the re-send request could not be sent" >&2
       fi
     fi
   done
+  if [ "$newly" = 1 ] && [ "$ckpt_format" = omnivoice ]; then
+    if python3 "$jobs_dir/checkpoints.py" --format omnivoice prune "$durable" --refresh-verified --yes >&2; then
+      :
+    else
+      echo "on-worker.sh: prune skipped this pass (a checkpoint is unverified or still arriving); it runs again after the next ack" >&2
+    fi
+  fi
 }
 
-# Count the epochs that still need pushing home (published, not acked).
+# Count the checkpoints that still need pushing home (published, not acked).
 unacked_epochs() {  # ACKED
   local acked=" $1 " ep n out=0
   [ -n "$durable" ] || { printf '0\n'; return 0; }
-  for ep in "$durable"/epoch-*; do
+  for ep in "$durable/$ckpt_prefix"-*; do
     [ -d "$ep" ] || continue
     case ${ep##*/} in *'.part') continue ;; esac
-    n=${ep##*/epoch-}
+    n=${ep##*/"$ckpt_prefix"-}
     case $n in ''|*[!0-9]*) continue ;; esac
-    case $acked in *" epoch-$n "*) continue ;; esac
+    case $acked in *" $ckpt_prefix-$n "*) continue ;; esac
     out=$((out + 1))
   done
   printf '%s\n' "$out"
@@ -1051,7 +1068,7 @@ if [ "$final_ok" = 1 ]; then
   # so an empty durable dir just means this stage publishes nothing: expect 0
   # and let verify clear its marker.
   if [ -n "$durable" ] && [ -z "$expect_epochs" ]; then
-    if compgen -G "$durable/epoch-*" >/dev/null; then
+    if compgen -G "$durable/$ckpt_prefix-*" >/dev/null; then
       echo "on-worker.sh: $VI_STAGE published epochs but sets no expect_epochs; keeping the worker copy and failing rather than deleting an unverified result" >&2
       exit 1
     fi
