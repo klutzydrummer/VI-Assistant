@@ -1359,7 +1359,11 @@ fn omnivoice_train_cmd(
     for name in ["train", "dev", "replay"] {
         let shards = data.join("shards").join(name);
         fs::create_dir_all(&shards).unwrap();
-        fs::write(shards.join("data.lst"), "shard-000000.tar shard-000000.jsonl 1\n").unwrap();
+        fs::write(
+            shards.join("data.lst"),
+            "shard-000000.tar shard-000000.jsonl 1\n",
+        )
+        .unwrap();
     }
     let mut cmd = Command::new("bash");
     cmd.arg(vf)
