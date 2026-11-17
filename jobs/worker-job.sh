@@ -140,8 +140,9 @@ if [ -d "$sync_src" ] && { [ -e "$work/.return-port" ] || [ -n "${VI_RETURN_PORT
 fi
 trap 'kill "${watch-}" "${sync-}" 2>/dev/null || true' EXIT
 
-cmd=("$@")
-attempt=0 resumed=0 rc=0
+base=("$@")
+cmd=("${base[@]}")
+attempt=0 rc=0
 while :; do
   before=$(oom_kill)
   before=${before:-0}
@@ -175,23 +176,20 @@ while :; do
     fi
   fi
   attempt=$((attempt + 1))
-  if [ $resumed = 0 ]; then
-    # The newest checkpoint-<step> whose SHA256SUMS exists (the manifest is written
-    # last, so a dir without one is a partial save). Every loop body ends with a
-    # zero status: under set -euo pipefail a failing substitution would kill this
-    # runner before it writes rc.
-    resume_ckpt=$({
-      for c in "$run"/checkpoint-*; do
-        if [ -d "$c" ] && [ -f "$c/SHA256SUMS" ]; then
-          printf '%s\n' "$c"
-        fi
-      done
-    } | sort -V | tail -n1) || resume_ckpt=""
-    if [ -n "$resume_ckpt" ]; then
-      cmd+=(--resume-from-checkpoint "$resume_ckpt")
-      resumed=1
-    fi
-  fi
+  # Every retry resumes from the newest checkpoint-<step> whose SHA256SUMS exists
+  # (the manifest is written last, so a dir without one is a partial save), not the
+  # one the first retry used. Every loop body ends with a zero status: under
+  # set -euo pipefail a failing substitution would kill this runner before it
+  # writes rc.
+  resume_ckpt=$({
+    for c in "$run"/checkpoint-*; do
+      if [ -d "$c" ] && [ -f "$c/SHA256SUMS" ]; then
+        printf '%s\n' "$c"
+      fi
+    done
+  } | sort -V | tail -n1) || resume_ckpt=""
+  cmd=("${base[@]}")
+  [ -z "$resume_ckpt" ] || cmd+=(--resume-from-checkpoint "$resume_ckpt")
   echo "worker-job.sh: retry $attempt/$retries" >&2
 done
 echo "$rc" >"$work/rc"

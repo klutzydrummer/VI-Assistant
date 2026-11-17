@@ -268,7 +268,7 @@ pick_attempt() {
       [ -e \"\$d/job.lock\" ] && ! flock -n \"\$d/job.lock\" true 2>/dev/null && l=1
       if [ -s \"\$d/train.pid\" ]; then
         tp=\$(cat \"\$d/train.pid\" 2>/dev/null) || tp=
-        kill -0 \"\$tp\" 2>/dev/null && tr '\\0' ' ' <\"/proc/\$tp/cmdline\" 2>/dev/null | grep -q voicetune.py && t=1
+        kill -0 \"\$tp\" 2>/dev/null && tr '\\0' ' ' <\"/proc/\$tp/cmdline\" 2>/dev/null | grep -qE 'voicetune.py|train_ft.py' && t=1
       fi
       [ -s \"\$d/stage.pid\" ] && kill -0 \"\$(cat \"\$d/stage.pid\" 2>/dev/null)\" 2>/dev/null && s=1
       ls \"\$d\"/pending/* >/dev/null 2>&1 && p=1
@@ -731,13 +731,17 @@ echo VI-REPUSH \"\$(ls repush 2>/dev/null | tr '\n' ' ')\"
 echo VI-BAD \"\$(ls bad 2>/dev/null | tr '\n' ' ')\"
 echo VI-WATCHDOG \$(pgrep -f vi-watchdog.sh >/dev/null 2>&1 && echo 1 || echo 0)
 echo VI-PROGRESS \$(find . -mindepth 1 -newermt \"@\$(( \$(date +%s) - $stall_seconds ))\" -print -quit 2>/dev/null | grep -q . && echo 1 || echo 0)
-echo VI-SIZE \$(stat -c %s job.log 2>/dev/null || echo 0)
+vi_size=\$(stat -c %s job.log 2>/dev/null || echo 0)
+echo VI-SIZE \$vi_size
 echo VI-LOG"
 
 poll_worker() {  # OFFSET
   local off=$1 raw="$return_state/status.raw"
+  # Read only up to the size reported above: text appended after the stat
+  # would otherwise be printed now and again on the next poll.
   remote "$status_head
-tail -c +$((off + 1)) job.log 2>/dev/null | head -c 65536" >"$raw" 2>"$return_state/poll.err" || return 1
+n=\$(( vi_size - $off )); [ \$n -le 65536 ] || n=65536
+[ \$n -le 0 ] || tail -c +$((off + 1)) job.log 2>/dev/null | head -c \$n" >"$raw" 2>"$return_state/poll.err" || return 1
   python3 - "$raw" "$return_state/status" "$return_state/chunk" <<'PY' || return 1
 import sys
 raw = open(sys.argv[1], "rb").read()

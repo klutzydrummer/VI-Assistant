@@ -25,7 +25,9 @@
 # replay_public.py --device cuda into replay/ and shards/replay/; both need CUDA) and rehearses a
 # real kill and resume: a 20-step run saving every 10 steps is SIGKILLed after checkpoint-10 and
 # resumed from it.
-# The train mode does not rebuild them: it needs the shards preflight wrote into the data folder.
+# The train mode prepares the data folder the same way: on-worker.sh sends the inputs into a fresh
+# work dir for every stage, so the shards preflight built are not there (a reattach keeps them,
+# and prepare_data then skips every piece).
 #
 # Expected inputs (jobs/on-worker.sh maps stage `inputs` to VI_INPUT_<NAME>):
 #   VI_INPUT_OMNIVOICE_DATA/                 one prepared folder, built at home, holding
@@ -535,6 +537,7 @@ train() {
   fi
   # Preflight already proved generate, so this gates VRAM/disk without the extra model load.
   check_and_gate
+  prepare_data
 
   local start reason elapsed rc wj_pid rc_file pid_file
   start=$(date +%s)

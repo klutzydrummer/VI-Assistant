@@ -1345,7 +1345,9 @@ fn omnivoice_train_stubs(dir: &Path, trainer_secs: u32) -> (PathBuf, PathBuf) {
     (stubs, py)
 }
 
-/// Env for `bash voicetune-fresh.sh train` against `omnivoice_train_stubs`.
+/// Env for `bash voicetune-fresh.sh train` against `omnivoice_train_stubs`. The
+/// train, dev and replay shard lists are written into `data`, so the train mode's
+/// prepare_data finds them built and skips tokenising and the replay set.
 fn omnivoice_train_cmd(
     vf: &Path,
     stubs: &Path,
@@ -1354,6 +1356,11 @@ fn omnivoice_train_cmd(
     data: &Path,
     home: &Path,
 ) -> Command {
+    for name in ["train", "dev", "replay"] {
+        let shards = data.join("shards").join(name);
+        fs::create_dir_all(&shards).unwrap();
+        fs::write(shards.join("data.lst"), "shard-000000.tar shard-000000.jsonl 1\n").unwrap();
+    }
     let mut cmd = Command::new("bash");
     cmd.arg(vf)
         .arg("train")
