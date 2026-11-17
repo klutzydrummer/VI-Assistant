@@ -205,7 +205,18 @@ else
   remote() { ssh "${ssh_opts[@]}" "$target" "$1"; }
   push() { local src=$1 dst=$2; shift 2; rsync -a --timeout=300 -e "ssh ${ssh_opts[*]}" "$@" "$src" "$target:$dst"; }
   # Keep home's idle clock running while the job does.
-  (while sleep 60 >/dev/null 2>&1; do "$vi" cloud touch >/dev/null 2>&1 || true; done) &
+  # It stops when this script is gone, even if that was a SIGKILL that skipped
+  # cleanup; otherwise it would keep home's idle clock running forever.
+  (
+    owner=$$
+    while :; do
+      for _ in $(seq 60); do
+        sleep 1 >/dev/null 2>&1
+        kill -0 "$owner" 2>/dev/null || exit 0
+      done
+      "$vi" cloud touch >/dev/null 2>&1 || true
+    done
+  ) &
   heartbeat=$!
 fi
 

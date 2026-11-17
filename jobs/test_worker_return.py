@@ -41,6 +41,36 @@ def port_open(port):
             return False
 
 
+def on_worker_leftovers(root):
+    """pids of on-worker.sh processes (or their subshells) whose command line names `root`."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+        except OSError:
+            continue
+        if b"on-worker.sh" in cmdline and str(root).encode() in cmdline:
+            found.append(int(entry.name))
+    return found
+
+
+def assert_no_on_worker_left(test, root, seconds=8):
+    """Fail the test (and kill the strays) if an on-worker.sh for `root` outlives it."""
+    deadline = time.time() + seconds
+    left = on_worker_leftovers(root)
+    while left and time.time() < deadline:
+        time.sleep(0.2)
+        left = on_worker_leftovers(root)
+    for pid in left:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+    test.assertEqual(left, [], "on-worker.sh processes outlived the test")
+
+
 @unittest.skipUnless(shutil.which("rsync"), "rsync is not installed")
 class WorkerReturnTest(unittest.TestCase):
     def setUp(self):
@@ -74,6 +104,7 @@ class WorkerReturnTest(unittest.TestCase):
                 process.kill()
         subprocess.run([SCRIPT, "stop", self.state], check=True, capture_output=True)
         self.tmp.cleanup()
+        assert_no_on_worker_left(self, self.root)
 
     def push(self, source, module, *options, check=True, env=None):
         return subprocess.run(
@@ -924,6 +955,7 @@ class HomeSupervisorTest(unittest.TestCase):
                 except ProcessLookupError:
                     pass
         self.tmp.cleanup()
+        assert_no_on_worker_left(self, self.root)
 
     # -- harness -----------------------------------------------------------
     def env(self, stage, **extra):
