@@ -6,9 +6,11 @@
 It drives the existing `vi` binary ($VI_BIN, else <repo>/target/release/vi if built, else `vi`) so a stub can stand in for tests:
 rent the cheapest qualifying offer, run the preflight stage (tunnel, receiver, token push, the
 worker gates), then the train stage, then release the worker and print what it cost. If ONLY the
-push-speed gate fails (stderr says `worker push (MB/s)`), the machine is released, that offer is
+cheap worker gate fails (stderr says `worker-preflight: ...`: disk, RAM, CUDA, VRAM, cores, push
+speed; or `worker upload ETA` for a too-slow upload line), the machine is released, that offer is
 excluded, and the next cheapest is tried, up to --max-attempts. Any other failure releases the
-worker and stops.
+worker and stops. Before renting anything it also checks home's free disk (the stage's
+min_home_gb plus reserve; exit 11) and shows the bundle cache and the pinned base-model revision.
 
 --cap and --max-hours cover ALL attempts together. A state file records every attempt, so a
 killed run can be started again with the same --run-id: a worker still up is adopted (if the
@@ -16,8 +18,8 @@ train stage had started) or destroyed first, and a second rental is never made o
 
 Exit codes:
   0 done        2 bad arguments         3 `vi cloud up` failed (boot failure included)
-  4 a preflight failure that is not the push gate
-  5 the push gate failed on every attempt allowed (--max-attempts)
+  4 a preflight failure that is not a retryable worker gate
+  5 a cheap worker gate failed on every attempt allowed (--max-attempts)
   6 the train stage failed             7 train finished but home checkpoints/listening sets
                                          did not verify
   8 interrupted (SIGINT/SIGTERM); worker released
@@ -56,6 +58,24 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO / "jobs" / "paid-run" / "omnivoice-run-cloud.toml"
 DEFAULT_STAGES = "characters/tali/omnivoice-ft.toml"
 PUSH_GATE_TEXT = "worker push (MB/s)"
+# Every failed cheap gate of jobs/worker-preflight.sh prints `worker-preflight: <what failed>`
+# (disk, RAM, CUDA, VRAM, cores, push speed, missing tools). They are facts about one offer, so
+# the next offer may pass; the success line `worker-preflight: ok` is not a failure.
+PREFLIGHT_GATE_RE = re.compile(r"worker-preflight: (?!ok\b)\S")
+# on-worker.sh prints this when the timed 8 MB probe says the inputs would take longer than
+# max_upload_minutes: also a per-offer fact (this worker's line), also before anything is sent.
+UPLOAD_GATE_TEXT = "worker upload ETA"
+
+
+def retryable_gate(out):
+    """The gate text that makes a failed preflight stage retry on another offer, or None."""
+    if PUSH_GATE_TEXT in out:
+        return "push-speed"
+    if UPLOAD_GATE_TEXT in out:
+        return "upload-ETA"
+    if PREFLIGHT_GATE_RE.search(out):
+        return "worker-preflight"
+    return None
 EU_COUNTRIES = ("US AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI "
                 "ES SE GB CH NO").split()
 # Home keeps the two newest checkpoints plus the exempt steps (jobs/checkpoints.py
@@ -291,6 +311,66 @@ def disk_check(config_text, env=None):
     return ok, disk, gate, line
 
 
+def base_model_revision(script=GATE_SCRIPT):
+    """The base-model revision pinned in the stage script (shown at --plan, not checked)."""
+    try:
+        m = re.search(r"VI_BASE_MODEL_REVISION:-([0-9a-f]{12,40})", Path(script).read_text())
+    except OSError:
+        m = None
+    return m.group(1) if m else "unknown"
+
+
+def stage_settings(stages, repo, stage):
+    """The [stage.<stage>.settings] table of the stage file, or None when it cannot be read."""
+    try:
+        import tomllib
+        p = Path(stages)
+        p = p if p.is_absolute() else Path(repo) / p
+        return tomllib.loads(p.read_text())["stage"][stage].get("settings", {})
+    except (ImportError, OSError, KeyError, ValueError):
+        return None
+
+
+def home_check(stages, repo, home=None, env=None):
+    """(ok, lines): the home-side checks on-worker.sh makes after renting, made before renting.
+
+    The home disk gate is jobs/checkpoints.py's own `gate` with the stages' min_home_gb and
+    home_gate_reserve_gb; the bundle cache line is a note (the cache key needs the data folder,
+    so only the cache's contents are shown)."""
+    env = os.environ if env is None else env
+    home = home or str(Path.home())
+    lines, ok = [], True
+    for stage in ("omnivoice_preflight", "omnivoice_train"):
+        st = stage_settings(stages, repo, stage)
+        if st is None:
+            lines.append(f"home disk       : {stage}: stage settings unreadable, not checked")
+            continue
+        floor = st.get("min_home_gb")
+        if floor is None:
+            continue
+        r = subprocess.run(
+            [sys.executable, str(REPO / "jobs" / "checkpoints.py"), "--format",
+             str(st.get("checkpoint_format", "omnivoice")), "gate", home, "--min-gb", str(floor),
+             "--reserve-gb", str(st.get("home_gate_reserve_gb", 0))],
+            capture_output=True, text=True)
+        free = r.stdout.strip().splitlines()[-1].split(": ", 1)[-1] if r.stdout.strip() else "?"
+        ok &= r.returncode == 0
+        lines.append(f"home disk       : {stage}: {free}, floor {floor} + reserve "
+                     f"{st.get('home_gate_reserve_gb', 0)} GiB: "
+                     f"{'OK' if r.returncode == 0 else 'FAIL'}")
+    cache = Path(env.get("VI_BUNDLE_DIR") or Path(env.get("XDG_CACHE_HOME")
+                                                   or Path(home) / ".cache") / "vi" / "bundles")
+    bundles = sorted(cache.glob("*.tar.zst")) if cache.is_dir() else []
+    if bundles:
+        mb = sum(b.stat().st_size for b in bundles) // 1048576
+        lines.append(f"bundle cache    : {len(bundles)} bundle(s), {mb} MB in {cache} (warm if the "
+                     "data folder is unchanged; a cold cache packs with zstd before the upload)")
+    else:
+        lines.append(f"bundle cache    : EMPTY in {cache}; the first run packs the data folder "
+                     "with zstd while the worker is rented")
+    return ok, lines
+
+
 def resolve_vi_bin():
     """$VI_BIN wins; else <repo>/target/release/vi if it is an executable file; else `vi`."""
     explicit = os.environ.get("VI_BIN")
@@ -493,22 +573,26 @@ class PaidRun:
     def plan_lines(self):
         a = self.a
         self.disk_ok, _, _, self.disk_line = disk_check(self.base_config_text())
+        self.home_ok, home_lines = home_check(a.stages, a.repo)
         countries = a.countries or "(from the config)"
         return [
             f"run id          : {a.run_id}",
             f"cap (all tries) : ${a.cap:.2f}",
             f"max hours (all) : {a.max_hours} h",
-            f"max attempts    : {a.max_attempts} (a retry only after a push-speed gate failure)",
+            f"max attempts    : {a.max_attempts} (a retry only after a failed cheap worker gate)",
             f"vi binary       : {self.vi}",
             f"run config      : {a.config}",
             self.disk_line,
+            *home_lines,
+            f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision) not verified (needs network)",
             f"countries       : {countries}",
             f"stage file      : {a.stages}",
             f"state file      : {self.path}",
             "flow            : offers -> cheapest not-failed offer -> up -> preflight stage "
             "(tunnel, receiver, token push, gates) -> train stage -> verify -> down",
-            "retry rule      : only `worker push (MB/s)` failures retry; every other failure "
-            "releases the worker and stops",
+            "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores, "
+            "push speed) or the upload-ETA gate retries on the next offer; every other "
+            "failure releases the worker and stops",
             f"keeps at home   : checkpoints {', '.join(map(str, EXPECTED_STEPS))}; listening sets "
             f"{', '.join(map(str, LISTENING_STEPS))} in {a.platter}",
         ]
@@ -653,7 +737,7 @@ class PaidRun:
                 n = len(self.s["attempts"]) + 1
                 cap_left, hours_left = self.remaining()
                 if n > a.max_attempts:
-                    raise Stop(EXIT["push"], f"the push-speed gate failed on all {a.max_attempts}"
+                    raise Stop(EXIT["push"], f"a cheap worker gate failed on all {a.max_attempts}"
                                " attempts allowed")
                 if hours_left < a.min_hours:
                     raise Stop(EXIT["budget"], f"only {hours_left:.2f} h of the {a.max_hours} h "
@@ -682,18 +766,19 @@ class PaidRun:
                 rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"],
                                    watch=True)
                 if rc != 0:
-                    if PUSH_GATE_TEXT in out:
-                        say(f"offer {offer['id']} failed the push-speed gate")
+                    gate = retryable_gate(out)
+                    if gate:
+                        say(f"offer {offer['id']} failed a cheap worker gate ({gate})")
                         self.s["failed_offers"].append(offer["id"])
                         self.s["failed_sigs"].append(offer["sig"])
-                        spent = self.release(at, "push-gate")
+                        spent = self.release(at, "push-gate" if gate == "push-speed" else "worker-gate")
                         say(f"attempt {n} cost ${spent:.2f}; total ${self.s['spent_total']:.2f} "
                             f"of ${a.cap:.2f}, {self.s['hours_total']:.2f} of {a.max_hours} h")
                         at = None
                         continue
                     self.release(at, "preflight-failed")
                     raise Stop(EXIT["preflight"], f"the preflight failed (exit {rc}) on a gate "
-                               "other than the push speed; the worker was released, no retry")
+                               "that is not a retryable worker gate; the worker was released, no retry")
                 self.set_phase(at, "train")
             # -- train (new or adopted) --
             say("preflight passed; starting the train stage")
@@ -812,6 +897,12 @@ class PaidRun:
                   "fail after you had paid for the machine. Raise disk_gb (the gate plus "
                   f"{DISK_OVERHEAD_GB:g} GB overhead is the minimum) or lower VI_MIN_DISK_GB. "
                   "Nothing was rented.", file=sys.stderr, flush=True)
+            return EXIT["disk"]
+        if not self.home_ok:
+            print(f"paid-run: STOPPED (exit {EXIT['disk']}): home is short of disk for the "
+                  "stage's min_home_gb plus reserve, so the run would fail after the worker was "
+                  "rented. Free space at home first. Nothing was rented.", file=sys.stderr,
+                  flush=True)
             return EXIT["disk"]
         if self.a.plan:
             say("--plan: nothing was called; exiting")

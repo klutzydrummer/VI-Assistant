@@ -2,7 +2,8 @@
 disk_gb = 125
 max_hours = 8
 [search]
-min_gpu_ram_gb = 24
+# Vast gpu_ram is MB (docs.vast.ai search-offers, checked 2026-11-18); 24.1 x 1000 = 24100 MB = 23.54 GiB, so no offer passes this and fails the live 23.5 GiB gate.
+min_gpu_ram_gb = 24.1
 min_compute_cap = 800
 min_cuda = 12.8
 min_reliability = 0.99

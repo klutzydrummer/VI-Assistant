@@ -90,8 +90,23 @@ STUB = textwrap.dedent('''\
             if r == "push":
                 print("worker-preflight: worker push (MB/s) is 1.80, under the required 2.5", file=sys.stderr)
                 print("on-worker.sh: the worker preflight failed; nothing was uploaded", file=sys.stderr); sys.exit(1)
-            if r == "vram":
-                print("worker-preflight: VRAM (GiB) is 15.6, under the required 23.5", file=sys.stderr); sys.exit(1)
+            gates = dict(
+                vram="VRAM (GiB) is 15.6, under the required 23.5",
+                disk="free disk (GiB) is 60.1, under the required 100",
+                ram="RAM (GiB) is 15.6, under the required 28",
+                cuda="CUDA version is 12.4, under the required 12.8",
+                cores="effective CPU cores is 2.0, under the required 4",
+            )
+            if r in gates:
+                print("worker-preflight: " + gates[r], file=sys.stderr)
+                print("on-worker.sh: the worker preflight failed; nothing was uploaded", file=sys.stderr); sys.exit(1)
+            if r == "upload":
+                print("on-worker.sh: worker upload ETA is 41 min, over the 30 min limit, so nothing was sent", file=sys.stderr); sys.exit(1)
+            if r == "other":
+                print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
+            if r == "ok-then-fail":
+                print("worker-preflight: ok (VRAM 23.9 GiB, push 9 MB/s)", file=sys.stderr)
+                print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
             print("preflight: ok")
         else:
             r = a.get("train", "pass")
@@ -274,6 +289,36 @@ class Flow(Base):
         self.assertAlmostEqual(s["spent_total"], 1.20)
         self.assertIn("total actual spend: $1.20", self.out)
 
+    def test_2c_every_cheap_gate_retries_with_the_next_offer(self):
+        for gate in ("vram", "disk", "ram", "cuda", "cores", "upload"):
+            with self.subTest(gate):
+                for f in ("calls.log", "state.json"):
+                    (self.sd / f).unlink(missing_ok=True)
+                subprocess.run(["rm", "-rf", str(self.tmp / "paid"), str(self.tmp / "ckpt"),
+                                str(self.tmp / "platter"), str(self.tmp / "vistate")])
+                self.scenario([dict(preflight=gate, spent=0.1, hours=0.5),
+                               dict(spent=0.2, hours=1.0)])
+                self.assertEqual(self.run_orch(), 0, self.out)
+                self.assertEqual([x["offer"] for x in self.ups()], ["1", "2"])
+                self.assertEqual(len(self.downs()), 2)
+                self.assertEqual(self.state()["failed_offers"], [1])
+                self.assertEqual(self.stages().count("omnivoice_train"), 1)
+
+    def test_2d_gate_failures_never_rent_the_same_offer_twice_and_stop_at_max_attempts(self):
+        self.scenario([dict(preflight="disk", spent=0.1, hours=0.2)])
+        self.assertEqual(self.run_orch(max_attempts=2), 5, self.out)
+        self.assertEqual([x["offer"] for x in self.ups()], ["1", "2"])
+        self.assertIsNone(self.worker())
+        self.assertEqual(self.stages().count("omnivoice_train"), 0)
+
+    def test_2e_the_ok_line_alone_is_not_a_gate_failure(self):
+        paid_run = load_paid_run()
+        self.assertIsNone(paid_run.retryable_gate("worker-preflight: ok (VRAM 23.9 GiB)"))
+        self.assertEqual(paid_run.retryable_gate("worker-preflight: RAM (GiB) is 1, under"),
+                         "worker-preflight")
+        self.assertEqual(paid_run.retryable_gate("worker-preflight: worker push (MB/s) is 1"),
+                         "push-speed")
+
     def test_2b_second_offer_same_machine_skipped(self):
         self.scenario([dict(preflight="push", spent=0.1), dict(spent=0.1)],
                       offer_list=offers((1, 0.20, "US", 800)))
@@ -327,7 +372,8 @@ class Flow(Base):
 
     def test_6_other_failures_destroy_stop_and_exit_codes(self):
         cases = [
-            ("other preflight gate", dict(preflight="vram", spent=0.1), 4, 1),
+            ("preflight failure that is no gate", dict(preflight="other", spent=0.1), 4, 1),
+            ("preflight passed then failed", dict(preflight="ok-then-fail", spent=0.1), 4, 1),
             ("up error / boot failure", dict(up="fail"), 3, 1),
             ("train failure", dict(train="fail", spent=0.1), 6, 1),
             ("checkpoints never verified", dict(train="noverify", spent=0.1), 7, 1),
@@ -431,6 +477,64 @@ class DiskGate(Base):
         self.assertEqual(disk, 125)
         for toml in (JOBS / "paid-run").glob("*.toml"):
             self.assertTrue(paid_run.disk_check(toml.read_text(), {})[0], toml)
+
+
+class HomeChecks(Base):
+    """Home's disk gate and the cache note run in --plan / before `vi cloud up`."""
+
+    def stages_file(self, floor, reserve=27, name="stages.toml"):
+        p = self.tmp / name
+        # "epoch" has no retention term, so a small scratch disk can pass the small floors.
+        body = (f'checkpoint_format = "epoch"\nmin_home_gb = {floor}\n'
+                f"home_gate_reserve_gb = {reserve}\n")
+        p.write_text(f"[stage.omnivoice_preflight.settings]\n{body}"
+                     f"[stage.omnivoice_train.settings]\n{body}")
+        return str(p)
+
+    def test_short_home_disk_rents_nothing_and_exits_11(self):
+        self.scenario([dict(spent=0.1, hours=1.0)])
+        self.env["HOME"] = str(self.tmp)
+        self.assertEqual(self.run_orch(stages=self.stages_file(100000000)), 11, self.out)
+        self.assertIn("home disk", self.out)
+        self.assertIn("FAIL", self.out)
+        self.assertIn("Nothing was rented", self.out)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.tmp / "paid").exists())
+
+    def test_short_home_disk_also_fails_plan(self):
+        self.scenario([{}])
+        self.env["HOME"] = str(self.tmp)
+        self.assertEqual(self.run_orch(stages=self.stages_file(100000000), plan=True), 11, self.out)
+        self.assertEqual(self.calls(), [])
+
+    def test_enough_home_disk_passes_and_plan_shows_the_lines(self):
+        self.scenario([{}])
+        self.env["HOME"] = str(self.tmp)
+        self.assertEqual(self.run_orch(stages=self.stages_file(1, 0), plan=True), 0, self.out)
+        self.assertIn("home disk       : omnivoice_preflight:", self.out)
+        self.assertIn("floor 1 + reserve 0 GiB: OK", self.out)
+        self.assertIn("pinned revision) not verified (needs network)", self.out)
+
+    def test_bundle_cache_empty_and_warm_notes(self):
+        self.scenario([{}])
+        self.env["HOME"] = str(self.tmp)
+        self.env["VI_BUNDLE_DIR"] = str(self.tmp / "bundles")
+        st = self.stages_file(1, 0)
+        self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
+        self.assertIn("bundle cache    : EMPTY", self.out)
+        (self.tmp / "bundles").mkdir()
+        (self.tmp / "bundles" / "abc.tar.zst").write_bytes(b"x" * 2048)
+        self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
+        self.assertIn("bundle cache    : 1 bundle(s)", self.out)
+
+    def test_checked_in_stage_file_settings_are_read(self):
+        paid_run = load_paid_run()
+        ok, lines = paid_run.home_check("characters/tali/omnivoice-ft.toml", str(JOBS.parent),
+                                        home=str(self.tmp), env={})
+        self.assertTrue(any("floor 50 + reserve 27 GiB" in ln for ln in lines), lines)
+
+    def test_base_revision_is_read_from_the_stage_script(self):
+        self.assertRegex(load_paid_run().base_model_revision(), r"^[0-9a-f]{40}$")
 
 
 class StatusAndStop(Base):

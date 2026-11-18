@@ -19,6 +19,7 @@ with train_ft.py's own manifest and verify functions.
 
 Knobs (environment):
   VI_STUB_VRAM_MIB          nvidia-smi memory.total (default 24467, a 24 GB card)
+  VI_STUB_CUDA              nvidia-smi CUDA Version (default 12.8)
   VI_STUB_HF_FAIL=1         the Base download raises
   VI_STUB_STEP_SECONDS      seconds per trainer step for long runs (default 0.02); runs of at
                             most 50 steps (probe, kill/resume rehearsal) use 0.25 s so the
@@ -442,7 +443,7 @@ case "$*" in
   *--query-gpu=clocks.sm*)
     echo "clocks.sm [MHz], clocks.max.sm [MHz], power.draw [W], power.limit [W], clocks_throttle_reasons.active"
     echo "210 MHz, 1980 MHz, 21.50 W, 350.00 W, 0x0000000000000001" ;;
-  "") printf '| NVIDIA-SMI 550.54.15   Driver Version: 550.54.15   CUDA Version: 12.4 |\n| stub card %s MiB |\n' "$mib" ;;
+  "") printf '| NVIDIA-SMI 550.54.15   Driver Version: 550.54.15   CUDA Version: %s |\n| stub card %s MiB |\n' "${VI_STUB_CUDA:-12.8}" "$mib" ;;
   *) echo "stub nvidia-smi: unsupported query: $*" >&2; exit 2 ;;
 esac
 '''

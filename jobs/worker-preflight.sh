@@ -8,6 +8,9 @@
 # The gates come from the stage settings JSON (the home side's $VI_SETTINGS):
 #   min_vram_gb       card memory, GiB (nvidia-smi MiB / 1024; a "24 GB" card reads 23.9, so use 23.5)
 #   min_disk_mb_s     sequential disk read AND write, MB/s (decimal, dd)
+#   min_disk_gb       free space on the job disk, GiB (statvfs / 2**30, the unit check_and_gate uses)
+#   min_ram_gb        MemTotal, GiB (an advertised 30 GB host reads 28.6, so use 28)
+#   min_cuda_version  CUDA version nvidia-smi reports (the driver's), compared as a number
 #   min_cpu_cores     effective cores (nproc capped by a cgroup cpu.max quota)
 #   min_push_mb_s     worker -> home rate measured by a raw 100 MiB dummy push
 # A setting that is absent or empty turns that gate off; the facts are still
@@ -33,6 +36,9 @@ setting() {
 min_vram=$(setting min_vram_gb)
 min_disk=$(setting min_disk_mb_s)
 min_cores=$(setting min_cpu_cores)
+min_disk_gb=$(setting min_disk_gb)
+min_ram=$(setting min_ram_gb)
+min_cuda=$(setting min_cuda_version)
 min_push=$(setting min_push_mb_s)
 
 fail() {
@@ -43,6 +49,14 @@ fail() {
 # at_least VALUE MIN LABEL: fail unless the measured number clears the setting.
 at_least() {
   python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$1" "$2" ||
+    fail "$3 is $1, under the required $2"
+}
+
+# version_at_least VALUE MIN LABEL: dotted versions compared part by part, so 12.10 beats 12.8.
+version_at_least() {
+  python3 -c 'import sys
+def v(x): return tuple(int(p) for p in x.split("."))
+sys.exit(0 if v(sys.argv[1]) >= v(sys.argv[2]) else 1)' "$1" "$2" 2>/dev/null ||
     fail "$3 is $1, under the required $2"
 }
 
@@ -72,6 +86,11 @@ fi
 # Free space on the job disk, already net of any kept attempts below $work.
 free_disk_gb=$(df -Pk "$work" | awk 'NR == 2 {printf "%.1f", $4 / 1048576}')
 
+# Gates that need only /proc and statvfs: RAM and free disk. Every one of them
+# runs before the 100 MiB push and before anything is uploaded.
+[ -z "$min_ram" ] || at_least "$ram_gb" "$min_ram" "RAM (GiB)"
+[ -z "$min_disk_gb" ] || at_least "$free_disk_gb" "$min_disk_gb" "free disk (GiB)"
+
 # VRAM and the static card facts. The under-load clock query is row 31's job
 # and runs inside the row-35 loadbench; this is the idle, pre-venv snapshot.
 vram_gb= driver_version= cuda_version= nvidia_facts='[]'
@@ -95,6 +114,10 @@ fi
 if [ -n "$min_vram" ]; then
   [ -n "$vram_gb" ] || fail "min_vram_gb is set but nvidia-smi reported no memory"
   at_least "$vram_gb" "$min_vram" "VRAM (GiB)"
+fi
+if [ -n "$min_cuda" ]; then
+  [ -n "$cuda_version" ] || fail "min_cuda_version is set but nvidia-smi reported no CUDA version"
+  version_at_least "$cuda_version" "$min_cuda" "CUDA version"
 fi
 
 # Sequential disk probe. O_DIRECT when the filesystem takes it, buffered

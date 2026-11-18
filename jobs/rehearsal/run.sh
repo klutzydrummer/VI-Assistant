@@ -14,6 +14,9 @@
 # With no arguments every scenario runs in order. Scenarios:
 #   gate-home      home disk gate refuses before anything is sent
 #   gate-vram      a 16 GB card fails the worker preflight VRAM gate
+#   gate-disk      a worker with too little free disk fails the worker preflight
+#   gate-ram       a worker with too little RAM fails the worker preflight
+#   gate-cuda      a CUDA 12.4 driver fails the worker preflight
 #   gate-push      a 2.37 MB/s push fails the 2.5 MB/s floor
 #   receiver-down  the return path never proves; nothing is sent
 #   receiver       the restricted receiver itself: token push, munged symlinks, write-only,
@@ -39,7 +42,7 @@ mkdir -p "$base"
 R=$(mktemp -d "$base/run.XXXXXX")
 echo "rehearsal: working in $R"
 
-all=(gate-home gate-vram gate-push receiver-down receiver base-fail disk-full preflight train enospc nan)
+all=(gate-home gate-vram gate-disk gate-ram gate-cuda gate-push receiver-down receiver base-fail disk-full preflight train enospc nan)
 [ $# -gt 0 ] && scenarios=("$@") || scenarios=("${all[@]}")
 
 avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
@@ -86,7 +89,9 @@ run_stage() {
   local name=$1 stage=$2 mode=$3; shift 3
   local sd="$R/s/$name"
   mkdir -p "$sd/out" "$R/faults/$name"
-  [ -s "$sd/settings.json" ] || settings "$stage" "$sd/settings.json"
+  # The committed disk, RAM and core floors describe a rented 24 GB worker, not this host, so
+  # the other scenarios relax them; the gate-* scenarios write their own settings first.
+  [ -s "$sd/settings.json" ] || settings "$stage" "$sd/settings.json" min_disk_gb=1 min_ram_gb=1 min_cpu_cores=1
   local -a envs=(
     -u XDG_STATE_HOME -u XDG_CACHE_HOME -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN
     -u HUGGINGFACE_HUB_TOKEN -u VI_BASE_MODEL -u OVFT_PYTHON -u VI_RETURN_PORT -u VI_WORKER
@@ -155,6 +160,47 @@ sc_gate_vram() {
   check "the VRAM gate names its floor" has "$L" "under the required 23.5"
   check "preflight failure stops before inputs" has "$L" "the worker preflight failed; nothing was uploaded"
   check "no data folder was sent" test -z "$(find "$R/worker/gate-vram" -path '*/inputs/*' -print -quit)"
+}
+
+# A cheap gate must fail inside worker-preflight, before the 100 MiB push, the input upload or
+# the marker: no bundle bytes, no inputs folder, no marker, no push-speed line.
+gate_before_upload() {  # NAME
+  local L="$R/s/$1/log"
+  check "preflight failure stops before inputs" has "$L" "the worker preflight failed; nothing was uploaded"
+  check "no data folder was sent" test -z "$(find "$R/worker/$1" -path '*/inputs/*' -print -quit)"
+  check "no marker was written" test -z "$(find "$R/state/$1/unverified" -type f -print -quit 2>/dev/null)"
+  check "the push test never ran" test ! -e "$R/s/$1/out/preflight.json"
+  check "no push-speed line was logged" hasnt "$L" "worker push (MB/s)"
+}
+
+sc_gate_disk() {
+  settings omnivoice_preflight "$R/s/gate-disk/settings.json" min_disk_gb=100000 min_ram_gb=1 min_cpu_cores=1
+  run_stage gate-disk omnivoice_preflight preflight; local rc=$?
+  show_log gate-disk
+  local L="$R/s/gate-disk/log"
+  check "a too-small disk fails (exit $rc)" test "$rc" -ne 0
+  check "the disk gate names its floor" has "$L" "worker-preflight: free disk (GiB) is"
+  gate_before_upload gate-disk
+}
+
+sc_gate_ram() {
+  settings omnivoice_preflight "$R/s/gate-ram/settings.json" min_ram_gb=100000 min_disk_gb=1 min_cpu_cores=1
+  run_stage gate-ram omnivoice_preflight preflight; local rc=$?
+  show_log gate-ram
+  local L="$R/s/gate-ram/log"
+  check "too little RAM fails (exit $rc)" test "$rc" -ne 0
+  check "the RAM gate names its floor" has "$L" "worker-preflight: RAM (GiB) is"
+  gate_before_upload gate-ram
+}
+
+sc_gate_cuda() {
+  settings omnivoice_preflight "$R/s/gate-cuda/settings.json" min_disk_gb=1 min_ram_gb=1 min_cpu_cores=1
+  run_stage gate-cuda omnivoice_preflight preflight VI_STUB_CUDA=12.4; local rc=$?
+  show_log gate-cuda
+  local L="$R/s/gate-cuda/log"
+  check "CUDA 12.4 fails (exit $rc)" test "$rc" -ne 0
+  check "the CUDA gate names its floor" has "$L" "worker-preflight: CUDA version is 12.4, under the required 12.8"
+  gate_before_upload gate-cuda
 }
 
 sc_gate_push() {

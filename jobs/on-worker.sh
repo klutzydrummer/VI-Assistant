@@ -661,7 +661,7 @@ if [ "$reattach" = 0 ]; then
     eta=$((packed_bytes / rate / 60))
     echo "on-worker.sh: $((packed_bytes / 1048576)) MB to upload at about $((rate / 1024)) KB/s: about $eta min" >&2
     if [ "$eta" -gt "$upload_limit" ]; then
-      echo "on-worker.sh: that's over ${upload_limit} min, so nothing was sent; free up home's uplink, or set VI_UPLOAD_ANYWAY=1" >&2
+      echo "on-worker.sh: worker upload ETA is $eta min, over the ${upload_limit} min limit, so nothing was sent; free up home's uplink, or set VI_UPLOAD_ANYWAY=1" >&2
       exit 1
     fi
   fi
