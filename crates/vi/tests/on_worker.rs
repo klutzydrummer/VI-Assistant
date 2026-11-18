@@ -533,6 +533,14 @@ while [ ! -e "$VI_OUT/release" ]; do sleep 0.1; done"#
 
     // The un-pushed worker dir survives the signal.
     assert!(work.is_dir(), "{} was deleted", work.display());
+    // A home-side kill never clears the unverified marker, even with no checkpoint.
+    assert_eq!(
+        fs::read_dir(dir.path().join("state/unverified"))
+            .unwrap()
+            .count(),
+        1,
+        "a home-side kill must keep the marker"
+    );
     // The receiver is stopped: its state dir (under TMPDIR) is gone and the
     // loopback port refuses connections. Local mode has no SSH tunnel.
     assert_eq!(
@@ -1006,6 +1014,38 @@ fn a_partial_publish_fails_the_stage_and_keeps_every_copy() {
         fs::read_to_string(&markers[0]).unwrap().trim(),
         d.canonicalize().unwrap().to_string_lossy()
     );
+}
+
+fn marker_count(dir: &Path) -> usize {
+    fs::read_dir(dir.join("state/unverified")).unwrap().count()
+}
+
+#[test]
+fn a_failed_stage_with_no_checkpoint_at_home_clears_its_marker() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), "exit 3");
+    assert!(!out.status.success());
+    // The empty durable dir protects nothing, so the marker is gone.
+    assert_eq!(marker_count(dir.path()), 0);
+    assert!(durable_dir(dir.path()).is_dir());
+    // The worker's copy is still kept.
+    assert_eq!(leftovers(dir.path()).len(), 1);
+}
+
+#[test]
+fn a_failed_stage_with_a_checkpoint_at_home_keeps_its_marker() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let job = publish_job(1, "w").replace("echo ok > \"$VI_OUT/ok.txt\"", "exit 3");
+    let out = run_settings(dir.path(), &job, "expect_epochs = 1", &[]);
+    assert!(!out.status.success());
+    assert!(durable_dir(dir.path()).join("epoch-0").is_dir());
+    assert_eq!(marker_count(dir.path()), 1);
 }
 
 #[test]

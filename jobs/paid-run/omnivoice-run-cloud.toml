@@ -1,4 +1,5 @@
-disk_gb = 100
+# gate 100 + overhead 5 + base/venv/cache ~8 + margin
+disk_gb = 125
 max_hours = 8
 [search]
 min_gpu_ram_gb = 24

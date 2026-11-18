@@ -42,6 +42,7 @@ ALLOWLIST = [
     ("jobs/on-worker.sh", r'rm -rf "\$return_state"', "the attempt's return state dir under the vi state dir"),
     ("jobs/on-worker.sh", r'rm -rf "\$return_scratch"', "the mktemp -d scratch this run created for the checkpoint module"),
     ("jobs/on-worker.sh", r'rm -f \$\(q "\$work/push\.pid"\)', "the worker job dir's push-loop pid file"),
+    ("jobs/on-worker.sh", r'rm -f "\$state_dir/unverified/', "this attempt's own unverified marker, only after a worker-side failure with no checkpoint at home"),
     ("jobs/on-worker.sh", r'rm -rf \$\(q "\$work"\)', "the worker's job dir (/root/vi-jobs)"),
     ("jobs/on-worker.sh", r'rm \$\(q "\$work/bundles/', "the worker job's unpacked bundle copy"),
     ("jobs/refscreen.py", r"shutil\.rmtree\(root, ignore_errors=True\)", "the run's own out/shortlist dir"),

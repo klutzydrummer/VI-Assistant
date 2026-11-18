@@ -362,6 +362,77 @@ class Flow(Base):
         self.assertIsNotNone(self.worker())
 
 
+def load_paid_run():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("paid_run_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class DiskGate(Base):
+    """The run config's disk_gb must clear the worker's free-disk gate before anything is rented."""
+
+    def cfg(self, disk, name="c.toml"):
+        p = self.tmp / name
+        p.write_text(f"disk_gb = {disk}\nmax_hours = 8\n[search]\nmax_dph = 0.31\n")
+        return str(p)
+
+    def test_gate_default_is_read_from_the_worker_script(self):
+        paid_run = load_paid_run()
+        self.assertEqual(paid_run.gate_default_gb(), 100.0)
+        self.assertEqual(paid_run.GATE_FALLBACK_GB, paid_run.gate_default_gb())
+
+    def test_100_fails_and_calls_nothing(self):
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(config=self.cfg(100)), 11, self.out)
+        self.assertIn("FAIL", self.out)
+        self.assertIn("Nothing was rented", self.out)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.tmp / "paid").exists())
+
+    def test_125_passes(self):
+        self.scenario([dict(spent=0.5, hours=1.0)])
+        self.assertEqual(self.run_orch(config=self.cfg(125)), 0, self.out)
+        self.assertIn("disk_gb 125 - overhead 5 vs gate 100 GiB free: OK", self.out)
+
+    def test_boundary(self):
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(config=self.cfg(104), plan=True), 11, self.out)
+        self.assertEqual(self.run_orch(config=self.cfg(105), plan=True), 0, self.out)
+        self.assertEqual(self.calls(), [])
+
+    def test_env_override_of_the_gate(self):
+        self.scenario([{}])
+        self.env["VI_MIN_DISK_GB"] = "50"
+        self.assertEqual(self.run_orch(config=self.cfg(100), plan=True), 0, self.out)
+        self.assertIn("gate 50 GiB", self.out)
+        self.env["VI_MIN_DISK_GB"] = "121"
+        self.assertEqual(self.run_orch(config=self.cfg(125), plan=True), 11, self.out)
+
+    def test_plan_shows_the_line_and_fails_nonzero(self):
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(config=self.cfg(100), plan=True), 11, self.out)
+        self.assertIn("worker disk     : disk_gb 100 - overhead 5 vs gate 100 GiB free: FAIL",
+                      self.out)
+        self.assertNotIn("--plan: nothing was called", self.out)
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_disk_gb_uses_the_vast_default_and_fails(self):
+        p = self.tmp / "n.toml"
+        p.write_text("max_hours = 8\n")
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(config=str(p), plan=True), 11, self.out)
+
+    def test_checked_in_configs_pass(self):
+        paid_run = load_paid_run()
+        ok, disk, gate, line = paid_run.disk_check(paid_run.DEFAULT_CONFIG.read_text(), {})
+        self.assertTrue(ok, line)
+        self.assertEqual(disk, 125)
+        for toml in (JOBS / "paid-run").glob("*.toml"):
+            self.assertTrue(paid_run.disk_check(toml.read_text(), {})[0], toml)
+
+
 class StatusAndStop(Base):
     def setUp(self):
         super().setUp()
@@ -617,7 +688,7 @@ class StatusAndStop(Base):
 
 class ViBinResolution(unittest.TestCase):
     def setUp(self):
-        import paid_run
+        paid_run = load_paid_run()
         self.pr = paid_run
         self.tmp = Path(tempfile.mkdtemp(prefix="vi-bin-test."))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))

@@ -84,7 +84,18 @@ STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
-            release=9, budget=10, other=1)
+            release=9, budget=10, disk=11, other=1)
+
+# The worker's preflight (jobs/voicetune-fresh.sh, `min_disk = float(os.environ.get(
+# "VI_MIN_DISK_GB", "100"))`) refuses a worker with less free disk than this many GiB. The
+# default is read from that script so the two cannot drift; GATE_FALLBACK is only used if the
+# script is missing, and a test fails if it differs from the script.
+GATE_SCRIPT = REPO / "jobs" / "voicetune-fresh.sh"
+GATE_FALLBACK_GB = 100.0
+# Measured on omnivoice-ft-r4: a 100 GB rented disk showed 95 GB free at the gate.
+DISK_OVERHEAD_GB = 5.0
+# Vast's offer filter default when a run config sets no disk_gb (crates/cloud/src/config.rs).
+CONFIG_DEFAULT_DISK_GB = 60.0
 
 
 class Stop(Exception):
@@ -244,6 +255,40 @@ def set_toml_values(text, max_hours=None, countries=None):
         elif not any(ln.strip() == "[search]" for ln in lines):
             lines += ["[search]", new]
     return "\n".join(lines) + "\n"
+
+
+def gate_default_gb(script=GATE_SCRIPT):
+    """The free-disk gate default (GiB) written in the worker preflight script."""
+    try:
+        m = re.search(r'"VI_MIN_DISK_GB",\s*"([\d.]+)"', Path(script).read_text())
+    except OSError:
+        m = None
+    return float(m.group(1)) if m else GATE_FALLBACK_GB
+
+
+def config_disk_gb(text):
+    """The top-level disk_gb of a cloud config (the Vast default when it sets none)."""
+    for ln in text.splitlines():
+        if ln.startswith("["):
+            break
+        m = re.match(r"\s*disk_gb\s*=\s*([\d.]+)", ln)
+        if m:
+            return float(m.group(1))
+    return CONFIG_DEFAULT_DISK_GB
+
+
+def disk_check(config_text, env=None):
+    """(ok, disk_gb, gate_gb, line): can the rented disk pass the worker's free-disk gate?"""
+    env = os.environ if env is None else env
+    disk = config_disk_gb(config_text)
+    try:
+        gate = float(env.get("VI_MIN_DISK_GB") or gate_default_gb())
+    except ValueError:
+        gate = gate_default_gb()
+    ok = disk - DISK_OVERHEAD_GB >= gate
+    line = (f"worker disk     : disk_gb {disk:g} - overhead {DISK_OVERHEAD_GB:g} vs gate "
+            f"{gate:g} GiB free: {'OK' if ok else 'FAIL'}")
+    return ok, disk, gate, line
 
 
 def resolve_vi_bin():
@@ -447,6 +492,7 @@ class PaidRun:
     # ----- the plan ------------------------------------------------------------------------
     def plan_lines(self):
         a = self.a
+        self.disk_ok, _, _, self.disk_line = disk_check(self.base_config_text())
         countries = a.countries or "(from the config)"
         return [
             f"run id          : {a.run_id}",
@@ -455,6 +501,7 @@ class PaidRun:
             f"max attempts    : {a.max_attempts} (a retry only after a push-speed gate failure)",
             f"vi binary       : {self.vi}",
             f"run config      : {a.config}",
+            self.disk_line,
             f"countries       : {countries}",
             f"stage file      : {a.stages}",
             f"state file      : {self.path}",
@@ -759,6 +806,13 @@ class PaidRun:
     def main(self):
         for ln in self.plan_lines():
             say(ln)
+        if not self.disk_ok:
+            print(f"paid-run: STOPPED (exit {EXIT['disk']}): the run config {self.a.config} "
+                  "rents a disk too small for the worker's free-disk gate, so the preflight would "
+                  "fail after you had paid for the machine. Raise disk_gb (the gate plus "
+                  f"{DISK_OVERHEAD_GB:g} GB overhead is the minimum) or lower VI_MIN_DISK_GB. "
+                  "Nothing was rented.", file=sys.stderr, flush=True)
+            return EXIT["disk"]
         if self.a.plan:
             say("--plan: nothing was called; exiting")
             return 0

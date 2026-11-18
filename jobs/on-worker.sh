@@ -249,6 +249,8 @@ tunnel_loop=
 keep_work=
 final_ok=0
 final_rc=1
+# Set only when the worker itself reported a non-zero stage exit with nothing un-pushed.
+stage_failed=
 
 # The durable dir a given attempt publishes into. Its marker is authoritative
 # when one exists (a previous run recorded the exact path), else it is derived
@@ -1008,6 +1010,7 @@ hs_loop() {
             # finish (it exits by itself once everything is acked).
           else
             echo "on-worker.sh: $VI_STAGE exited with $stage_rc on the worker" >&2
+            [ -z "$pending" ] && stage_failed=1
             stage_finished "$stage_rc"
             return
           fi
@@ -1101,4 +1104,14 @@ fi
 
 keep_work=1
 echo "on-worker.sh: $VI_STAGE did not complete successfully; keeping the worker copy" >&2
+# A stage that failed on the worker before any checkpoint reached home protects
+# nothing, so its marker would only make a plain `vi cloud down` refuse. Clear it
+# only then: never after a home-side kill (that exits above), a lost poll, or
+# when home holds any checkpoint-* entry or .part.
+if [ -n "$stage_failed" ] && [ -n "$checkpoint" ] && [ -n "$durable" ] && [ -d "$durable" ] &&
+   ! compgen -G "$durable/$ckpt_prefix-*" >/dev/null && ! compgen -G "$durable/*.part" >/dev/null &&
+   ! compgen -G "$durable/.*.part" >/dev/null; then
+  rm -f "$state_dir/unverified/$VI_STAGE-$(basename "$durable")"
+  echo "on-worker.sh: no checkpoint reached home; cleared this attempt's unverified marker" >&2
+fi
 exit "${final_rc:-1}"
