@@ -25,6 +25,16 @@ Exit codes:
  10 no offer or budget left to try (cap, hours, or offers exhausted)
   1 anything unexpected (worker release is still attempted)
 
+Watching and stopping a run (no vi call unless --credit; neither command can rent, retry or
+change the cap, hours or attempts):
+
+    python3 -I jobs/paid_run.py status --run-id ID [--json] [--credit]
+    python3 -I jobs/paid_run.py stop   --run-id ID [--now]
+
+`stop` writes <run-id>.stop beside the state file; the run waits for the current checkpoint push
+(at most 10 minutes), releases the worker and exits 8. `stop --now` sends SIGTERM to the recorded
+paid_run process, which releases the worker at once.
+
 Heavy work happens inside `vi dataset run` (stages `omnivoice_preflight`, `omnivoice_train`).
 No Vast credential file is read here; only the `vi` CLI is called.
 """
@@ -32,11 +42,14 @@ No Vast credential file is read here; only the `vi` CLI is called.
 import argparse
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -56,6 +69,20 @@ OFFER_RE = re.compile(
     r"net down\s+(\d+) / up\s+(\d+) Mbps\s+([\d.]+) cores\s+(\d+) GB ram\s+"
     r"disk (\d+) MB/s\s*(.*)$")
 
+# Trainer output the train stage streams (train_ft.py runs upstream's OmniTrainer, which logs
+# through tqdm/accelerate; save_steps is 500 in train_ft.py). Two shapes are read, the one with
+# the larger total wins when a line holds both an epoch bar and a step bar:
+#   tqdm bar:   "  3%|▎  | 150/5000 [02:10<1:10:00,  1.15it/s]"
+#   plain text: "Step 150/5000" / "step: 150 of 5000"
+TQDM_RE = re.compile(r"(\d+)/(\d+) \[\d+:\d+")
+STEP_RE = re.compile(r"\b[Ss]teps?\s*[:=]?\s*(\d+)\s*(?:/|of)\s*(\d+)")
+# on-worker.sh prints this on home once a checkpoint is verified at home and acked to the worker.
+ACK_RE = re.compile(r"on-worker\.sh: checkpoint (\d+) verified home and acked")
+CKPT_EVERY = 500
+PROGRESS_SECONDS = 30.0
+STOP_WAIT_SECONDS = 600.0
+MIN_SAMPLES = 3
+
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
             release=9, budget=10, other=1)
 
@@ -70,7 +97,49 @@ class Stop(Exception):
 
 
 class Interrupted(Exception):
-    pass
+    reason = "interrupted by a signal"
+
+
+class StopRequested(Interrupted):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def parse_step(line):
+    """(step, total) from one trainer output line, or None."""
+    found = [(int(m.group(1)), int(m.group(2))) for rx in (TQDM_RE, STEP_RE)
+             for m in rx.finditer(line)]
+    found = [f for f in found if f[1] > 0 and f[0] <= f[1]]
+    return max(found, key=lambda f: f[1]) if found else None
+
+
+def eta_seconds(samples, step, total):
+    """Rough seconds left from the recent [time, step] samples; None until MIN_SAMPLES."""
+    if not samples or len(samples) < MIN_SAMPLES or not total or step is None:
+        return None
+    (t0, s0), (t1, s1) = samples[0], samples[-1]
+    if t1 <= t0 or s1 <= s0:
+        return None
+    return max(0.0, (total - step) * (t1 - t0) / (s1 - s0))
+
+
+def proc_start(pid):
+    """Start time (clock ticks since boot) of a process, from /proc; None if it is gone."""
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_is_run(pid, run_id, started):
+    """True only if pid is a live paid_run.py process for this run id that started when recorded."""
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return False
+    return (any(a.endswith("paid_run.py") for a in argv) and run_id in argv
+            and started is not None and proc_start(pid) == started)
 
 
 def say(msg):
@@ -112,6 +181,14 @@ def clock():
 
 def rfc3339(t):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def state_path(run_id):
+    return state_root() / f"{run_id}.json"
+
+
+def stop_path(run_id):
+    return state_root() / f"{run_id}.stop"
 
 
 def parse_offers(text):
@@ -191,6 +268,15 @@ class PaidRun:
         self.in_teardown = False
         self.config_path = None  # the per-attempt config currently in force
         self.s = None
+        self.stop_file = stop_path(args.run_id)
+        self.step = self.total = None
+        self.samples = []
+        self.last_ack = 0
+        self.tail = deque(maxlen=30)
+        self.last_progress = None  # monotonic time of the last progress write
+        self.stop_deadline = self.stop_target = None
+        self.stop_wait = float(os.environ.get("PAID_RUN_STOP_WAIT_SECONDS", STOP_WAIT_SECONDS))
+        self.progress_every = float(os.environ.get("PAID_RUN_PROGRESS_SECONDS", PROGRESS_SECONDS))
 
     # ----- state ---------------------------------------------------------------------------
     def load_or_create(self):
@@ -222,18 +308,39 @@ class PaidRun:
             env["VI_CLOUD_CONFIG"] = str(self.config_path)
         return env
 
-    def run(self, argv, stream=True):
-        """Run a command, returning (returncode, combined stdout+stderr text)."""
+    def run(self, argv, stream=True, watch=False, train=False):
+        """Run a command, returning (returncode, combined stdout+stderr text). With watch=True a
+        stop request is noticed even while the command prints nothing; train=True also reads the
+        trainer's progress and checkpoint acks from its output."""
         p = subprocess.Popen(argv, cwd=self.a.repo, env=self.env(), text=True, bufsize=1,
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT)
         self.child = p
         buf = []
+        lines = queue.Queue()
+
+        def pump():
+            for ln in p.stdout:
+                lines.put(ln)
+            lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
         try:
-            for line in p.stdout:
-                buf.append(line)
-                if stream:
-                    print(line, end="", flush=True)
+            while True:
+                try:
+                    line = lines.get(timeout=0.2 if watch else None)
+                except queue.Empty:
+                    line = ""
+                if line is None:
+                    break
+                if line:
+                    buf.append(line)
+                    if stream:
+                        print(line, end="", flush=True)
+                    if train:
+                        self.note_line(line)
+                if watch:
+                    self.check_stop()
             p.wait()
         except BaseException:
             if p.poll() is None:
@@ -246,7 +353,78 @@ class PaidRun:
             raise
         finally:
             self.child = None
+            if train:
+                self.write_progress(force=True)
         return p.returncode, "".join(buf)
+
+    # ----- progress and stop requests ------------------------------------------------------
+    def note_line(self, line):
+        self.tail.append(line.rstrip("\n"))
+        got = parse_step(line)
+        if got:
+            self.step, self.total = got
+        m = ACK_RE.search(line)
+        if m:
+            self.last_ack = max(self.last_ack, int(m.group(1)))
+        self.write_progress()
+
+    def set_phase(self, at, phase):
+        at["phase"] = phase
+        self.write_progress(force=True)  # also saves the state
+
+    def write_progress(self, force=False):
+        """Store the trainer step in the state, at most every PROGRESS_SECONDS (and on phase
+        changes). Also keeps the last stage output lines for `status`."""
+        now = time.monotonic()
+        if not force and self.last_progress is not None \
+                and now - self.last_progress < self.progress_every:
+            return
+        if self.s is None:
+            return
+        # a phase change does not start the throttle window: the first trainer line still writes
+        self.last_progress = None if force else now
+        if self.step is not None and (not self.samples or self.step > self.samples[-1][1]):
+            self.samples = (self.samples + [[clock(), self.step]])[-10:]
+        at = self.open_attempt()
+        self.s["progress"] = dict(step=self.step, total=self.total, updated_at=clock(),
+                                  phase=at["phase"] if at else None, samples=self.samples)
+        self.save()
+        if self.tail:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.dir / "stage-tail.tmp"
+            tmp.write_text("\n".join(self.tail) + "\n")
+            os.replace(tmp, self.dir / "stage-tail.log")
+
+    def check_stop(self):
+        """Called while a watched command runs. Raises StopRequested when the worker should now
+        be torn down: at once before training, after the checkpoint push (or the wait limit)
+        during training."""
+        if self.in_teardown or not self.stop_file.exists():
+            return
+        at = self.open_attempt()
+        if self.stop_deadline is None:
+            if at is None or at["phase"] != "train":
+                raise StopRequested("stop requested before training started; released at once")
+            newest = (self.step // CKPT_EVERY) * CKPT_EVERY if self.step is not None else None
+            if newest is None:
+                say("stop requested, but the trainer's step could not be read, so a pending "
+                    "checkpoint push cannot be told; releasing at once")
+                raise StopRequested("stop requested; checkpoint push state unreadable, "
+                                    "released at once")
+            if newest == 0 or newest <= self.last_ack:
+                raise StopRequested("stop requested; no checkpoint push was pending")
+            self.stop_target = newest
+            self.stop_deadline = time.monotonic() + self.stop_wait
+            say(f"stop requested: waiting for the checkpoint push (checkpoint {newest}) "
+                f"for up to {self.stop_wait:.0f} s, then releasing the worker")
+            return
+        if self.last_ack >= self.stop_target:
+            raise StopRequested(f"stop requested; checkpoint {self.stop_target} reached home")
+        if time.monotonic() >= self.stop_deadline:
+            say(f"gave up waiting for checkpoint {self.stop_target} after "
+                f"{self.stop_wait:.0f} s; releasing the worker now")
+            raise StopRequested(f"stop requested; checkpoint {self.stop_target} push did not "
+                                "finish in time")
 
     def vi_cmd(self, *args, stream=False):
         return self.run([self.vi, *args], stream=stream)
@@ -423,6 +601,8 @@ class PaidRun:
         at = adopted
         while True:
             if at is None:
+                if self.stop_file.exists():
+                    raise StopRequested("stop requested; nothing was rented")
                 n = len(self.s["attempts"]) + 1
                 cap_left, hours_left = self.remaining()
                 if n > a.max_attempts:
@@ -445,15 +625,15 @@ class PaidRun:
                 self.save()
                 self.worker_maybe_up = True
                 until = rfc3339(clock() + 3600)
-                rc, out = self.vi_cmd("cloud", "up", "--offer", str(offer["id"]), "--cap",
-                                      f"{cap_left:.2f}", "--until", until, "--yes", stream=True)
+                rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
+                                    f"{cap_left:.2f}", "--until", until, "--yes"], watch=True)
                 if rc != 0:
                     self.release(at, "up-failed")
                     raise Stop(EXIT["up"], f"`vi cloud up` failed (exit {rc}); the machine was "
                                "released and nothing else was rented")
-                at["phase"] = "preflight"
-                self.save()
-                rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"])
+                self.set_phase(at, "preflight")
+                rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"],
+                                   watch=True)
                 if rc != 0:
                     if PUSH_GATE_TEXT in out:
                         say(f"offer {offer['id']} failed the push-speed gate")
@@ -467,18 +647,17 @@ class PaidRun:
                     self.release(at, "preflight-failed")
                     raise Stop(EXIT["preflight"], f"the preflight failed (exit {rc}) on a gate "
                                "other than the push speed; the worker was released, no retry")
-                at["phase"] = "train"
-                self.save()
+                self.set_phase(at, "train")
             # -- train (new or adopted) --
             say("preflight passed; starting the train stage")
-            rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_train"])
+            rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_train"],
+                               watch=True, train=True)
             if rc != 0:
                 self.release(at, "train-failed")
                 raise Stop(EXIT["train"], f"the train stage failed (exit {rc}); the worker was "
                            f"released. Any checkpoints that came home are under "
                            f"{a.checkpoint_root}")
-            at["phase"] = "verify"
-            self.save()
+            self.set_phase(at, "verify")
             problems = self.verify_final()
             spent = self.release(at, "verify-failed" if problems else "done")
             if problems:
@@ -593,6 +772,8 @@ class PaidRun:
                 f"{self.s['message']}")
             return self.s["exit_code"]
         self.s["status"] = "running"
+        self.s["pid"], self.s["pid_start"] = os.getpid(), proc_start(os.getpid())
+        self.stop_file.unlink(missing_ok=True)  # a stop request left by an older run is void
         self.save()
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, self.signal_handler)
@@ -602,8 +783,8 @@ class PaidRun:
                 self.execute()
             except Stop as e:
                 code, message = e.code, e.message
-            except Interrupted:
-                code, message = EXIT["interrupted"], "interrupted by a signal"
+            except Interrupted as e:
+                code, message = EXIT["interrupted"], e.reason
             except Exception as e:  # noqa: BLE001: always fall through to the release below
                 code, message = EXIT["other"], f"unexpected error: {type(e).__name__}: {e}"
         finally:
@@ -618,6 +799,8 @@ class PaidRun:
                         f"release failed unexpectedly ({e}); run `vi cloud status` now")
         self.s["status"] = {0: "done", EXIT["interrupted"]: "interrupted"}.get(code, "failed")
         self.s["exit_code"], self.s["message"] = code, message
+        self.s["pid"] = self.s["pid_start"] = None
+        self.stop_file.unlink(missing_ok=True)
         self.save()
         try:
             self.report()
@@ -626,6 +809,129 @@ class PaidRun:
         (say if code == 0 else lambda m: print(f"paid-run: STOPPED (exit {code}): {m}",
                                                file=sys.stderr, flush=True))(message)
         return code
+
+
+def load_state(run_id):
+    """The state dict for a run id, or None if there is no such run."""
+    try:
+        return json.loads(state_path(run_id).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def stage_tail(run_id, n=10):
+    try:
+        return (state_root() / run_id / "stage-tail.log").read_text().splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def build_status(s, now):
+    """Everything `status` shows, from a state dict. Open-attempt figures are estimates."""
+    at = next((x for x in s["attempts"] if x.get("ended") is None), None)
+    open_h = max(0.0, (now - at["started"]) / 3600) if at else 0.0
+    open_spend = round((at.get("dph") or 0) * open_h, 4) if at else 0.0
+    spent = round(s["spent_total"] + open_spend, 4)
+    hours = round(s["hours_total"] + open_h, 4)
+    pr = s.get("progress") or {}
+    step, total = pr.get("step"), pr.get("total")
+    eta = eta_seconds(pr.get("samples") or [], step, total) if at else None
+    alive = proc_is_run(s["pid"], s["run_id"], s.get("pid_start")) if s.get("pid") else False
+    return dict(
+        run_id=s["run_id"], status=s["status"], exit_code=s["exit_code"], message=s["message"],
+        phase=at["phase"] if at else None,
+        attempt=dict(n=at["n"] if at else len(s["attempts"]), max=s["max_attempts"]),
+        offer=(at or (s["attempts"][-1] if s["attempts"] else {})).get("offer"),
+        price_per_hour=(at or (s["attempts"][-1] if s["attempts"] else {})).get("dph"),
+        spend=dict(closed_attempts=s["spent_total"], open_attempt_estimate=open_spend,
+                   total=spent, total_is_estimate=at is not None),
+        hours_used=hours, max_hours=s["max_hours"], hours_left=round(s["max_hours"] - hours, 4),
+        cap=s["cap"], cap_left=round(s["cap"] - spent, 4),
+        train=dict(step=step, total=total, updated_at=pr.get("updated_at"),
+                   eta_seconds=eta, eta_is_estimate=True),
+        process_alive=alive, stop_requested=stop_path(s["run_id"]).exists(),
+        stage_log_tail=stage_tail(s["run_id"]))
+
+
+def fmt_secs(x):
+    x = int(x)
+    return f"{x // 3600}h{x % 3600 // 60:02d}m"
+
+
+def cmd_status(args):
+    s = load_state(args.run_id)
+    if s is None:
+        print(f"paid-run: no run with id {args.run_id!r} (looked for {state_path(args.run_id)})",
+              file=sys.stderr)
+        return EXIT["args"]
+    st = build_status(s, clock())
+    if args.credit:
+        r = subprocess.run([resolve_vi_bin(), "cloud", "status"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
+        m = re.search(r"^credit \$([\d.]+)", r.stdout, re.M)
+        st["credit"] = float(m.group(1)) if r.returncode == 0 and m else None
+    if args.json:
+        print(json.dumps(st, indent=1))
+        return 0
+    t, sp = st["train"], st["spend"]
+    est = " (estimate)" if sp["total_is_estimate"] else ""
+    print(f"run {st['run_id']}: {st['status']}"
+          + (f" (exit {st['exit_code']}): {st['message']}" if st["exit_code"] is not None else ""))
+    if st["status"] == "running" and not st["process_alive"]:
+        print("  WARNING: no live paid_run process for this run; start it again with the same "
+              "limits to resume")
+    print(f"  phase    : {st['phase'] or '-'}; attempt {st['attempt']['n']}/{st['attempt']['max']}"
+          f"; offer {st['offer']} at ${st['price_per_hour'] or 0:.3f}/hr")
+    print(f"  spend    : ${sp['total']:.2f}{est} = ${sp['closed_attempts']:.2f} closed attempts "
+          f"+ ${sp['open_attempt_estimate']:.2f} open attempt (estimate)")
+    print(f"  cap      : ${st['cap']:.2f}, ${st['cap_left']:.2f} left{est}")
+    print(f"  hours    : {st['hours_used']:.2f} used of {st['max_hours']}, "
+          f"{st['hours_left']:.2f} left{est}")
+    if t["step"] is not None:
+        eta = f"ETA about {fmt_secs(t['eta_seconds'])} (estimate)" if t["eta_seconds"] is not None \
+            else "ETA not known yet (needs 3 samples)"
+        print(f"  training : step {t['step']}/{t['total']}; {eta}")
+    else:
+        print("  training : no step read yet")
+    if st["stop_requested"]:
+        print("  a stop has been requested")
+    if "credit" in st:
+        print(f"  credit   : " + (f"${st['credit']:.2f}" if st["credit"] is not None
+                                 else "unavailable"))
+    if st["stage_log_tail"]:
+        print("  last stage output:")
+        for ln in st["stage_log_tail"]:
+            print(f"    {ln}")
+    return 0
+
+
+def cmd_stop(args):
+    s = load_state(args.run_id)
+    if s is None:
+        print(f"paid-run: no run with id {args.run_id!r}; nothing changed", file=sys.stderr)
+        return EXIT["args"]
+    if s["status"] != "running":
+        print(f"paid-run: run {args.run_id} is not running (status {s['status']}); nothing "
+              "changed", file=sys.stderr)
+        return EXIT["args"]
+    pid = s.get("pid")
+    if pid and not proc_is_run(pid, args.run_id, s.get("pid_start")):
+        print(f"paid-run: the state says running but no paid_run process for {args.run_id} is "
+              "alive (it was killed). Nothing changed; start it again with the same limits to "
+              "resume and release the worker.", file=sys.stderr)
+        return EXIT["args"]
+    if args.now:
+        if not pid:
+            print("paid-run: the state records no process id; cannot signal. Nothing changed",
+                  file=sys.stderr)
+            return EXIT["args"]
+        os.kill(pid, signal.SIGTERM)
+        print(f"paid-run: sent SIGTERM to paid_run (pid {pid}); it releases the worker at once")
+        return 0
+    stop_path(args.run_id).write_text("stop\n")
+    print(f"paid-run: stop requested for {args.run_id}. It waits for the current checkpoint "
+          "push (at most 10 minutes), releases the worker and exits 8. Use `status` to follow.")
+    return 0
 
 
 def parse(argv):
@@ -656,9 +962,32 @@ def parse(argv):
     return a
 
 
+def parse_sub(argv):
+    p = argparse.ArgumentParser(prog=f"paid_run.py {argv[0]}")
+    p.add_argument("--run-id", required=True)
+    if argv[0] == "status":
+        p.add_argument("--json", action="store_true", help="machine-readable output")
+        p.add_argument("--credit", action="store_true",
+                       help="also call `vi cloud status` and show the account credit")
+    else:
+        p.add_argument("--now", action="store_true",
+                       help="signal the run to release the worker at once (no push wait)")
+    a = p.parse_args(argv[1:])
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", a.run_id):
+        p.error("--run-id may only hold letters, digits, dot, dash and underscore")
+    return a
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("status", "stop"):
+        try:
+            a = parse_sub(argv)
+        except SystemExit as e:
+            return e.code if isinstance(e.code, int) else EXIT["args"]
+        return (cmd_status if argv[0] == "status" else cmd_stop)(a)
     try:
-        args = parse(sys.argv[1:] if argv is None else argv)
+        args = parse(argv)
     except SystemExit as e:
         return e.code if isinstance(e.code, int) else EXIT["args"]
     return PaidRun(args).main()

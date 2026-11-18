@@ -70,6 +70,7 @@ STUB = textwrap.dedent('''\
         print(f"destroyed instance {w['id']}")
         print(f"credit ${w['credit']:.2f} before, ${st['credit']:.2f} now (${spent:.2f} spent)")
     elif args[:2] == ["cloud", "status"]:
+        log("status")
         if st["worker"]:
             print(f"worker {st['worker']['id']} running: RTX 3090 at $0.200/hr, up 0h01m, about $0.00 so far")
         else:
@@ -97,6 +98,17 @@ STUB = textwrap.dedent('''\
             if r == "hang": hang()
             if r == "fail":
                 print("train failed: exit 1", file=sys.stderr); sys.exit(1)
+            if r == "lines":
+                # a fake trainer: print the scenario's lines, then (optionally) wait for the test
+                # to release a checkpoint ack, then stay up until killed
+                for ln in a.get("lines", []): print(ln, flush=True)
+                (D / "train.ready").write_text("1")
+                if a.get("ack_wait"):
+                    for _ in range(600):
+                        if (D / "ack.go").exists(): break
+                        time.sleep(0.1)
+                    print("on-worker.sh: checkpoint 1000 verified home and acked", flush=True)
+                hang()
             run = Path(os.environ["VI_CHECKPOINT_ROOT"]) / "omnivoice_train" / "run1"
             for s in (1000, 2500, 4500, 5000):
                 (run / f"checkpoint-{s}").mkdir(parents=True, exist_ok=True)
@@ -348,6 +360,259 @@ class Flow(Base):
         self.assertEqual(self.run_orch(), 9, self.out)
         self.assertIn("COULD NOT RELEASE", self.out)
         self.assertIsNotNone(self.worker())
+
+
+class StatusAndStop(Base):
+    def setUp(self):
+        super().setUp()
+        self.env["PAID_RUN_PROGRESS_SECONDS"] = "0"
+
+    PUSH_LINES = ["  25%|██▍       | 1200/5000 [10:00<30:00,  2.00it/s]"]
+
+    def cli(self, *a):
+        r = subprocess.run([sys.executable, "-I", str(SCRIPT), *a], env=self.env, text=True,
+                           capture_output=True, timeout=60)
+        self.out = r.stdout + r.stderr
+        return r.returncode
+
+    def status(self, run_id="t1", *extra):
+        rc = self.cli("status", "--run-id", run_id, "--json", *extra)
+        self.assertEqual(rc, 0, self.out)
+        return json.loads(self.out)
+
+    def wait_step(self, step, run_id="t1", timeout=20):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if (self.state(run_id).get("progress") or {}).get("step") == step:
+                    return
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.02)
+        self.fail(f"progress never reached step {step}")
+
+    def start_train(self, lines, **extra):
+        self.scenario([dict(train="lines", lines=lines, spent=0.5, hours=1.0, **extra)])
+        p = self.start(*self.args())
+        self.wait_for(self.sd / "train.ready")
+        return p
+
+    def read_until(self, p, text, timeout=30):
+        end = time.time() + timeout
+        seen = []
+        while time.time() < end:
+            ln = p.stdout.readline()
+            if not ln:
+                break
+            seen.append(ln)
+            if text in ln:
+                return "".join(seen)
+        self.fail(f"never saw {text!r} in:\n" + "".join(seen))
+
+    def finish(self, p):
+        out, _ = p.communicate(timeout=60)
+        self.out = out
+        return p.returncode
+
+    # ----- status -----
+    def test_status_running_shows_everything_and_makes_no_vi_call(self):
+        lines = [f"  2%|▏ | {n}/5000 [00:01<1:00:00, 1.0it/s]" for n in (100, 200, 300)]
+        p = self.start_train(lines)
+        self.wait_step(300)
+        before = len(self.calls())
+        self.assertEqual(self.cli("status", "--run-id", "t1"), 0, self.out)
+        for want in ("run t1: running", "phase    : train; attempt 1/3", "offer 1 at $0.200/hr",
+                     "(estimate)", "step 300/5000", "ETA about", "last stage output"):
+            self.assertIn(want, self.out)
+        st = self.status()
+        self.assertEqual(len(self.calls()), before, "status without --credit called vi")
+        self.assertTrue(st["process_alive"])
+        self.assertEqual(st["phase"], "train")
+        self.assertEqual((st["train"]["step"], st["train"]["total"]), (300, 5000))
+        self.assertTrue(st["spend"]["total_is_estimate"])
+        self.assertAlmostEqual(st["cap_left"], 5 - st["spend"]["total"])
+        self.assertTrue(any("300/5000" in x for x in st["stage_log_tail"]))
+        self.status("t1", "--credit")
+        self.assertEqual(len(self.calls()), before + 1, "--credit makes exactly one vi call")
+        self.assertEqual(self.calls()[-1], ["status"])
+        self.assertEqual(self.cli("stop", "--run-id", "t1", "--now"), 0, self.out)
+        self.assertEqual(self.finish(p), 8)
+
+    def test_status_json_shape_and_credit(self):
+        p = self.start_train(self.PUSH_LINES)
+        self.wait_step(1200)
+        st = self.status("t1", "--credit")
+        self.assertEqual(set(st), {
+            "run_id", "status", "exit_code", "message", "phase", "attempt", "offer",
+            "price_per_hour", "spend", "hours_used", "max_hours", "hours_left", "cap",
+            "cap_left", "train", "process_alive", "stop_requested", "stage_log_tail", "credit"})
+        self.assertEqual(set(st["spend"]), {"closed_attempts", "open_attempt_estimate", "total",
+                                            "total_is_estimate"})
+        self.assertEqual(set(st["train"]), {"step", "total", "updated_at", "eta_seconds",
+                                            "eta_is_estimate"})
+        self.assertEqual(st["credit"], 20.0)
+        self.assertEqual(st["attempt"], {"n": 1, "max": 3})
+        self.cli("stop", "--run-id", "t1", "--now")
+        self.finish(p)
+
+    def test_status_done_failed_interrupted_and_unknown(self):
+        self.scenario([dict(spent=0.8, hours=2.0)])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        n = len(self.calls())
+        st = self.status()
+        self.assertEqual((st["status"], st["exit_code"], st["phase"]), ("done", 0, None))
+        self.assertFalse(st["process_alive"])
+        self.assertAlmostEqual(st["spend"]["total"], 0.8)
+        self.assertFalse(st["spend"]["total_is_estimate"])
+        self.assertEqual(len(self.calls()), n)
+        self.scenario([dict(train="fail", spent=0.1)])
+        self.assertEqual(self.run_orch(run_id="f1"), 6)
+        st = self.status("f1")
+        self.assertEqual((st["status"], st["exit_code"]), ("failed", 6))
+        self.assertIn("train stage failed", st["message"])
+        self.scenario([dict(preflight="hang", spent=0.4, hours=0.5)])
+        p = self.start(*self.args(run_id="i1"))
+        self.wait_for(self.sd / "omnivoice_preflight.pid")
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(self.finish(p), 8)
+        self.assertEqual(self.status("i1")["status"], "interrupted")
+        before = {f.name: f.read_bytes() for f in (self.tmp / "paid").glob("*.json")}
+        self.assertEqual(self.cli("status", "--run-id", "nope"), 2)
+        self.assertIn("no run with id", self.out)
+        self.assertEqual(self.cli("stop", "--run-id", "nope"), 2)
+        self.assertEqual(before, {f.name: f.read_bytes() for f in (self.tmp / "paid").glob("*.json")})
+        self.assertFalse(list((self.tmp / "paid").glob("nope*")))
+
+    def test_progress_parsing_and_eta_needs_three_samples(self):
+        import paid_run as pr
+        self.assertEqual(pr.parse_step("  3%|▎  | 150/5000 [02:10<1:10:00,  1.15it/s]"), (150, 5000))
+        self.assertEqual(pr.parse_step("Step 150/5000 loss 1.2"), (150, 5000))
+        self.assertEqual(pr.parse_step("step: 7 of 5000"), (7, 5000))
+        self.assertEqual(pr.parse_step("Epoch 1/4: 50%|█| 100/2500 [00:01<00:01, 9it/s]"),
+                         (100, 2500))
+        self.assertIsNone(pr.parse_step("loading model 3 of 4 shards"))
+        self.assertIsNone(pr.parse_step("on-worker.sh: poll failed"))
+        self.assertIsNone(pr.eta_seconds([[0, 0], [10, 100]], 100, 5000))
+        self.assertIsNone(pr.eta_seconds([[0, 100], [5, 100], [10, 100]], 100, 5000))
+        self.assertAlmostEqual(pr.eta_seconds([[0, 0], [10, 100], [20, 200]], 200, 5000), 480.0)
+        # end to end: two samples give no ETA, a third gives one
+        p = self.start_train(["Step 100/5000", "noise", "step 200/5000"])
+        self.wait_step(200)
+        t = self.status()["train"]
+        self.assertEqual((t["step"], t["total"], t["eta_seconds"]), (200, 5000, None))
+        self.cli("stop", "--run-id", "t1", "--now")
+        self.finish(p)
+
+    def test_progress_write_is_throttled(self):
+        self.env["PAID_RUN_PROGRESS_SECONDS"] = "3600"
+        p = self.start_train(["Step 100/5000", "Step 200/5000", "Step 300/5000"])
+        self.wait_for(self.tmp / "paid" / "t1" / "stage-tail.log")
+        end = time.time() + 20
+        while time.time() < end and "Step 300/5000" not in p.stdout.readline():
+            pass
+        self.assertEqual(self.state()["progress"]["step"], 100)  # first write only
+        self.cli("stop", "--run-id", "t1", "--now")
+        self.finish(p)
+
+    # ----- stop -----
+    def test_stop_during_preflight_is_immediate(self):
+        self.scenario([dict(preflight="hang", spent=0.4, hours=0.5)])
+        p = self.start(*self.args())
+        self.wait_for(self.sd / "omnivoice_preflight.pid")
+        self.assertEqual(self.cli("stop", "--run-id", "t1"), 0, self.out)
+        self.assertTrue((self.tmp / "paid" / "t1.stop").exists())
+        self.assertEqual(self.finish(p), 8, self.out)
+        self.assertIn("released at once", self.out)
+        self.assertIsNone(self.worker())
+        self.assertEqual(len(self.downs()), 1)
+        self.assertEqual(len(self.ups()), 1, "stop never rents")
+        s = self.state()
+        self.assertEqual((s["status"], s["exit_code"]), ("interrupted", 8))
+        self.assertAlmostEqual(s["spent_total"], 0.4)
+        self.assertFalse((self.tmp / "paid" / "t1.stop").exists())
+
+    def test_stop_during_train_waits_for_the_checkpoint_push(self):
+        p = self.start_train(self.PUSH_LINES, ack_wait=True)
+        self.wait_step(1200)
+        self.assertEqual(self.cli("stop", "--run-id", "t1"), 0, self.out)
+        seen = self.read_until(p, "waiting for the checkpoint push (checkpoint 1000)")
+        self.assertEqual(len(self.downs()), 0, "torn down before the push finished")
+        self.assertIsNotNone(self.worker())
+        (self.sd / "ack.go").write_text("1")
+        self.assertEqual(self.finish(p), 8, seen + self.out)
+        self.assertIn("checkpoint 1000 verified home and acked", self.out)
+        self.assertIn("checkpoint 1000 reached home", self.out)
+        self.assertIsNone(self.worker())
+        self.assertEqual(len(self.downs()), 1)
+        self.assertEqual(self.state()["status"], "interrupted")
+        self.assertIn("total actual spend", self.out)
+
+    def test_stop_wait_times_out_and_tears_down_anyway(self):
+        self.env["PAID_RUN_STOP_WAIT_SECONDS"] = "1"
+        p = self.start_train(self.PUSH_LINES, ack_wait=True)
+        self.wait_step(1200)
+        self.assertEqual(self.cli("stop", "--run-id", "t1"), 0, self.out)
+        self.assertEqual(self.finish(p), 8, self.out)
+        self.assertIn("gave up waiting for checkpoint 1000", self.out)
+        self.assertIsNone(self.worker())
+        self.assertEqual(len(self.downs()), 1)
+
+    def test_stop_with_no_push_pending_or_unreadable_step_is_immediate(self):
+        p = self.start_train(["Step 300/5000"])  # newest checkpoint would be 0: nothing pending
+        self.wait_step(300)
+        self.cli("stop", "--run-id", "t1")
+        self.assertEqual(self.finish(p), 8, self.out)
+        self.assertIn("no checkpoint push was pending", self.out)
+        self.assertIsNone(self.worker())
+        for f in ("calls.log", "state.json", "train.ready"):
+            (self.sd / f).unlink(missing_ok=True)
+        subprocess.run(["rm", "-rf", str(self.tmp / "paid")])
+        p = self.start_train(["no step lines here"])
+        self.cli("stop", "--run-id", "t1")
+        self.assertEqual(self.finish(p), 8, self.out)
+        self.assertIn("could not be read", self.out)
+        self.assertIsNone(self.worker())
+
+    def test_stop_now_signals_the_recorded_process(self):
+        p = self.start_train(self.PUSH_LINES, ack_wait=True)
+        self.wait_step(1200)
+        pid = self.state()["pid"]
+        self.assertEqual(pid, p.pid)
+        self.assertEqual(self.cli("stop", "--run-id", "t1", "--now"), 0, self.out)
+        self.assertEqual(self.finish(p), 8, self.out)  # no waiting for the ack
+        self.assertNotIn("waiting for the checkpoint push", self.out)
+        self.assertIsNone(self.worker())
+        self.assertEqual(len(self.downs()), 1)
+
+    def test_stop_now_never_signals_a_pid_that_is_not_this_run(self):
+        self.scenario([dict(spent=0.1)])
+        self.assertEqual(self.run_orch(), 0)
+        bystander = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(bystander.kill)
+        s = self.state()
+        s.update(status="running", pid=bystander.pid, pid_start=1)
+        (self.tmp / "paid" / "t1.json").write_text(json.dumps(s))
+        self.assertEqual(self.cli("stop", "--run-id", "t1", "--now"), 2, self.out)
+        self.assertIn("nothing changed", self.out.lower())
+        self.assertIsNone(bystander.poll(), "an unrelated process was signalled")
+
+    def test_stop_on_a_finished_run_refuses_and_changes_nothing(self):
+        self.scenario([dict(spent=0.1)])
+        self.assertEqual(self.run_orch(), 0)
+        before = (self.tmp / "paid" / "t1.json").read_bytes()
+        self.assertEqual(self.cli("stop", "--run-id", "t1"), 2)
+        self.assertIn("is not running", self.out)
+        self.assertEqual(self.cli("stop", "--run-id", "t1", "--now"), 2)
+        self.assertEqual((self.tmp / "paid" / "t1.json").read_bytes(), before)
+        self.assertFalse((self.tmp / "paid" / "t1.stop").exists())
+
+    def test_stale_stop_file_is_not_honoured_by_a_new_run(self):
+        (self.tmp / "paid").mkdir()
+        (self.tmp / "paid" / "t1.stop").write_text("stop\n")
+        self.scenario([dict(spent=0.1)])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual(self.stages(), ["omnivoice_preflight", "omnivoice_train"])
+        self.assertFalse((self.tmp / "paid" / "t1.stop").exists())
 
 
 class ViBinResolution(unittest.TestCase):
