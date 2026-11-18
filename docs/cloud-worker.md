@@ -85,7 +85,7 @@ The receiver has separate `vi-out`, `vi-checkpoint`, and `vi-publish` modules ro
 For tests, `VI_WORKER_HOST=local` with `VI_WORKER_ROOT=<folder>` runs the "worker" in a local folder; `crates/vi/tests/on_worker.rs` does this, so CI needs no GPU or rented machine.
 
 ## One command for the paid OmniVoice fine-tune
-`jobs/paid_run.py` runs the whole paid flow unattended, driving the `vi` binary (`$VI_BIN`, default `vi`). It rents the cheapest offer that has not failed yet, runs the `omnivoice_preflight` stage (tunnel, receiver, token push, worker gates), then `omnivoice_train`, checks what came home, and releases the worker. Start it only with Brandon's approval of the cap and hours for that run.
+`jobs/paid_run.py` runs the whole paid flow unattended, driving the `vi` binary (`$VI_BIN`; if unset, `<repo>/target/release/vi` when that executable exists; otherwise `vi` on PATH). It rents the cheapest offer that has not failed yet, runs the `omnivoice_preflight` stage (tunnel, receiver, token push, worker gates), then `omnivoice_train`, checks what came home, and releases the worker. Start it only with Brandon's approval of the cap and hours for that run.
 
 ```sh
 python3 -I jobs/paid_run.py --run-id omnivoice-ft-1 --cap 5.00 --max-hours 8 \

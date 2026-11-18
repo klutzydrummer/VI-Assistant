@@ -357,6 +357,47 @@ class Flow(Base):
         self.assertIsNotNone(self.worker())
 
 
+class ViBinResolution(unittest.TestCase):
+    def setUp(self):
+        import paid_run
+        self.pr = paid_run
+        self.tmp = Path(tempfile.mkdtemp(prefix="vi-bin-test."))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
+        self.old_repo = paid_run.REPO
+        paid_run.REPO = self.tmp
+        self.addCleanup(lambda: setattr(paid_run, "REPO", self.old_repo))
+        self.saved = os.environ.pop("VI_BIN", None)
+        self.addCleanup(self.restore_env)
+
+    def restore_env(self):
+        os.environ.pop("VI_BIN", None)
+        if self.saved is not None:
+            os.environ["VI_BIN"] = self.saved
+
+    def release(self, mode=0o755):
+        f = self.tmp / "target" / "release" / "vi"
+        f.parent.mkdir(parents=True)
+        f.write_text("#!/bin/sh\n")
+        f.chmod(mode)
+        return f
+
+    def test_env_wins_over_release_binary(self):
+        self.release()
+        os.environ["VI_BIN"] = "/some/stub/vi"
+        self.assertEqual(self.pr.resolve_vi_bin(), "/some/stub/vi")
+
+    def test_release_binary_is_default_when_present(self):
+        f = self.release()
+        self.assertEqual(self.pr.resolve_vi_bin(), str(f))
+
+    def test_falls_back_to_path_vi_when_absent(self):
+        self.assertEqual(self.pr.resolve_vi_bin(), "vi")
+
+    def test_falls_back_when_release_not_executable(self):
+        self.release(0o644)
+        self.assertEqual(self.pr.resolve_vi_bin(), "vi")
+
+
 class KillAndSignals(Base):
     def test_7a_sigkill_in_preflight_then_resume_destroys_and_carries_limits(self):
         self.scenario([dict(preflight="hang", spent=1.0, hours=2.0),

@@ -3,7 +3,7 @@
 
     python3 -I jobs/paid_run.py --run-id ID --cap USD --max-hours H [options]
 
-It drives the existing `vi` binary ($VI_BIN, default `vi`) so a stub can stand in for tests:
+It drives the existing `vi` binary ($VI_BIN, else <repo>/target/release/vi if built, else `vi`) so a stub can stand in for tests:
 rent the cheapest qualifying offer, run the preflight stage (tunnel, receiver, token push, the
 worker gates), then the train stage, then release the worker and print what it cost. If ONLY the
 push-speed gate fails (stderr says `worker push (MB/s)`), the machine is released, that offer is
@@ -169,10 +169,21 @@ def set_toml_values(text, max_hours=None, countries=None):
     return "\n".join(lines) + "\n"
 
 
+def resolve_vi_bin():
+    """$VI_BIN wins; else <repo>/target/release/vi if it is an executable file; else `vi`."""
+    explicit = os.environ.get("VI_BIN")
+    if explicit:
+        return explicit
+    release = REPO / "target" / "release" / "vi"
+    if release.is_file() and os.access(release, os.X_OK):
+        return str(release)
+    return "vi"
+
+
 class PaidRun:
     def __init__(self, args):
         self.a = args
-        self.vi = os.environ.get("VI_BIN", "vi")
+        self.vi = resolve_vi_bin()
         self.dir = state_root() / args.run_id
         self.path = state_root() / f"{args.run_id}.json"
         self.child = None
