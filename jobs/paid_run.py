@@ -42,6 +42,7 @@ No Vast credential file is read here; only the `vi` CLI is called.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -311,6 +312,22 @@ def disk_check(config_text, env=None):
     return ok, disk, gate, line
 
 
+# Assumed ceiling for Vast's storage price, in $/GB/month. The real storage_cost is only known
+# from the live offer, so this is a bound for the plan, not a quote.
+DISK_CEILING_PER_GB_MONTH = 1.00
+HOURS_PER_MONTH = 730
+
+
+def disk_cost_line(disk_gb, hours):
+    """The plan line about disk billing: Vast charges storage on top of the GPU price, per GB and
+    second, until the instance is destroyed (stopping does not end it)."""
+    cost = disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours
+    return (f"disk billing    : Vast bills disk on top of the GPU price, per GB-hour until the "
+            f"instance is destroyed; worst case for {disk_gb:g} GB over {hours:g} h is about "
+            f"${cost:.2f} at an assumed ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month (estimate; "
+            "the real storage_cost is only known from the live offer)")
+
+
 def base_model_revision(script=GATE_SCRIPT):
     """The base-model revision pinned in the stage script (shown at --plan, not checked)."""
     try:
@@ -331,12 +348,92 @@ def stage_settings(stages, repo, stage):
         return None
 
 
+def bundle_dir(home, env):
+    """The bundle cache folder on-worker.sh uses ($VI_BUNDLE_DIR, else the XDG cache)."""
+    return Path(env.get("VI_BUNDLE_DIR") or Path(env.get("XDG_CACHE_HOME")
+                                                  or Path(home) / ".cache") / "vi" / "bundles")
+
+
+def bundle_key(folder):
+    """The bundle cache key of one input folder, computed as jobs/on-worker.sh does (read-only):
+    sha256 of `pwd -P` plus the LC_ALL=C sorted `find . -printf '%P %s %T@\\n'` listing, first 16
+    hex digits. %T@ is seconds with ten fractional digits (nanoseconds plus a trailing 0)."""
+    top = Path(folder).resolve()
+
+    def row(path, rel):
+        st = os.lstat(path)
+        ns = st.st_mtime_ns
+        return os.fsencode(rel) + b" %d %d.%09d0\n" % (st.st_size, ns // 10**9, ns % 10**9)
+
+    rows = [row(top, "")]  # find lists the folder itself with an empty %P
+    for dirpath, dirnames, filenames in os.walk(top):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            rows.append(row(path, os.path.relpath(path, top)))
+    return hashlib.sha256(os.fsencode(top) + b"\n" + b"".join(sorted(rows))).hexdigest()[:16]
+
+
+def bundle_inputs(stages, repo):
+    """The stage inputs the GPU stages read, or None when the stage file cannot be read."""
+    try:
+        import tomllib
+        p = Path(stages)
+        p = p if p.is_absolute() else Path(repo) / p
+        doc = tomllib.loads(p.read_text())
+    except (ImportError, OSError, ValueError):
+        return None, None
+    names = []
+    for stage in ("omnivoice_preflight", "omnivoice_train"):
+        for i in doc.get("stage", {}).get(stage, {}).get("inputs", []):
+            if i not in names:
+                names.append(i)
+    return p.parent / doc.get("corpus", "."), names
+
+
+def bundle_cache_status(stages, repo, home, env):
+    """One plan line: is every large input folder's bundle already packed for its current key?"""
+    corpus, names = bundle_inputs(stages, repo)
+    if not names:
+        return "bundle cache    : not checked (stage file unreadable or lists no inputs)"
+    try:
+        min_kb = int(env.get("VI_PACK_MIN_KB") or 1024)
+    except ValueError:
+        min_kb = 1024
+    cache = bundle_dir(home, env)
+    keys, missing = [], []
+    for name in names:
+        cur = corpus / "stages" / name / "current"
+        try:
+            folder = cur.parent / cur.read_text().strip() / "out"
+        except OSError:
+            return (f"bundle cache    : not checked ({name} has not been built at home, so its "
+                    "folder, and so the key, is unknown)")
+        if not folder.is_dir():
+            return f"bundle cache    : not checked ({folder} is missing)"
+        r = subprocess.run(["du", "-sk", str(folder)], capture_output=True, text=True)
+        try:
+            kb = int(r.stdout.split()[0])
+        except (IndexError, ValueError):
+            return f"bundle cache    : not checked (du failed on {folder})"
+        if kb < min_kb:
+            continue  # on-worker.sh sends small inputs unpacked
+        key = bundle_key(folder)
+        keys.append(key)
+        if not (cache / f"{key}.tar.zst").is_file() or (cache / f"{key}.tar.zst").stat().st_size == 0:
+            missing.append(key)
+    if not keys:
+        return "bundle cache    : no input is large enough to pack (sent as plain files)"
+    if missing:
+        return ("bundle cache    : not built, will pack before renting (home CPU/disk only, no "
+                "spend)")
+    return f"bundle cache    : built and current ({', '.join(keys)})"
+
+
 def home_check(stages, repo, home=None, env=None):
     """(ok, lines): the home-side checks on-worker.sh makes after renting, made before renting.
 
     The home disk gate is jobs/checkpoints.py's own `gate` with the stages' min_home_gb and
-    home_gate_reserve_gb; the bundle cache line is a note (the cache key needs the data folder,
-    so only the cache's contents are shown)."""
+    home_gate_reserve_gb; the bundle cache line computes the same key on-worker.sh does."""
     env = os.environ if env is None else env
     home = home or str(Path.home())
     lines, ok = [], True
@@ -358,16 +455,12 @@ def home_check(stages, repo, home=None, env=None):
         lines.append(f"home disk       : {stage}: {free}, floor {floor} + reserve "
                      f"{st.get('home_gate_reserve_gb', 0)} GiB: "
                      f"{'OK' if r.returncode == 0 else 'FAIL'}")
-    cache = Path(env.get("VI_BUNDLE_DIR") or Path(env.get("XDG_CACHE_HOME")
-                                                   or Path(home) / ".cache") / "vi" / "bundles")
+    cache = bundle_dir(home, env)
+    lines.append(bundle_cache_status(stages, repo, home, env))
     bundles = sorted(cache.glob("*.tar.zst")) if cache.is_dir() else []
     if bundles:
         mb = sum(b.stat().st_size for b in bundles) // 1048576
-        lines.append(f"bundle cache    : {len(bundles)} bundle(s), {mb} MB in {cache} (warm if the "
-                     "data folder is unchanged; a cold cache packs with zstd before the upload)")
-    else:
-        lines.append(f"bundle cache    : EMPTY in {cache}; the first run packs the data folder "
-                     "with zstd while the worker is rented")
+        lines.append(f"bundle files    : {len(bundles)} bundle(s), {mb} MB in {cache}")
     return ok, lines
 
 
@@ -572,7 +665,7 @@ class PaidRun:
     # ----- the plan ------------------------------------------------------------------------
     def plan_lines(self):
         a = self.a
-        self.disk_ok, _, _, self.disk_line = disk_check(self.base_config_text())
+        self.disk_ok, disk_gb, _, self.disk_line = disk_check(self.base_config_text())
         self.home_ok, home_lines = home_check(a.stages, a.repo)
         countries = a.countries or "(from the config)"
         return [
@@ -583,6 +676,7 @@ class PaidRun:
             f"vi binary       : {self.vi}",
             f"run config      : {a.config}",
             self.disk_line,
+            disk_cost_line(disk_gb, a.max_hours),
             *home_lines,
             f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision) not verified (needs network)",
             f"countries       : {countries}",

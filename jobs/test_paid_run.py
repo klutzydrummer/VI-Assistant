@@ -521,11 +521,73 @@ class HomeChecks(Base):
         self.env["VI_BUNDLE_DIR"] = str(self.tmp / "bundles")
         st = self.stages_file(1, 0)
         self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
-        self.assertIn("bundle cache    : EMPTY", self.out)
+        self.assertIn("bundle cache    : not checked", self.out)
+        self.assertNotIn("bundle files", self.out)
         (self.tmp / "bundles").mkdir()
         (self.tmp / "bundles" / "abc.tar.zst").write_bytes(b"x" * 2048)
         self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
-        self.assertIn("bundle cache    : 1 bundle(s)", self.out)
+        self.assertIn("bundle files    : 1 bundle(s)", self.out)
+        self.assertNotIn("warm if", self.out)
+
+    def folder_fixture(self):
+        corpus = self.tmp / "corpus"
+        out = corpus / "stages" / "omnivoice_data" / "k1" / "out"
+        (out / "sub dir").mkdir(parents=True)
+        (out / "a.txt").write_text("hello")
+        (out / "sub dir" / "B b.bin").write_bytes(b"\0" * 5000)
+        (out / "Z").write_text("z")
+        os.symlink("a.txt", out / "link")
+        (corpus / "stages" / "omnivoice_data" / "current").write_text("k1\n")
+        st = self.tmp / "ck.toml"
+        st.write_text(f'corpus = "{corpus}"\n[stage.omnivoice_preflight]\n'
+                      'inputs = ["omnivoice_data"]\n[stage.omnivoice_train]\n'
+                      'inputs = ["omnivoice_data"]\n')
+        return out, st
+
+    def test_python_bundle_key_equals_the_shell_key(self):
+        out, _ = self.folder_fixture()
+        shell = subprocess.run(
+            ["bash", "-c", 'cd "$1" && { pwd -P && find . -printf \'%P %s %T@\\n\' | LC_ALL=C sort; }'
+             " | sha256sum | cut -c1-16", "_", str(out)], capture_output=True, text=True)
+        self.assertEqual(shell.returncode, 0, shell.stderr)
+        self.assertEqual(load_paid_run().bundle_key(out), shell.stdout.strip())
+
+    def test_bundle_cache_line_not_built_then_built_and_current(self):
+        paid_run = load_paid_run()
+        out, st = self.folder_fixture()
+        env = {"VI_BUNDLE_DIR": str(self.tmp / "b"), "VI_PACK_MIN_KB": "1"}
+        self.assertIn("not built, will pack before renting",
+                      paid_run.bundle_cache_status(str(st), str(self.tmp), str(self.tmp), env))
+        key = paid_run.bundle_key(out)
+        (self.tmp / "b").mkdir()
+        (self.tmp / "b" / f"{key}.tar.zst").write_bytes(b"x")
+        self.assertEqual(f"bundle cache    : built and current ({key})",
+                         paid_run.bundle_cache_status(str(st), str(self.tmp), str(self.tmp), env))
+        (out / "a.txt").write_text("changed size")  # a changed listing is a different key
+        self.assertIn("not built", paid_run.bundle_cache_status(str(st), str(self.tmp),
+                                                               str(self.tmp), env))
+
+    def test_small_inputs_are_not_packed(self):
+        _, st = self.folder_fixture()
+        env = {"VI_BUNDLE_DIR": str(self.tmp / "b"), "VI_PACK_MIN_KB": "100000"}
+        self.assertIn("no input is large enough", load_paid_run().bundle_cache_status(
+            str(st), str(self.tmp), str(self.tmp), env))
+
+    def test_plan_shows_disk_billing_bound(self):
+        self.scenario([{}])
+        self.env["HOME"] = str(self.tmp)
+        cfg = self.tmp / "c.toml"
+        cfg.write_text("disk_gb = 125\nmax_hours = 8\n[search]\nmax_dph = 0.31\n")
+        self.assertEqual(self.run_orch(stages=self.stages_file(1, 0), plan=True, config=str(cfg)),
+                         0, self.out)
+        self.assertIn("worst case for 125 GB over 8 h is about $1.37 at an assumed $1.00/GB/month",
+                      self.out)
+        self.assertIn("estimate", self.out)
+
+    def test_disk_cost_formula(self):
+        f = load_paid_run().disk_cost_line
+        self.assertIn("$1.37", f(125, 8))
+        self.assertIn("$0.34", f(125, 2))
 
     def test_checked_in_stage_file_settings_are_read(self):
         paid_run = load_paid_run()
