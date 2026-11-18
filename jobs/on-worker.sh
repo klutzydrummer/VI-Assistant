@@ -1107,10 +1107,12 @@ echo "on-worker.sh: $VI_STAGE did not complete successfully; keeping the worker 
 # A stage that failed on the worker before any checkpoint reached home protects
 # nothing, so its marker would only make a plain `vi cloud down` refuse. Clear it
 # only then: never after a home-side kill (that exits above), a lost poll, or
-# when home holds any checkpoint-* entry or .part.
+# when home holds any checkpoint data: a checkpoint-* entry or .part in the
+# durable dir, or any file in the stage's $checkpoint scratch dir.
 if [ -n "$stage_failed" ] && [ -n "$checkpoint" ] && [ -n "$durable" ] && [ -d "$durable" ] &&
    ! compgen -G "$durable/$ckpt_prefix-*" >/dev/null && ! compgen -G "$durable/*.part" >/dev/null &&
-   ! compgen -G "$durable/.*.part" >/dev/null; then
+   ! compgen -G "$durable/.*.part" >/dev/null &&
+   { [ ! -d "$checkpoint" ] || [ -z "$(find "$checkpoint" -mindepth 1 -print -quit 2>/dev/null)" ]; }; then
   rm -f "$state_dir/unverified/$VI_STAGE-$(basename "$durable")"
   echo "on-worker.sh: no checkpoint reached home; cleared this attempt's unverified marker" >&2
 fi
