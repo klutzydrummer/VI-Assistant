@@ -39,7 +39,9 @@ STUB = textwrap.dedent('''\
     cfgtext = Path(cfg).read_text() if cfg else ""
     if args[:2] == ["cloud", "offers"]:
         log("offers")
-        for o in sc["offers"]:
+        # "offers_after_down" is the relisted market: it applies once a worker has been destroyed.
+        lst = sc["offers_after_down"] if st.get("downs") and "offers_after_down" in sc else sc["offers"]
+        for o in lst:
             print(f"{o['id']:>10}  {o.get('gpu','RTX 3090'):<12} 24 GB  ${o['dph']:.3f}/hr  reliability 0.990  "
                   f"net down   900 / up {o.get('up',800):>5} Mbps   8.0 cores  32 GB ram  disk 500 MB/s  {o.get('loc','US')}")
     elif args[:2] == ["cloud", "up"]:
@@ -64,7 +66,7 @@ STUB = textwrap.dedent('''\
         if not st["worker"]:
             print("no worker to release"); sys.exit(0)
         w = st["worker"]; spent = att().get("spent", 0.0)
-        st["credit"] = round(st["credit"] - spent, 4); st["worker"] = None; save()
+        st["credit"] = round(st["credit"] - spent, 4); st["worker"] = None; st["downs"] = st.get("downs", 0) + 1; save()
         print(f"destroyed instance {w['id']}")
         print(f"credit ${w['credit']:.2f} before, ${st['credit']:.2f} now (${spent:.2f} spent)")
     elif args[:2] == ["cloud", "status"]:
@@ -85,7 +87,7 @@ STUB = textwrap.dedent('''\
             r = a.get("preflight", "pass")
             if r == "hang": hang()
             if r == "push":
-                print("worker-preflight: worker push (MB/s) is 3.10, under the required 4.5", file=sys.stderr)
+                print("worker-preflight: worker push (MB/s) is 1.80, under the required 2.5", file=sys.stderr)
                 print("on-worker.sh: the worker preflight failed; nothing was uploaded", file=sys.stderr); sys.exit(1)
             if r == "vram":
                 print("worker-preflight: VRAM (GiB) is 15.6, under the required 23.5", file=sys.stderr); sys.exit(1)
@@ -264,21 +266,12 @@ class Flow(Base):
         self.scenario([dict(preflight="push", spent=0.1), dict(spent=0.1)],
                       offer_list=offers((1, 0.20, "US", 800)))
         # After attempt 1 the list shows a relisted id 5 for the same machine plus a different one.
-        code = self.start_with_relist()
-        self.assertEqual(code, 0, self.out)
-        self.assertEqual([x["offer"] for x in self.ups()], ["1", "6"])
-
-    def start_with_relist(self):
-        # swap the offer list once the first down has happened
-        p = self.start(*self.args())
-        end = time.time() + 30
-        while time.time() < end and not any(c[0] == "down" for c in self.calls()):
-            time.sleep(0.02)
+        # The stub switches lists on its own state (the first destroyed worker), so no timing matters.
         sc = json.loads((self.sd / "scenario.json").read_text())
-        sc["offers"] = offers((5, 0.19, "US", 800), (6, 0.40, "SE", 500))
+        sc["offers_after_down"] = offers((5, 0.19, "US", 800), (6, 0.40, "SE", 500))
         (self.sd / "scenario.json").write_text(json.dumps(sc))
-        self.out, _ = p.communicate(timeout=60)
-        return p.returncode
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual([x["offer"] for x in self.ups()], ["1", "6"])
 
     def test_3_push_gate_fails_every_attempt(self):
         self.scenario([dict(preflight="push", spent=0.2, hours=0.5)])

@@ -14,7 +14,7 @@
 # With no arguments every scenario runs in order. Scenarios:
 #   gate-home      home disk gate refuses before anything is sent
 #   gate-vram      a 16 GB card fails the worker preflight VRAM gate
-#   gate-push      a 4.37 MB/s push fails the 4.5 MB/s floor
+#   gate-push      a 2.37 MB/s push fails the 2.5 MB/s floor
 #   receiver-down  the return path never proves; nothing is sent
 #   receiver       the restricted receiver itself: token push, munged symlinks, write-only,
 #                  no delete
@@ -158,11 +158,11 @@ sc_gate_vram() {
 }
 
 sc_gate_push() {
-  run_stage gate-push omnivoice_preflight preflight VI_FAKE_PUSH_SECONDS=24; local rc=$?
+  run_stage gate-push omnivoice_preflight preflight VI_FAKE_PUSH_SECONDS=44.2; local rc=$?
   show_log gate-push
   local L="$R/s/gate-push/log"
-  check "a 4.37 MB/s worker fails (exit $rc)" test "$rc" -ne 0
-  check "the push gate names the 4.5 floor" has "$L" "worker push (MB/s) is 4.37, under the required 4.5"
+  check "a 2.37 MB/s worker fails (exit $rc)" test "$rc" -ne 0
+  check "the push gate names the 2.5 floor" has "$L" "worker push (MB/s) is 2.37, under the required 2.5"
   check "the 24467 MiB card passed the VRAM gate" hasnt "$L" "VRAM (GiB) is"
 }
 

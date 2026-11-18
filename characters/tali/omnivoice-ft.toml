@@ -58,7 +58,7 @@ max_upload_minutes = 30
 # The OmniVoice backbone trains in bf16 on a 24 GB card; min_vram_gb is in GiB, so that card
 # reads 23.9. The push floor covers one checkpoint in max_upload_minutes.
 min_vram_gb = 23.5
-min_push_mb_s = 4.5
+min_push_mb_s = 2.5
 
 # GPU, manual, only after the preflight checkpoint is verified and Brandon okays the paid run.
 # Runs 5000 steps through worker-job.sh (survives the stage session dying, restarts a crash with
@@ -83,4 +83,4 @@ min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
 min_vram_gb = 23.5
-min_push_mb_s = 4.5
+min_push_mb_s = 2.5
