@@ -100,3 +100,18 @@ python3 -I jobs/paid_run.py --run-id omnivoice-ft-1 --cap 5.00 --max-hours 8 \
 - Exit codes: 0 done, 2 bad arguments, 3 `up` failed, 4 other preflight failure, 5 push gate failed on all attempts, 6 train failed, 7 home results did not verify, 8 interrupted, 9 worker could not be released (check `vi cloud status`), 10 no offer or budget left, 1 unexpected.
 - After training it checks that home holds checkpoints 1000, 2500, 4500 and 5000 with `VERIFIED` and no unverified marker, and that `step-1000`, `step-2500` and `step-5000` listening sets (with `listening.jsonl` and `README.txt`) are in the stage's `platter` (`--platter`, default `corpus/tali/stages/omnivoice_train/current/out/platter`). Human listening decides voice quality. For each set it also writes `step-N/clips.toml` (one clip per `listening.jsonl` row, audio at `step-N/wav/<label>.wav`, unblinded, answers her / partly / not her). The review hub (`vi review corpus/tali`, port 8737) already finds any `clips.toml` under a stage's current output, so the three sets then show up there as clip lists; a single model has nothing to blind against, so there is no A/B. If a row has no wav at home, the run exits 7. This needs the default `--platter` (or any folder under that stage's current output); the hub display itself has not been checked on the real service.
 - Tests: `jobs/test_paid_run.py` (stub `vi`, no Vast, no network).
+
+### Status and stop
+
+Agents can read a run's progress and ask it to stop safely. Neither command can change the cap, the hours limit, or the attempt count, and neither rents or retries anything.
+
+```sh
+python3 -I jobs/paid_run.py status --run-id omnivoice-ft-1 [--json] [--credit]
+python3 -I jobs/paid_run.py stop --run-id omnivoice-ft-1 [--now]
+```
+
+- `status` reads the run's state file only and makes no `vi` call. `--credit` adds one `vi cloud status` call to show the account credit. Spend for the open attempt and the ETA are labelled estimates, and the ETA appears only after 3 step samples. An unknown run id exits 2 and changes nothing.
+- The training step comes from the trainer output that `paid_run.py` already streams. It reads a tqdm bar (`150/5000 [02:10<...`) or a text line such as `Step 150/5000` or `step: 150 of 5000`. **Assumption:** the real trainer's line format has not been checked against a live run. If neither shape matches, `status` says "no step read yet" and `stop` releases the worker at once, so check `status` early in the first real run.
+- `stop` writes `<run-id>.stop` beside the state file. It refuses (exit 2) if the run is not running. Before training starts (offer, up, preflight) it releases the worker immediately. During training it waits for the newest checkpoint (saved every 500 steps) to reach home and be acknowledged, for at most 10 minutes, then tears the worker down and exits 8. It also releases at once if no checkpoint is pending or the step is unreadable.
+- `stop --now` skips the wait. It sends SIGTERM to the recorded `paid_run.py` pid, but only after checking that the process is this run's (command line holds `paid_run.py` and the run id, and the start time matches). Otherwise it signals nothing.
+- A stop file left from an older run is deleted when a run starts, so it never stops a new run with the same id.
