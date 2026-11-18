@@ -57,6 +57,7 @@ ALLOWLIST = [
     ("jobs/worker-return.sh", r'rm -rf "\$tmp"', "the mktemp -d scratch the receiver_verify token push created"),
     ("jobs/worker-return.sh", r'rm -f "\$path/\.restart-token"', "the receiver module dirs: only the .restart-token this receiver itself pushed"),
     ("jobs/worker-return.sh", r'rm -f "\$state/rsyncd\.pid"', "the state dir's dead-receiver pid and per-module lock files on restart"),
+    ("jobs/paid_run.py", r"self\.stop_file\.unlink\(missing_ok=True\)", "the state dir's <run-id>.stop file for this exact run (cleared at run start and run end)"),
     ("jobs/worker-preflight.sh", r'rm -f "\$disk_probe"', "the worker job dir's disk-probe file"),
     ("jobs/worker-preflight.sh", r'rm -f "\$speed_file"', "the worker job dir's speed-test dummy"),
     ("crates/cloud/src/state.rs", r"std::fs::remove_file\(path\)", "the vi state dir (markers and known_hosts)"),
