@@ -98,7 +98,7 @@ publish_sync() {
         continue
       fi
       n=${ck##*/checkpoint-}
-      case $n in ''|*[!0-9]*) ;; *) rm -f "$work/pushed/checkpoint-$n" ;; esac
+      case $n in ''|*[!0-9]*) ;; *) rm -f "$work/pushed/checkpoint-$n" "$work/wpushed/checkpoint-$n" ;; esac
       rm -rf "$d"
     fi
     mkdir -p "$dst"
@@ -204,10 +204,91 @@ push_publish() {
   local dir=$1 acked=()
   [ -d "$dir" ] || return 0
   push_repairs
+  if [ "${VI_WEIGHTS_FIRST:-0}" = 1 ]; then
+    push_two_part "$dir"
+    return
+  fi
   mapfile -t acked < <(acked_checkpoints)
   if "$jobs_dir/worker-return.sh" push "$dir" "${VI_PUBLISH:-vi-publish}" --exclude='*.part' "${acked[@]}"; then
     mark_pushed
   else
+    return 1
+  fi
+}
+
+# Weights-only publish (F-PUSH-6 c), switched on with VI_WEIGHTS_FIRST=1. Off by default: home's
+# verify in jobs/on-worker.sh does not yet pass --weights-only-older, so it would reject a
+# checkpoint home holds only as weights. Per pass:
+#   1. weights part: every checkpoint without optimizer.bin, scheduler.bin, random_states_0.pkl
+#      and without SHA256SUMS, but with its own SHA256SUMS.weights (the full manifest minus those
+#      three files), so the weights are checkable the moment they land.
+#   2. full part, for the newest checkpoint only (the one training resumes from).
+#   3. an older checkpoint whose full part is not home is not sent it once a newer checkpoint's
+#      full part is; home gets the weights-only manifest as its SHA256SUMS instead (staged
+#      beside the publish dir, pushed after the weights), which checkpoints.py verify
+#      --weights-only-older accepts for every checkpoint but the newest.
+FULL_ONLY_RE='  (optimizer\.bin|scheduler\.bin|random_states_0\.pkl)$'
+push_two_part() {
+  local dir=$1 c name n newest=-1 acked=() skip=() part1=() stage="$scratch/weights-stage"
+  local mod=${VI_PUBLISH:-vi-publish}
+  for c in "$dir"/checkpoint-*; do
+    [ -f "$c/SHA256SUMS" ] || continue
+    n=${c##*/checkpoint-}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    [ "$n" -le "$newest" ] || newest=$n
+    grep -vE "$FULL_ONLY_RE" "$c/SHA256SUMS" >"$c/SHA256SUMS.weights" || true
+  done
+  mapfile -t acked < <(acked_checkpoints)
+  part1=(--exclude='*.part' --exclude=SHA256SUMS --exclude=optimizer.bin --exclude=scheduler.bin
+         --exclude=random_states_0.pkl)
+  "$jobs_dir/worker-return.sh" push "$dir" "$mod" "${part1[@]}" "${acked[@]}" || return 1
+  mkdir -p "$work/wpushed"
+  for c in "$dir"/checkpoint-*; do
+    [ -f "$c/SHA256SUMS.weights" ] || continue
+    name=${c##*/}; n=${name#checkpoint-}
+    : >"$work/wpushed/$name"
+    if [ "$n" -lt "$newest" ] && [ ! -e "$work/pushed/$name" ] && [ ! -e "$work/acked/$name" ]; then
+      skip+=("$name" "--exclude=/$name")
+    fi
+  done
+  local skipargs=() i
+  for ((i = 1; i < ${#skip[@]}; i += 2)); do skipargs+=("${skip[i]}"); done
+  "$jobs_dir/worker-return.sh" push "$dir" "$mod" --exclude='*.part' "${skipargs[@]}" "${acked[@]}" || return 1
+  for ((i = 0; i < ${#skip[@]}; i += 2)); do
+    name=${skip[i]}
+    mkdir -p "$stage/$name"
+    cp "$dir/$name/SHA256SUMS.weights" "$stage/$name/SHA256SUMS"
+    "$jobs_dir/worker-return.sh" push "$stage/./$name" "$mod" --relative --exclude='*.part' || return 1
+    echo "voicetune-fresh: ${name} is home as weights only (its optimizer state was skipped; a newer checkpoint is home in full)" >&2
+  done
+  mark_pushed
+}
+
+# backlog_check: F-TRN-3. Checkpoints finished here but not yet home pile up on the worker's disk
+# when pushes keep failing. Warn when free space is under 3 x one checkpoint's size with any
+# un-acked checkpoint; return 1 (the caller writes abort.json "push backlog") at six or more.
+# VI_FREE_GB overrides the measured free space.
+backlog_check() {
+  local c name n unacked=0 size=0 s free
+  for c in "$publish"/checkpoint-* "$publish"/epoch-*; do
+    [ -d "$c" ] || continue
+    name=${c##*/}
+    case $name in *.part) continue ;; esac
+    n=${name#*-}
+    case $n in ''|*[!0-9]*) continue ;; esac
+    [ ! -e "$work/acked/$name" ] || continue
+    if [ "${name%%-*}" = checkpoint ] && [ -e "$work/pushed/$name" ]; then continue; fi
+    unacked=$((unacked + 1))
+    s=$(du -sbL "$c" | cut -f1)
+    [ "$s" -le "$size" ] || size=$s
+  done
+  [ "$unacked" -gt 0 ] || return 0
+  free=${VI_FREE_GB:-$(df -P -k "$work" | awk 'NR==2 {printf "%.1f", $4 / 1048576}')}
+  if awk -v f="$free" -v s="$size" 'BEGIN {exit !(f * 1073741824 < 3 * s)}'; then
+    echo "voicetune-fresh: WARNING: $free GB free is under 3 x the checkpoint size ($size bytes) with $unacked checkpoints not yet home" >&2
+  fi
+  if [ "$unacked" -ge "${VI_BACKLOG_MAX:-6}" ]; then
+    echo "voicetune-fresh: push backlog: $unacked checkpoints are not home" >&2
     return 1
   fi
 }
@@ -217,6 +298,11 @@ push_loop() {
   while :; do
     publish_sync "$run" "$publish"
     push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
+    if ! backlog_check; then
+      mkdir -p "$run"
+      python3 -c 'import json; print(json.dumps({"reason": "push backlog"}))' >"$run/abort.json"
+      break
+    fi
     # A live trainer can still publish another checkpoint: keep going.
     if [ -s "$work/train.pid" ] && kill -0 "$(cat "$work/train.pid" 2>/dev/null)" 2>/dev/null; then
       sleep "${VI_PUSH_SECONDS:-15}"
@@ -477,6 +563,44 @@ for n in ("omnivoice", "torch", "transformers", "accelerate", "webdataset"):
 print("versions: " + " ".join(out))' || echo "versions: could not read" >&2
 }
 
+# vram_peak_gate LOG: F-OOM-1 (d). train_ft prints "train_ft: vram peak X of Y GiB" at the end of
+# a CUDA run. Above 90 % of the card the real run is one longer batch from an out-of-memory stop
+# hours in, so print the retryable worker-preflight line (a new worker with a higher VRAM floor
+# is tried) and exit 1. No such line (a non-CUDA run or an older trainer) means no gate, only a warning.
+vram_peak_gate() {
+  local line x y
+  line=$(grep -E 'train_ft: vram peak [0-9.]+ of [0-9.]+ GiB' "$1" 2>/dev/null | tail -n 1 || true)
+  if [ -z "$line" ]; then
+    echo "voicetune-fresh: WARNING: no 'train_ft: vram peak' line in $1; the VRAM headroom gate was skipped" >&2
+    return 0
+  fi
+  x=$(printf '%s' "$line" | sed -E 's/.*vram peak ([0-9.]+) of ([0-9.]+) GiB.*/\1/')
+  y=$(printf '%s' "$line" | sed -E 's/.*vram peak ([0-9.]+) of ([0-9.]+) GiB.*/\2/')
+  if awk -v x="$x" -v y="$y" 'BEGIN {exit !(x > 0.90 * y)}'; then
+    echo "worker-preflight: vram peak $x of $y GiB" >&2
+    exit 1
+  fi
+  echo "preflight: vram peak $x of $y GiB (limit 90 %)"
+}
+
+# eta_check STEP ELAPSED_S: F-TRN-5. From step 100 on, extrapolate the time the remaining steps
+# need at the pace so far. Over hours_left - 0.5 h (VI_HOURS_LEFT is the budget left when train
+# started, 8 if unset), warn once and push now so a stop at the cap loses as little as possible.
+# It only warns: the step count never changes.
+eta_check() {
+  local step=$1 elapsed=$2 total=${VI_TRAIN_STEPS:-5000} left_h out
+  [ "$step" -ge "${VI_ETA_MIN_STEP:-100}" ] || return 0
+  [ ! -e "$work/eta.warned" ] || return 0
+  out=$(awk -v st="$step" -v el="$elapsed" -v tot="$total" -v hl="${VI_HOURS_LEFT:-8}" 'BEGIN {
+    proj = (tot - st) * el / st / 3600; left = hl - el / 3600
+    if (proj > left - 0.5) printf "%.1f %.1f", proj, left }')
+  [ -n "$out" ] || return 0
+  : >"$work/eta.warned"
+  echo "voicetune-fresh: projected ${out%% *} h > ${out##* } h left" >&2
+  publish_sync "$run" "$publish"
+  push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
+}
+
 # rehearse_kill_resume: the real-GPU kill/resume proof. A 20-step run saving every 10 steps is
 # SIGKILLed a few micro-steps after checkpoint-10 lands (about step 15), then resumed from
 # checkpoint-10; both checkpoints must pass --verify-checkpoint. A run that finishes before the
@@ -558,11 +682,15 @@ preflight() {
   # Five real steps at the full batch (--steps 5 --save-steps 5 writes checkpoint-5), published
   # and pushed home as an end-to-end integrity proof, timed for the record. The Qwen3 loadbench
   # and push-rate gate are gone: they were voicetune.py internals with no OmniVoice counterpart.
+  # The probe uses the trainer's default batch, the same one train() runs, so it is the largest
+  # batch the real run will see; its log carries the VRAM peak line the gate reads.
+  mkdir -p "$probe_run"
   "$ACCELERATE" launch --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
     --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
     --output-dir "$probe_run" --steps 5 --save-steps 5 \
-    --num-workers "${VI_NUM_WORKERS:-2}"
+    --num-workers "${VI_NUM_WORKERS:-2}" 2>&1 | tee "$probe_run/train.log"
   [ -d "$probe_run/checkpoint-5" ] || { echo "preflight: no $probe_run/checkpoint-5 produced" >&2; exit 1; }
+  vram_peak_gate "$probe_run/train.log"
   publish_sync "$probe_run" "$probe_publish"
 
   local bytes seconds mb_s t0 t1
@@ -644,12 +772,26 @@ train() {
   # Watchdog: push each finished checkpoint home as it appears, and stop the run on the abort
   # rules (NaN loss; collapse guard fired in the latest attempt).
   reason=""
+  local step
   while [ ! -s "$rc_file" ]; do
     publish_sync "$run" "$publish"
     # A loop push failure must not orphan the running train, so it is non-fatal
     # here; the final push below is the one that decides success.
     push_publish "$publish" || echo "voicetune-fresh: publish push failed; will retry" >&2
     reason=$(abort_reason "$run/style_metrics.jsonl" "$run/collapse_guard.jsonl" "$run/ft_config.json")
+    [ -n "$reason" ] || backlog_check || reason="push backlog"
+    if [ -z "$reason" ]; then
+      step=$(python3 -c '
+import json, sys
+last = 0
+for line in open(sys.argv[1], errors="replace"):
+    try:
+        last = max(last, int(json.loads(line)["micro_step"]))
+    except (ValueError, KeyError, TypeError):
+        pass
+print(last)' "$run/style_metrics.jsonl" 2>/dev/null || echo 0)
+      eta_check "$step" "$(( $(date +%s) - start ))"
+    fi
     if [ -n "$reason" ]; then
       echo "train abort: $reason" >&2
       # Written before the kill: worker-job.sh sees it and never restarts an
@@ -658,7 +800,7 @@ train() {
       kill "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null || true
       break
     fi
-    sleep 15
+    sleep "${VI_WATCH_SECONDS:-15}"
   done
   set +e
   wait "$wj_pid"

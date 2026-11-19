@@ -27,7 +27,15 @@ Exit codes:
  10 no offer or budget left to try (cap, hours, or offers exhausted)
   11 home or the rented disk is too small (checked before renting)
   12 a clip id in the data folder would break WebDataset (checked before renting)
+  13 the home real-path check did not pass (checked before renting)
+  14 the pinned base-model revision is gone or changed on Hugging Face (checked before renting)
   1 anything unexpected (worker release is still attempted)
+
+A failed train stage never rents a second machine. It is recovered IN PLACE on the same worker
+(GPU visible, disk free, stage process gone, a verified checkpoint to resume from; at most
+INPLACE_MAX_RESTARTS restarts within INPLACE_MAX_SECONDS). Anything else (bounds hit, ENOSPC,
+abort.json, a deterministic traceback, no checkpoint, a vanished instance) releases the worker
+and stops with exit 6 so that a person decides.
 
 Watching and stopping a run (no vi call unless --credit; neither command can rent, retry or
 change the cap, hours or attempts):
@@ -45,6 +53,7 @@ No Vast credential file is read here; only the `vi` CLI is called.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import queue
@@ -80,6 +89,31 @@ def retryable_gate(out):
     if PREFLIGHT_GATE_RE.search(out):
         return "worker-preflight"
     return None
+def nap(seconds):
+    """Every retry/backoff wait goes through here. PAID_RUN_SLEEP_SCALE shrinks it for tests and
+    PAID_RUN_SLEEP_LOG records each requested wait (seconds, one per line)."""
+    log = os.environ.get("PAID_RUN_SLEEP_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(f"{seconds}\n")
+    time.sleep(seconds * float(os.environ.get("PAID_RUN_SLEEP_SCALE", "1")))
+
+
+def timeout_scale(seconds):
+    """A per-call timeout; PAID_RUN_TIMEOUT_SCALE shrinks it for tests (never below 2 s)."""
+    return min(seconds, max(seconds * float(os.environ.get("PAID_RUN_TIMEOUT_SCALE", "1")), 2.0))
+
+
+def gate_kind(out):
+    """How a failed worker gate should mark the machine: 'cuda' (machine and host), 'memory'
+    (VRAM/RAM: raise the next VRAM floor too), or 'other' (machine only)."""
+    if CUDA_GATE_RE.search(out):
+        return "cuda"
+    if MEMORY_GATE_RE.search(out):
+        return "memory"
+    return "other"
+
+
 EU_COUNTRIES = ("US AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI "
                 "ES SE GB CH NO").split()
 # Home keeps the two newest checkpoints plus the exempt steps (jobs/checkpoints.py
@@ -108,7 +142,45 @@ STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
-            release=9, budget=10, disk=11, ids=12, realpath=13, other=1)
+            release=9, budget=10, disk=11, ids=12, realpath=13, hf=14, other=1)
+
+# ---- retries, timeouts and recovery bounds (every wait goes through nap(), so tests never wait) ----
+OUTER_RETRY_SECONDS = 20          # F-NET-1: one more try of `offers` / `status` after this long
+RELEASE_BACKOFF = (10, 20, 40, 80)  # F-REL-1: waits between `down --force` tries before exit 9
+QUERY_TIMEOUT_SECONDS = 180       # F-CLK-1: offers / status
+DOWN_TIMEOUT_SECONDS = 300        # a hung `down` would bill forever
+PREFLIGHT_TIMEOUT_SECONDS = 90 * 60
+UP_EXTRA_SECONDS = 5 * 60         # `up` may take boot_minutes plus this
+DEFAULT_BOOT_MINUTES = 15
+INPLACE_MAX_RESTARTS = 2          # F-RES-1 / F-TRN-2: in-place train restarts on the same worker
+INPLACE_MAX_SECONDS = 45 * 60     # ... and the window, from the first failure, they must fit in
+REATTACH_MAX = 3                  # F-PUSH-5: stage died but the trainer lives; reattach this often
+REATTACH_WAIT_SECONDS = 15
+BOOT_FAIL_RE = re.compile(r"no ssh after|disappeared while booting|failed to start|boot (?:timeout|failure)",
+                          re.I)
+INPLACE_MIN_DISK_GB = 5.0         # a worker with less free disk than this is treated as ENOSPC
+HF_REPO = "k2-fsa/OmniVoice"
+HF_TRIES = 3
+HF_TIMEOUT_SECONDS = 60
+HF_BACKOFF = (5, 15)
+VRAM_FLOOR_STEP_GB = 4.0          # F-OOM-1: how much a memory failure raises the next offer's VRAM floor
+CUDA_GATE_RE = re.compile(r"worker-preflight: .*\b(CUDA|driver)\b", re.I)
+MEMORY_GATE_RE = re.compile(r"worker-preflight: (?:vram peak \S+ of \S+ GiB|.*\b(?:VRAM|RAM)\b)", re.I)
+# Worker check for an in-place train restart, run through `vi cloud ssh`.
+INPLACE_SCRIPT = r"""
+exec 2>&1
+# INPLACE_CHECK
+if timeout 20 nvidia-smi -L >/dev/null 2>&1; then echo "inplace: gpu=ok"; else echo "inplace: gpu=missing"; fi
+echo "inplace: disk_free_gb=$(df -BG --output=avail "$HOME" 2>/dev/null | tail -n1 | tr -dc 0-9)"
+n=$(pgrep -fc '[w]orker-job.sh|[t]rain_ft.py|[v]oicetune-fresh.sh' 2>/dev/null); echo "inplace: procs=${n:-0}"
+ab=$(find "$HOME" /tmp /workspace -maxdepth 8 -name abort.json -path '*voicetune-fresh*' 2>/dev/null | head -n1)
+echo "inplace: abort=${ab:-none}"
+if find "$HOME" /tmp /workspace -maxdepth 6 -name job.log 2>/dev/null | head -n3 | xargs -r grep -l 'No space left on device' >/dev/null 2>&1; then
+  echo "inplace: enospc=1"; else echo "inplace: enospc=0"; fi
+ck=$(find "$HOME" /tmp /workspace -maxdepth 8 -path '*voicetune-fresh/run/checkpoint-*' -name SHA256SUMS 2>/dev/null \
+  | sed -E 's#.*/checkpoint-([0-9]+)/SHA256SUMS#\1#' | sort -n | tail -n1)
+echo "inplace: ckpt=${ck:-none}"
+"""
 
 # The worker's preflight (jobs/voicetune-fresh.sh, `min_disk = float(os.environ.get(
 # "VI_MIN_DISK_GB", "100"))`) refuses a worker with less free disk than this many GiB. The
@@ -282,19 +354,31 @@ def stop_path(run_id):
     return state_root() / f"{run_id}.stop"
 
 
+MACHINE_TAIL_RE = re.compile(r"\s+machine (\d+) host (\d+|\?)\s*$")
+
+
 def parse_offers(text):
-    """[{id, gpu, dph, up, cores, ram, loc, sig}] in the order `vi cloud offers` printed them."""
+    """[{id, gpu, dph, up, cores, ram, loc, sig, machine, host}] in the order `vi cloud offers`
+    printed them. The line ends with `machine N host M` (host `?` when Vast gave none); older
+    output without it gives machine/host None."""
     out = []
     for line in text.splitlines():
         m = OFFER_RE.match(line)
         if not m:
             continue
         loc = m.group(11).strip()
+        tail = MACHINE_TAIL_RE.search(loc)
+        machine = host = None
+        if tail:
+            machine = int(tail.group(1))
+            host = None if tail.group(2) == "?" else int(tail.group(2))
+            loc = loc[:tail.start()].strip()
         out.append(dict(
             id=int(m.group(1)), gpu=m.group(2).strip(), dph=float(m.group(4)),
             up=int(m.group(7)), cores=m.group(8), ram=m.group(9), loc=loc,
-            # `vi cloud offers` does not print machine_id, so a relisted machine is recognised by
-            # what it is and where it is.
+            machine=machine, host=host,
+            # A relisted machine is also recognised by what it is and where it is, for output
+            # that carries no machine id.
             sig=f"{m.group(2).strip()}|{loc}|{m.group(8)}|{m.group(9)}|{m.group(7)}"))
     return out
 
@@ -335,6 +419,53 @@ def set_toml_values(text, max_hours=None, countries=None):
         elif not any(ln.strip() == "[search]" for ln in lines):
             lines += ["[search]", new]
     return "\n".join(lines) + "\n"
+
+
+def set_search_value(text, key, value):
+    """A copy of a cloud config with `key = value` set inside its [search] table."""
+    lines = text.splitlines()
+    new = f"{key} = {value}"
+    in_search, at = False, None
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        if t.startswith("["):
+            if in_search:
+                break
+            in_search = t == "[search]"
+            if in_search:
+                at = i + 1
+        elif in_search and re.match(rf"{re.escape(key)}\s*=", t):
+            lines[i], at = new, None
+            break
+    if at is not None:
+        lines.insert(at, new)
+    elif not any(ln.strip() == "[search]" for ln in lines):
+        lines += ["[search]", new]
+    return "\n".join(lines) + "\n"
+
+
+def search_value(text, key, default=None):
+    in_search = False
+    for ln in text.splitlines():
+        t = ln.strip()
+        if t.startswith("["):
+            in_search = t == "[search]"
+        elif in_search and re.match(rf"{re.escape(key)}\s*=", t):
+            try:
+                return float(t.split("=", 1)[1].split("#")[0].strip())
+            except ValueError:
+                return default
+    return default
+
+
+def config_boot_minutes(text):
+    for ln in text.splitlines():
+        if ln.startswith("["):
+            break
+        m = re.match(r"boot_minutes\s*=\s*(\d+)", ln)
+        if m:
+            return int(m.group(1))
+    return DEFAULT_BOOT_MINUTES
 
 
 def gate_default_gb(script=GATE_SCRIPT):
@@ -551,6 +682,9 @@ def realpath_code_hash(folder, req=None, repo=None):
                                                          "home_realpath_check.py", "data_manifest.py")]
     files += sorted((repo / "jobs" / "omnistyle").glob("*.py"))
     files.append(Path(req or REALPATH_REQ))
+    # F-HOME-1: the worker's pins and the pinned base-model revision are part of the key too, so
+    # a changed pin cannot reuse an OK that was earned with the old ones.
+    files.append(repo / "jobs" / "requirements-omnivoice-worker.txt")
     for f in files:
         h.update(f.name.encode() + b"\0")
         try:
@@ -558,7 +692,85 @@ def realpath_code_hash(folder, req=None, repo=None):
         except OSError:
             h.update(b"<missing>")
     h.update(Path(folder).parent.name.encode())
+    h.update(b"revision\0" + base_model_revision(repo / "jobs" / "voicetune-fresh.sh").encode())
     return h.hexdigest()[:24]
+
+
+# F-NET-4: the pinned base-model revision must still exist upstream, with the pinned file sizes.
+CHECKPOINT_BYTES_CALCULATED = 3 * 2_450_344_112  # weights + two AdamW states (WP3 / w27 report)
+WEIGHTS_BYTES_CALCULATED = 2_450_344_112
+
+
+def load_size_table():
+    """(SIZE_TABLE, DEFAULT_REVISION_PREFIX) from jobs/omnivoice-ft/fetch_base_model.py."""
+    spec = importlib.util.spec_from_file_location(
+        "fetch_base_model_pins", REPO / "jobs" / "omnivoice-ft" / "fetch_base_model.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return dict(mod.SIZE_TABLE), mod.DEFAULT_REVISION_PREFIX
+
+
+def hf_model_info(repo, revision, timeout):
+    """HfApi().model_info(...); the one network call of the gate (tests replace it)."""
+    from huggingface_hub import HfApi
+    return HfApi().model_info(repo, revision=revision, files_metadata=True, timeout=timeout)
+
+
+def hf_revision_gate(home=None, revision=None, model_info=None, sleep=None):
+    """(ok, lines). A revision that is gone or has other file sizes fails. A network failure
+    after HF_TRIES tries is only a warning when the home HF cache holds the snapshot."""
+    model_info = model_info or hf_model_info
+    sleep = sleep or nap
+    label = "hf revision    : "
+    rev = revision or base_model_revision()
+    home = Path(home or Path.home())
+    snap = (home / ".cache" / "huggingface" / "hub" / "models--k2-fsa--OmniVoice" / "snapshots" / rev)
+    last = None
+    for i in range(HF_TRIES):
+        try:
+            info = model_info(HF_REPO, rev, HF_TIMEOUT_SECONDS)
+            break
+        except Exception as e:  # noqa: BLE001: classified below
+            last = e
+            if type(e).__name__ in ("RevisionNotFoundError", "RepositoryNotFoundError",
+                                    "EntryNotFoundError", "GatedRepoError"):
+                return False, [f"{label}NOT FOUND: {HF_REPO} @ {rev} ({type(e).__name__}: {e}); the "
+                               "worker would fail after being rented. Nothing was rented."]
+            if i + 1 < HF_TRIES:
+                sleep(HF_BACKOFF[min(i, len(HF_BACKOFF) - 1)])
+    else:
+        if snap.is_dir():
+            return True, [f"{label}WARNING not checked ({type(last).__name__}: {last}); the home "
+                          f"cache holds the snapshot {snap}"]
+        return False, [f"{label}could not be checked after {HF_TRIES} tries ({type(last).__name__}: "
+                       f"{last}) and the home cache has no snapshot at {snap}. Nothing was rented."]
+    table, prefix = load_size_table()
+    if not rev.startswith(prefix):
+        return True, [f"{label}ok ({HF_REPO} @ {rev} exists; the pinned size table is for {prefix}, "
+                      "so sizes were not compared)"]
+    sizes = {}
+    for f in info.siblings or []:
+        name, size = (f.get("rfilename"), f.get("size")) if isinstance(f, dict) else (
+            getattr(f, "rfilename", None), getattr(f, "size", None))
+        sizes[name] = size
+    bad = [f"{name}: {sizes.get(name)} bytes upstream, pinned {want}"
+           for name, want in table.items() if sizes.get(name) != want]
+    if bad:
+        return False, [f"{label}CHANGED upstream: " + "; ".join(bad) + ". Nothing was rented."]
+    return True, [f"{label}ok ({HF_REPO} @ {rev}; pinned file sizes match)"]
+
+
+def push_hours_line(settings, bytes_full=CHECKPOINT_BYTES_CALCULATED,
+                    bytes_weights=WEIGHTS_BYTES_CALCULATED):
+    """`push ≈ X h at floor` for one full checkpoint and one weights-only checkpoint, at the
+    stage's min_push_mb_s. The sizes are CALCULATED (3 x the 2,450,344,112-byte weights file),
+    not measured; jobs/checkpoints.py only enforces lower bounds."""
+    floor = float((settings or {}).get("min_push_mb_s", 2.5))
+    full, weights = bytes_full / (floor * 1e6) / 3600, bytes_weights / (floor * 1e6) / 3600
+    return (f"push time       : push ≈ {full:.2f} h at floor ({floor:g} MB/s) per full checkpoint "
+            f"({bytes_full / 1e9:.2f} GB), {weights:.2f} h per weights-only one "
+            f"({bytes_weights / 1e9:.2f} GB); sizes calculated, not measured (jobs/checkpoints.py "
+            f"floors {'2.0 GB weights + 4.0 GB optimizer'})")
 
 
 def run_realpath(cmd, timeout, env):
@@ -716,6 +928,8 @@ class PaidRun:
         self.dir = state_root() / args.run_id
         self.path = state_root() / f"{args.run_id}.json"
         self.child = None
+        self.timed_out = False
+        self.last_facts = {}
         self.worker_maybe_up = False
         self.in_teardown = False
         self.config_path = None  # the per-attempt config currently in force
@@ -738,11 +952,15 @@ class PaidRun:
                 if abs(self.s[key] - want) > 1e-9:
                     raise Stop(EXIT["args"], f"run {self.a.run_id} was started with {key} "
                                f"{self.s[key]}, not {want}; use the same limits or a new --run-id")
+            for key, default in (("failed_machines", []), ("failed_hosts", []),
+                                 ("vram_floor_gb", None)):
+                self.s.setdefault(key, default)
             say(f"resuming run {self.a.run_id} from {self.path}")
             return True
         self.s = dict(run_id=self.a.run_id, cap=self.a.cap, max_hours=self.a.max_hours,
                       max_attempts=self.a.max_attempts, created=clock(), status="running",
                       exit_code=None, message="", attempts=[], failed_offers=[], failed_sigs=[],
+                      failed_machines=[], failed_hosts=[], vram_floor_gb=None,
                       spent_total=0.0, hours_total=0.0, credit_before_run=None,
                       credit_after_run=None)
         return False
@@ -760,13 +978,18 @@ class PaidRun:
             env["VI_CLOUD_CONFIG"] = str(self.config_path)
         return env
 
-    def run(self, argv, stream=True, watch=False, train=False):
+    def run(self, argv, stream=True, watch=False, train=False, timeout=None):
         """Run a command, returning (returncode, combined stdout+stderr text). With watch=True a
         stop request is noticed even while the command prints nothing; train=True also reads the
-        trainer's progress and checkpoint acks from its output."""
+        trainer's progress and checkpoint acks from its output. A `timeout` (seconds, scaled by
+        PAID_RUN_TIMEOUT_SCALE) kills the command's whole process group: rc 124, and
+        self.timed_out is set for the caller."""
+        self.timed_out = False
+        limit = timeout_scale(timeout) if timeout else None
+        deadline = time.monotonic() + limit if limit else None
         p = subprocess.Popen(argv, cwd=self.a.repo, env=self.env(), text=True, bufsize=1,
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT)
+                             stderr=subprocess.STDOUT, start_new_session=bool(limit))
         self.child = p
         buf = []
         lines = queue.Queue()
@@ -780,7 +1003,7 @@ class PaidRun:
         try:
             while True:
                 try:
-                    line = lines.get(timeout=0.2 if watch else None)
+                    line = lines.get(timeout=0.2 if (watch or limit) else None)
                 except queue.Empty:
                     line = ""
                 if line is None:
@@ -793,10 +1016,29 @@ class PaidRun:
                         self.note_line(line)
                 if watch:
                     self.check_stop()
+                if deadline is not None and time.monotonic() > deadline:
+                    self.timed_out = True
+                    msg = (f"paid-run: {' '.join(map(str, argv[:4]))} timed out after {limit:.0f} s; "
+                           "killing its process group\n")
+                    buf.append(msg)
+                    if stream:
+                        print(msg, end="", flush=True)
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except OSError:
+                        p.kill()
+                    p.wait()
+                    return 124, "".join(buf)
             p.wait()
         except BaseException:
             if p.poll() is None:
-                p.terminate()
+                try:
+                    if limit:
+                        os.killpg(p.pid, signal.SIGTERM)
+                    else:
+                        p.terminate()
+                except OSError:
+                    p.terminate()
                 try:
                     p.wait(timeout=60)
                 except subprocess.TimeoutExpired:
@@ -879,12 +1121,34 @@ class PaidRun:
                                 "finish in time")
 
     def vi_cmd(self, *args, stream=False):
-        return self.run([self.vi, *args], stream=stream)
+        """Run a `vi` subcommand. `cloud offers` and `cloud status` are read-only, so they get a
+        timeout and one more try after OUTER_RETRY_SECONDS (F-NET-1, F-CLK-1); `down` gets a
+        timeout; nothing else is retried here."""
+        kind = args[1] if len(args) > 1 and args[0] == "cloud" else None
+        timeout = QUERY_TIMEOUT_SECONDS if kind in ("offers", "status") else (
+            DOWN_TIMEOUT_SECONDS if kind == "down" else None)
+        rc, out = self.run([self.vi, *args], stream=stream, timeout=timeout)
+        if rc != 0 and kind in ("offers", "status"):
+            say(f"`vi cloud {kind}` failed (exit {rc}); trying once more in {OUTER_RETRY_SECONDS} s")
+            nap(OUTER_RETRY_SECONDS)
+            rc, out = self.run([self.vi, *args], stream=stream, timeout=timeout)
+        return rc, out
 
     def credit(self):
         rc, out = self.vi_cmd("cloud", "status")
         m = re.search(r"^credit \$([\d.]+)", out, re.M)
         return float(m.group(1)) if rc == 0 and m else None
+
+    def instance_id(self):
+        """The id of the billing worker from `vi cloud status`, or None (best effort)."""
+        try:
+            rc, out = self.run([self.vi, "cloud", "status"], stream=False,
+                               timeout=QUERY_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001
+            return None
+        m = re.search(r"^worker (\d+) (?!is gone)", out, re.M) or \
+            re.search(r"^untracked .* instance (\d+)", out, re.M)
+        return m.group(1) if rc == 0 and m else None
 
     def worker_present(self):
         """(present, text, tracked): is any vi-worker instance on the account?"""
@@ -918,7 +1182,9 @@ class PaidRun:
             *ids_lines,
             *realpath_lines,
             *stale_marker_lines(),
-            f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision) not verified (needs network)",
+            f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision); "
+            f"checked against Hugging Face before renting (exit {EXIT['hf']}), not in --plan",
+            push_hours_line(stage_settings(a.stages, a.repo, "omnivoice_train")),
             f"countries       : {countries}",
             f"stage file      : {a.stages}",
             f"state file      : {self.path}",
@@ -943,7 +1209,10 @@ class PaidRun:
     def write_attempt_config(self, n, hours):
         self.dir.mkdir(parents=True, exist_ok=True)
         p = self.dir / f"attempt-{n}.toml"
-        p.write_text(set_toml_values(self.base_config_text(), max_hours=hours))
+        text = set_toml_values(self.base_config_text(), max_hours=hours)
+        if self.s.get("vram_floor_gb"):
+            text = set_search_value(text, "min_gpu_ram_gb", f"{self.s['vram_floor_gb']:g}")
+        p.write_text(text)
         self.config_path = p
         return p
 
@@ -971,20 +1240,28 @@ class PaidRun:
         """`vi cloud down`, then close the attempt with its spend. Raises Stop(9) if the worker
         cannot be released."""
         self.in_teardown = True
-        if outcome not in ("done", "up-failed"):
+        if outcome not in ("done", "up-failed", "train-vanished"):
             self.fetch_diagnostics(at, outcome)
         say("releasing the worker (vi cloud down)")
         rc, out = self.vi_cmd("cloud", "down", stream=True)
         if rc != 0:
             say("plain `down` refused; trying `down --force` so nothing keeps billing")
             rc, out = self.vi_cmd("cloud", "down", "--force", stream=True)
+            for wait in RELEASE_BACKOFF:
+                if rc == 0:
+                    break
+                say(f"`down --force` failed (exit {rc}); trying again in {wait} s")
+                nap(wait)
+                rc, out = self.vi_cmd("cloud", "down", "--force", stream=True)
         if rc != 0:
             self.worker_maybe_up = True
             if at is not None:
                 at["outcome"] = outcome + "+release-failed"
                 self.save()
-            raise Stop(EXIT["release"], "COULD NOT RELEASE THE WORKER. It may still be billing. "
-                       "Run `vi cloud status` and `vi cloud down --force` now.")
+            ident = self.instance_id()
+            raise Stop(EXIT["release"], "COULD NOT RELEASE THE WORKER. It may still be billing"
+                       f"{f' (instance {ident})' if ident else ''}. Run `vi cloud status`, then "
+                       "`vi cloud down --force` now.")
         self.worker_maybe_up = False
         spent, est = None, False
         m = re.search(r"\(\$([\d.]+) spent\)", out)
@@ -1074,17 +1351,30 @@ class PaidRun:
 
     # ----- the flow ------------------------------------------------------------------------
     def choose_offer(self, hours_left, cap_left):
-        rc, out = self.vi_cmd("cloud", "offers")
+        excl = [x for m in self.s["failed_machines"] for x in ("--exclude-machine", str(m))]
+        rc, out = self.vi_cmd("cloud", "offers", *excl)
         if rc != 0:
             raise Stop(EXIT["up"], f"`vi cloud offers` failed:\n{out.strip()}")
         offers = sorted(parse_offers(out), key=lambda o: o["dph"])
         if not offers:
             raise Stop(EXIT["budget"], "no offers match the config right now")
-        fresh = [o for o in offers if o["id"] not in self.s["failed_offers"]
-                 and o["sig"] not in self.s["failed_sigs"]]
+
+        def failed(o):
+            if o["id"] in self.s["failed_offers"]:
+                return True
+            if o["machine"] is not None and o["machine"] in self.s["failed_machines"]:
+                return True
+            if o["host"] is not None and o["host"] in self.s["failed_hosts"]:
+                return True
+            # without a machine id in the listing, fall back to what the machine looks like
+            return o["machine"] is None and o["sig"] in self.s["failed_sigs"]
+
+        fresh = [o for o in offers if not failed(o)]
         if not fresh:
+            on_failed = len(offers) - len(fresh)
             raise Stop(EXIT["budget"], "every listed offer has already failed this run "
-                       f"({len(offers)} listed)")
+                       f"({len(offers)} offers listed, {on_failed} on failed machines; "
+                       f"{len(self.s['failed_machines'])} machines excluded in the search)")
         affordable = [o for o in fresh if o["dph"] * hours_left <= cap_left + 1e-9]
         if not affordable:
             cheapest = fresh[0]
@@ -1092,6 +1382,114 @@ class PaidRun:
                        f"{hours_left:.2f} h (cheapest is ${cheapest['dph']:.3f}/hr, worst case "
                        f"${cheapest['dph'] * hours_left:.2f})")
         return affordable[0]
+
+    # ----- failed machines and memory floors ----------------------------------------------
+    def mark_machine(self, at, host_too=False):
+        """Never rent this machine again in this run (F-RENT-4); `host_too` also drops every offer
+        from the same host, used for CUDA/driver failures where the whole box is suspect."""
+        m, h = at.get("machine"), at.get("host")
+        if m is not None and m not in self.s["failed_machines"]:
+            self.s["failed_machines"].append(m)
+        if host_too and h is not None and h not in self.s["failed_hosts"]:
+            self.s["failed_hosts"].append(h)
+        self.save()
+
+    def raise_vram_floor(self, why):
+        """F-OOM-1: after a memory failure the next offer must have more GPU memory."""
+        cur = self.s.get("vram_floor_gb") or search_value(self.base_config_text(),
+                                                          "min_gpu_ram_gb", 24.0)
+        self.s["vram_floor_gb"] = cur + VRAM_FLOOR_STEP_GB
+        self.save()
+        say(f"{why}: the next offer needs at least {self.s['vram_floor_gb']:g} GB of GPU memory "
+            f"(was {cur:g})")
+
+    # ----- train stage with in-place recovery ----------------------------------------------
+    def inplace_check(self):
+        """The worker facts for an in-place restart as a dict, or None if they cannot be read."""
+        rc, out = self.run([self.vi, "cloud", "ssh", INPLACE_SCRIPT], stream=False, timeout=120)
+        facts = dict(re.findall(r"^inplace: (\w+)=(\S*)", out, re.M))
+        return facts if rc == 0 and {"gpu", "disk_free_gb", "procs"} <= facts.keys() else None
+
+    def train_blocker(self, rc, out, restarts, first_fail):
+        """Why the train stage cannot be restarted in place, or None when it can. A string
+        starting with 'VANISHED' means the instance is gone."""
+        if self.timed_out:
+            return "the train stage ran out of its hours and was killed"
+        if rc == 76 or "GPU out of memory" in out:
+            return "the GPU ran out of memory (exit 76); a restart on this card would do the same"
+        if restarts >= INPLACE_MAX_RESTARTS:
+            return f"{INPLACE_MAX_RESTARTS} in-place restarts were already used"
+        if clock() - first_fail > INPLACE_MAX_SECONDS:
+            return (f"the first failure was more than {INPLACE_MAX_SECONDS // 60} min ago "
+                    "(the in-place recovery window)")
+        present, _, tracked = self.worker_present()
+        if not tracked:
+            return "VANISHED: the instance is gone"
+        if "No space left on device" in out:
+            return "the worker disk is full (ENOSPC)"
+        facts = self.inplace_check()
+        if facts is None:
+            return "the worker could not be inspected (`vi cloud ssh` failed)"
+        if facts.get("abort", "none") != "none":
+            return f"the run was aborted by its own rule ({facts['abort']})"
+        if facts.get("enospc") == "1":
+            return "the worker disk is full (ENOSPC in the job log)"
+        if facts.get("gpu") != "ok":
+            return "the GPU is not visible on the worker"
+        try:
+            if float(facts["disk_free_gb"]) < INPLACE_MIN_DISK_GB:
+                return f"the worker has under {INPLACE_MIN_DISK_GB:g} GB of free disk"
+        except ValueError:
+            return "the worker's free disk could not be read"
+        if facts.get("ckpt", "none") == "none":
+            return "no verified checkpoint on the worker to restart from"
+        self.last_facts = facts
+        return None
+
+    def run_train(self, at):
+        """The train stage; a failure is recovered in place on this worker (never by renting
+        another one) within INPLACE_MAX_RESTARTS and INPLACE_MAX_SECONDS, else the worker is
+        released and the run stops so that a person decides. A stage process that exited while
+        the trainer still runs on the worker (the supervisor died) is reattached, not counted."""
+        a = self.a
+        restarts = reattaches = 0
+        first_fail = None
+        while True:
+            _, hours_left = self.remaining()
+            left = max(1 / 60, hours_left - (clock() - at["started"]) / 3600)
+            rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_train"],
+                               watch=True, train=True, timeout=left * 3600)
+            if rc == 0:
+                return
+            if first_fail is None:
+                first_fail = clock()
+            if rc == 76 or "GPU out of memory" in out:
+                self.raise_vram_floor("train ran out of GPU memory")
+            why = self.train_blocker(rc, out, restarts, first_fail)
+            if why is None and self.last_facts.get("procs") not in ("0", ""):
+                if reattaches >= REATTACH_MAX:
+                    why = f"the stage process died {REATTACH_MAX} times while the trainer lived"
+                else:
+                    reattaches += 1
+                    say(f"the stage exited (exit {rc}) but the trainer still runs on the worker: "
+                        f"reattaching ({reattaches} of {REATTACH_MAX})")
+                    nap(REATTACH_WAIT_SECONDS)
+                    continue
+            if why is None:
+                restarts += 1
+                say(f"train stage failed (exit {rc}); the worker is healthy (GPU visible, disk "
+                    f"free, stage process gone, newest checkpoint {self.last_facts['ckpt']}): "
+                    f"in-place restart {restarts} of {INPLACE_MAX_RESTARTS} on the same worker")
+                continue
+            vanished = why.startswith("VANISHED")
+            self.mark_machine(at, host_too=False)
+            say(f"train stage failed (exit {rc}) and cannot be recovered in place: {why}")
+            self.release(at, "train-vanished" if vanished else "train-failed")
+            raise Stop(EXIT["train"], f"the train stage failed (exit {rc}): {why}. No other "
+                       "worker was rented; the worker was "
+                       f"{'already gone' if vanished else 'released'}. Checkpoints that came home "
+                       f"are under {a.checkpoint_root}. STOPPED so that you decide what next "
+                       "(this machine is on the run's failed list).")
 
     def execute(self):
         a = self.a
@@ -1106,7 +1504,9 @@ class PaidRun:
                     raise StopRequested("stop requested; nothing was rented")
                 n = len(self.s["attempts"]) + 1
                 cap_left, hours_left = self.remaining()
-                if n > a.max_attempts:
+                # an offer that never booked cost nothing, so it does not use up an attempt
+                billed = sum(1 for x in self.s["attempts"] if x.get("outcome") != "up-failed")
+                if billed >= a.max_attempts:
                     raise Stop(EXIT["push"], f"a cheap worker gate failed on all {a.max_attempts}"
                                " attempts allowed")
                 if hours_left < a.min_hours:
@@ -1121,27 +1521,43 @@ class PaidRun:
                 say(f"cheapest offer not tried: {offer['id']} {offer['gpu']} {offer['loc']} "
                     f"${offer['dph']:.3f}/hr")
                 at = dict(n=n, offer=offer["id"], sig=offer["sig"], dph=offer["dph"],
+                          machine=offer["machine"], host=offer["host"],
                           phase="up", started=clock(), ended=None, cap=round(cap_left, 4),
                           hours=None, credit_start=self.credit())
                 self.s["attempts"].append(at)
                 self.save()
                 self.worker_maybe_up = True
                 until = rfc3339(clock() + 3600)
+                boot_s = config_boot_minutes(self.base_config_text()) * 60 + UP_EXTRA_SECONDS
                 rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
-                                    f"{cap_left:.2f}", "--until", until, "--yes"], watch=True)
+                                    f"{cap_left:.2f}", "--until", until, "--yes"], watch=True,
+                                   timeout=boot_s)
                 if rc != 0:
+                    # F-RENT-1/2: the offer is gone, or the box did not boot. Release whatever
+                    # exists (a no-op when nothing was created), skip this offer, try the next.
+                    boot_fault = self.timed_out or bool(BOOT_FAIL_RE.search(out))
+                    say(f"`vi cloud up` failed (exit {rc}) for offer {offer['id']}"
+                        f"{' (boot failure: machine marked failed)' if boot_fault else ''}")
+                    self.s["failed_offers"].append(offer["id"])
+                    if boot_fault:
+                        self.s["failed_sigs"].append(offer["sig"])
+                        self.mark_machine(at)
                     self.release(at, "up-failed")
-                    raise Stop(EXIT["up"], f"`vi cloud up` failed (exit {rc}); the machine was "
-                               "released and nothing else was rented")
+                    at = None
+                    continue
                 self.set_phase(at, "preflight")
                 rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"],
-                                   watch=True)
+                                   watch=True, timeout=PREFLIGHT_TIMEOUT_SECONDS)
                 if rc != 0:
-                    gate = retryable_gate(out)
+                    gate = retryable_gate(out) or ("stage-timeout" if self.timed_out else None)
                     if gate:
                         say(f"offer {offer['id']} failed a cheap worker gate ({gate})")
                         self.s["failed_offers"].append(offer["id"])
                         self.s["failed_sigs"].append(offer["sig"])
+                        kind = gate_kind(out)
+                        self.mark_machine(at, host_too=kind == "cuda")
+                        if kind == "memory":
+                            self.raise_vram_floor("a memory gate failed")
                         spent = self.release(at, "push-gate" if gate == "push-speed" else "worker-gate")
                         say(f"attempt {n} cost ${spent:.2f}; total ${self.s['spent_total']:.2f} "
                             f"of ${a.cap:.2f}, {self.s['hours_total']:.2f} of {a.max_hours} h")
@@ -1154,13 +1570,7 @@ class PaidRun:
             # -- train (new or adopted) --
             say(f"===== train stage (attempt {at['n']}) at {rfc3339(clock())} =====")
             say("preflight passed; starting the train stage")
-            rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_train"],
-                               watch=True, train=True)
-            if rc != 0:
-                self.release(at, "train-failed")
-                raise Stop(EXIT["train"], f"the train stage failed (exit {rc}); the worker was "
-                           f"released. Any checkpoints that came home are under "
-                           f"{a.checkpoint_root}")
+            self.run_train(at)
             self.set_phase(at, "verify")
             problems = self.verify_final()
             spent = self.release(at, "verify-failed" if problems else "done")
@@ -1186,7 +1596,15 @@ class PaidRun:
         if tuple(steps) != EXPECTED_STEPS:
             problems.append(f"{d}: checkpoints present {steps}, expected {list(EXPECTED_STEPS)}")
         if not (d / "VERIFIED").is_file():
-            problems.append(f"{d}: no VERIFIED file (the stage's final verify did not finish)")
+            # F-PUSH-6: older checkpoints may have been pushed weights-only; the stage's own verify
+            # does not accept that, so try home's weights-only-older verify (the newest must be
+            # full). It writes VERIFIED and clears the unverified marker when it passes.
+            rc, out = self.run(["nice", "-n", "19", sys.executable, "-I", str(REPO / "jobs" / "checkpoints.py"),
+                                "--format", "omnivoice", "verify", str(d), "--expect", str(len(EXPECTED_STEPS)),
+                                "--weights-only-older"], stream=False, timeout=1800)
+            if rc != 0 or not (d / "VERIFIED").is_file():
+                problems.append(f"{d}: no VERIFIED file and the weights-only-older verify failed: "
+                                f"{out.strip()[-300:]}")
         markers = vi_state_dir() / "unverified"
         if markers.is_dir():
             for m in markers.iterdir():
@@ -1293,6 +1711,15 @@ class PaidRun:
         if self.a.plan:
             say("--plan: nothing was called; exiting")
             return 0
+        if os.environ.get("VI_SKIP_HF_CHECK") != "1":
+            hf_ok, hf_lines = hf_revision_gate(Path.home())
+            for ln in hf_lines:
+                say(ln)
+            if not hf_ok:
+                print(f"paid-run: STOPPED (exit {EXIT['hf']}): the pinned base-model revision could "
+                      "not be confirmed on Hugging Face and is not in the home cache. Nothing was "
+                      "rented.", file=sys.stderr, flush=True)
+                return EXIT["hf"]
         try:
             resumed = self.load_or_create()
         except Stop as e:

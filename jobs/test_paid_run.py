@@ -38,22 +38,36 @@ STUB = textwrap.dedent('''\
     cfg = os.environ.get("VI_CLOUD_CONFIG")
     cfgtext = Path(cfg).read_text() if cfg else ""
     if args[:2] == ["cloud", "offers"]:
-        log("offers")
+        log("offers", args[2:])
+        if sc.get("offers_hang"): time.sleep(600)
+        if st.get("offers_failed", 0) < sc.get("offers_fail", 0):
+            st["offers_failed"] = st.get("offers_failed", 0) + 1; save()
+            print("error: could not reach the Vast API", file=sys.stderr); sys.exit(1)
         # "offers_after_down" is the relisted market: it applies once a worker has been destroyed.
         lst = sc["offers_after_down"] if st.get("downs") and "offers_after_down" in sc else sc["offers"]
+        excl = [args[i + 1] for i in range(2, len(args) - 1) if args[i] == "--exclude-machine"]
         for o in lst:
+            if "machine" in o and str(o["machine"]) in excl and not sc.get("ignore_exclude"): continue
+            tail = f"  machine {o['machine']} host {o.get('host', '?')}" if "machine" in o else ""
             print(f"{o['id']:>10}  {o.get('gpu','RTX 3090'):<12} 24 GB  ${o['dph']:.3f}/hr  reliability 0.990  "
-                  f"net down   900 / up {o.get('up',800):>5} Mbps   8.0 cores  32 GB ram  disk 500 MB/s  {o.get('loc','US')}")
+                  f"net down   900 / up {o.get('up',800):>5} Mbps   8.0 cores  32 GB ram  disk 500 MB/s  {o.get('loc','US')}{tail}")
     elif args[:2] == ["cloud", "up"]:
         opt = {args[i]: args[i + 1] for i in range(2, len(args) - 1) if args[i].startswith("--")}
         mh = [l for l in cfgtext.splitlines() if l.startswith("max_hours")]
         log("up", {"offer": opt.get("--offer"), "cap": opt.get("--cap"), "until": opt.get("--until"),
                    "max_hours": mh[0].split("=")[1].strip() if mh else None, "yes": "--yes" in args,
-                   "countries": [l for l in cfgtext.splitlines() if l.startswith("countries")]})
+                   "countries": [l for l in cfgtext.splitlines() if l.startswith("countries")],
+                   "min_gpu_ram_gb": [l.split("=")[1].strip() for l in cfgtext.splitlines() if l.startswith("min_gpu_ram_gb")]})
         if st["worker"]:
             print("worker already up"); sys.exit(0)
         st["ups"] += 1
         a = att()
+        save()
+        if a.get("up") == "hang": time.sleep(600)
+        if a.get("up") == "gone":
+            print("error: no such ask: the offer was taken", file=sys.stderr); save(); sys.exit(1)
+        if a.get("up") == "boot_timeout":
+            print("error: no ssh after 15 minutes (status loading)", file=sys.stderr); save(); sys.exit(1)
         if a.get("up") == "fail":
             print("error: boot failure: machine given back", file=sys.stderr); save(); sys.exit(1)
         st["worker"] = {"id": 100 + st["ups"], "offer": opt.get("--offer"), "credit": st["credit"]}
@@ -61,6 +75,9 @@ STUB = textwrap.dedent('''\
         save(); print(f"worker {st['worker']['id']} ready: ssh -p 1 root@h  ($0.2/hr)")
     elif args[:2] == ["cloud", "down"]:
         log("down", args[2:])
+        if st.get("downs_failed", 0) < sc.get("down_fail_times", 0):
+            st["downs_failed"] = st.get("downs_failed", 0) + 1; save()
+            print("error: vast api timeout", file=sys.stderr); sys.exit(1)
         if sc.get("down_fail") == "always" or (sc.get("down_fail") == "plain" and "--force" not in args):
             print("error: refused", file=sys.stderr); sys.exit(1)
         if not st["worker"]:
@@ -71,6 +88,7 @@ STUB = textwrap.dedent('''\
         print(f"credit ${w['credit']:.2f} before, ${st['credit']:.2f} now (${spent:.2f} spent)")
     elif args[:2] == ["cloud", "status"]:
         log("status")
+        if sc.get("status_hang"): time.sleep(600)
         if st["worker"]:
             print(f"worker {st['worker']['id']} running: RTX 3090 at $0.200/hr, up 0h01m, about $0.00 so far")
         else:
@@ -78,6 +96,12 @@ STUB = textwrap.dedent('''\
         print(f"credit ${st['credit']:.2f}")
     elif args[:2] == ["cloud", "ssh"]:
         log("ssh")
+        if "INPLACE_CHECK" in " ".join(args):
+            seq = sc.get("inplace", [{}]); n = st.get("inplace_n", 0); st["inplace_n"] = n + 1; save()
+            f = dict(gpu="ok", disk_free_gb="80", procs="0", abort="none", enospc="0", ckpt="1000")
+            f.update(seq[min(n, len(seq) - 1)])
+            for k, v in f.items(): print(f"inplace: {k}={v}")
+            sys.exit(0)
         mode = sc.get("diag", "ok")
         if mode == "hang":
             (D / "diag.pid").write_text(str(os.getpid())); print("partial nvidia-smi line", flush=True); time.sleep(600)
@@ -120,6 +144,17 @@ STUB = textwrap.dedent('''\
             print("preflight: ok")
         else:
             r = a.get("train", "pass")
+            if "train_seq" in a:
+                n = st.get("trains", 0); st["trains"] = n + 1
+                r = a["train_seq"][min(n, len(a["train_seq"]) - 1)]
+                tick(a.get("train_tick", 0)); save()
+            log("train", r)
+            if r == "vanish":
+                st["worker"] = None; save(); print("train: the instance vanished", file=sys.stderr); sys.exit(1)
+            if r == "oom":
+                print("train_ft: GPU out of memory at batch_tokens 8192", file=sys.stderr); sys.exit(76)
+            if r == "enospc":
+                print("OSError: [Errno 28] No space left on device", file=sys.stderr); sys.exit(1)
             if r == "hang": hang()
             if r == "fail":
                 print("train failed: exit 1", file=sys.stderr); sys.exit(1)
@@ -163,6 +198,11 @@ def offers(*specs):
     return [dict(id=i, dph=d, loc=loc, up=up) for i, d, loc, up in specs]
 
 
+def machine_offers(*specs):
+    """(id, dph, machine, host): offers whose listing ends with `machine N host M`."""
+    return [dict(id=i, dph=d, loc="US", up=800, machine=m, host=h) for i, d, m, h in specs]
+
+
 def load_paid_run():
     import importlib.util
     spec = importlib.util.spec_from_file_location("paid_run_under_test", SCRIPT)
@@ -198,6 +238,8 @@ class Base(unittest.TestCase):
         self.env = dict(
             os.environ, VI_BIN=str(self.stub), STUB_DIR=str(self.sd),
             PAID_RUN_CLOCK_FILE=str(self.tmp / "clock"),
+            PAID_RUN_SLEEP_SCALE="0", PAID_RUN_SLEEP_LOG=str(self.tmp / "sleeps.log"),
+            PAID_RUN_TIMEOUT_SCALE="1", VI_SKIP_HF_CHECK="1",
             VI_PAID_RUN_STATE_DIR=str(self.tmp / "paid"), VI_STATE_DIR=str(self.tmp / "vistate"),
             VI_CHECKPOINT_ROOT=str(self.tmp / "ckpt"), VI_PLATTER_DIR=str(self.tmp / "platter"))
         self.procs = []
@@ -408,7 +450,6 @@ class Flow(Base):
         cases = [
             ("preflight failure that is no gate", dict(preflight="other", spent=0.1), 4, 1),
             ("preflight passed then failed", dict(preflight="ok-then-fail", spent=0.1), 4, 1),
-            ("up error / boot failure", dict(up="fail"), 3, 1),
             ("train failure", dict(train="fail", spent=0.1), 6, 1),
             ("checkpoints never verified", dict(train="noverify", spent=0.1), 7, 1),
             ("unverified marker left", dict(train="marker", spent=0.1), 7, 1),
@@ -439,6 +480,8 @@ class Flow(Base):
         self.scenario([dict(train="fail", spent=0.1)], down_fail="always")
         self.assertEqual(self.run_orch(), 9, self.out)
         self.assertIn("COULD NOT RELEASE", self.out)
+        self.assertIn("vi cloud down --force", self.out)
+        self.assertIn("instance 101", self.out)
         self.assertIsNotNone(self.worker())
 
 
@@ -547,7 +590,7 @@ class HomeChecks(Base):
         self.assertEqual(self.run_orch(stages=self.stages_file(1, 0), plan=True), 0, self.out)
         self.assertIn("home disk       : omnivoice_preflight:", self.out)
         self.assertIn("floor 1 + reserve 0 GiB: OK", self.out)
-        self.assertIn("pinned revision) not verified (needs network)", self.out)
+        self.assertIn("(pinned revision); checked against Hugging Face before renting (exit 14), not in --plan", self.out)
 
     def test_bundle_cache_empty_and_warm_notes(self):
         self.scenario([{}])
@@ -1297,6 +1340,274 @@ class RunLogging(Base):
                             env=self.env, text=True, capture_output=True, timeout=60)
         self.assertTrue(any("worker-preflight: CUDA version" in ln
                             for ln in json.loads(rc.stdout)["stage_log_tail"]), rc.stdout)
+
+
+def tmp_repo_for_hash(root, req_text="torch==2.8.0\n", rev="a" * 40):
+    (root / "jobs" / "omnivoice-ft").mkdir(parents=True)
+    (root / "jobs" / "requirements-omnivoice-worker.txt").write_text(req_text)
+    (root / "jobs" / "voicetune-fresh.sh").write_text(f': "${{VI_BASE_MODEL_REVISION:-{rev}}}"\n')
+    data = root / "built" / "data-id"
+    data.mkdir(parents=True, exist_ok=True)
+    return data
+
+
+class FakeHfError(Exception):
+    pass
+
+
+class RevisionNotFoundError(Exception):
+    pass
+
+
+class Resilience(Base):
+    """WP5: transient failures at renting, release, train and the hf gate (stub `vi`, no network)."""
+
+    def sleeps(self):
+        f = self.tmp / "sleeps.log"
+        return [float(x) for x in f.read_text().split()] if f.exists() else []
+
+    def trains(self):
+        return [c[1] for c in self.calls() if c[0] == "train"]
+
+    def train_stage_count(self):
+        return self.stages().count("omnivoice_train")
+
+    def test_paid_run_offers_retry(self):
+        self.scenario([{}], offers_fail=1)
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertIn(20.0, self.sleeps())
+        self.assertGreaterEqual([c[0] for c in self.calls()].count("offers"), 2)
+        self.assertEqual(len(self.ups()), 1)
+
+    def test_paid_run_hf_revision_gate(self):
+        pr = load_paid_run()
+        table, prefix = pr.load_size_table()
+        rev = prefix + "0" * (40 - len(prefix))
+        home = self.tmp / "home"
+        home.mkdir()
+        good = lambda *_: type("I", (), {"siblings": [type("S", (), {"rfilename": n, "size": z})()
+                                                      for n, z in table.items()]})()
+        waits = []
+        ok, lines = pr.hf_revision_gate(home, rev, good, waits.append)
+        self.assertTrue(ok, lines)
+        self.assertEqual(waits, [])
+        # sizes changed upstream
+        bad = lambda *_: type("I", (), {"siblings": [{"rfilename": n, "size": z + 1}
+                                                     for n, z in table.items()]})()
+        ok, lines = pr.hf_revision_gate(home, rev, bad, waits.append)
+        self.assertFalse(ok)
+        self.assertIn("CHANGED upstream", lines[0])
+        # revision gone: fails at once, no retry
+        def gone(*_):
+            raise RevisionNotFoundError("404")
+        waits.clear()
+        ok, lines = pr.hf_revision_gate(home, rev, gone, waits.append)
+        self.assertFalse(ok)
+        self.assertEqual(waits, [])
+        # network down: 3 tries, backoff between them, then fail without a cache ...
+        calls = []
+        def down(repo, revision, timeout):
+            calls.append(timeout)
+            raise FakeHfError("connection reset")
+        ok, lines = pr.hf_revision_gate(home, rev, down, waits.append)
+        self.assertFalse(ok)
+        self.assertEqual(calls, [60, 60, 60])
+        self.assertEqual(waits, list(pr.HF_BACKOFF[:2]))
+        # ... and only a warning when home holds the snapshot
+        (home / ".cache" / "huggingface" / "hub" / "models--k2-fsa--OmniVoice" / "snapshots" / rev).mkdir(parents=True)
+        ok, lines = pr.hf_revision_gate(home, rev, down, waits.append)
+        self.assertTrue(ok)
+        self.assertIn("WARNING", lines[0])
+        self.assertEqual(pr.EXIT["hf"], 14)
+
+    def test_paid_run_up_offer_gone_retries(self):
+        self.scenario([dict(up="gone"), {}])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual([u["offer"] for u in self.ups()], ["1", "2"])
+        self.assertGreaterEqual(len(self.downs()), 1)  # the failed `up` was released first
+        self.assertEqual(self.state()["failed_offers"], [1])
+
+    def test_paid_run_boot_timeout_retries(self):
+        self.scenario([dict(up="boot_timeout"), {}],
+                      offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 11, 2)))
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual([u["offer"] for u in self.ups()], ["1", "2"])
+        self.assertEqual(self.state()["failed_machines"], [10])
+        offer_calls = [c[1] for c in self.calls() if c[0] == "offers"]
+        self.assertIn(["--exclude-machine", "10"], offer_calls[1:])
+
+    def test_paid_run_all_offers_failed_message(self):
+        self.scenario([dict(up="boot_timeout")], ignore_exclude=True,
+                      offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 10, 1)))
+        self.assertEqual(self.run_orch(), 10, self.out)
+        self.assertIn("2 offers listed, 2 on failed machines", self.out)
+        self.assertEqual(len(self.ups()), 1)
+
+    def test_paid_run_cuda_gate_skips_machine(self):
+        offs = machine_offers((1, 0.20, 10, 7), (2, 0.25, 11, 7), (3, 0.30, 12, 8))
+        self.scenario([dict(preflight="cuda", spent=0.1), {}], offer_list=offs)
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual([u["offer"] for u in self.ups()], ["1", "3"])  # host 7's offer 2 skipped
+        st = self.state()
+        self.assertEqual((st["failed_machines"], st["failed_hosts"]), ([10], [7]))
+        # a non-CUDA gate excludes the machine only
+        for f in ("calls.log", "state.json"):
+            (self.sd / f).unlink(missing_ok=True)
+        subprocess.run(["rm", "-rf", str(self.tmp / "paid"), str(self.tmp / "ckpt"),
+                        str(self.tmp / "platter"), str(self.tmp / "vistate")])
+        self.scenario([dict(preflight="disk", spent=0.1), {}], offer_list=offs)
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual([u["offer"] for u in self.ups()], ["1", "2"])
+        self.assertEqual(self.state()["failed_hosts"], [])
+
+    def test_memory_gate_raises_the_next_vram_floor(self):
+        # F-OOM-1: a vram peak or VRAM gate failure asks the next offer for 4 GB more memory
+        pr = load_paid_run()
+        self.assertEqual(pr.gate_kind("worker-preflight: vram peak 22.1 of 23.5 GiB"), "memory")
+        self.assertEqual(pr.gate_kind("worker-preflight: CUDA version is 12.4, under 12.8"), "cuda")
+        self.assertEqual(pr.gate_kind("worker-preflight: free disk (GiB) is 60"), "other")
+        self.assertTrue(pr.retryable_gate("worker-preflight: vram peak 22.1 of 23.5 GiB\n"))
+        self.scenario([dict(preflight="vram", spent=0.1), {}])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        floors = [u["min_gpu_ram_gb"] for u in self.ups()]
+        self.assertEqual(floors, [["24.1"], ["28.1"]])
+
+    def test_paid_run_release_retries(self):
+        self.scenario([dict(train="fail", spent=0.1)], down_fail_times=3)
+        self.assertEqual(self.run_orch(), 6, self.out)
+        self.assertEqual([c[1] for c in self.downs()],
+                         [[], ["--force"], ["--force"], ["--force"]])
+        self.assertEqual([x for x in self.sleeps() if x in (10.0, 20.0, 40.0, 80.0)], [10.0, 20.0])
+        self.assertIsNone(self.worker())
+
+    def test_paid_run_release_total_failure_backs_off_10_20_40_80(self):
+        self.scenario([dict(train="fail", spent=0.1)], down_fail="always")
+        self.assertEqual(self.run_orch(), 9, self.out)
+        self.assertEqual([x for x in self.sleeps() if x in (10.0, 20.0, 40.0, 80.0)][:4],
+                         [10.0, 20.0, 40.0, 80.0])
+
+    def test_paid_run_release_with_stale_marker(self):
+        # the r1 state: an unverified marker names the run dir, plain `down` refuses, --force works
+        self.scenario([dict(train="marker", spent=0.1)], down_fail="plain")
+        self.assertEqual(self.run_orch(), 7, self.out)
+        self.assertEqual([c[1] for c in self.downs()], [[], ["--force"]])
+        self.assertIsNone(self.worker())
+
+    def test_paid_run_train_inplace_recovery(self):
+        self.scenario([dict(train_seq=["fail", "pass"], spent=0.1)],
+                      offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 11, 2)))
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual(self.train_stage_count(), 2)
+        self.assertEqual(len(self.ups()), 1)  # same worker, never a second rental
+        self.assertIn("in-place restart 1 of 2", self.out)
+        self.assertEqual(self.state()["failed_machines"], [])
+        pr = load_paid_run()
+        self.assertEqual((pr.INPLACE_MAX_RESTARTS, pr.INPLACE_MAX_SECONDS), (2, 45 * 60))
+
+    def test_paid_run_train_unrecoverable_stops(self):
+        cases = [
+            ("restarts used up", dict(train_seq=["fail"]), {}, 3, "2 in-place restarts"),
+            ("45 minute window", dict(train_seq=["fail"], train_tick=0.8), {}, 2, "in-place recovery window"),
+            ("abort.json", dict(train_seq=["fail"]), dict(inplace=[{"abort": "/w/abort.json"}]), 1, "aborted"),
+            ("ENOSPC", dict(train_seq=["enospc"]), {}, 1, "ENOSPC"),
+            ("GPU gone", dict(train_seq=["fail"]), dict(inplace=[{"gpu": "missing"}]), 1, "GPU is not visible"),
+            ("no checkpoint", dict(train_seq=["fail"]), dict(inplace=[{"ckpt": "none"}]), 1, "no verified checkpoint"),
+            ("disk low", dict(train_seq=["fail"]), dict(inplace=[{"disk_free_gb": "2"}]), 1, "free disk"),
+            ("OOM", dict(train_seq=["oom"]), {}, 1, "out of memory"),
+        ]
+        for name, att, extra, trains, text in cases:
+            with self.subTest(name):
+                for f in ("calls.log", "state.json"):
+                    (self.sd / f).unlink(missing_ok=True)
+                subprocess.run(["rm", "-rf", str(self.tmp / "paid"), str(self.tmp / "ckpt"),
+                                str(self.tmp / "platter"), str(self.tmp / "vistate")])
+                self.scenario([dict(att, spent=0.1)], offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 11, 2)), **extra)
+                self.assertEqual(self.run_orch(), 6, self.out)
+                self.assertEqual(self.train_stage_count(), trains, self.out)
+                self.assertEqual(len(self.ups()), 1, "a train failure must never re-rent")
+                self.assertIn(text, self.out)
+                self.assertIn("STOPPED so that you decide", self.out)
+                self.assertIsNone(self.worker(), "the worker must be destroyed")
+                self.assertEqual(self.state()["failed_machines"], [10])
+        # an OOM also raises the VRAM floor recorded for a later run
+        self.assertEqual(self.state()["vram_floor_gb"], 28.1)
+
+    def test_paid_run_vanish_mid_train(self):
+        self.scenario([dict(train_seq=["vanish"], spent=0.1)],
+                      offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 11, 2)))
+        self.assertEqual(self.run_orch(), 6, self.out)
+        self.assertEqual(self.train_stage_count(), 1)
+        self.assertEqual(len(self.ups()), 1)
+        self.assertEqual(self.state()["failed_machines"], [10])
+        self.assertIn("instance is gone", self.out)
+        self.assertEqual(self.state()["attempts"][0]["outcome"], "train-vanished")
+
+    def test_paid_run_reattach_after_supervisor_death(self):
+        # the stage process died but the trainer still runs on the worker: reattach, not a restart
+        self.scenario([dict(train_seq=["fail", "pass"], spent=0.1)], inplace=[{"procs": "2"}, {}])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual(self.train_stage_count(), 2)
+        self.assertEqual(len(self.ups()), 1)
+        self.assertIn("reattaching (1 of", self.out)
+        self.assertNotIn("in-place restart", self.out)
+
+    def hang_check(self, stage):
+        pid = int((self.sd / f"{stage}.pid").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_paid_run_stage_timeout(self):
+        self.env["PAID_RUN_TIMEOUT_SCALE"] = "0.0001"  # every timeout shrinks to the 2 s floor
+        # a hung offers call: killed, retried once, then the run stops with nothing rented
+        self.scenario([{}], offers_hang=True)
+        self.assertEqual(self.run_orch(), 3, self.out)
+        self.assertIn("timed out after 2 s", self.out)
+        self.assertEqual(self.ups(), [])
+        # a hung `up`: killed, released, the next offer is tried
+        for f in ("calls.log", "state.json"):
+            (self.sd / f).unlink(missing_ok=True)
+        subprocess.run(["rm", "-rf", str(self.tmp / "paid")])
+        self.scenario([dict(up="hang"), {}])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2)
+        # a hung preflight: process group killed, counts as a worker gate, next offer
+        for f in ("calls.log", "state.json"):
+            (self.sd / f).unlink(missing_ok=True)
+        subprocess.run(["rm", "-rf", str(self.tmp / "paid"), str(self.tmp / "ckpt"),
+                        str(self.tmp / "platter"), str(self.tmp / "vistate")])
+        self.scenario([dict(preflight="hang", spent=0.1), {}])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2)
+        self.hang_check("omnivoice_preflight")
+        # a hung train: killed at its hours, the worker released, exit 6
+        for f in ("calls.log", "state.json"):
+            (self.sd / f).unlink(missing_ok=True)
+        subprocess.run(["rm", "-rf", str(self.tmp / "paid"), str(self.tmp / "ckpt"),
+                        str(self.tmp / "platter"), str(self.tmp / "vistate")])
+        self.scenario([dict(train="hang", spent=0.1)])
+        self.assertEqual(self.run_orch(), 6, self.out)
+        self.hang_check("omnivoice_train")
+        self.assertIn("ran out of its hours", self.out)
+        self.assertIsNone(self.worker())
+
+    def test_paid_run_plan_push_hours(self):
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(plan=True), 0)
+        self.assertIn("push ≈ 0.82 h at floor (2.5 MB/s) per full checkpoint (7.35 GB)", self.out)
+        self.assertIn("calculated, not measured", self.out)
+        self.assertEqual(self.calls(), [])
+        pr = load_paid_run()
+        self.assertEqual(pr.CHECKPOINT_BYTES_CALCULATED, 7_351_032_336)
+
+    def test_realpath_cache_key_includes_pins(self):
+        pr = load_paid_run()
+        base = pr.realpath_code_hash(tmp_repo_for_hash(self.tmp / "r1"), None, self.tmp / "r1")
+        again = pr.realpath_code_hash(tmp_repo_for_hash(self.tmp / "r1b"), None, self.tmp / "r1b")
+        self.assertEqual(base, again)
+        pins = pr.realpath_code_hash(tmp_repo_for_hash(self.tmp / "r2", req_text="torch==2.9.0\n"),
+                                     None, self.tmp / "r2")
+        rev = pr.realpath_code_hash(tmp_repo_for_hash(self.tmp / "r3", rev="b" * 40), None, self.tmp / "r3")
+        self.assertEqual(len({base, pins, rev}), 3)
 
 
 if __name__ == "__main__":

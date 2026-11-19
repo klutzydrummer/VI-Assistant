@@ -49,6 +49,8 @@ for step in range(start + 1, a.steps + 1):
     if step % a.save_steps == 0 or step == a.steps:
         corrupt = a.resume_from_checkpoint and os.environ.get("STUB_RESUME_NO_MANIFEST") and step == 20
         write_ck(step, manifest=not corrupt)
+if os.environ.get("STUB_VRAM_PEAK"):
+    print("train_ft: vram peak %s GiB" % os.environ["STUB_VRAM_PEAK"])
 '''
 
 TOKENISE_STUB = r'''
@@ -571,3 +573,129 @@ class FetchBaseModelGuardTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.fb.size_problems(dest, self.REV), [])
+
+
+WORKER_JOB_STUB = r'''
+while [ "$1" != -- ]; do
+  case "$1" in --work) w=$2; shift 2 ;; --run|--publish) shift 2 ;; *) shift ;; esac
+done
+shift
+"$@" &
+echo $! >"$w/train.pid"
+wait $!
+echo $? >"$w/rc"
+'''
+
+
+class PublishSideTest(PreflightHarness):
+    """The vram gate, the push backlog abort, the ETA warning and the weights-only publish."""
+
+    def mode(self, mode, **extra):
+        return subprocess.run(["bash", str(self.root / "jobs" / "voicetune-fresh.sh"), mode],
+                              env=self.env(**extra), capture_output=True, text=True, timeout=120)
+
+    @property
+    def scratch(self):
+        return self.work / "voicetune-fresh"
+
+    def make_ck(self, base, step, full=True, size=100):
+        d = base / f"checkpoint-{step}"
+        d.mkdir(parents=True)
+        names = ["model.safetensors"] + (["optimizer.bin", "scheduler.bin", "random_states_0.pkl"] if full else [])
+        lines = []
+        for n in names:
+            (d / n).write_bytes(b"x" * size)
+            lines.append(f"{'0' * 64}  {n}")
+        (d / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+    def test_voicetune_vram_peak_gate(self):
+        ok = self.preflight(STUB_VRAM_PEAK="19.2 of 24.0")  # 80 %
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("preflight: vram peak 19.2 of 24.0 GiB", ok.stdout)
+        bad = self.preflight(STUB_VRAM_PEAK="22.8 of 24.0")  # 95 %
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("worker-preflight: vram peak 22.8 of 24.0 GiB", bad.stderr)
+        self.assertNotIn("preflight: ok", bad.stdout)
+        none = self.preflight()
+        self.assertEqual(none.returncode, 0, none.stderr)
+        self.assertIn("WARNING: no 'train_ft: vram peak' line", none.stderr)
+
+    def test_voicetune_disk_backlog_abort(self):
+        # every push fails, so checkpoints stay un-acked; six of them abort the run
+        (self.root / "jobs" / "worker-return.sh").write_text("#!/usr/bin/env bash\nexit 1\n")
+        run = self.scratch / "run"
+        for step in range(1, 7):
+            self.make_ck(run, step * 100)
+        r = self.mode("push", VI_FREE_GB="0.0000001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads((run / "abort.json").read_text()), {"reason": "push backlog"})
+        self.assertIn("push backlog: 6 checkpoints are not home", r.stderr)
+        self.assertIn("WARNING: 0.0000001 GB free is under 3 x the checkpoint size", r.stderr)
+        # plenty of disk: no warning, the count alone aborts
+        (run / "abort.json").unlink()
+        r = self.mode("push", VI_FREE_GB="500")
+        self.assertTrue((run / "abort.json").exists())
+        self.assertNotIn("WARNING", r.stderr)
+
+    def test_voicetune_eta_warning(self):
+        jobs = self.root / "jobs"
+        (jobs / "worker-job.sh").write_text("#!/usr/bin/env bash\n" + WORKER_JOB_STUB)
+        (jobs / "worker-job.sh").chmod(0o755)
+        shutil.copy(JOBS / "omnivoice_abort.py", jobs / "omnivoice_abort.py")
+        run = self.scratch / "run"
+        run.mkdir(parents=True)
+        (run / "ft_config.json").write_text("{}")
+        (run / "collapse_guard.jsonl").write_text("")
+        r = self.mode("train", VI_TRAIN_STEPS="200", VI_SAVE_STEPS="100", VI_WATCH_SECONDS="0.2",
+                      VI_HOURS_LEFT="0.01", STUB_FAST="")
+        self.assertRegex(r.stderr, r"voicetune-fresh: projected [0-9.]+ h > [0-9.]+ h left")
+        self.assertEqual(r.stderr.count("projected"), 1, r.stderr)
+        # a roomy budget prints nothing and the step count is untouched
+        (self.work / "eta.warned").unlink(missing_ok=True)
+        shutil.rmtree(run)
+        run.mkdir(parents=True)
+        (run / "ft_config.json").write_text("{}")
+        (run / "collapse_guard.jsonl").write_text("")
+        (self.work / "rc").unlink(missing_ok=True)
+        r = self.mode("train", VI_TRAIN_STEPS="200", VI_SAVE_STEPS="100", VI_WATCH_SECONDS="0.2",
+                      VI_HOURS_LEFT="8")
+        self.assertNotIn("projected", r.stderr)
+        self.assertIn("--steps 200", "\n".join(self.log()))
+
+    def push_calls(self):
+        return [l for l in self.log() if l.startswith("push ")]
+
+    def test_voicetune_weights_first_publish(self):
+        (self.root / "jobs" / "worker-return.sh").write_text(
+            "#!/usr/bin/env bash\necho \"push $*\" >>\"$CALLS\"\nexit 0\n")
+        run = self.scratch / "run"
+        self.make_ck(run, 1000)
+        self.make_ck(run, 2500)
+        # push mode loops until nothing is pending; one pass is enough here
+        r = self.mode("push", VI_WEIGHTS_FIRST="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pub = self.scratch / "publish"
+        for step in (1000, 2500):
+            weights = (pub / f"checkpoint-{step}" / "SHA256SUMS.weights").read_text()
+            self.assertIn("model.safetensors", weights)
+            self.assertNotIn("optimizer.bin", weights)
+            self.assertNotIn("random_states_0.pkl", weights)
+        calls = self.push_calls()
+        self.assertIn("--exclude=optimizer.bin", calls[0])  # weights part goes first
+        self.assertIn("--exclude=SHA256SUMS", calls[0])
+        self.assertNotIn("--exclude=optimizer.bin", calls[1])  # then the full part...
+        self.assertIn("--exclude=/checkpoint-1000", calls[1])  # ...but not for the older checkpoint
+        self.assertNotIn("--exclude=/checkpoint-2500", calls[1])
+        self.assertTrue(any("weights-stage/./checkpoint-1000" in c for c in calls[2:]), calls)
+        staged = (self.scratch / "weights-stage" / "checkpoint-1000" / "SHA256SUMS").read_text()
+        self.assertNotIn("optimizer.bin", staged)
+        self.assertIn("checkpoint-1000 is home as weights only", r.stderr)
+        # off by default: one ordinary push, optimizer state included
+        self.calls.write_text("")
+        shutil.rmtree(self.scratch / "publish")
+        shutil.rmtree(self.work / "pushed")
+        r = self.mode("push")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.push_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertNotIn("optimizer.bin", calls[0])
