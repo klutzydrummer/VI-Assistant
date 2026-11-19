@@ -122,6 +122,9 @@ settings = {{ {settings} }}
         .env("VI_WORKER_ROOT", dir.join("worker"))
         .env("VI_STATE_DIR", dir.join("state"))
         .env("HOME", dir.join("home"))
+        // The stub omnivoice trainers write tiny files; the real run keeps the size floors.
+        .env("VI_MIN_MODEL_BYTES", "0")
+        .env("VI_MIN_OPTIMIZER_BYTES", "0")
         .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

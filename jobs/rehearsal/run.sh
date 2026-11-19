@@ -369,7 +369,7 @@ sc_preflight() {
   check "the kill landed mid-run" has "$L" "rehearsal: SIGKILL at micro-step"
   check "resume from checkpoint-10 verified checkpoint-20" has "$L" "rehearsal: resumed from checkpoint-10 and verified checkpoint-20"
   check "preflight: ok" has "$L" "preflight: ok"
-  check "durable checkpoint-5 verifies home" python3 "$repo/jobs/checkpoints.py" --format omnivoice verify "$dur" --expect 1
+  check "durable checkpoint-5 verifies home" env VI_MIN_MODEL_BYTES=1 VI_MIN_OPTIMIZER_BYTES=1 python3 "$repo/jobs/checkpoints.py" --format omnivoice verify "$dur" --expect 1
   check "the probe listening set is labelled synthetic" has "$R/s/preflight/out/probe-speak/README.txt" "SYNTHETIC"
   check "the trace shows the rehearsal resumed from checkpoint-10" has "$R/s/preflight/trace.jsonl" "checkpoint-10"
 }
@@ -446,7 +446,7 @@ sc_train() {
   check "the home loop restarted the killed receiver" has "$L" "the return receiver is down; restarting it"
   check "the restarted receiver was re-proved" has "$L" "re-proved"
   check "home kept exactly 1000, 2500, 4500, 5000" test "$(cd "$dur" 2>/dev/null && ls -d checkpoint-* | sort -t- -k2n | tr '\n' ' ')" = "checkpoint-1000 checkpoint-2500 checkpoint-4500 checkpoint-5000 "
-  check "the durable checkpoints verify (expect 4)" python3 "$repo/jobs/checkpoints.py" --format omnivoice verify "$dur" --expect 4
+  check "the durable checkpoints verify (expect 4)" env VI_MIN_MODEL_BYTES=1 VI_MIN_OPTIMIZER_BYTES=1 python3 "$repo/jobs/checkpoints.py" --format omnivoice verify "$dur" --expect 4
   local step
   for step in 1000 2500 5000; do
     check "listening set step-$step is labelled synthetic" has "$R/s/$name/out/platter/step-$step/README.txt" "SYNTHETIC"
