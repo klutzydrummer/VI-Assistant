@@ -26,7 +26,7 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
         Err(e) => return fail(e),
     };
     match args {
-        ["offers"] => offers(&c),
+        ["offers", rest @ ..] => offers(&c, rest),
         ["up", rest @ ..] => up(&c, rest, cap, until),
         ["start", rest @ ..] => start(&c, rest, cap, until),
         ["refresh"] => refresh(&c),
@@ -61,10 +61,11 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
 }
 
 fn describe(o: &Offer) -> String {
+    let host = o.host_id.map_or("?".to_string(), |h| h.to_string());
     format!(
         "{:>10}  {:<12} {:>3.0} GB  ${:.3}/hr  reliability {:.3}  \
          net down {:>5.0} / up {:>5.0} Mbps  {:>4.1} cores  {:.0} GB ram  \
-         disk {:.0} MB/s  {}",
+         disk {:.0} MB/s  {}  machine {} host {}",
         o.id,
         o.gpu_name,
         o.gpu_ram / 1024.0,
@@ -75,12 +76,20 @@ fn describe(o: &Offer) -> String {
         o.cpu_cores_effective,
         o.cpu_ram / 1000.0,
         o.disk_bw,
-        o.geolocation.as_deref().unwrap_or("")
+        o.geolocation.as_deref().unwrap_or(""),
+        o.machine_id,
+        host
     )
 }
 
-fn offers(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
-    match c.offers(10) {
+/// `vi cloud offers [--exclude-machine ID]...`. The machine filter goes into
+/// the Vast search itself, so excluded machines don't use up the ten slots.
+fn offers(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
+    let machines = match parse_exclusions(args) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    match c.offers_excluding(10, &machines) {
         Ok(list) if list.is_empty() => {
             println!("no offers match; raise search.max_dph in the cloud config");
             ExitCode::SUCCESS
@@ -93,6 +102,28 @@ fn offers(c: &Cloud<HttpVast, SystemHost>) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+fn parse_exclusions(args: &[&str]) -> Result<Vec<u64>, ExitCode> {
+    let mut machines = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match *arg {
+            "--exclude-machine" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(id) => machines.push(id),
+                None => {
+                    return Err(fail(
+                        "--exclude-machine needs a machine id from `vi cloud offers`",
+                    ))
+                }
+            },
+            _ => {
+                eprintln!("{}", crate::USAGE);
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok(machines)
 }
 
 /// Parse the approval Brandon gave this run: the most it may cost, and when it
@@ -413,5 +444,32 @@ fn ssh(c: &Cloud<HttpVast, SystemHost>, rest: &[&str]) -> ExitCode {
         Ok(s) if s.success() => ExitCode::SUCCESS,
         Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(1, 255) as u8),
         Err(e) => fail(format!("could not run ssh: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vi_cloud_offers_prints_machine() {
+        let o: Offer = serde_json::from_value(serde_json::json!({
+            "id": 123, "machine_id": 88888, "host_id": 55555, "gpu_name": "RTX 4090"
+        }))
+        .unwrap();
+        let line = describe(&o);
+        assert!(line.contains("machine 88888 host 55555"), "{line}");
+        let o: Offer =
+            serde_json::from_value(serde_json::json!({"id": 1, "machine_id": 9})).unwrap();
+        assert!(describe(&o).contains("machine 9 host ?"));
+    }
+
+    #[test]
+    fn exclusions_repeat_and_reject_junk() {
+        let m = parse_exclusions(&["--exclude-machine", "5", "--exclude-machine", "6"]).unwrap();
+        assert_eq!(m, vec![5, 6]);
+        assert!(parse_exclusions(&["--exclude-machine", "x"]).is_err());
+        assert!(parse_exclusions(&["--exclude-machine"]).is_err());
+        assert!(parse_exclusions(&["--bogus"]).is_err());
     }
 }

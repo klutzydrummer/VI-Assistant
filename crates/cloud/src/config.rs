@@ -141,8 +141,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The Vast.ai offer search for these limits, cheapest first.
-    pub fn offer_query(&self, limit: usize) -> Value {
+    /// The Vast.ai offer search for these limits, cheapest first, skipping the
+    /// machines in `exclude_machines` (Vast documents `machine_id` as a filter
+    /// field but lists no `host_id` filter, so hosts can't be excluded here).
+    pub fn offer_query(&self, limit: usize, exclude_machines: &[u64]) -> Value {
         let s = &self.search;
         let mut q = json!({
             "rentable": {"eq": true},
@@ -168,6 +170,9 @@ impl Config {
         }
         if !s.gpu_names.is_empty() {
             q["gpu_name"] = json!({"in": s.gpu_names});
+        }
+        if !exclude_machines.is_empty() {
+            q["machine_id"] = json!({"notin": exclude_machines});
         }
         if !s.countries.is_empty() {
             let codes: Vec<String> = s
@@ -445,7 +450,7 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.idle_minutes, 5);
         assert_eq!(cfg.search.min_gpu_ram_gb, 24.0);
-        let q = cfg.offer_query(3);
+        let q = cfg.offer_query(3, &[]);
         assert_eq!(q["gpu_name"]["in"][0], "RTX 4090");
         assert_eq!(q["dph_total"]["lte"], 0.3);
         assert_eq!(q["limit"], 3);
@@ -458,7 +463,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cloud.toml");
         std::fs::write(&path, "[search]\ncountries = [\"us\", \"CA\"]\n").unwrap();
-        let q = Config::load(&path).unwrap().offer_query(3);
+        let q = Config::load(&path).unwrap().offer_query(3, &[]);
         assert_eq!(q["geolocation"]["in"], json!(["US", "CA"]));
     }
 
@@ -504,6 +509,7 @@ mod tests {
         let ok = Offer {
             id: 1,
             machine_id: 2,
+            host_id: None,
             gpu_name: "RTX 3090".into(),
             gpu_ram: 24576.0,
             dph_total: 0.2,
@@ -617,8 +623,19 @@ mod tests {
     }
 
     #[test]
+    fn offer_query_excludes_machines() {
+        let cfg = Config::default();
+        let q = cfg.offer_query(5, &[88888, 7]);
+        assert_eq!(q["machine_id"], json!({"notin": [88888, 7]}));
+        // Without exclusions the key is absent, so the query is unchanged.
+        assert!(cfg.offer_query(5, &[]).get("machine_id").is_none());
+        // And no host filter is ever sent: Vast documents none.
+        assert!(q.get("host_id").is_none());
+    }
+
+    #[test]
     fn offer_query_uses_raw_units() {
-        let q = Config::default().offer_query(5);
+        let q = Config::default().offer_query(5, &[]);
         // GB x 1000, like gpu_ram, because the offer JSON is in MB.
         assert_eq!(q["cpu_ram"]["gte"], 64000.0);
         assert_eq!(q["gpu_ram"]["gte"], 24000.0);

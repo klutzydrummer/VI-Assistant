@@ -316,7 +316,12 @@ pub fn newest_hostkey_batch(log: &str, last: Option<u64>) -> Option<HostkeyBatch
 
 impl<V: Vast, H: Host> Cloud<V, H> {
     pub fn offers(&self, limit: usize) -> Result<Vec<Offer>> {
-        self.vast.offers(&self.cfg.offer_query(limit))
+        self.offers_excluding(limit, &[])
+    }
+
+    /// Like `offers`, but never lists the given machines.
+    pub fn offers_excluding(&self, limit: usize, machines: &[u64]) -> Result<Vec<Offer>> {
+        self.vast.offers(&self.cfg.offer_query(limit, machines))
     }
 
     /// Rents a worker (or reuses the one we have) and waits until ssh answers.
@@ -1089,6 +1094,7 @@ mod tests {
         Offer {
             id,
             machine_id: machine,
+            host_id: None,
             gpu_name: "RTX 3090".into(),
             gpu_ram: 24576.0,
             dph_total: dph,
