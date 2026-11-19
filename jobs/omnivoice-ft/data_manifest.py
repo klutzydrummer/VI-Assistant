@@ -55,6 +55,14 @@ _BRACKETS = re.compile(r"\[[^\]]*\]")
 _WS = re.compile(r"\s+")
 
 
+def sanitise_id(clip_id: str) -> str:
+    """A manifest id WebDataset can round-trip. WebDataset cuts a sample key at the first dot
+    (base_plus_ext), and extract_audio_tokens writes each member as ``{id}.npy``, so an id with a
+    dot (``le2.s178234_m``) comes back as key ``le2``. Dots become underscores; the clip's
+    audio path is a path, not a key, and is left alone."""
+    return clip_id.replace(".", "_")
+
+
 def normalise_text(text: str) -> str:
     """Same text cleanup as jobs/buildset.py: drop bracketed annotations, collapse whitespace."""
     return _WS.sub(" ", _BRACKETS.sub("", text)).strip()
@@ -100,7 +108,7 @@ def rows_from_manifests(paths: Iterable[str], audio_root: Optional[str] = None) 
                 raise SystemExit(f"{p}: a row has no string 'id'")
             out.append(
                 {
-                    "id": row["id"],
+                    "id": sanitise_id(row["id"]),
                     "audio": _resolve_audio(_audio_field(row, str(p)), base),
                     "text": normalise_text(str(row.get("text") or "")),
                 }
@@ -116,7 +124,8 @@ def rows_from_pool(pool_dir: str, texts: Dict[str, str]) -> List[Dict[str, Any]]
     out = []
     for path in sorted(root.rglob("*")):
         if path.is_file() and path.suffix.lower() in AUDIO_EXTS:
-            out.append({"id": path.stem, "audio": str(path.resolve()), "text": texts.get(path.stem, "")})
+            out.append({"id": sanitise_id(path.stem), "audio": str(path.resolve()),
+                        "text": texts.get(path.stem, "")})
     return out
 
 
@@ -166,7 +175,9 @@ def build_manifest(
                     rid = f"{row['id']}-replay{n}"
                     n += 1
             if rid in seen:
-                raise SystemExit(f"duplicate id {rid!r}; OmniVoice's LabelDataset requires unique ids")
+                raise SystemExit(f"duplicate id {rid!r} (ids are unique after dots become '_', "
+                                 "so two source ids may differ only by '.' vs '_'); OmniVoice's "
+                                 "LabelDataset requires unique ids")
             seen.add(rid)
             deduped.append(
                 {

@@ -43,6 +43,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import sys
 import tarfile
@@ -357,16 +358,41 @@ def extract_audio_tokens_main():
                         continue
                     raise SystemExit(f"missing audio {r['audio_path']}")
                 data = hashlib.sha256(open(r["audio_path"], "rb").read()).digest() * 8
-                info = tarfile.TarInfo(f"{r['id']}.tokens")
+                info = tarfile.TarInfo(f"{r['id']}.npy")  # as upstream's serialise_numpy writes it
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
         with open(jsonl_path, "w") as f:
             f.writelines(json.dumps({"id": r["id"], "text": r["text"]}) + "\n" for r in part)
+        readback_check(tar_path, {r["id"] for r in part})
         lst.append(f"{os.path.abspath(tar_path)} {os.path.abspath(jsonl_path)} {len(part)}")
     out_dir = os.path.dirname(os.path.dirname(a.tar_output_pattern))
     with open(os.path.join(out_dir, "data.lst"), "w") as f:
         f.writelines(l + "\n" for l in lst)
     _log(f"tokenised {len(rows)} rows into {out_dir}")
+
+
+_BASE_PLUS_EXT = re.compile(r"^((?:.*/|)[^.]+)[.]([^/]*)$")  # webdataset 1.0.2 base_plus_ext
+
+
+def readback_check(tar_path, label_ids):
+    """What webdataset + omnivoice's LabelDataset do with the shard, reduced to the part that broke
+    omnivoice-ft-r5: members group into samples by the text before the FIRST dot, and every sample
+    needs an `npy` field and a label under that key. A dotted id fails here exactly as it did on
+    the worker (KeyError on the cut key). Not emulated: tar I/O, shuffling, tensors."""
+    samples = {}
+    with tarfile.open(tar_path) as tar:
+        for name in tar.getnames():
+            m = _BASE_PLUS_EXT.match(name)
+            key, suffix = (m.group(1), m.group(2)) if m else (name, "")
+            samples.setdefault(key, {})[suffix] = name
+    for key, fields in samples.items():
+        if key not in label_ids:
+            raise KeyError(f"stub webdataset: sample key {key!r} (members {sorted(fields.values())}) "
+                           "has no label; ids must not contain '.'")
+        if "npy" not in fields:
+            raise KeyError(f"stub webdataset: sample {key!r} has no 'npy' field: {sorted(fields)}")
+    if len(samples) != len(label_ids):
+        raise KeyError(f"stub webdataset: {len(label_ids)} labels but {len(samples)} samples")
 
 
 def snapshot_download(repo_id, revision=None, local_dir=None, **_):
@@ -500,18 +526,24 @@ def build_data(out_dir: str, jobs_dir: str):
     import omnivoice_data  # noqa: E402  (stdlib + buildset/data_manifest; reads no corpus here)
 
     os.makedirs(out_dir, exist_ok=True)
-    def rows(prefix, n, base):
-        out = []
-        for i in range(n):
-            rel = f"wav/{prefix}-{i:03d}.wav"
-            write_tone(os.path.join(out_dir, rel), base + 15 * i)
-            out.append({"id": f"{prefix}-{i:03d}", "audio_path": rel,
-                        "text": f"Synthetic rehearsal sentence {prefix} {i}.", "language_id": "en"})
-        return out
-    train, dev = rows("train", 12, 200), rows("dev", 3, 600)
-    for name, rs in (("train_manifest.jsonl", train), ("dev_manifest.jsonl", dev)):
-        with open(os.path.join(out_dir, name), "w") as f:
-            f.writelines(json.dumps(r) + "\n" for r in rs)
+    # Raw rows shaped like jobs/buildset.py's (real ids look like `le2.s178234_m`, dot included)
+    # go through the real manifest builder, so a regression in its id sanitising reaches the
+    # stub tokeniser's read-back check. The wav paths keep the dots, as the real ones do.
+    import data_manifest  # noqa: E402
+
+    def build(stem, game, n, base, first):
+        raw = os.path.join(out_dir, f"{stem}_raw.jsonl")
+        with open(raw, "w") as f:
+            for i in range(n):
+                cid = f"{game}.s{first + 37 * i}_m"
+                write_tone(os.path.join(out_dir, f"wav/{cid}.wav"), base + 15 * i)
+                f.write(json.dumps({"id": cid, "audio": f"wav/{cid}.wav",
+                                    "text": f"Synthetic rehearsal sentence {stem} {i}."}) + "\n")
+        name = f"{stem}_manifest.jsonl"
+        data_manifest.build_manifest(raw_jsonls=[raw], audio_root=out_dir, out=os.path.join(out_dir, name))
+        os.remove(raw)
+        return omnivoice_data.relativise(os.path.join(out_dir, name), out_dir)
+    train, dev = build("train", "le2", 12, 200, 178234), build("dev", "le3", 3, 600, 505116)
     with open(os.path.join(out_dir, "style_manifest.jsonl"), "w") as f:
         f.writelines(json.dumps({k: r[k] for k in ("id", "audio_path", "text")}) + "\n" for r in train[:6])
     for i in range(2):

@@ -41,6 +41,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "omnivoice-ft"))
 import buildset  # noqa: E402
 import data_manifest  # noqa: E402
+import bundle_ids  # noqa: E402
 
 CACHE = Path.home() / ".cache" / "vi" / "voicetune"
 REPLAY_TEXTS = CACHE / "fresh" / "data" / "replay_with_codes.jsonl"
@@ -166,6 +167,10 @@ def build(out, repo, reuse_wav, voices, replay_texts, audio_tokenizer, raw_dir=N
         "note": "Label-blind: no mood/rating/legacy-label field was read or used.",
     }
     (out / "omnivoice_data_summary.json").write_text(json.dumps(summary, indent=1) + "\n", encoding="utf-8")
+    ok, problems, _ = bundle_ids.check_ids(out)  # same check paid_run --plan repeats before renting
+    if not ok:
+        raise SystemExit("omnivoice_data: the folder's clip ids would break tokenising on the worker:\n  "
+                         + "\n  ".join(problems))
     return summary
 
 
