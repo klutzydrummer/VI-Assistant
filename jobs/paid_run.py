@@ -108,7 +108,7 @@ STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
-            release=9, budget=10, disk=11, ids=12, other=1)
+            release=9, budget=10, disk=11, ids=12, realpath=13, other=1)
 
 # The worker's preflight (jobs/voicetune-fresh.sh, `min_disk = float(os.environ.get(
 # "VI_MIN_DISK_GB", "100"))`) refuses a worker with less free disk than this many GiB. The
@@ -521,6 +521,118 @@ def ids_check(stages, repo):
     return False, [f"clip ids        : FAIL in {folder}"] + [f"                  - {p}" for p in problems]
 
 
+REALPATH_REQ = REPO / "jobs" / "requirements-omnivoice-home-cpu.txt"
+REALPATH_SCRIPT = REPO / "jobs" / "omnivoice-ft" / "home_realpath_check.py"
+REALPATH_MIN_RAM_MB = 4096
+REALPATH_FORWARD_RAM_MB = 12288  # model + KL reference + gradients, measured ~9 GB peak by estimate
+REALPATH_TIMEOUT = {False: 900, True: 1800}
+
+
+def mem_available_mb(meminfo="/proc/meminfo"):
+    try:
+        for line in Path(meminfo).read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def realpath_venv(home, req=None):
+    req = Path(req or REALPATH_REQ)
+    return Path(home) / ".cache" / "vi" / f"home-cpu-venv-{hashlib.sha256(req.read_bytes()).hexdigest()[:16]}"
+
+
+def realpath_code_hash(folder, req=None, repo=None):
+    """Hash of everything the check exercises: our data/training code, the pins, the data folder id."""
+    repo = Path(repo or REPO)
+    h = hashlib.sha256()
+    files = [repo / "jobs" / "omnivoice-ft" / n for n in ("ft_data.py", "train_ft.py",
+                                                         "home_realpath_check.py", "data_manifest.py")]
+    files += sorted((repo / "jobs" / "omnistyle").glob("*.py"))
+    files.append(Path(req or REALPATH_REQ))
+    for f in files:
+        h.update(f.name.encode() + b"\0")
+        try:
+            h.update(f.read_bytes())
+        except OSError:
+            h.update(b"<missing>")
+    h.update(Path(folder).parent.name.encode())
+    return h.hexdigest()[:24]
+
+
+def run_realpath(cmd, timeout, env):
+    """(rc, output) of the check subprocess; a timeout is rc 124."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as e:
+        return 124, f"timed out after {timeout} s\n{(e.stdout or b'')[-1500:]!r}"
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def realpath_check(stages, repo, forward=False, home=None, mem_mb=None, runner=run_realpath,
+                   req=None, script=None):
+    """(ok, lines): the worker's real data path on CPU, on a few real clips, before renting.
+
+    Runs jobs/omnivoice-ft/home_realpath_check.py in the home CPU venv. The batch-only check runs
+    on every call but its OK result is cached by code hash; the forward+backward step is opt-in and
+    only runs with enough free RAM (otherwise the check stops at the collated batch and says so)."""
+    label = "real-path check : "
+    folder, why = data_folder(stages, repo)
+    if folder is None:
+        return True, [f"{label}not checked ({why})"]
+    home = Path(home or Path.home())
+    req = Path(req or REALPATH_REQ)
+    script = Path(script or REALPATH_SCRIPT)
+    venv = realpath_venv(home, req)
+    py = venv / "bin" / "python"
+    if not py.is_file():
+        return False, [f"{label}NOT RUN (venv missing; build it once, it needs ~0.5 GB of downloads): "
+                       f"uv venv -p 3.11 {venv} && uv pip install --index-strategy unsafe-best-match "
+                       f"-p {py} -r {req}"]
+    rev = base_model_revision()
+    base = Path(os.environ.get("VI_BASE_MODEL") or home / ".cache" / "huggingface" / "hub"
+                / "models--k2-fsa--OmniVoice" / "snapshots" / rev)
+    if not (base / "audio_tokenizer").is_dir():
+        return False, [f"{label}NOT RUN (the pinned base-model snapshot is missing at {base}; "
+                       "set VI_BASE_MODEL to a local snapshot)"]
+    ram = mem_available_mb() if mem_mb is None else mem_mb
+    note = []
+    if forward and ram < REALPATH_FORWARD_RAM_MB:
+        note = [f"                  forward step skipped: {ram} MB RAM available, it needs "
+                f"{REALPATH_FORWARD_RAM_MB} MB; the check stops at the collated batch"]
+        forward = False
+    code = realpath_code_hash(folder, req, Path(script).parents[2])
+    cache = home / ".cache" / "vi" / "realpath-check"
+    entry = cache / f"{code}.json"
+    try:
+        cached = json.loads(entry.read_text())
+    except (OSError, ValueError):
+        cached = {}
+    if cached.get("ok") and (cached.get("forward") or not forward):
+        return True, [f"{label}OK (cached, {'with' if cached.get('forward') else 'without'} forward "
+                      f"step; code {code[:8]})"] + note
+    if ram < REALPATH_MIN_RAM_MB:
+        return False, [f"{label}NOT RUN (only {ram} MB RAM available, needs {REALPATH_MIN_RAM_MB} MB; "
+                       "free memory and run --plan again)"]
+    cmd = ["nice", "-n", "19", str(py), "-I", str(script), "--data", str(folder), "--base", str(base),
+           "--scratch", str(cache / "scratch"), "--code-hash", code, "--json"]
+    if forward:
+        cmd.append("--forward")
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    env.update(HF_HUB_OFFLINE="1", CUDA_VISIBLE_DEVICES="", HOME=str(home))
+    rc, out = runner(cmd, REALPATH_TIMEOUT[forward], env)
+    if rc == 0:
+        cache.mkdir(parents=True, exist_ok=True)
+        entry.write_text(json.dumps({"ok": True, "forward": forward, "code": code,
+                                     "when": time.strftime("%Y-%m-%d %H:%M:%S")}))
+        last = [ln for ln in out.splitlines() if ln.startswith("real-path check: OK")]
+        return True, [f"{label}{last[-1].split(': ', 1)[1] if last else 'OK'}"] + note
+    tail = [ln for ln in out.splitlines() if ln.strip()][-12:]
+    head = "REFUSED" if rc == 3 else "FAIL"
+    return False, [f"{label}{head} (exit {rc}); last lines of the check:"] + [f"                  | {ln}" for ln in tail]
+
+
 def stale_markers(state_dir=None, home=None):
     """Unverified markers whose checkpoint dir is missing or empty: [(marker, dir)]. Read-only."""
     root = Path(state_dir) if state_dir else vi_state_dir()
@@ -790,6 +902,8 @@ class PaidRun:
         self.disk_ok, disk_gb, _, self.disk_line = disk_check(self.base_config_text())
         self.home_ok, home_lines = home_check(a.stages, a.repo)
         self.ids_ok, ids_lines = ids_check(a.stages, a.repo)
+        self.realpath_ok, realpath_lines = realpath_check(
+            a.stages, a.repo, forward=getattr(a, "realpath_forward", False))
         countries = a.countries or "(from the config)"
         return [
             f"run id          : {a.run_id}",
@@ -802,6 +916,7 @@ class PaidRun:
             disk_cost_line(disk_gb, a.max_hours),
             *home_lines,
             *ids_lines,
+            *realpath_lines,
             *stale_marker_lines(),
             f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision) not verified (needs network)",
             f"countries       : {countries}",
@@ -1168,6 +1283,13 @@ class PaidRun:
                   "the current jobs/omnivoice_data.py first. Nothing was rented.",
                   file=sys.stderr, flush=True)
             return EXIT["ids"]
+        if not self.realpath_ok:
+            print(f"paid-run: STOPPED (exit {EXIT['realpath']}): the home real-path check did not "
+                  "pass (see the `real-path check` lines above), so the worker's data path is "
+                  "unproven and the run could fail after the worker was rented. Fix the code or "
+                  "the home setup it names, then run --plan again. Nothing was rented.",
+                  file=sys.stderr, flush=True)
+            return EXIT["realpath"]
         if self.a.plan:
             say("--plan: nothing was called; exiting")
             return 0
@@ -1366,6 +1488,9 @@ def parse(argv):
     p.add_argument("--platter", default=os.environ.get("VI_PLATTER_DIR", str(
         REPO / "corpus" / "tali" / "stages" / "omnivoice_train" / "current" / "out" / "platter")))
     p.add_argument("--plan", action="store_true", help="print the plan and exit; no vi calls")
+    p.add_argument("--realpath-forward", action="store_true",
+                   help="also run one forward+backward step of the real model in the home real-path "
+                        "check (needs 12 GB free RAM; otherwise it stops at the collated batch)")
     a = p.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", a.run_id):
         p.error("--run-id may only hold letters, digits, dot, dash and underscore")

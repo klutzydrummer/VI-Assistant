@@ -174,8 +174,11 @@ def _resolved_mixed_precision(cfg: FTTrainConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
-def load_style_model(cfg: FTTrainConfig) -> Tuple[StyleOmniVoice, Any]:
-    """Load the public Base into the subclass; tokenizer from the resume checkpoint when given."""
+def load_text_tokenizer(cfg: FTTrainConfig) -> Tuple[Any, str]:
+    """(tokenizer, resolved init path): the text tokenizer with upstream's pad and special tokens.
+
+    Split out of ``load_style_model`` so the home real-path check can build the data path without
+    loading the 2.5 GB model."""
     from transformers import AutoTokenizer
 
     from omnivoice.models.omnivoice import _resolve_model_path
@@ -192,6 +195,12 @@ def load_style_model(cfg: FTTrainConfig) -> Tuple[StyleOmniVoice, Any]:
     to_add = [t for t in special if t not in tokenizer.get_vocab()]
     if to_add:
         tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    return tokenizer, init_path
+
+
+def load_style_model(cfg: FTTrainConfig) -> Tuple[StyleOmniVoice, Any]:
+    """Load the public Base into the subclass; tokenizer from the resume checkpoint when given."""
+    tokenizer, init_path = load_text_tokenizer(cfg)
 
     model_cfg = StyleOmniVoiceConfig.from_pretrained(init_path)
     model_cfg.style_n_vectors = cfg.style_n_vectors

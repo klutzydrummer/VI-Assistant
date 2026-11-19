@@ -93,6 +93,9 @@ class StyleShardProcessor:
         instruct_ratio: float = 0.0,
         rng: random.Random = random,
     ):
+        # Upstream's PaddingDataCollator reads ``processor.text_tokenizer.pad_token_id``, so the
+        # wrapper must expose it too (r6 failed with an AttributeError here).
+        self.text_tokenizer = text_tokenizer
         self.base = SD.StyleSampleProcessor(
             text_tokenizer,
             num_channels=num_channels,

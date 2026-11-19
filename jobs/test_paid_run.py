@@ -163,6 +163,29 @@ def offers(*specs):
     return [dict(id=i, dph=d, loc=loc, up=up) for i, d, loc, up in specs]
 
 
+def load_paid_run():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("paid_run_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def install_fake_realpath(home, rc=0, text="real-path check: OK (3 batches, forward skipped)"):
+    """A fake home CPU venv + base snapshot under `home`: its python prints `text` and exits `rc`,
+    appending its argv to home/realpath-calls.log. The real subprocess path in paid_run runs it."""
+    pr = load_paid_run()
+    py = pr.realpath_venv(home) / "bin" / "python"
+    py.parent.mkdir(parents=True, exist_ok=True)
+    py.write_text(f"#!/bin/sh\necho \"$@\" >> {home}/realpath-calls.log\necho '{text}'\nexit {rc}\n")
+    py.chmod(0o755)
+    snap = (Path(home) / ".cache" / "huggingface" / "hub" / "models--k2-fsa--OmniVoice" / "snapshots"
+            / pr.base_model_revision() / "audio_tokenizer")
+    snap.mkdir(parents=True, exist_ok=True)
+    return py
+
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="paid-run-test."))
@@ -1028,6 +1051,7 @@ class IdsAndMarkers(Base):
         self.scenario([dict(spent=0.1, hours=1.0)])
         self.env["HOME"] = str(self.tmp)
         st = self.stages_with_data(["le2_s1_m"], ["le3_s9_m"])
+        install_fake_realpath(self.tmp)
         self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
         self.assertIn("clip ids        : OK", self.out)
 
@@ -1051,6 +1075,126 @@ class IdsAndMarkers(Base):
         self.assertNotIn(f"abandon {full} ", self.out)
         self.assertEqual(sorted(p.name for p in mdir.iterdir()), ["a", "b", "c"])
         self.assertTrue(empty.is_dir())
+
+
+class RealPathCheck(Base):
+    """The home real-path check in the plan: runs, caches by code hash, blocks with exit 13."""
+
+    def setUp(self):
+        super().setUp()
+        self.pr = load_paid_run()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.env["HOME"] = str(self.home)
+        self.st = IdsAndMarkers.stages_with_data(self, ["le2_s1_m"], ["le3_s9_m"])
+        self.calls_log = self.home / "realpath-calls.log"
+
+    def run_check(self, **kw):
+        return self.pr.realpath_check(self.st, str(self.tmp), home=self.home, **kw)
+
+    def n_runs(self):
+        return len(self.calls_log.read_text().splitlines()) if self.calls_log.exists() else 0
+
+    def test_pass_runs_once_then_cache_hit(self):
+        install_fake_realpath(self.home)
+        ok, lines = self.run_check(mem_mb=20000)
+        self.assertTrue(ok, lines)
+        self.assertIn("OK (3 batches", lines[0])
+        self.assertEqual(self.n_runs(), 1)
+        cmd = self.calls_log.read_text()
+        self.assertNotIn("--forward", cmd)
+        ok, lines = self.run_check(mem_mb=20000)
+        self.assertTrue(ok)
+        self.assertIn("OK (cached", lines[0])
+        self.assertEqual(self.n_runs(), 1)  # not run again
+
+    def test_data_folder_id_is_part_of_the_cache_key(self):
+        other = self.tmp / "other-data" / "zzz" / "out"
+        other.mkdir(parents=True)
+        h1 = self.pr.realpath_code_hash(self.tmp / "a" / "x" / "out")
+        h2 = self.pr.realpath_code_hash(other)
+        self.assertNotEqual(h1, h2)  # the data folder id is part of the key
+
+    def test_failure_blocks_plan_and_run_with_exit_13_and_is_not_cached(self):
+        install_fake_realpath(self.home, rc=1, text="AttributeError: no text_tokenizer")
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(stages=self.st, plan=True), 13, self.out)
+        self.assertIn("real-path check : FAIL (exit 1)", self.out)
+        self.assertIn("AttributeError: no text_tokenizer", self.out)
+        self.assertEqual(self.run_orch(stages=self.st), 13, self.out)
+        self.assertIn("Nothing was rented", self.out)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.tmp / "paid").exists())
+        self.assertEqual(self.n_runs(), 2)  # a failure is re-run, never cached
+
+    def test_missing_venv_blocks_and_prints_the_build_command(self):
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(stages=self.st, plan=True), 13, self.out)
+        self.assertIn("real-path check : NOT RUN (venv missing", self.out)
+        self.assertIn("uv venv -p 3.11", self.out)
+        self.assertFalse((self.home / ".cache" / "vi" / "home-cpu-venv").exists())  # never builds it
+
+    def test_passing_check_lets_plan_through(self):
+        install_fake_realpath(self.home)
+        self.scenario([dict(spent=0.1, hours=1.0)])
+        self.assertEqual(self.run_orch(stages=self.st, plan=True), 0, self.out)
+        self.assertIn("real-path check : OK", self.out)
+
+    def test_low_ram_refuses_instead_of_running(self):
+        install_fake_realpath(self.home)
+        ok, lines = self.run_check(mem_mb=1000)
+        self.assertFalse(ok)
+        self.assertIn("NOT RUN (only 1000 MB RAM", lines[0])
+        self.assertEqual(self.n_runs(), 0)
+
+    def test_forward_flag_needs_12gb_else_stops_at_the_batch_and_says_so(self):
+        install_fake_realpath(self.home)
+        ok, lines = self.run_check(forward=True, mem_mb=8000)
+        self.assertTrue(ok, lines)
+        self.assertIn("forward step skipped: 8000 MB RAM available", "\n".join(lines))
+        self.assertNotIn("--forward", self.calls_log.read_text())
+        ok, lines = self.run_check(forward=True, mem_mb=20000)  # batch-only cache does not satisfy it
+        self.assertTrue(ok, lines)
+        self.assertEqual(self.n_runs(), 2)
+        self.assertIn("--forward", self.calls_log.read_text().splitlines()[1])
+        ok, lines = self.run_check(forward=True, mem_mb=20000)
+        self.assertIn("cached, with forward", lines[0])
+        self.assertEqual(self.n_runs(), 2)
+
+    def test_runner_is_injectable_and_gets_nice_19(self):
+        install_fake_realpath(self.home)
+        seen = []
+        ok, _ = self.run_check(mem_mb=20000, runner=lambda c, t, e: seen.append((c, t)) or (0, "ok"))
+        self.assertTrue(ok)
+        self.assertEqual(seen[0][0][:3], ["nice", "-n", "19"])
+        self.assertIn("-I", seen[0][0])
+
+    def test_no_data_folder_is_not_checked(self):
+        st = HomeChecks.stages_file(self, 1, 0)
+        ok, lines = self.pr.realpath_check(st, str(self.tmp), home=self.home)
+        self.assertTrue(ok)
+        self.assertIn("not checked", lines[0])
+
+    def test_home_cpu_pins_match_the_worker_pins_except_torch(self):
+        def pins(name):
+            return {ln.strip() for ln in (JOBS / name).read_text().splitlines()
+                    if ln.strip() and not ln.startswith("#") and not ln.startswith("--")}
+        worker = pins("requirements-omnivoice-worker.txt")
+        home = pins("requirements-omnivoice-home-cpu.txt")
+        swap = {"torch==2.8.0": "torch==2.8.0+cpu", "torchaudio==2.8.0": "torchaudio==2.8.0+cpu"}
+        self.assertEqual({swap.get(p, p) for p in worker}, home)
+        self.assertIn("--extra-index-url https://download.pytorch.org/whl/cpu",
+                      (JOBS / "requirements-omnivoice-home-cpu.txt").read_text())
+
+    def test_tokenise_flags_match_the_worker_script(self):
+        text = (JOBS / "voicetune-fresh.sh").read_text()
+        src = (JOBS / "omnivoice-ft" / "home_realpath_check.py").read_text()
+        self.assertIn('TOKENISE_FLAGS = ["--samples_per_shard", "1000", "--skip_errors"]', src)
+        self.assertIn("--samples_per_shard 1000 --skip_errors", text)
+
+    def test_exit_code_13_is_documented(self):
+        self.assertEqual(self.pr.EXIT["realpath"], 13)
+        self.assertIn("13 ", (JOBS.parent / "docs" / "cloud-worker.md").read_text().split("Exit codes:")[1][:1500])
 
 
 class RunLogging(Base):

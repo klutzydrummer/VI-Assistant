@@ -173,6 +173,26 @@ def test_shard_processor_layout_and_replay(monkeypatch):
     assert int((replay["labels"] != -100).sum()) > 0  # loss positions still exist
 
 
+def test_shard_processor_collates_through_the_real_collator():
+    """Regression (r6): upstream's PaddingDataCollator reads ``processor.text_tokenizer``.
+
+    The collator gets the real StyleShardProcessor here, not a plain StyleSampleProcessor, which
+    is what hid the missing attribute from the synthetic-bundle tests."""
+    proc = FD.StyleShardProcessor(SD.FakeTextTokenizer(), n_style=3, target_frames=12, crop_frames=6)
+    assert proc.text_tokenizer is proc.base.text_tokenizer
+    collate = SD.StylePaddingCollator(proc, batch_tokens=256)
+    raw = [
+        {"audio_tokens": torch.randint(0, 64, (8, 30)), "label": {"text": "hi"}},
+        {"audio_tokens": torch.randint(0, 64, (8, 40)), "label": {"text": "there", "replay": True}},
+    ]
+    batch = collate([proc(r) for r in raw])
+    for key in ("input_ids", "labels", "audio_mask", "style_slot", "style_tokens", "style_valid",
+                "kl_mask"):
+        assert key in batch, key
+    assert batch["input_ids"].shape[0] == 2 and batch["input_ids"].shape[1] == 8
+    assert batch["kl_mask"].tolist() == [False, True]
+
+
 def test_synthetic_bundle_exposes_style_and_probe_fields():
     bundle = FD.build_synthetic_bundle(batch_size=4, seed=0)
     batch = next(iter(bundle.loader))
