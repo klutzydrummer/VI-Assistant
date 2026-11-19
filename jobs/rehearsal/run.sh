@@ -21,6 +21,10 @@
 #   receiver-down  the return path never proves; nothing is sent
 #   receiver       the restricted receiver itself: token push, munged symlinks, write-only,
 #                  no delete
+#   ckpt-push-real  a real epoch published with checkpoints.py, pushed through the real receiver
+#                  (loopback, temp state dir), verified home, acked and pruned; byte-identical
+#   receiver-restart  the receiver is killed mid-push and restarted; push_retry resumes from
+#                  .rsync-partial and the epoch still arrives byte-identical and verified
 #   base-fail      the real venv install runs, then the Base download fails
 #   disk-full      the worker disk gate refuses
 #   preflight      the full preflight stage (tokenise, replay, probe, push, speak, kill/resume)
@@ -42,7 +46,7 @@ mkdir -p "$base"
 R=$(mktemp -d "$base/run.XXXXXX")
 echo "rehearsal: working in $R"
 
-all=(gate-home gate-vram gate-disk gate-ram gate-cuda gate-push receiver-down receiver base-fail disk-full preflight train enospc nan)
+all=(gate-home gate-vram gate-disk gate-ram gate-cuda gate-push receiver-down receiver ckpt-push-real receiver-restart base-fail disk-full preflight train enospc nan)
 [ $# -gt 0 ] && scenarios=("$@") || scenarios=("${all[@]}")
 
 avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
@@ -101,6 +105,7 @@ run_stage() {
     VI_POLL_SECONDS=1 VI_BIN=false VI_MEMORY_EVENTS="$R/memory.events"
     PATH="$R/fakebin:$PATH" VI_REAL_RSYNC="$real_rsync" VI_REHEARSAL_FAULTS="$R/faults/$name"
     PIP_NO_INDEX=1 PIP_FIND_LINKS="$R/wheels" PIP_CONFIG_FILE=/dev/null
+    VI_MIN_MODEL_BYTES=1 VI_MIN_OPTIMIZER_BYTES=1   # the stub trainer writes tiny files
     PIP_DISABLE_PIP_VERSION_CHECK=1 VI_FAKE_PUSH_SECONDS=22 VI_STUB_TRACE="$sd/trace.jsonl"
     "$@"
   )
@@ -248,6 +253,83 @@ sc_receiver() {
   bash "$repo/jobs/worker-return.sh" stop "$st"
   check "the receiver pid $pid is gone after stop" bash -c "! kill -0 $pid 2>/dev/null"
 }
+
+# Any case that writes files of a real size first checks the free space on the rehearsal
+# disk: 2 x the size plus a 20 GB margin (VI_REHEARSAL_FREE_BYTES injects a fake value).
+space_guard() {  # BYTES
+  local need=$1 free
+  free=${VI_REHEARSAL_FREE_BYTES:-$(df -B1 --output=avail "$base" | tail -n1 | tr -d ' ')}
+  if [ "$free" -lt $((need * 2 + 20 * 1024 * 1024 * 1024)) ]; then
+    echo "rehearsal: refusing: $free bytes free is under 2 x $need plus 20 GB" >&2
+    return 1
+  fi
+}
+
+# Publish one synthetic epoch, push it through the real receiver, verify, ack and prune.
+# KILL=1 kills the receiver mid-push and restarts it.
+push_real_epoch() {  # NAME
+  local name=$1 d="$R/s/$1" port st="$R/s/$1/state" size=$((48 * 1024 * 1024))
+  space_guard "$size" || { bad "free-space guard passed"; return; }
+  mkdir -p "$d/work/epoch-0" "$d/home-out" "$d/home-ck" "$d/home-pub"
+  head -c "$size" /dev/urandom >"$d/work/epoch-0/talker.safetensors"
+  echo '{"epoch": 1}' >"$d/work/epoch-0/tune.json"
+  python3 - "$repo/jobs" "$d/work/epoch-0" "$d/work/publish" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import checkpoints
+checkpoints.publish_epoch(sys.argv[2], sys.argv[3])
+PY
+  check "the epoch was published with a SHA256SUMS" test -s "$d/work/publish/epoch-0/SHA256SUMS"
+  port=$(bash "$repo/jobs/worker-return.sh" start "$d/home-out" "$d/home-ck" "$st" "$d/home-pub")
+  local pid; pid=$(cat "$st/rsyncd.pid")
+  local push_rc=0
+  if [ "${KILL:-}" = 1 ]; then
+    env VI_RETURN_PORT="$port" VI_PUSH_WAIT=60 bash "$repo/jobs/worker-return.sh" push \
+      "$d/work/publish" vi-publish --bwlimit=6000 >"$d/push.log" 2>&1 &
+    local pushpid=$!
+    local i got=
+    for i in $(seq 1 100); do
+      if [ -n "$(find "$d/home-pub" -type f -size +1M -print -quit 2>/dev/null)" ]; then got=1; break; fi
+      sleep 0.1
+    done
+    check "bytes reached home before the kill" test -n "$got"
+    # SIGKILL to the daemon and its connection child, as a crashed home would. (A SIGTERM makes
+    # rsync keep the half file in .rsync-partial but exits the client with 20, which push_retry
+    # does not retry; see the W27 report.) After a SIGKILL the file restarts from zero.
+    pkill -9 -f -- "$st/rsyncd.conf" 2>/dev/null || true
+    # Restart before push_retry's first retry (it backs off 1 s): the receiver has one
+    # connection slot per module, and the restart's own token push needs it.
+    for i in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+    check "the receiver is dead after the kill" bash -c "! kill -0 $pid 2>/dev/null"
+    check "SHA256SUMS had not arrived at the kill" test ! -e "$d/home-pub/epoch-0/SHA256SUMS"
+    local newport; newport=$(bash "$repo/jobs/worker-return.sh" restart "$st")
+    check "the receiver restarted on the same port" test "$newport" = "$port"
+    pid=$(cat "$st/rsyncd.pid")
+    wait "$pushpid" || push_rc=$?
+    check "push_retry finished the push after the restart (exit $push_rc)" test "$push_rc" -eq 0
+    check "the push log shows a retry" has "$d/push.log" "retrying in"
+  else
+    env VI_RETURN_PORT="$port" VI_PUSH_WAIT=30 bash "$repo/jobs/worker-return.sh" push \
+      "$d/work/publish" vi-publish >"$d/push.log" 2>&1 || push_rc=$?
+    check "the push succeeded (exit $push_rc)" test "$push_rc" -eq 0
+  fi
+  check "talker.safetensors is byte-identical home" cmp -s "$d/work/epoch-0/talker.safetensors" "$d/home-pub/epoch-0/talker.safetensors"
+  check "tune.json is byte-identical home" cmp -s "$d/work/epoch-0/tune.json" "$d/home-pub/epoch-0/tune.json"
+  check "no .rsync-partial debris is left home" test -z "$(find "$d/home-pub" -path '*.rsync-partial/*' -type f -print -quit)"
+  check "home verify-epoch accepts the copy" python3 "$repo/jobs/checkpoints.py" --format epoch verify-epoch "$d/home-pub" 0
+  mkdir -p "$d/work/acked" && : >"$d/work/acked/epoch-0"
+  check "the epoch is acked" test -e "$d/work/acked/epoch-0"
+  check "home verify writes VERIFIED" python3 "$repo/jobs/checkpoints.py" --format epoch verify "$d/home-pub" --expect 1
+  check "VERIFIED exists" test -s "$d/home-pub/VERIFIED"
+  check "prune keeps the only epoch" python3 "$repo/jobs/checkpoints.py" --format epoch prune "$d/home-pub" --keep 0 --yes
+  check "the epoch survived the prune" test -s "$d/home-pub/epoch-0/talker.safetensors"
+  bash "$repo/jobs/worker-return.sh" stop "$st"
+  check "the receiver pid $pid is gone after stop" bash -c "! kill -0 $pid 2>/dev/null"
+  rm -rf "$d/work" "$d/home-pub" "$d/home-out" "$d/home-ck"
+}
+
+sc_ckpt_push_real() { push_real_epoch ckpt-push-real; }
+sc_receiver_restart() { KILL=1 push_real_epoch receiver-restart; }
 
 sc_base_fail() {
   local venv; venv=$(venv_dir)

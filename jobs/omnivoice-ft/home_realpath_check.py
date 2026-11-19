@@ -11,6 +11,12 @@ shown. This script runs that path on a tiny slice of the real clips:
   4. run ``train_ft._build_data`` and pull collated batches from the real loader,
   5. with ``--forward`` only: load the real model, attach the KL reference, run one forward and
      backward step (no optimizer) and check the style encoder received gradients.
+  6. with ``--save`` only (after ``--forward`` when both are given): the real ``train_ft.run_training``
+     (real optimizer, KL reference, checkpoint hook, fp32 on CPU) for 1 step, save checkpoint-1,
+     verify it strictly; a fresh process resumes it for 1 more step and saves checkpoint-2; the
+     checkpoint reloads on CPU. Needs a lot of RAM (about 13-15 GB, run only above 18000 MB
+     available, otherwise it reports "skipped (RAM)" and the save path is NOT proven) and free disk
+     of the calculated checkpoint size plus 20 GB (otherwise it refuses, exit 3).
 
 Run it with the home CPU venv (see jobs/requirements-omnivoice-home-cpu.txt):
 
@@ -23,7 +29,8 @@ copied into the repo or sent anywhere. No mood or other legacy label is read: th
 the manifests in file order.
 
 Not proven: CUDA, bf16, GPU memory at the real batch size, DDP, throughput, GPU replay generation,
-``accelerator.save_state`` with an optimizer, the network, or how the voice sounds.
+the network, or how the voice sounds; ``accelerator.save_state`` with an optimizer is proven only
+when ``--save`` ran (not "skipped (RAM)").
 """
 
 from __future__ import annotations
@@ -49,6 +56,12 @@ EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 3
 MIN_RAM_MB = 4096
 MIN_RAM_FORWARD_MB = 12288
 MIN_SCRATCH_GB = 2.0
+MIN_RAM_SAVE_MB = 18000
+# Base model.safetensors, bytes (fp32). A full checkpoint is the weights plus the two AdamW
+# states of the same size (optimizer.bin) plus small files: CALCULATED, not measured, unless a
+# real --save ran and recorded checkpoint_bytes.
+BASE_MODEL_BYTES = 2_450_344_112
+SAVE_DISK_MARGIN_GB = 20.0
 MARKER = ".realpath-scratch"
 BATCH_TOKENS = 1024
 BATCH_KEYS = {"input_ids", "labels", "audio_mask", "attention_mask", "position_ids",
@@ -78,6 +91,67 @@ def refusal(forward: bool, scratch: Path, ram_mb: int | None = None, free_gb: fl
     if free_gb < MIN_SCRATCH_GB:
         return f"only {free_gb:.1f} GB free under {scratch}, the check needs {MIN_SCRATCH_GB} GB"
     return None
+
+
+def calc_checkpoint_bytes(base_bytes: int = BASE_MODEL_BYTES) -> int:
+    """Calculated size of one full checkpoint: weights + two AdamW states (about 7.35 GB)."""
+    return 3 * base_bytes
+
+
+def free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+class SaveRefused(RuntimeError):
+    """The save step must not write: the disk would be left with too little free space."""
+
+
+def check_save_disk(path: Path, ckpt_bytes: int | None = None, free: int | None = None,
+                    margin_gb: float = SAVE_DISK_MARGIN_GB) -> None:
+    """Refuse when the filesystem of ``path`` has less than (checkpoint size + margin) free.
+
+    Two checkpoints are written (checkpoint-1 and checkpoint-2), so the need is counted twice."""
+    ckpt_bytes = calc_checkpoint_bytes() if ckpt_bytes is None else ckpt_bytes
+    path = Path(path)
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    free = free_bytes(probe) if free is None else free
+    need = 2 * ckpt_bytes + int(margin_gb * 1e9)
+    if free < need:
+        raise SaveRefused(f"only {free / 1e9:.1f} GB free under {probe}, the save step needs "
+                          f"{need / 1e9:.1f} GB (two checkpoints of {ckpt_bytes / 1e9:.1f} GB "
+                          f"plus a {margin_gb:.0f} GB margin)")
+
+
+def dir_bytes(path) -> int:
+    return sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file())
+
+
+def prove_save(out_dir: Path, make_cfg, resume, reload, log=print) -> dict:
+    """The save / resume / reload proof (F-CKPT-1), independent of the model size.
+
+    ``make_cfg(steps, resume_from)`` returns the FTTrainConfig; ``resume(ckpt1)`` runs the second
+    step in a fresh process (or in-process in a test); ``reload(ckpt2)`` loads it back on CPU."""
+    import train_ft as TF
+
+    out_dir = Path(out_dir)
+    TF.run_training(make_cfg(1, None))
+    ck1 = out_dir / "checkpoint-1"
+    rep = TF.verify_checkpoint(str(ck1), strict_files=True)
+    if not rep["ok"]:
+        raise RuntimeError(f"checkpoint-1 failed verify_checkpoint: {rep['problems']}")
+    size = dir_bytes(ck1)
+    log(f"save: checkpoint-1 saved and verified ({size} bytes, measured)")
+    resume(ck1)
+    ck2 = out_dir / "checkpoint-2"
+    rep = TF.verify_checkpoint(str(ck2), strict_files=True)
+    if not rep["ok"]:
+        raise RuntimeError(f"checkpoint-2 failed verify_checkpoint: {rep['problems']}")
+    log("save: a fresh process resumed checkpoint-1 and saved a verified checkpoint-2")
+    reload(ck2)
+    log("save: checkpoint-2 reloads on CPU")
+    return {"checkpoint_bytes": size, "checkpoint_bytes_label": "measured"}
 
 
 def read_rows(path: Path, n: int):
@@ -267,9 +341,69 @@ def run_check(args) -> dict:
         result["loss"] = float(loss)
         step(f"forward + backward ok, loss {float(loss):.4f}, style encoder has gradients")
 
+    if args.save:
+        model = None  # free the forward step's model before the heavier save run
+        import gc
+        gc.collect()
+        ram = mem_available_mb()
+        result["checkpoint_bytes_calculated"] = calc_checkpoint_bytes()
+        if ram <= MIN_RAM_SAVE_MB:
+            result["save"] = "skipped (RAM)"
+            step(f"save: skipped (RAM): {ram} MB available, needs more than {MIN_RAM_SAVE_MB} MB; "
+                 f"NOT PROVEN. Calculated checkpoint size {calc_checkpoint_bytes()} bytes "
+                 "(3 x Base weights; calculated, not measured)")
+        else:
+            result.update(run_save(args, base, cfg_path, scratch, step))
+            result["save"] = "ok"
     result["ok"] = True
     result["seconds"] = round(time.time() - t0, 1)
     return result
+
+
+def _save_cfg(base: Path, cfg_path: Path, out: Path, steps: int, resume_from):
+    import train_ft as TF
+
+    return TF.FTTrainConfig(
+        output_dir=str(out), init_from=str(base), data_config=str(cfg_path),
+        batch_tokens=BATCH_TOKENS, num_workers=0, mixed_precision="no", steps=steps, save_steps=1,
+        logging_steps=1, guard=False, resume_from_checkpoint=str(resume_from) if resume_from else None,
+    )
+
+
+def run_save(args, base: Path, cfg_path: Path, scratch: Path, step) -> dict:
+    """Real-Base save proof. Resume runs in a fresh process via ``--resume-phase``."""
+    out = scratch / "save-run"
+
+    def resume(ck1):
+        cmd = [sys.executable, str(Path(__file__).resolve()), "--data", args.data, "--base", str(base),
+               "--scratch", str(scratch), "--resume-phase", str(ck1)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"resume process failed (exit {r.returncode}):\n{(r.stdout + r.stderr)[-2000:]}")
+
+    def reload(ck2):
+        import torch
+        from style_omnivoice import StyleOmniVoice
+
+        m = StyleOmniVoice.from_pretrained(str(ck2), train=True, dtype=torch.float32)
+        if not any(True for _ in m.parameters()):
+            raise RuntimeError("reloaded model has no parameters")
+
+    res = prove_save(out, lambda steps, rf: _save_cfg(base, cfg_path, out, steps, rf), resume, reload, log=step)
+    step(f"save: checkpoint size {res['checkpoint_bytes']} bytes (measured)")
+    return res
+
+
+def run_resume_phase(args) -> int:
+    """Second process of the save proof: resume checkpoint-1 for one more step (steps=2)."""
+    import train_ft as TF
+
+    scratch = Path(args.scratch)
+    os.environ["TMPDIR"] = str(scratch)
+    os.chdir(scratch)
+    cfg = _save_cfg(Path(args.base), scratch / "data_config.json", scratch / "save-run", 2, args.resume_phase)
+    TF.run_training(cfg)
+    return EXIT_OK
 
 
 def main(argv=None) -> int:
@@ -278,6 +412,9 @@ def main(argv=None) -> int:
     ap.add_argument("--base", required=True, help="local HF snapshot of k2-fsa/OmniVoice")
     ap.add_argument("--scratch", required=True, help="throwaway folder under ~/.cache (wiped first)")
     ap.add_argument("--forward", action="store_true", help="also load the model; one forward+backward")
+    ap.add_argument("--save", action="store_true",
+                    help="also prove save/resume/reload of a real checkpoint (needs >18000 MB RAM)")
+    ap.add_argument("--resume-phase", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--json", action="store_true", help="print the result as one JSON line")
     ap.add_argument("--reuse-shards", action="store_true", help="debugging: keep shards from the last run")
     ap.add_argument("--rows", type=int, default=8)
@@ -288,11 +425,19 @@ def main(argv=None) -> int:
 
     if os.nice(0) < 19:
         os.nice(19 - os.nice(0))  # heavy home job: lowest priority, whoever started it
+    if a.resume_phase:
+        return run_resume_phase(a)
     scratch = Path(a.scratch)
     why = refusal(a.forward, scratch.parent if not scratch.exists() else scratch)
     if why:
         print(f"real-path check: REFUSED ({why})", flush=True)
         return EXIT_REFUSED
+    if a.save:
+        try:
+            check_save_disk(scratch)
+        except SaveRefused as e:
+            print(f"real-path check: REFUSED ({e})", flush=True)
+            return EXIT_REFUSED
     try:
         result = run_check(a)
     except BaseException:  # noqa: BLE001  (report any failure, including SystemExit from upstream)
@@ -306,7 +451,8 @@ def main(argv=None) -> int:
         pass
     if result["ok"]:
         print(f"real-path check: OK ({result['batches']} batches, keys {sorted(BATCH_KEYS)}, "
-              f"forward {'ok' if a.forward else 'skipped'})", flush=True)
+              f"forward {'ok' if a.forward else 'skipped'}, "
+              f"save {result.get('save', 'not requested')})", flush=True)
     else:
         print("real-path check: FAIL (see the traceback above)", flush=True)
     if a.json:

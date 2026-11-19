@@ -17,6 +17,20 @@ import checkpoints
 
 CLI = [sys.executable, str(Path(__file__).resolve().parent / "checkpoints.py")]
 
+_FLOOR_ENV = ("VI_MIN_MODEL_BYTES", "VI_MIN_OPTIMIZER_BYTES")
+
+
+def setUpModule():
+    # The CLI enforces real-size floors by default; these fixtures are a few bytes.
+    for k in _FLOOR_ENV:
+        os.environ[k] = "1"
+
+
+def tearDownModule():
+    for k in _FLOOR_ENV:
+        os.environ.pop(k, None)
+
+
 # The pipeline's checkpoint contract: one file from each required category
 # (jobs/omnivoice-ft/train_ft.py), listed in SHA256SUMS. Real ones also carry
 # tokenizer_config.json; one tokenizer file satisfies the category.
@@ -290,6 +304,95 @@ class VerifyTest(unittest.TestCase):
                                 capture_output=True, text=True)
             self.assertEqual(ok.returncode, 0, ok.stderr)
             self.assertIn("1 checkpoints ok", ok.stdout)
+
+
+class SizeFloorAndWeightsOnlyTest(unittest.TestCase):
+    """F-CKPT-3 size floor and F-PUSH-6 verify side (weights-only older checkpoints)."""
+
+    FULL = dict(CKPT_FILES)
+    WEIGHTS_ONLY = {k: v for k, v in CKPT_FILES.items()
+                    if k not in ("optimizer.bin", "scheduler.bin", "random_states_0.pkl")}
+
+    def test_checkpoints_tiny_model_refused(self):
+        # A valid SHA256SUMS over a 7-byte model.safetensors still fails a real-size floor.
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _ckpt(run, 500)
+            with self.assertRaises(SystemExit):
+                checkpoints.verify(run, 1, min_model_bytes=2_000_000_000)
+            with self.assertRaises(SystemExit):
+                checkpoints.verify(run, 1, min_optimizer_bytes=4_000_000_000)
+            # a floor the files clear passes; the floors are off by default
+            checkpoints.verify(run, 1, min_model_bytes=7, min_optimizer_bytes=3)
+            checkpoints.verify(run, 1)
+
+    def test_cli_applies_the_floor_by_default_in_omnivoice_mode_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _ckpt(run, 500)
+            clean = {k: v for k, v in os.environ.items() if k not in _FLOOR_ENV}
+            r = subprocess.run([*CLI, "verify", str(run), "--expect", "1"], capture_output=True, text=True, env=clean)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("floor", r.stderr)
+            r = subprocess.run([*CLI, "verify", str(run), "--expect", "1",
+                                "--min-model-bytes", "1", "--min-optimizer-bytes", "1"],
+                               capture_output=True, text=True, env=clean)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            env = {**clean, "VI_MIN_MODEL_BYTES": "1", "VI_MIN_OPTIMIZER_BYTES": "1"}
+            r = subprocess.run([*CLI, "verify-epoch", str(run), "500"], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_checkpoints_weights_only_older(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _ckpt(run, 10, self.WEIGHTS_ONLY)
+            _ckpt(run, 20, self.FULL)
+            # not accepted unless asked for
+            with self.assertRaises(SystemExit):
+                checkpoints.verify(run, 2)
+            out = checkpoints.verify(run, 2, weights_only_older=True)
+            self.assertEqual(set(out), {"checkpoint-10", "checkpoint-20"})
+            self.assertTrue((run / "VERIFIED").is_file())
+
+    def test_checkpoints_weights_only_newest_refused_as_resume_point(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _ckpt(run, 10, self.FULL)
+            _ckpt(run, 20, self.WEIGHTS_ONLY)
+            with self.assertRaises(SystemExit):
+                checkpoints.verify(run, 2, weights_only_older=True)
+            self.assertFalse((run / "VERIFIED").exists())
+
+    def test_weights_only_still_needs_weights_config_and_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            files = dict(self.WEIGHTS_ONLY)
+            del files["model.safetensors"]
+            _ckpt(run, 10, files)
+            _ckpt(run, 20, self.FULL)
+            with self.assertRaises(SystemExit):
+                checkpoints.verify(run, 2, weights_only_older=True)
+
+    def test_final_set_1000_2500_4500_weights_only_5000_full(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            for s in (1000, 2500, 4500):
+                _ckpt(run, s, self.WEIGHTS_ONLY)
+            _ckpt(run, 5000, self.FULL)
+            checkpoints.verify(run, 4, weights_only_older=True)
+            r = subprocess.run([*CLI, "prune", str(run), "--weights-only-older", "--min-model-bytes", "1",
+                                "--min-optimizer-bytes", "1"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("nothing to delete", r.stdout)
+
+    def test_verify_epoch_weights_only_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _ckpt(run, 10, self.WEIGHTS_ONLY)
+            with self.assertRaises(SystemExit):
+                checkpoints.verify_epoch(run, 10)
+            self.assertEqual(len(checkpoints.verify_epoch(run, 10, allow_weights_only=True)),
+                             len(self.WEIGHTS_ONLY))
 
 
 class EpochModeRegressionTest(unittest.TestCase):

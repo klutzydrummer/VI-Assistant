@@ -56,6 +56,22 @@ CKPT_REQUIRED = (
     ("ft_config.json",),
     ("tokenizer.json", "tokenizer_config.json", "fake_tokenizer.json"),
 )
+# A checkpoint of weights only (no optimizer, scheduler or rng state). Decision
+# (Brandon): older checkpoints are pushed weights-only; only the newest carries the
+# full state, because only the newest is ever resumed from.
+CKPT_WEIGHTS_ONLY_REQUIRED = (
+    ("config.json",),
+    ("model.safetensors", "pytorch_model.bin"),
+    ("tokenizer.json", "tokenizer_config.json", "fake_tokenizer.json"),
+)
+WEIGHT_NAMES = ("model.safetensors", "pytorch_model.bin")
+FULL_ONLY_NAMES = ("optimizer.bin", "scheduler.bin", "random_states_0.pkl")
+# Size floors for a real OmniVoice checkpoint (Base weights are 2,450,344,112 bytes;
+# AdamW adds two states of the same size). A checkpoint saved from a wrong, tiny
+# model cannot clear them. The CLI applies them by default in omnivoice mode;
+# the Python functions default to no floor so small synthetic fixtures still verify.
+MIN_MODEL_BYTES = 2_000_000_000
+MIN_OPTIMIZER_BYTES = 4_000_000_000
 # Decision Q1b: prune exempts steps 1000 and 2500 so Brandon can pick by ear;
 # they stay at home (~15 GB) until then.
 EXEMPT_STEPS = (1000, 2500)
@@ -270,21 +286,40 @@ def _check_epoch(ep):
     return per, problems
 
 
-def _check_ckpt(ck):
+def _is_weights_only(listed, ck):
+    """True when the checkpoint carries none of the full-state files (listed or on disk)."""
+    return not any(n in listed or (ck / n).exists() for n in FULL_ONLY_NAMES)
+
+
+def _check_ckpt(ck, min_model_bytes=0, min_optimizer_bytes=0, allow_weights_only=False):
     """Verify one checkpoint dir against its SHA256SUMS: ({relpath: sha256}, [problems]).
 
     The pipeline contract: every file in the folder is listed, the manifest is
     written last (a kill during save leaves no manifest at all), and one file
-    from each required category must be present."""
+    from each required category must be present. With `allow_weights_only` a
+    checkpoint holding no optimizer/scheduler/rng files passes on the weights
+    categories alone (the caller decides whether it may be the newest one).
+    The size floors apply to the model weights and, for a full checkpoint, to
+    optimizer.bin; 0 disables a floor."""
     problems = []
     sums = ck / CHECKSUM_NAME
     if not sums.is_file():
         return {}, [f"{ck.name}/{CHECKSUM_NAME}: missing (a checkpoint is complete only when its manifest exists)"]
     listed, problems = _read_sums(sums, ck.name)
     per = _check_listed(ck, listed, problems)
-    for group in CKPT_REQUIRED:
+    weights_only = allow_weights_only and _is_weights_only(listed, ck)
+    for group in (CKPT_WEIGHTS_ONLY_REQUIRED if weights_only else CKPT_REQUIRED):
         if not any(name in listed for name in group):
             problems.append(f"{ck.name}/{CHECKSUM_NAME}: does not list {list(group)}")
+    floors = [(WEIGHT_NAMES, min_model_bytes, "model weights")]
+    if not weights_only:
+        floors.append((("optimizer.bin",), min_optimizer_bytes, "optimizer state"))
+    for names, floor, label in floors:
+        for name in names:
+            f = ck / name
+            if floor and name in listed and f.is_file() and f.stat().st_size < floor:
+                problems.append(f"{ck.name}/{name}: {f.stat().st_size} bytes is under the {label} "
+                                f"floor of {floor} bytes (a checkpoint from the wrong model?)")
     for p in sorted(ck.rglob("*")):
         if not p.is_file():
             continue
@@ -296,8 +331,11 @@ def _check_ckpt(ck):
     return per, problems
 
 
-def _check(dir, fmt):
-    """Verify a whole run dir: returns (problems, {checkpoint_name: {file: sha256}})."""
+def _check(dir, fmt, min_model_bytes=0, min_optimizer_bytes=0, weights_only_older=False):
+    """Verify a whole run dir: returns (problems, {checkpoint_name: {file: sha256}}).
+
+    With `weights_only_older` (omnivoice only) every checkpoint but the newest may
+    be weights-only; the newest, the only resume point, must be a full checkpoint."""
     problems = []
     found = {}
     if not dir.is_dir():
@@ -318,6 +356,8 @@ def _check(dir, fmt):
             problems += errs
             found[p.name] = per
     else:
+        steps = [k for k, _, _ in _list_checkpoints(dir) if k is not None]
+        newest = max(steps) if steps else None
         for key, name, p in _list_checkpoints(dir):
             if p.is_symlink():
                 continue  # already rejected above
@@ -327,7 +367,8 @@ def _check(dir, fmt):
             if not p.is_dir():
                 problems.append(f"{name}: not a directory")
                 continue
-            per, errs = _check_ckpt(p)
+            older_ok = weights_only_older and key != newest
+            per, errs = _check_ckpt(p, min_model_bytes, min_optimizer_bytes, older_ok)
             problems += errs
             found[name] = per
     return problems, found
@@ -368,12 +409,13 @@ def _clear_markers(dir):
             p.unlink()
 
 
-def verify(dir, expect, fmt="omnivoice"):
+def verify(dir, expect, fmt="omnivoice", min_model_bytes=0, min_optimizer_bytes=0, weights_only_older=False):
     """Check a run dir has exactly `expect` verified checkpoints, then write VERIFIED.
     Exits non-zero on any symlink, leftover/unrecognized dir, missing/empty/mismatched
-    file, or (epoch mode) epoch dirs not numbered 0..N-1."""
+    file, or (epoch mode) epoch dirs not numbered 0..N-1. `weights_only_older`
+    accepts weights-only checkpoints below the newest step and refuses one as the newest."""
     dir = Path(dir)
-    problems, found = _check(dir, fmt)
+    problems, found = _check(dir, fmt, min_model_bytes, min_optimizer_bytes, weights_only_older)
     if fmt == "epoch":
         if len(found) != expect:
             problems.append(f"expected {expect} epoch dirs, found {len(found)}")
@@ -452,7 +494,8 @@ def _rmtree_guarded(dir, p, prefix):
     shutil.rmtree(p)
 
 
-def prune(dir, keep=None, yes=False, fmt="omnivoice", exempt=EXEMPT_STEPS, refresh_verified=False):
+def prune(dir, keep=None, yes=False, fmt="omnivoice", exempt=EXEMPT_STEPS, refresh_verified=False,
+          min_model_bytes=0, min_optimizer_bytes=0, weights_only_older=False):
     """Keep at most two verified checkpoints, deleting the rest. Dry run unless `yes`.
     Omnivoice mode keeps the two newest steps plus `exempt`; epoch mode keeps
     `keep` plus its neighbour."""
@@ -463,7 +506,7 @@ def prune(dir, keep=None, yes=False, fmt="omnivoice", exempt=EXEMPT_STEPS, refre
         # checkpoint now and record it. Any problem (corrupt, half-arrived,
         # symlink) exits before anything is written or deleted. The unverified
         # marker is left alone; the end-of-run verify still clears it.
-        problems, found = _check(dir, fmt)
+        problems, found = _check(dir, fmt, min_model_bytes, min_optimizer_bytes, weights_only_older)
         if problems:
             for p in problems:
                 print(p, file=sys.stderr)
@@ -478,7 +521,7 @@ def prune(dir, keep=None, yes=False, fmt="omnivoice", exempt=EXEMPT_STEPS, refre
         recorded = json.loads(vf.read_text())[field]
     except (ValueError, KeyError, TypeError):
         sys.exit(f"prune: {vf} is not a valid verify record")
-    problems, found = _check(dir, fmt)
+    problems, found = _check(dir, fmt, min_model_bytes, min_optimizer_bytes, weights_only_older)
     if problems:
         for p in problems:
             print(p, file=sys.stderr)
@@ -535,7 +578,7 @@ def cmd_gate(a):
         sys.exit(1)
 
 
-def verify_epoch(dir, key, fmt="omnivoice"):
+def verify_epoch(dir, key, fmt="omnivoice", min_model_bytes=0, min_optimizer_bytes=0, allow_weights_only=False):
     """Check one numbered checkpoint dir against its SHA256SUMS; return its file
     hashes. Writes no VERIFIED and clears no marker: a run is verified as a whole."""
     dir = Path(dir)
@@ -545,8 +588,10 @@ def verify_epoch(dir, key, fmt="omnivoice"):
         sys.exit(f"verify-epoch: {dir} is not a directory")
     if ep.is_symlink() or not ep.is_dir():
         sys.exit(f"verify-epoch: {ep} is not a directory")
-    checker = _check_ckpt if fmt == "omnivoice" else _check_epoch
-    per, problems = checker(ep)
+    if fmt == "omnivoice":
+        per, problems = _check_ckpt(ep, min_model_bytes, min_optimizer_bytes, allow_weights_only)
+    else:
+        per, problems = _check_epoch(ep)
     if problems:
         for p in problems:
             print(p, file=sys.stderr)
@@ -555,12 +600,31 @@ def verify_epoch(dir, key, fmt="omnivoice"):
     return per
 
 
+def _floors(a):
+    """(min_model_bytes, min_optimizer_bytes) for the CLI: the flag, else the
+    VI_MIN_MODEL_BYTES / VI_MIN_OPTIMIZER_BYTES environment variable (the local
+    rehearsal's stub trainer writes tiny files), else the real-size default.
+    Omnivoice mode only; epoch mode has no floor."""
+    if a.format != "omnivoice":
+        return 0, 0
+    def pick(flag, env, default):
+        if flag is not None:
+            return flag
+        if os.environ.get(env, "").isdigit():
+            return int(os.environ[env])
+        return default
+    return (pick(a.min_model_bytes, "VI_MIN_MODEL_BYTES", MIN_MODEL_BYTES),
+            pick(a.min_optimizer_bytes, "VI_MIN_OPTIMIZER_BYTES", MIN_OPTIMIZER_BYTES))
+
+
 def cmd_verify(a):
-    verify(a.dir, a.expect, a.format)
+    mm, mo = _floors(a)
+    verify(a.dir, a.expect, a.format, mm, mo, a.weights_only_older)
 
 
 def cmd_verify_epoch(a):
-    verify_epoch(a.dir, a.key, a.format)
+    mm, mo = _floors(a)
+    verify_epoch(a.dir, a.key, a.format, mm, mo, a.weights_only)
 
 
 def cmd_prune(a):
@@ -573,7 +637,8 @@ def cmd_prune(a):
             sys.exit("prune: --keep is required in epoch mode")
         if a.exempt_step:
             sys.exit("prune: --exempt-step is omnivoice-mode only")
-    prune(a.dir, a.keep, a.yes, a.format, exempt, a.refresh_verified)
+    mm, mo = _floors(a)
+    prune(a.dir, a.keep, a.yes, a.format, exempt, a.refresh_verified, mm, mo, a.weights_only_older)
 
 
 def cmd_abandon(a):
@@ -585,6 +650,15 @@ def cmd_audit(a):
     word = "epoch dirs" if a.format == "epoch" else "checkpoint dirs"
     for run, n in audit(a.root, a.format, exempt):
         print(f"{run}: {n} {word}")
+
+
+def _add_floor_flags(sp):
+    sp.add_argument("--min-model-bytes", type=int, default=None,
+                    help=f"omnivoice mode: smallest model weights file (default {MIN_MODEL_BYTES}, "
+                         "or $VI_MIN_MODEL_BYTES)")
+    sp.add_argument("--min-optimizer-bytes", type=int, default=None,
+                    help=f"omnivoice mode: smallest optimizer.bin of a full checkpoint (default "
+                         f"{MIN_OPTIMIZER_BYTES}, or $VI_MIN_OPTIMIZER_BYTES)")
 
 
 def main(argv=None):
@@ -602,9 +676,16 @@ def main(argv=None):
     v = sub.add_parser("verify", help="check every checkpoint's SHA256SUMS and write VERIFIED")
     v.add_argument("dir", type=Path)
     v.add_argument("--expect", type=int, required=True)
+    _add_floor_flags(v)
+    v.add_argument("--weights-only-older", action="store_true",
+                   help="omnivoice mode: accept weights-only checkpoints below the newest step; "
+                        "the newest (the resume point) must be full")
     e = sub.add_parser("verify-epoch", help="check one checkpoint's SHA256SUMS; write nothing")
     e.add_argument("dir", type=Path)
     e.add_argument("key", type=int)
+    _add_floor_flags(e)
+    e.add_argument("--weights-only", action="store_true",
+                   help="omnivoice mode: accept this checkpoint without optimizer/scheduler/rng state")
     p = sub.add_parser("prune", help="keep at most two verified checkpoints")
     p.add_argument("dir", type=Path)
     p.add_argument("--keep", type=int, default=None, help="epoch mode only: the pivot epoch to keep")
@@ -613,6 +694,9 @@ def main(argv=None):
                    help="verify every checkpoint and write VERIFIED first (mid-run pruning); never clears markers")
     p.add_argument("--exempt-step", type=int, action="append", default=None,
                    help="omnivoice mode only: a step exempt from pruning (default 1000, 2500)")
+    _add_floor_flags(p)
+    p.add_argument("--weights-only-older", action="store_true",
+                   help="omnivoice mode: older checkpoints may be weights-only (see verify)")
     b = sub.add_parser("abandon", help="mark a run dir as given up on; keep every file")
     b.add_argument("dir", type=Path)
     b.add_argument("--reason", required=True, help="why this run is being abandoned")

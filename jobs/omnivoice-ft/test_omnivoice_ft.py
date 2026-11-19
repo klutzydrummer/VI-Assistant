@@ -418,3 +418,63 @@ def test_inference_refuses_a_tampered_checkpoint(tiny_run, tmp_path):
                          tokens_only=True, fake_tokenizer=True)
     with pytest.raises(SystemExit):
         IL.run_inference(cfg)
+
+
+# ---------------------------------------------------------------------------
+# home_realpath_check.py --save: save / resume / reload proof (F-CKPT-1), F-HOME-3 disk guard
+# ---------------------------------------------------------------------------
+
+
+def test_realpath_save_tiny_synthetic(tmp_path):
+    """The --save code path (prove_save) on the tiny synthetic model: save checkpoint-1,
+    resume it for one more step, save checkpoint-2, reload it."""
+    import home_realpath_check as H
+    from style_omnivoice import StyleOmniVoice
+
+    out = tmp_path / "run"
+    logs = []
+
+    def make_cfg(steps, resume_from):
+        return _tiny_cfg(str(out), steps=steps, save_steps=1, kl_weight=1.0,
+                         resume_from_checkpoint=str(resume_from) if resume_from else None)
+
+    def resume(ck1):
+        trainer, _ = TF.run_training(make_cfg(2, ck1))
+        assert trainer.global_step == 2
+
+    reloaded = {}
+
+    def reload(ck2):
+        m = StyleOmniVoice.from_pretrained(str(ck2), train=True, dtype=torch.float32)
+        reloaded["n"] = sum(p.numel() for p in m.parameters())
+
+    res = H.prove_save(out, make_cfg, resume, reload, log=logs.append)
+    assert res["checkpoint_bytes"] > 0 and res["checkpoint_bytes_label"] == "measured"
+    assert reloaded["n"] > 0
+    assert TF.verify_checkpoint(str(out / "checkpoint-1"))["ok"]
+    assert TF.verify_checkpoint(str(out / "checkpoint-2"))["ok"]
+    assert any("fresh process resumed" in m for m in logs)
+
+
+def test_realpath_save_refuses_low_disk(tmp_path, monkeypatch, capsys):
+    """F-HOME-3: --save refuses (exit 3, clear message) below calculated checkpoint size + 20 GB."""
+    import home_realpath_check as H
+
+    need = 2 * H.calc_checkpoint_bytes() + int(20 * 1e9)
+    H.check_save_disk(tmp_path, free=need)  # exactly enough: allowed
+    with pytest.raises(H.SaveRefused, match="needs"):
+        H.check_save_disk(tmp_path, free=need - 1)
+    # end to end through main(): inject a fake free-space value; nothing is written
+    monkeypatch.setattr(H, "free_bytes", lambda p: 10 * 10**9)
+    monkeypatch.setattr(H, "mem_available_mb", lambda *a: 64000)
+    scratch = tmp_path / "scratch"
+    rc = H.main(["--data", str(tmp_path), "--base", str(tmp_path), "--scratch", str(scratch), "--save"])
+    assert rc == H.EXIT_REFUSED
+    assert "REFUSED" in capsys.readouterr().out
+    assert not (scratch / "result.json").exists()
+
+
+def test_realpath_save_ram_skip_is_not_proof():
+    import home_realpath_check as H
+
+    assert H.calc_checkpoint_bytes() == 3 * 2_450_344_112
