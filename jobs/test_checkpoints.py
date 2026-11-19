@@ -385,6 +385,24 @@ class SizeFloorAndWeightsOnlyTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("nothing to delete", r.stdout)
 
+    def test_checkpoints_ignores_weights_manifest(self):
+        # voicetune-fresh.sh writes SHA256SUMS.weights beside SHA256SUMS; it is not a stray file.
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            _ckpt(run, 10, self.WEIGHTS_ONLY)
+            _ckpt(run, 20, self.FULL)
+            for step in (10, 20):
+                (run / f"checkpoint-{step}" / checkpoints.WEIGHTS_MANIFEST).write_text(
+                    "".join(f"{'0' * 64}  {n}\n" for n in self.WEIGHTS_ONLY))
+            checkpoints.verify_epoch(run, 20)
+            checkpoints.verify_epoch(run, 10, allow_weights_only=True)
+            out = checkpoints.verify(run, 2, weights_only_older=True)
+            self.assertEqual(set(out), {"checkpoint-10", "checkpoint-20"})
+            # the name is exempt only as that exact file; another unlisted file is still flagged
+            (run / "checkpoint-20" / "extra.bin").write_bytes(b"x")
+            with self.assertRaises(SystemExit):
+                checkpoints.verify_epoch(run, 20)
+
     def test_verify_epoch_weights_only_flag(self):
         with tempfile.TemporaryDirectory() as d:
             run = Path(d) / "run"

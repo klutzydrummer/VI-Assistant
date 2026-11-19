@@ -237,8 +237,10 @@ EOF
       while :; do
         if push_once "$@"; then return 0; else rc=$?; fi
         # rsync(1): 5 protocol start, 10 socket I/O, 12 data stream,
-        # 30 data timeout, 35 daemon-connect timeout. Everything else is real.
-        case " 5 10 12 30 35 " in *" $rc "*) ;; *) return "$rc" ;; esac
+        # 20 received SIGUSR1/SIGINT (the daemon child gives it when the receiver is
+        # stopped or restarted), 30 data timeout, 35 daemon-connect timeout.
+        # Everything else is real. VI_PUSH_WAIT bounds the whole loop.
+        case " 5 10 12 20 30 35 " in *" $rc "*) ;; *) return "$rc" ;; esac
         [ "$(date +%s)" -lt "$deadline" ] || {
           echo "worker-return: giving up after rsync exit $rc (waited ${wait_s}s)" >&2
           return "$rc"

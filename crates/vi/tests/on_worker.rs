@@ -2218,6 +2218,133 @@ fn omnivoice_checkpoints_are_acked_mid_run_and_pruned() {
     );
 }
 
+/// A weights-only checkpoint, as the two-part push leaves it on home: config,
+/// weights, tokenizer, a SHA256SUMS that lists them, and the extra
+/// SHA256SUMS.weights manifest the first part carries.
+const WEIGHTS_ONLY_SHELL: &str = r#"
+mkw() {
+  d=voicetune-fresh/run/checkpoint-$1
+  mkdir -p "$d"
+  for f in config.json tokenizer.json; do
+    printf '%s-%s' "$f" "$1" > "$d/$f"
+  done
+  head -c "$2" /dev/zero | tr '\0' 'a' > "$d/model.safetensors"
+  printf 'step-%s' "$1" >> "$d/model.safetensors"
+  ( cd "$d" && sha256sum $(ls) > ../S.$1 ) && cp "voicetune-fresh/run/S.$1" "$d/SHA256SUMS.weights" && mv "voicetune-fresh/run/S.$1" "$d/SHA256SUMS"
+}
+"#;
+
+/// Round 12 fix 4: the home supervisor acks an older weights-only checkpoint
+/// (with its extra SHA256SUMS.weights file), keeps it through the mid-run prune,
+/// and the final verify accepts it because the newest checkpoint is full.
+#[test]
+fn onworker_acks_weights_only_older() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = String::from("set -e\n");
+    job += CKPT_SHELL;
+    job += WEIGHTS_ONLY_SHELL;
+    job += "mkw 500 64\nwait_ack 500\nmk 1000 64\nwait_ack 1000\n";
+    job += "echo done > \"$VI_OUT/done.txt\"\n";
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "wo-older",
+        &job,
+        "checkpoint_format = \"omnivoice\", expect_epochs = 2",
+        &envs,
+    );
+    let status = wait_stage(&mut child, 240);
+    let err = err_text(&err_path);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains("checkpoint 500 verified home and acked"),
+        "{err}"
+    );
+    assert!(
+        err.contains("checkpoint 1000 verified home and acked"),
+        "{err}"
+    );
+    assert!(!err.contains("failed verification"), "{err}");
+    let durable = maybe_durable(dir.path()).expect("no durable dir");
+    assert_eq!(
+        ckpt_names(&durable),
+        vec!["checkpoint-1000", "checkpoint-500"],
+        "{err}"
+    );
+    assert!(!durable.join("checkpoint-500/optimizer.bin").exists());
+    assert!(durable.join("checkpoint-1000/optimizer.bin").is_file());
+    assert!(durable.join("VERIFIED").is_file());
+}
+
+/// The newest checkpoint is the only resume point, so a weights-only newest one
+/// is refused by the final verify even though the per-checkpoint ack allows it.
+#[test]
+fn onworker_refuses_weights_only_newest() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = String::from("set -e\n");
+    job += CKPT_SHELL;
+    job += WEIGHTS_ONLY_SHELL;
+    job += "mk 500 64\nwait_ack 500\nmkw 1000 64\nwait_ack 1000\n";
+    job += "echo done > \"$VI_OUT/done.txt\"\n";
+    let mut envs = poll_env();
+    envs.push(("VI_PUSH_SECONDS", "1".to_string()));
+    let (mut child, err_path) = start_stage(
+        dir.path(),
+        "wo-newest",
+        &job,
+        "checkpoint_format = \"omnivoice\", expect_epochs = 2",
+        &envs,
+    );
+    let status = wait_stage(&mut child, 240);
+    let err = err_text(&err_path);
+    assert!(
+        !status.success(),
+        "a weights-only newest checkpoint was accepted: {err}"
+    );
+    // The per-checkpoint ack let the weights-only copy through; the final verify refused it.
+    assert!(
+        err.contains("checkpoint 1000 verified home and acked"),
+        "{err}"
+    );
+    assert!(err.contains("on-worker.sh: verify failed for"), "{err}");
+    assert!(
+        err.contains("checkpoint-1000/SHA256SUMS: does not list ['optimizer.bin']"),
+        "{err}"
+    );
+}
+
+/// Round 12 fix 2: the hours left that the orchestrator sets for the run reach
+/// the stage on the worker.
+#[test]
+fn on_worker_forwards_hours_left() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_with(
+        dir.path(),
+        "echo \"${VI_HOURS_LEFT:-unset}\" > \"$VI_OUT/hours.txt\"",
+        &[("VI_HOURS_LEFT", "3.25".to_string())],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(
+        fs::read_to_string(got.join("hours.txt")).unwrap().trim(),
+        "3.25"
+    );
+}
+
 /// The work dir the run left behind, if any (a successful run removes it).
 fn kept_or_gone(dir: &Path) -> Option<PathBuf> {
     fs::read_dir(dir.join("worker"))

@@ -653,9 +653,19 @@ if [ "$reattach" = 0 ]; then
   done
 fi
 
+# Older checkpoints may be home as weights only (voicetune-fresh.sh weights_first). The ack accepts
+# a weights-only checkpoint; the end-of-stage verify still insists the newest one is full.
+weights_only_flag=; weights_only_older_flag=
+if [ "$ckpt_format" = omnivoice ]; then
+  weights_only_flag=--weights-only
+  weights_only_older_flag=--weights-only-older
+fi
+
 exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$work/settings.json") VI_WORKER=1 VI_RETURN_PORT=$(q "$worker_port")"
 [ -n "$checkpoint" ] && exports+=" VI_CHECKPOINT=$(q "$work/checkpoint")"
 [ -n "$durable" ] && exports+=" VI_PUBLISH=vi-publish"
+# The hours left in the run's cap, so the worker's ETA warning measures against the real budget.
+[ -z "${VI_HOURS_LEFT:-}" ] || exports+=" VI_HOURS_LEFT=$(q "$VI_HOURS_LEFT")"
 
 if [ "$reattach" = 0 ]; then
   # Preflight: time a small upload and stop before sending the inputs if they'd
@@ -834,7 +844,7 @@ ack_epochs() {  # ACKED REPUSH BAD
     case $repush in *" $name "*) continue ;; esac
     case $bad in *" $name "*) continue ;; esac
     [ -f "$ep/SHA256SUMS" ] || continue
-    if python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify-epoch "$durable" "$n" >/dev/null 2>&1; then
+    if python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify-epoch "$durable" "$n" $weights_only_flag >/dev/null 2>&1; then
       if remote "mkdir -p $(q "$work/acked") && : > $(q "$work/acked/$name")"; then
         echo "on-worker.sh: $ckpt_prefix $n verified home and acked" >&2
         newly=1
@@ -850,7 +860,7 @@ ack_epochs() {  # ACKED REPUSH BAD
     fi
   done
   if [ "$newly" = 1 ] && [ "$ckpt_format" = omnivoice ]; then
-    if python3 "$jobs_dir/checkpoints.py" --format omnivoice prune "$durable" --refresh-verified --yes >&2; then
+    if python3 "$jobs_dir/checkpoints.py" --format omnivoice prune "$durable" --refresh-verified --weights-only-older --yes >&2; then
       :
     else
       echo "on-worker.sh: prune skipped this pass (a checkpoint is unverified or still arriving); it runs again after the next ack" >&2
@@ -1119,7 +1129,7 @@ if [ "$final_ok" = 1 ]; then
     expect_epochs=0
   fi
   if [ -n "$durable" ]; then
-    if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify "$durable" --expect "$expect_epochs"; then
+    if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify "$durable" --expect "$expect_epochs" $weights_only_older_flag; then
       echo "on-worker.sh: verify failed for $durable" >&2
       exit 1
     fi

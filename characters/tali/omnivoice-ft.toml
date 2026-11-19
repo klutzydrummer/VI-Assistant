@@ -98,3 +98,6 @@ min_ram_gb = 28
 min_cuda_version = "12.8"
 min_cpu_cores = 4
 min_push_mb_s = 2.5
+# Older checkpoints may stay home as weights only (the newest is always full). Set false to push
+# every checkpoint in full. jobs/voicetune-fresh.sh reads this from the settings JSON.
+weights_first = true

@@ -976,6 +976,7 @@ class PaidRun:
         env = dict(os.environ)
         if self.config_path:
             env["VI_CLOUD_CONFIG"] = str(self.config_path)
+        env.update(getattr(self, "extra_env", {}))
         return env
 
     def run(self, argv, stream=True, watch=False, train=False, timeout=None):
@@ -1173,7 +1174,7 @@ class PaidRun:
             f"run id          : {a.run_id}",
             f"cap (all tries) : ${a.cap:.2f}",
             f"max hours (all) : {a.max_hours} h",
-            f"max attempts    : {a.max_attempts} (a retry only after a failed cheap worker gate)",
+            f"max attempts    : {a.max_attempts} (every attempt counts, including a rental that failed to start)",
             f"vi binary       : {self.vi}",
             f"run config      : {a.config}",
             self.disk_line,
@@ -1457,6 +1458,11 @@ class PaidRun:
         while True:
             _, hours_left = self.remaining()
             left = max(1 / 60, hours_left - (clock() - at["started"]) / 3600)
+            # the worker's ETA warning reads this (on-worker.sh forwards it); refreshed on every
+            # in-place restart, so it shrinks as the run uses its hours. The stale "projected"
+            # marker ($work/eta.warned) is not reset: a restart that is still too slow was
+            # already warned about once.
+            self.extra_env = {**getattr(self, "extra_env", {}), "VI_HOURS_LEFT": f"{left:.2f}"}
             rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_train"],
                                watch=True, train=True, timeout=left * 3600)
             if rc == 0:
@@ -1504,11 +1510,12 @@ class PaidRun:
                     raise StopRequested("stop requested; nothing was rented")
                 n = len(self.s["attempts"]) + 1
                 cap_left, hours_left = self.remaining()
-                # an offer that never booked cost nothing, so it does not use up an attempt
-                billed = sum(1 for x in self.s["attempts"] if x.get("outcome") != "up-failed")
-                if billed >= a.max_attempts:
-                    raise Stop(EXIT["push"], f"a cheap worker gate failed on all {a.max_attempts}"
-                               " attempts allowed")
+                # Every attempt counts, including one whose `vi cloud up` failed: attempts bound
+                # the number of rentals (a boot timeout bills real minutes), while the cap and
+                # the hours bound the spend. Otherwise a long run of dead offers is unbounded.
+                if len(self.s["attempts"]) >= a.max_attempts:
+                    raise Stop(EXIT["push"], f"all {a.max_attempts} attempts allowed are used "
+                               "(each ended in a failed rental or a failed cheap worker gate)")
                 if hours_left < a.min_hours:
                     raise Stop(EXIT["budget"], f"only {hours_left:.2f} h of the {a.max_hours} h "
                                f"left (under --min-hours {a.min_hours}); not renting again")

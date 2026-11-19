@@ -204,7 +204,7 @@ push_publish() {
   local dir=$1 acked=()
   [ -d "$dir" ] || return 0
   push_repairs
-  if [ "${VI_WEIGHTS_FIRST:-0}" = 1 ]; then
+  if weights_first; then
     push_two_part "$dir"
     return
   fi
@@ -216,9 +216,23 @@ push_publish() {
   fi
 }
 
-# Weights-only publish (F-PUSH-6 c), switched on with VI_WEIGHTS_FIRST=1. Off by default: home's
-# verify in jobs/on-worker.sh does not yet pass --weights-only-older, so it would reject a
-# checkpoint home holds only as weights. Per pass:
+# weights_first: on unless switched off. VI_WEIGHTS_FIRST (1 or 0) wins; else the stage setting
+# weights_first from the $VI_SETTINGS JSON; else on. Home's verify in jobs/on-worker.sh passes
+# --weights-only / --weights-only-older, so it accepts an older checkpoint held as weights only.
+weights_first() {
+  case "${VI_WEIGHTS_FIRST:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  [ -n "${VI_SETTINGS:-}" ] && [ -r "$VI_SETTINGS" ] || return 0
+  python3 - "$VI_SETTINGS" <<'PY'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1])).get("weights_first", True)
+except (OSError, ValueError):
+    value = True
+sys.exit(0 if value not in (False, 0, "0", "false", "False") else 1)
+PY
+}
+
+# Weights-only publish (F-PUSH-6 c). Per pass:
 #   1. weights part: every checkpoint without optimizer.bin, scheduler.bin, random_states_0.pkl
 #      and without SHA256SUMS, but with its own SHA256SUMS.weights (the full manifest minus those
 #      three files), so the weights are checkable the moment they land.
@@ -240,7 +254,7 @@ push_two_part() {
   done
   mapfile -t acked < <(acked_checkpoints)
   part1=(--exclude='*.part' --exclude=SHA256SUMS --exclude=optimizer.bin --exclude=scheduler.bin
-         --exclude=random_states_0.pkl)
+         --exclude=random_states_0.pkl --exclude=SHA256SUMS.weights)
   "$jobs_dir/worker-return.sh" push "$dir" "$mod" "${part1[@]}" "${acked[@]}" || return 1
   mkdir -p "$work/wpushed"
   for c in "$dir"/checkpoint-*; do
@@ -253,7 +267,7 @@ push_two_part() {
   done
   local skipargs=() i
   for ((i = 1; i < ${#skip[@]}; i += 2)); do skipargs+=("${skip[i]}"); done
-  "$jobs_dir/worker-return.sh" push "$dir" "$mod" --exclude='*.part' "${skipargs[@]}" "${acked[@]}" || return 1
+  "$jobs_dir/worker-return.sh" push "$dir" "$mod" --exclude='*.part' --exclude=SHA256SUMS.weights "${skipargs[@]}" "${acked[@]}" || return 1
   for ((i = 0; i < ${#skip[@]}; i += 2)); do
     name=${skip[i]}
     mkdir -p "$stage/$name"
@@ -262,6 +276,19 @@ push_two_part() {
     echo "voicetune-fresh: ${name} is home as weights only (its optimizer state was skipped; a newer checkpoint is home in full)" >&2
   done
   mark_pushed
+}
+
+# push_final DIR: the last push after the trainer exits. A receiver restarting at that moment must
+# not fail a finished run, so it gets 3 tries; VI_FINAL_PUSH_SLEEP (default 20 s) is the pause.
+push_final() {
+  local try
+  for try in 1 2 3; do
+    push_publish "$1" && return 0
+    [ "$try" -lt 3 ] || break
+    echo "voicetune-fresh: final push failed (try $try of 3); retrying" >&2
+    sleep "${VI_FINAL_PUSH_SLEEP:-20}"
+  done
+  return 1
 }
 
 # backlog_check: F-TRN-3. Checkpoints finished here but not yet home pile up on the worker's disk
@@ -808,7 +835,7 @@ print(last)' "$run/style_metrics.jsonl" 2>/dev/null || echo 0)
   set -e
   trap - EXIT HUP TERM
   publish_sync "$run" "$publish"
-  push_publish "$publish"  # push what exists (the final checkpoints, or the ones before an abort)
+  push_final "$publish"  # push what exists (the final checkpoints, or the ones before an abort)
   if [ -n "$reason" ]; then
     echo "train aborted: $reason" >&2
     exit 1

@@ -3,6 +3,7 @@ the kill/resume rehearsal. The script is copied beside stub trainer/replay/token
 no GPU, torch or omnivoice is needed. The stubs log every call to $CALLS."""
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -690,12 +691,161 @@ class PublishSideTest(PreflightHarness):
         staged = (self.scratch / "weights-stage" / "checkpoint-1000" / "SHA256SUMS").read_text()
         self.assertNotIn("optimizer.bin", staged)
         self.assertIn("checkpoint-1000 is home as weights only", r.stderr)
-        # off by default: one ordinary push, optimizer state included
+        # switched off (VI_WEIGHTS_FIRST=0): one ordinary push, optimizer state included
         self.calls.write_text("")
         shutil.rmtree(self.scratch / "publish")
         shutil.rmtree(self.work / "pushed")
-        r = self.mode("push")
+        r = self.mode("push", VI_WEIGHTS_FIRST="0")
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = self.push_calls()
         self.assertEqual(len(calls), 1, calls)
         self.assertNotIn("optimizer.bin", calls[0])
+
+    def reset_push(self):
+        self.calls.write_text("")
+        shutil.rmtree(self.scratch / "publish", ignore_errors=True)
+        shutil.rmtree(self.work / "pushed", ignore_errors=True)
+
+    def test_voicetune_weights_first_settings_key(self):
+        (self.root / "jobs" / "worker-return.sh").write_text(
+            "#!/usr/bin/env bash\necho \"push $*\" >>\"$CALLS\"\nexit 0\n")
+        run = self.scratch / "run"
+        self.make_ck(run, 1000)
+        self.make_ck(run, 2500)
+        settings = self.root / "settings.json"
+        # no env, no settings file: on by default (two-part push)
+        r = self.mode("push")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(len(self.push_calls()), 1)
+        # settings without the key: on
+        settings.write_text("{}")
+        self.reset_push()
+        self.assertEqual(self.mode("push", VI_SETTINGS=str(settings)).returncode, 0)
+        self.assertGreater(len(self.push_calls()), 1)
+        # settings key false: one ordinary push
+        settings.write_text('{"weights_first": false}')
+        self.reset_push()
+        self.assertEqual(self.mode("push", VI_SETTINGS=str(settings)).returncode, 0)
+        self.assertEqual(len(self.push_calls()), 1, self.push_calls())
+        # the env wins over the key, both ways
+        self.reset_push()
+        self.assertEqual(self.mode("push", VI_SETTINGS=str(settings), VI_WEIGHTS_FIRST="1").returncode, 0)
+        self.assertGreater(len(self.push_calls()), 1)
+        settings.write_text('{"weights_first": true}')
+        self.reset_push()
+        self.assertEqual(self.mode("push", VI_SETTINGS=str(settings), VI_WEIGHTS_FIRST="0").returncode, 0)
+        self.assertEqual(len(self.push_calls()), 1)
+
+    def real_ck(self, base, step, full=True):
+        """A checkpoint with real sha256 sums: model 2 MB, optimizer 4 MB (full only)."""
+        d = base / f"checkpoint-{step}"
+        d.mkdir(parents=True)
+        files = {"config.json": b"{}", "tokenizer.json": b"{}",
+                 "model.safetensors": b"m" * 2_000_000 + str(step).encode()}
+        if full:
+            files.update({"optimizer.bin": b"o" * 4_000_000, "scheduler.bin": b"s" * 100,
+                          "random_states_0.pkl": b"r" * 100, "train_config.json": b"{}",
+                          "ft_config.json": b"{}"})
+        lines = []
+        for name, data in files.items():
+            (d / name).write_bytes(data)
+            lines.append(f"{hashlib.sha256(data).hexdigest()}  {name}")
+        (d / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+
+    @staticmethod
+    def home_bytes(publish, step):
+        return sum(f.stat().st_size for f in (publish / f"checkpoint-{step}").rglob("*") if f.is_file())
+
+    def test_voicetune_weights_first_end_to_end(self):
+        """Two checkpoints pushed by the real worker-return.sh to a real loopback receiver,
+        then home's own verify with the flags jobs/on-worker.sh passes. Also records the
+        bytes home holds per checkpoint, with a push that keeps up and with one that lags."""
+        if not shutil.which("rsync"):
+            self.skipTest("rsync is not installed")
+        shutil.copy(JOBS / "worker-return.sh", self.root / "jobs" / "worker-return.sh")
+        shutil.copy(JOBS / "checkpoints.py", self.root / "jobs" / "checkpoints.py")
+        results = {}
+        for label, lag in (("keeping-up", False), ("lagging", True)):
+            base = self.root / label
+            out, ckpt, state, publish = (base / n for n in ("out", "ckpt", "state", "publish"))
+            started = subprocess.run([str(JOBS / "worker-return.sh"), "start", str(out), str(ckpt),
+                                      str(state), str(publish)],
+                                     check=True, capture_output=True, text=True)
+            port = started.stdout.strip()
+            self.addCleanup(subprocess.run, [str(JOBS / "worker-return.sh"), "stop", str(state)],
+                            capture_output=True)
+            run = self.scratch / "run"
+            shutil.rmtree(run, ignore_errors=True)
+            shutil.rmtree(self.work / "pushed", ignore_errors=True)
+            shutil.rmtree(self.work / "wpushed", ignore_errors=True)
+            env = dict(VI_RETURN_PORT=port, VI_PUSH_WAIT="5", VI_WEIGHTS_FIRST=None)
+            self.real_ck(run, 1000)
+            if not lag:
+                r = self.mode("push", **env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            self.real_ck(run, 2500)
+            r = self.mode("push", **env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            sizes = {step: self.home_bytes(publish, step) for step in (1000, 2500)}
+            results[label] = sizes
+            checks = JOBS / "checkpoints.py"
+            os.environ["VI_MIN_MODEL_BYTES"] = os.environ["VI_MIN_OPTIMIZER_BYTES"] = "0"  # stub sizes
+            self.addCleanup(os.environ.pop, "VI_MIN_MODEL_BYTES", None)
+            self.addCleanup(os.environ.pop, "VI_MIN_OPTIMIZER_BYTES", None)
+            for step in (1000, 2500):
+                v = subprocess.run(["python3", str(checks), "--format", "omnivoice", "verify-epoch",
+                                    str(publish), str(step), "--weights-only"],
+                                   capture_output=True, text=True)
+                self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+            v = subprocess.run(["python3", str(checks), "--format", "omnivoice", "verify", str(publish),
+                                "--expect", "2", "--weights-only-older"], capture_output=True, text=True)
+            self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+            # the newest must be full; the old one is weights only only when the push lagged
+            self.assertTrue((publish / "checkpoint-2500" / "optimizer.bin").is_file())
+            self.assertEqual((publish / "checkpoint-1000" / "optimizer.bin").is_file(), not lag)
+            self.assertFalse((publish / "checkpoint-1000" / "SHA256SUMS.weights").exists())
+            self.assertFalse((publish / "checkpoint-2500" / "SHA256SUMS.weights").exists())
+            # without the on-worker flags home refuses the lagging layout (the old behaviour)
+            plain = subprocess.run(["python3", str(checks), "--format", "omnivoice", "verify",
+                                    str(publish), "--expect", "2"], capture_output=True, text=True)
+            self.assertEqual(plain.returncode == 0, not lag, plain.stdout + plain.stderr)
+        print("\nweights-first bytes home per checkpoint:", results)
+        keeping, lagging = results["keeping-up"], results["lagging"]
+        self.assertLess(lagging[1000], keeping[1000])
+        self.assertGreater(keeping[1000] - lagging[1000], 3_900_000)  # optimizer.bin of N-1
+
+    def test_tali_toml_turns_weights_first_on(self):
+        text = (JOBS.parent / "characters" / "tali" / "omnivoice-ft.toml").read_text()
+        train = text.split("[stage.omnivoice_train.settings]")[1]
+        self.assertRegex(train, r"(?m)^weights_first = true$")
+
+    def test_voicetune_final_push_retries(self):
+        jobs = self.root / "jobs"
+        (jobs / "worker-job.sh").write_text("#!/usr/bin/env bash\n" + WORKER_JOB_STUB)
+        (jobs / "worker-job.sh").chmod(0o755)
+        shutil.copy(JOBS / "omnivoice_abort.py", jobs / "omnivoice_abort.py")
+        # worker-return.sh fails the first two pushes of the final push, then succeeds
+        # (only pushes after the trainer wrote $work/rc count; the in-train watchdog pushes are free)
+        flaky = ("#!/usr/bin/env bash\n[ -e \"$VI_RC\" ] || exit 0\n"
+                 "n=$(cat \"$CALLS.n\" 2>/dev/null || echo 0)\n"
+                 "echo $((n + 1)) >\"$CALLS.n\"\n"
+                 "[ \"$n\" -lt \"$VI_FAILS\" ] && exit 20\nexit 0\n")
+        (jobs / "worker-return.sh").write_text(flaky)
+        run = self.scratch / "run"
+        for attempt, (fails, want_rc) in enumerate(((2, 0), (9, 20))):
+            shutil.rmtree(run, ignore_errors=True)
+            run.mkdir(parents=True)
+            (run / "ft_config.json").write_text("{}")
+            (run / "collapse_guard.jsonl").write_text("")
+            (self.work / "rc").unlink(missing_ok=True)
+            Path(str(self.calls) + ".n").unlink(missing_ok=True)
+            r = self.mode("train", VI_TRAIN_STEPS="200", VI_SAVE_STEPS="100", VI_WATCH_SECONDS="0.2",
+                          VI_HOURS_LEFT="8", VI_RC=str(self.work / "rc"), VI_FAILS=str(fails),
+                          VI_FINAL_PUSH_SLEEP="0", VI_WEIGHTS_FIRST="0")
+            if want_rc == 0:
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("final push failed (try 1 of 3)", r.stderr)
+                self.assertNotIn("(try 3 of 3)", r.stderr)
+            else:
+                self.assertNotEqual(r.returncode, 0, "a dead receiver must still fail the run")
+                self.assertIn("final push failed (try 2 of 3)", r.stderr)

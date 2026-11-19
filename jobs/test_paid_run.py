@@ -149,6 +149,7 @@ STUB = textwrap.dedent('''\
                 r = a["train_seq"][min(n, len(a["train_seq"]) - 1)]
                 tick(a.get("train_tick", 0)); save()
             log("train", r)
+            log("hours_left", os.environ.get("VI_HOURS_LEFT"))
             if r == "vanish":
                 st["worker"] = None; save(); print("train: the instance vanished", file=sys.stderr); sys.exit(1)
             if r == "oom":
@@ -1435,6 +1436,29 @@ class Resilience(Base):
         self.assertEqual(self.state()["failed_machines"], [10])
         offer_calls = [c[1] for c in self.calls() if c[0] == "offers"]
         self.assertIn(["--exclude-machine", "10"], offer_calls[1:])
+
+    def test_paid_run_up_failures_count(self):
+        # every `up` fails (offers on different machines, so each is tried): the run stops at
+        # --max-attempts with the attempts message, not only "every listed offer failed"
+        self.scenario([dict(up="gone")],
+                      offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 11, 2), (3, 0.30, 12, 3),
+                                                (4, 0.35, 13, 4), (5, 0.40, 14, 5)))
+        self.assertEqual(self.run_orch(max_attempts=3), 5, self.out)
+        self.assertEqual([u["offer"] for u in self.ups()], ["1", "2", "3"])
+        self.assertIn("all 3 attempts allowed are used", self.out)
+        self.assertNotIn("every listed offer has already failed", self.out)
+        self.assertIn("attempt 3 of 3", self.out)
+        self.assertNotIn("attempt 4 of 3", self.out)
+
+    def test_paid_run_exports_hours_left(self):
+        self.scenario([dict(train_seq=["fail", "pass"], train_tick=0.5, spent=0.1)],
+                      offer_list=machine_offers((1, 0.20, 10, 1), (2, 0.25, 11, 2)))
+        self.assertEqual(self.run_orch(), 0, self.out)
+        left = [float(c[1]) for c in self.calls() if c[0] == "hours_left" and c[1] is not None]
+        self.assertEqual(len(left), 2, self.calls())
+        self.assertLessEqual(left[0], 8.0)
+        self.assertGreater(left[0], 7.0)
+        self.assertLess(left[1], left[0] - 0.4)  # the in-place restart sees the smaller figure
 
     def test_paid_run_all_offers_failed_message(self):
         self.scenario([dict(up="boot_timeout")], ignore_exclude=True,

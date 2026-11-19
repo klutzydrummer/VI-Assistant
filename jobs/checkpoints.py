@@ -44,6 +44,9 @@ import time
 from pathlib import Path
 
 CHECKSUM_NAME = "SHA256SUMS"
+# Written by the worker (voicetune-fresh.sh push_two_part) beside SHA256SUMS: the manifest minus
+# the optimizer/scheduler/rng files. It is a worker-side aid, not part of the checkpoint.
+WEIGHTS_MANIFEST = "SHA256SUMS.weights"
 # A complete OmniVoice checkpoint holds at least one file from each category
 # (jobs/omnivoice-ft/train_ft.py REQUIRED_CHECKPOINT_FILES).
 CKPT_REQUIRED = (
@@ -324,7 +327,7 @@ def _check_ckpt(ck, min_model_bytes=0, min_optimizer_bytes=0, allow_weights_only
         if not p.is_file():
             continue
         rel = p.relative_to(ck).as_posix()
-        if rel == CHECKSUM_NAME:
+        if rel in (CHECKSUM_NAME, WEIGHTS_MANIFEST):
             continue
         if rel not in listed:
             problems.append(f"{ck.name}/{rel}: not listed in {CHECKSUM_NAME}")

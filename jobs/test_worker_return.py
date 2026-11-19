@@ -523,6 +523,87 @@ class WorkerReturnTest(unittest.TestCase):
                                capture_output=True, text=True)
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
+    def rsync_shim(self, body):
+        """A PATH dir whose `rsync` runs `body`; REAL_RSYNC is the genuine binary."""
+        shim = self.root / "shim"
+        shim.mkdir(exist_ok=True)
+        (shim / "rsync").write_text("#!/usr/bin/env bash\n" + body + "\n")
+        (shim / "rsync").chmod(0o755)
+        return {**self.env, "PATH": f"{shim}:{os.environ['PATH']}",
+                "REAL_RSYNC": shutil.which("rsync"), "COUNT": str(self.root / "count")}
+
+    def test_worker_return_retries_exit20(self):
+        # a receiver stopped with SIGTERM gives the client exit 20; it must be retried
+        (self.src / "out" / "a.txt").write_text("alpha\n")
+        env = self.rsync_shim('n=$(cat "$COUNT" 2>/dev/null || echo 0); echo $((n + 1)) >"$COUNT"\n'
+                              '[ "$n" -ge 2 ] || exit 20\nexec "$REAL_RSYNC" "$@"')
+        result = self.push(self.src / "out", "vi-out", env=env, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.out / "a.txt").read_text(), "alpha\n")
+        self.assertEqual((self.root / "count").read_text().strip(), "3")
+        self.assertIn("rsync exit 20; retrying", result.stderr)
+
+    def test_worker_return_exit20_gives_up_after_push_wait(self):
+        (self.src / "out" / "a.txt").write_text("alpha\n")
+        env = self.rsync_shim("exit 20")
+        env["VI_PUSH_WAIT"] = "3"
+        started = time.time()
+        result = self.push(self.src / "out", "vi-out", env=env, check=False)
+        self.assertEqual(result.returncode, 20, result.stderr)
+        self.assertIn("worker-return: giving up after rsync exit 20 (waited 3s)", result.stderr)
+        self.assertLess(time.time() - started, 15)
+
+    def test_push_survives_receiver_sigterm_mid_push(self):
+        megabytes = 120
+        data = self.src / "out" / "big.bin"
+        with data.open("wb") as f:
+            for _ in range(megabytes):
+                f.write(os.urandom(1 << 20))
+        log = (self.root / "sigterm-push.log").open("w")
+        push = subprocess.Popen(
+            [SCRIPT, "push", str(self.src / "out"), "vi-out", "--bwlimit=20000"],
+            env={**self.env, "VI_PUSH_WAIT": "30"}, stdout=log, stderr=log, start_new_session=True)
+        pid_file = self.state / "rsyncd.pid"
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                received = sum(p.stat().st_size for p in self.out.rglob("*") if p.is_file())
+                if received >= megabytes * (1 << 20) // 3:
+                    break
+                if push.poll() is not None:
+                    self.fail("push finished before the receiver was stopped")
+                time.sleep(0.05)
+            else:
+                self.fail("timed out waiting for part of the push")
+            pid = int(pid_file.read_text().split()[0])
+            # SIGTERM to the daemon and its connection child, as stopping the receiver does
+            subprocess.run(["pkill", "-TERM", "-f", "--", str(self.state / "rsyncd.conf")])
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            # the old receiver's owner lock goes free once its last child is gone
+            for _ in range(100):
+                if subprocess.run(["flock", "-n", str(self.state / "owner.lock"), "true"]).returncode == 0:
+                    break
+                time.sleep(0.1)
+            restarted = subprocess.run([SCRIPT, "restart", self.state], capture_output=True, text=True)
+            self.assertEqual(restarted.returncode, 0, restarted.stderr)
+            self.assertEqual(push.wait(timeout=60), 0, (self.root / "sigterm-push.log").read_text())
+        finally:
+            if push.poll() is None:
+                os.killpg(push.pid, 9)
+                push.wait(timeout=5)
+            log.close()
+        self.assertEqual(hashlib.sha256((self.out / "big.bin").read_bytes()).hexdigest(),
+                         hashlib.sha256(data.read_bytes()).hexdigest())
+        text = (self.root / "sigterm-push.log").read_text()
+        print(f"\nsigterm-mid-push log: {text.strip()[-300:]!r}; "
+              f".rsync-partial used: {any('.rsync-partial' in p.parts for p in self.out.rglob('*'))}")
+
     def test_partial_epoch_never_verifies(self):
         epoch = self.interrupt_publish(32)
         self.assertFalse((epoch / "talker.safetensors").exists())
