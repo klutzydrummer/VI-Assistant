@@ -33,7 +33,11 @@ from torch.utils.data import DataLoader
 _OMNISTYLE = Path(__file__).resolve().parents[1] / "omnistyle"
 if str(_OMNISTYLE) not in sys.path:
     sys.path.insert(0, str(_OMNISTYLE))
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
+import ft_guards as FG  # noqa: E402
 import style_data as SD  # noqa: E402
 import smoke_style as S  # noqa: E402
 import train_style as TS  # noqa: E402
@@ -137,6 +141,7 @@ class DataBundle:
     probe_kind: str
     probe_dataset: Any = None
     probe_crops: Any = None  # list of (tokens [B,C,Tc], valid [B,Tc])
+    sample_counter: Any = None  # ft_guards.SampleCounter on the real loader's processor
 
 
 def build_synthetic_bundle(
@@ -221,6 +226,8 @@ def build_shard_bundle(
         instruct_ratio=instruct_ratio,
     )
     collate = SD.StylePaddingCollator(proc, batch_tokens)
+    # Upstream skips a sample whose processing raises; count them so a shrunk set is loud (F-DATA-2).
+    counted = FG.SampleCounter(proc)
 
     def make_dataset(evaluation: bool):
         raw = WebDatasetReader(manifests=manifests, evaluation=evaluation)
@@ -230,7 +237,7 @@ def build_shard_bundle(
             min_length=min_sample_tokens,
             max_length=max_sample_tokens,
             max_sample=max_batch_size,
-            processor=proc,
+            processor=counted,
             length_fn=lambda s: s["length"],
         )
 
@@ -262,12 +269,14 @@ def build_shard_bundle(
             break
     if not crops:
         raise ValueError("probe pass produced no batches; check the data config and tokenised shards")
+    FG.check_sample_counts(counted, "probe pass")
 
     return DataBundle(
         loader=loader,
         tokenizer=tokenizer,
         probe_kind="unsupervised",
         probe_crops=crops,
+        sample_counter=counted,
     )
 
 

@@ -206,6 +206,70 @@ class ResumeWiringTest(unittest.TestCase):
             self.assertIn("--resume-from-checkpoint", invocations[1])
             self.assertIn("--resume-from-checkpoint", invocations[2])
 
+    def _run_script(self, root, script, retries=2, extra=()):
+        """Run worker-job.sh around a python -c script; returns (proc, arg lists per call)."""
+        work, run = root / "work", root / "run"
+        run.mkdir(exist_ok=True)
+        events = root / "memory.events"
+        events.write_text("oom_kill 0\n")
+        log = root / "args.log"
+        env = dict(os.environ, LOG=str(log), VI_MEMORY_EVENTS=str(events))
+        args = ["bash", str(JOBS / "worker-job.sh"), "--work", str(work), "--run", str(run),
+                "--retries", str(retries), "--", sys.executable, "-c", script, *extra]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=120, env=env)
+        calls = [l.split("\x1f") for l in log.read_text().splitlines()] if log.exists() else []
+        return proc, calls
+
+    def test_worker_job_oom_halves_batch(self):
+        # Exit 76 once, then succeed: the retry halves the batch, doubles grad-accum and resumes.
+        script = ("import os, sys; log = os.environ['LOG']; "
+                  "first = not os.path.exists(log); "
+                  "open(log, 'a').write('\\x1f'.join(sys.argv[1:]) + '\\n'); "
+                  "sys.exit(76 if first else 0)")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._checkpoint(root / "run", 1000)
+            proc, calls = self._run_script(
+                root, script, extra=["--batch-tokens", "8192", "--gradient-accumulation-steps", "1"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0], ["--batch-tokens", "8192", "--gradient-accumulation-steps", "1"])
+            self.assertEqual(calls[1], ["--batch-tokens", "4096", "--gradient-accumulation-steps", "2",
+                                        "--resume-from-checkpoint", str(root / "run" / "checkpoint-1000")])
+            rows = [json.loads(l) for l in (root / "work" / "retries.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["reason"], "oom-halve")
+
+    def test_worker_job_oom_uses_defaults_and_stops_at_the_floor(self):
+        # No flags given: the trainer defaults (8192, 1) are made explicit; 8192 -> 4096 -> 2048,
+        # and the next halving would go below the floor, so the job stops with 76.
+        script = ("import os, sys; "
+                  "open(os.environ['LOG'], 'a').write('\\x1f'.join(sys.argv[1:]) + '\\n'); sys.exit(76)")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            proc, calls = self._run_script(root, script, retries=5)
+            self.assertEqual(proc.returncode, 76)
+            self.assertNotIn("--batch-tokens", calls[0])
+            self.assertEqual(len(calls), 3)
+            self.assertEqual([c[c.index("--batch-tokens") + 1] for c in calls[1:]], ["4096", "2048"])
+            self.assertEqual([c[c.index("--gradient-accumulation-steps") + 1] for c in calls[1:]], ["2", "4"])
+            self.assertIn("below the 2048 floor", (root / "work" / "job.log").read_text())
+
+    def test_worker_job_same_traceback_stops(self):
+        # The same traceback line twice is deterministic: one retry, then stop (not a 3rd run).
+        script = ("import os, sys; "
+                  "open(os.environ['LOG'], 'a').write('x\\n'); "
+                  "sys.stderr.write('Traceback (most recent call last):\\n  File \"/a/b.py\", line 7, in f\\n"
+                  "    boom()\\nValueError: boom\\n'); sys.exit(1)")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            proc, calls = self._run_script(root, script, retries=2)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("same traceback line repeated", (root / "work" / "job.log").read_text())
+            rows = [json.loads(l) for l in (root / "work" / "retries.jsonl").read_text().splitlines()]
+            self.assertEqual([r["reason"] for r in rows], ["crash", "same-traceback-stop"])
+            self.assertIn('File "/a/b.py", line 7', rows[1]["signature"])
+
 
 if __name__ == "__main__":
     unittest.main()

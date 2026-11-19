@@ -23,6 +23,12 @@
 # run with VI_NUM_WORKERS=0. Images without cgroup v2 memory.events retry
 # unchanged once.
 #
+# Exit 76 is a GPU out-of-memory (train_ft.py wrote $run/oom.json): the retry halves
+# --batch-tokens and doubles --gradient-accumulation-steps (the same tokens per optimizer
+# step) and resumes; below a batch of 2048 tokens it stops. A retry that fails with the
+# same last traceback line as the attempt before it is deterministic and is not repeated.
+# Every retry decision is appended to $work/retries.jsonl.
+#
 # The rc file outlives a session that died. Relaunching a stopped job belongs
 # to the home supervisor, a later task; this wrapper only records enough to
 # make that relaunch safe.
@@ -143,7 +149,45 @@ trap 'kill "${watch-}" "${sync-}" 2>/dev/null || true' EXIT
 base=("$@")
 cmd=("${base[@]}")
 attempt=0 rc=0
+min_batch_tokens=${VI_MIN_BATCH_TOKENS:-2048}
+retries_log=$work/retries.jsonl
+
+json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n\r'; }
+# log_retry ATTEMPT RC REASON SIG: one JSON line per decision, for the diagnostics.
+log_retry() {
+  printf '{"attempt":%s,"rc":%s,"reason":"%s","signature":"%s","time":"%s"}\n' \
+    "$1" "$2" "$(json_str "$3")" "$(json_str "$4")" "$(date -u +%FT%TZ)" >>"$retries_log" || true
+}
+# last_frame OFFSET: the last traceback frame line this attempt wrote to job.log.
+last_frame() {
+  tail -c +"$(($1 + 1))" "$work/job.log" 2>/dev/null |
+    grep -E '^ +File ".*", line [0-9]+, in ' | tail -n1 || true
+}
+# get_flag NAME DEFAULT: the value of --NAME in base (either "--NAME V" or "--NAME=V").
+get_flag() {
+  local i
+  for ((i = 0; i < ${#base[@]}; i++)); do
+    case ${base[i]} in
+      "$1") echo "${base[i + 1]}"; return ;;
+      "$1"=*) echo "${base[i]#*=}"; return ;;
+    esac
+  done
+  echo "$2"
+}
+# set_flag NAME VALUE: replace --NAME's value in base, or append the flag.
+set_flag() {
+  local i
+  for ((i = 0; i < ${#base[@]}; i++)); do
+    case ${base[i]} in
+      "$1") base[i + 1]=$2; return ;;
+      "$1"=*) base[i]="$1=$2"; return ;;
+    esac
+  done
+  base+=("$1" "$2")
+}
+prev_sig=
 while :; do
+  log_off=$(stat -c %s "$work/job.log" 2>/dev/null || echo 0)
   before=$(oom_kill)
   before=${before:-0}
   # The trainer gets its own session, so it survives this wrapper too; it
@@ -162,17 +206,46 @@ while :; do
     break
   fi
   [ $rc -eq 75 ] && break
-  [ $attempt -ge $retries ] && break
-  if [ $has_oom = 0 ]; then
+  sig=$(last_frame "$log_off")
+  if [ $rc -ne 76 ] && [ -n "$sig" ] && [ "$sig" = "$prev_sig" ]; then
+    log_retry "$attempt" "$rc" "same-traceback-stop" "$sig"
+    echo "worker-job.sh: the same traceback line repeated; not retrying" >&2
+    break
+  fi
+  prev_sig=$sig
+  if [ $attempt -ge $retries ]; then
+    log_retry "$attempt" "$rc" "retries-exhausted" "$sig"
+    break
+  fi
+  if [ $rc -eq 76 ]; then
+    bt=$(get_flag --batch-tokens 8192)
+    ga=$(get_flag --gradient-accumulation-steps 1)
+    if [ $((bt / 2)) -lt "$min_batch_tokens" ]; then
+      log_retry "$attempt" "$rc" "oom-at-floor" "batch_tokens=$bt"
+      echo "worker-job.sh: GPU out of memory at batch_tokens $bt; below the $min_batch_tokens floor, stopping" >&2
+      break
+    fi
+    set_flag --batch-tokens $((bt / 2))
+    set_flag --gradient-accumulation-steps $((ga * 2))
+    log_retry "$((attempt + 1))" "$rc" "oom-halve" "batch_tokens=$((bt / 2)) grad_accum=$((ga * 2))"
+    echo "worker-job.sh: GPU out of memory; batch_tokens $bt -> $((bt / 2)), grad accumulation $ga -> $((ga * 2))" >&2
+  elif [ $has_oom = 0 ]; then
     # No cgroup v2 memory.events (old container or cgroup v1): retry once,
     # unchanged, rather than guess that the failure was an OOM.
-    [ $attempt -ge 1 ] && break
+    if [ $attempt -ge 1 ]; then
+      log_retry "$attempt" "$rc" "no-cgroup-retry-once" "$sig"
+      break
+    fi
+    log_retry "$((attempt + 1))" "$rc" "crash" "$sig"
   else
     after=$(oom_kill)
     after=${after:-0}
     if [ "$after" -gt "$before" ]; then
+      log_retry "$((attempt + 1))" "$rc" "host-oom" "oom_kill $before -> $after"
       export VI_NUM_WORKERS=0
       echo "worker-job.sh: oom_kill $before -> $after; retrying with VI_NUM_WORKERS=0" >&2
+    else
+      log_retry "$((attempt + 1))" "$rc" "crash" "$sig"
     fi
   fi
   attempt=$((attempt + 1))

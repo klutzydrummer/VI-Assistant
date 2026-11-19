@@ -1,0 +1,106 @@
+"""Tests for omnivoice-ft/ft_guards.py (standard library only: no torch, no omnivoice)."""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "omnivoice-ft"))
+import ft_guards as FG
+
+
+class _Processor:
+    """Raises on 30 % of the rows (every row whose index mod 10 is 0, 1 or 2)."""
+
+    text_tokenizer = "tok"
+
+    def __call__(self, sample):
+        if sample % 10 < 3:
+            raise RuntimeError(f"bad row {sample}")
+        return sample
+
+
+def _run_like_upstream(counter, n):
+    """What StreamLengthGroupDataset does: call the processor, silently skip a raise."""
+    kept = 0
+    for i in range(n):
+        try:
+            counter(i)
+            kept += 1
+        except Exception:
+            pass
+    return kept
+
+
+def _data_config(root, lines, repeat=1):
+    lst = root / "data.lst"
+    lst.write_text("".join(l + "\n" for l in lines))
+    cfg = root / "data.json"
+    cfg.write_text(json.dumps({"train": [{"manifest_path": [str(lst)], "repeat": repeat}]}))
+    return str(cfg)
+
+
+class GuardTests(unittest.TestCase):
+    def test_ft_data_counts_skipped_samples(self):
+        counter = FG.SampleCounter(_Processor())
+        self.assertEqual(counter.text_tokenizer, "tok")  # collator attributes pass through
+        self.assertEqual(_run_like_upstream(counter, 100), 70)
+        self.assertEqual((counter.ok, counter.failed), (70, 30))
+        self.assertEqual(len(counter.first_errors), 3)
+        with self.assertRaises(ValueError) as cm:
+            FG.check_sample_counts(counter, "probe pass")
+        msg = str(cm.exception)
+        self.assertIn("ft_data: 30 of 100 samples failed in the processor", msg)
+        self.assertIn("first error: RuntimeError('bad row 0')", msg)
+
+    def test_ft_data_counts_cross_process_workers(self):
+        import multiprocessing as mp
+        counter = FG.SampleCounter(_Processor())
+        p = mp.get_context("fork").Process(target=_run_like_upstream, args=(counter, 20))
+        p.start()
+        p.join()
+        self.assertEqual((counter.ok, counter.failed), (14, 6))
+
+    def test_few_failures_are_tolerated(self):
+        counter = FG.SampleCounter(lambda s: 1 / s)  # one ZeroDivisionError in 1000
+        _run_like_upstream(counter, 1000)
+        self.assertEqual(counter.failed, 1)
+        FG.check_sample_counts(counter, "x")  # 0.1 %, 1 sample: fine
+
+    def test_train_ft_too_few_batches(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _data_config(Path(d), ["a.tar a.jsonl 3 2.0"])
+            with self.assertRaises(ValueError) as cm:
+                FG.check_batches_per_epoch(cfg, 8192)
+            self.assertIn("expected 1 batch per epoch", str(cm.exception))
+            self.assertIn("need at least 50", str(cm.exception))
+
+    def test_enough_batches_pass_and_halving_doubles_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _data_config(Path(d), ["a.tar a.jsonl 500 4000.0"])  # 100000 tokens
+            self.assertEqual(FG.expected_batches_per_epoch(cfg, 8192), 13)
+            self.assertEqual(FG.expected_batches_per_epoch(cfg, 2048), 49)
+            self.assertEqual(FG.check_batches_per_epoch(cfg, 1024), 98)
+
+    def test_missing_seconds_column_uses_target_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = _data_config(Path(d), ["a.tar a.jsonl 1000"])  # 250000 tokens
+            self.assertEqual(FG.expected_batches_per_epoch(cfg, 5000), 50)
+
+    def test_train_ft_resume_allows_equal_product(self):
+        saved = {"batch_tokens": 8192, "gradient_accumulation_steps": 1}
+        self.assertIsNone(FG.resume_product_mismatch(saved, 4096, 2))
+        self.assertIsNone(FG.resume_product_mismatch(saved, 2048, 4))
+        self.assertIsNone(FG.resume_product_mismatch({}, 1, 1))
+        self.assertIn("8192 to 4096", FG.resume_product_mismatch(saved, 4096, 1))
+
+    def test_oom_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = FG.write_oom_json(d, 3, 8192, 123)
+            self.assertEqual(json.load(open(path)),
+                             {"step": 3, "batch_tokens": 8192, "max_memory_allocated": 123})
+
+
+if __name__ == "__main__":
+    unittest.main()

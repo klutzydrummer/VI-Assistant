@@ -59,6 +59,7 @@ from omnivoice.training.config import TrainingConfig  # noqa: E402
 from omnivoice.training.trainer import OmniTrainer  # noqa: E402
 
 import ft_data  # noqa: E402
+import ft_guards as FG  # noqa: E402
 import smoke_style as S  # noqa: E402
 import train_style as TS  # noqa: E402
 from style_omnivoice import StyleOmniVoice, StyleOmniVoiceConfig  # noqa: E402
@@ -77,6 +78,10 @@ REQUIRED_CHECKPOINT_FILES: Dict[str, Tuple[str, ...]] = {
     "pipeline config": ("ft_config.json",),
     "text tokenizer": ("tokenizer.json", "tokenizer_config.json", "fake_tokenizer.json"),
 }
+
+
+# Latest micro-step of this process, so the OOM handler in main() can say where it died.
+_PROGRESS: Dict[str, int] = {"micro_step": 0}
 
 
 class SimulatedKill(RuntimeError):
@@ -137,6 +142,7 @@ class FTTrainConfig:
     min_sample_tokens: int = 50
     max_sample_tokens: int = 2000
     max_batch_size: int = 64
+    min_batches_per_epoch: int = FG.MIN_BATCHES_PER_EPOCH  # F-DATA-2; 0 disables (stub tests)
     batch_size: int = 16  # synthetic loader only
     synthetic_replay_fraction: float = 0.0
 
@@ -441,6 +447,13 @@ def _run_training_once(
     guard_log: List[Dict[str, Any]],
 ) -> Tuple[OmniTrainer, StyleOmniVoice]:
     """One training attempt.  Raises ``train_style.CollapseDetected`` when the guard fires."""
+    if not cfg.synthetic and cfg.data_config and cfg.min_batches_per_epoch > 0:
+        # Lengths only (data.lst rows and seconds): no decode, no labels.
+        n_batches = FG.check_batches_per_epoch(
+            cfg.data_config, cfg.batch_tokens, cfg.min_batches_per_epoch,
+            cfg.max_batch_size, cfg.target_frames,
+        )
+        print(f"train_ft: about {n_batches} batches per epoch at batch_tokens {cfg.batch_tokens}")
     if cfg.synthetic:
         model = S.build_model(
             seed=attempt_seed,
@@ -452,6 +465,7 @@ def _run_training_once(
         model, tokenizer = load_style_model(cfg)
     data = _build_data(cfg, attempt_seed, tokenizer)
     tokenizer = data.tokenizer
+    _PROGRESS["micro_step"] = 0
 
     # Frozen Base snapshot for the KL term (not a submodule: never in state_dict/DDP/checkpoints).
     if cfg.kl_weight > 0:
@@ -471,6 +485,9 @@ def _run_training_once(
 
     def sink(row: Dict[str, Any]):
         counter["n"] += 1
+        _PROGRESS["micro_step"] = counter["n"]
+        if counter["n"] == 50 and data.sample_counter is not None:
+            FG.check_sample_counts(data.sample_counter, "first 50 micro-steps")
         if counter["n"] % cfg.logging_steps == 0 or counter["n"] == 1:
             with open(metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"micro_step": counter["n"], "attempt": attempt,
@@ -530,6 +547,11 @@ def _check_resume_config(cfg: FTTrainConfig):
             f"resume config mismatch in {path}: {bad}; the checkpoint's architecture must be reused "
             "(pass the same flags, or edit the saved ft_config.json deliberately)"
         )
+    # worker-job.sh halves batch_tokens and doubles grad-accum after a GPU OOM (exit 76); the
+    # tokens per optimizer step, and so the data and schedule, must not change.
+    why = FG.resume_product_mismatch(saved, cfg.batch_tokens, cfg.gradient_accumulation_steps)
+    if why:
+        raise SystemExit(f"resume config mismatch in {path}: {why}")
 
 
 def run_training(cfg: FTTrainConfig) -> Tuple[OmniTrainer, StyleOmniVoice]:
@@ -604,6 +626,8 @@ def _add_common(ap: argparse.ArgumentParser):
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--logging-steps", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=16, help="synthetic loader only")
+    ap.add_argument("--min-batches-per-epoch", type=int, default=FG.MIN_BATCHES_PER_EPOCH,
+                    help="fail before training when the data gives fewer batches per epoch; 0 disables")
     ap.add_argument("--no-collapse-guard", action="store_true")
     ap.add_argument("--guard-attempts", type=int, default=3)
     ap.add_argument("--guard-warmup", type=int, default=200)
@@ -652,6 +676,7 @@ def config_from_args(a: argparse.Namespace) -> FTTrainConfig:
         num_workers=a.num_workers,
         logging_steps=a.logging_steps,
         batch_size=a.batch_size,
+        min_batches_per_epoch=a.min_batches_per_epoch,
         guard=not a.no_collapse_guard,
         guard_attempts=a.guard_attempts,
         guard_warmup=a.guard_warmup,
@@ -676,7 +701,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not a.synthetic and not a.data_config:
         ap.error("give --data-config for a real run (or --synthetic for the CPU smoke)")
     cfg = config_from_args(a)
-    trainer, model = run_training(cfg)
+    try:
+        trainer, model = run_training(cfg)
+    except torch.cuda.OutOfMemoryError:
+        peak = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
+        path = FG.write_oom_json(cfg.output_dir, _PROGRESS["micro_step"], cfg.batch_tokens, peak)
+        print(f"train_ft: GPU out of memory at micro-step {_PROGRESS['micro_step']}, "
+              f"batch_tokens {cfg.batch_tokens}; wrote {path}; exit {FG.OOM_EXIT_CODE}", file=sys.stderr)
+        return FG.OOM_EXIT_CODE
+    if torch.cuda.is_available():
+        # The preflight gate reads this line (fail above 90 % of the device).
+        total = torch.cuda.get_device_properties(0).total_memory
+        print(f"train_ft: vram peak {torch.cuda.max_memory_allocated() / 2**30:.2f} of "
+              f"{total / 2**30:.2f} GiB")
     print(json.dumps({"output_dir": cfg.output_dir, "global_step": trainer.global_step,
                       "attempts": getattr(trainer, "guard_attempts", None)}, indent=1))
     return 0

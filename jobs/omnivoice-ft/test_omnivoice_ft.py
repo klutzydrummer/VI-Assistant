@@ -478,3 +478,106 @@ def test_realpath_save_ram_skip_is_not_proof():
     import home_realpath_check as H
 
     assert H.calc_checkpoint_bytes() == 3 * 2_450_344_112
+
+
+# ---------------------------------------------------------------------------
+# WP4 guards: skipped-sample counting, GPU OOM exit 76, equal-product resume
+# ---------------------------------------------------------------------------
+
+
+def test_ft_data_counts_skipped_samples(tmp_path, monkeypatch):
+    """The processor raises on 30 % of rows; upstream would skip them silently, the bundle raises."""
+    import types
+
+    class FakeStream(torch.utils.data.IterableDataset):
+        def __init__(self, raw, batch_duration, min_length, max_length, max_sample, processor, length_fn):
+            self.raw, self.processor = raw, processor
+
+        def __iter__(self):
+            batch = []
+            for row in self.raw:
+                try:
+                    batch.append(self.processor(row))
+                except Exception:
+                    continue  # what upstream does
+                if len(batch) == 2:
+                    yield batch
+                    batch = []
+
+    class FakeRaw:
+        def __init__(self, manifests, evaluation):
+            pass
+
+        def __iter__(self):
+            return iter(range(100))
+
+    class FakeProc:
+        text_tokenizer = None
+
+        def __init__(self, *a, **k):
+            pass
+
+        def __call__(self, i):
+            if i % 10 < 3:
+                raise RuntimeError(f"bad row {i}")
+            return {"style_tokens": torch.zeros(1, 1, 1), "style_valid": torch.ones(1, 1)}
+
+    mods = {
+        "omnivoice.data.batching": types.SimpleNamespace(StreamLengthGroupDataset=FakeStream),
+        "omnivoice.data.dataset": types.SimpleNamespace(
+            WebDatasetReader=FakeRaw, prepare_data_manifests_from_json=lambda p: (["m"], None)),
+        "transformers.trainer_utils": types.SimpleNamespace(seed_worker=lambda *a, **k: None),
+    }
+    for name, mod in mods.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setattr(FD, "StyleShardProcessor", FakeProc)
+    monkeypatch.setattr(FD.SD, "StylePaddingCollator", lambda proc, bt: (lambda b: {
+        "style_tokens": b[0]["style_tokens"], "style_valid": b[0]["style_valid"]}))
+    with pytest.raises(ValueError, match=r"ft_data: \d+ of \d+ samples failed in the processor"):
+        FD.build_shard_bundle("cfg.json", None, num_workers=0, probe_batches=50)
+
+
+def test_train_ft_too_few_batches(tmp_path):
+    lst = tmp_path / "data.lst"
+    lst.write_text("a.tar a.jsonl 3 2.0\n")
+    cfgp = tmp_path / "data.json"
+    cfgp.write_text(json.dumps({"train": [{"manifest_path": [str(lst)], "repeat": 1}]}))
+    cfg = _tiny_cfg(str(tmp_path / "run"), synthetic=False, data_config=str(cfgp))
+    with pytest.raises(ValueError, match="expected 1 batch per epoch, need at least 50"):
+        TF._run_training_once(cfg, 0, 0, [])
+
+
+def test_train_ft_oom_exit_76(tmp_path, monkeypatch):
+    """The model forward raises a CUDA OOM at micro-step 3: exit 76 and oom.json, no crash."""
+    from style_omnivoice import StyleOmniVoice
+
+    real_forward = StyleOmniVoice.forward
+    calls = {"n": 0}
+
+    def forward(self, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (test)")
+        return real_forward(self, *a, **k)
+
+    monkeypatch.setattr(StyleOmniVoice, "forward", forward)
+    out = str(tmp_path / "run")
+    rc = TF.main(["--synthetic", "--output-dir", out, "--steps", "10", "--save-steps", "100",
+                  "--batch-size", "4", "--mixed-precision", "no", "--kl-weight", "0",
+                  "--no-collapse-guard", "--batch-tokens", "8192"])
+    assert rc == 76
+    info = json.load(open(os.path.join(out, "oom.json")))
+    assert info["batch_tokens"] == 8192 and info["step"] >= 1
+
+
+def test_train_ft_resume_allows_equal_product(tmp_path):
+    ck = tmp_path / "checkpoint-5"
+    ck.mkdir()
+    saved = TF._config_dict(_tiny_cfg(str(tmp_path / "run"), batch_tokens=8192, gradient_accumulation_steps=1))
+    (ck / "ft_config.json").write_text(json.dumps(saved))
+    ok = _tiny_cfg(str(tmp_path / "run"), batch_tokens=4096, gradient_accumulation_steps=2,
+                   resume_from_checkpoint=str(ck))
+    TF._check_resume_config(ok)  # same tokens per optimizer step: allowed
+    bad = replace(ok, gradient_accumulation_steps=1)
+    with pytest.raises(SystemExit, match="product"):
+        TF._check_resume_config(bad)
