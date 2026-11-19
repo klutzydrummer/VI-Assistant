@@ -25,6 +25,8 @@ Exit codes:
   8 interrupted (SIGINT/SIGTERM); worker released
   9 THE WORKER COULD NOT BE RELEASED: check `vi cloud status` now
  10 no offer or budget left to try (cap, hours, or offers exhausted)
+  11 home or the rented disk is too small (checked before renting)
+  12 a clip id in the data folder would break WebDataset (checked before renting)
   1 anything unexpected (worker release is still attempted)
 
 Watching and stopping a run (no vi call unless --credit; neither command can rent, retry or
@@ -47,6 +49,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -105,7 +108,7 @@ STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
-            release=9, budget=10, disk=11, other=1)
+            release=9, budget=10, disk=11, ids=12, other=1)
 
 # The worker's preflight (jobs/voicetune-fresh.sh, `min_disk = float(os.environ.get(
 # "VI_MIN_DISK_GB", "100"))`) refuses a worker with less free disk than this many GiB. The
@@ -117,6 +120,62 @@ GATE_FALLBACK_GB = 100.0
 DISK_OVERHEAD_GB = 5.0
 # Vast's offer filter default when a run config sets no disk_gb (crates/cloud/src/config.rs).
 CONFIG_DEFAULT_DISK_GB = 60.0
+
+
+# Run logging. Everything this script prints is also appended to <run dir>/run.log (capped), and
+# before a FAILED worker is destroyed a bounded diagnostics file is pulled into the run dir.
+RUN_LOG_MAX_BYTES = 200 * 1024 * 1024
+DIAG_MAX_BYTES = 256 * 1024
+DIAG_TIMEOUT_SECONDS = 25.0
+# Run on the worker through `vi cloud ssh`; every part is bounded by head/tail and `timeout`.
+DIAG_SCRIPT = r"""
+exec 2>&1
+echo "== date: $(date -u +%FT%TZ)"
+echo "== nvidia-smi (raw)"
+timeout 10 nvidia-smi 2>&1 | head -n 80 || echo "(nvidia-smi failed or is missing)"
+echo "== pip freeze, worker venv(s)"
+for v in "$HOME"/.cache/vi/venv-*; do
+  [ -x "$v/bin/python" ] || continue
+  echo "-- $v"
+  timeout 15 "$v/bin/python" -m pip freeze 2>&1 | head -n 400
+done
+echo "== job and stage logs (newest two job dirs, last 20 KB of each log)"
+for d in $(ls -dt "${VI_WORKER_ROOT:-/root/vi-jobs}"/*/ 2>/dev/null | head -n 2); do
+  for f in "$d"job.log "$d"out/*.log "$d"out/*/*.log; do
+    [ -f "$f" ] || continue
+    echo "-- $f"
+    tail -c 20000 "$f"
+  done
+done
+""" 
+
+
+class Tee:
+    """A stdout/stderr wrapper that also appends everything to the run log (best effort)."""
+
+    def __init__(self, stream, path):
+        self.stream, self.path, self.written, self.capped = stream, path, 0, False
+
+    def write(self, text):
+        n = self.stream.write(text)
+        if not self.capped:
+            try:
+                with open(self.path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write(text)
+                self.written += len(text)
+                if self.written > RUN_LOG_MAX_BYTES:
+                    self.capped = True
+                    with open(self.path, "a", encoding="utf-8") as f:
+                        f.write(f"\n[run.log reached {RUN_LOG_MAX_BYTES} bytes; no more is written]\n")
+            except OSError:
+                self.capped = True
+        return n
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 class Stop(Exception):
@@ -429,6 +488,69 @@ def bundle_cache_status(stages, repo, home, env):
     return f"bundle cache    : built and current ({', '.join(keys)})"
 
 
+def load_bundle_ids():
+    """jobs/bundle_ids.py by path (this script runs under `python3 -I`, so jobs/ is not on sys.path)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("bundle_ids", REPO / "jobs" / "bundle_ids.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def data_folder(stages, repo):
+    """(folder, why_not): the built omnivoice_data folder the GPU stages read."""
+    corpus, names = bundle_inputs(stages, repo)
+    if not names or "omnivoice_data" not in names:
+        return None, "stage file unreadable or does not list omnivoice_data"
+    cur = corpus / "stages" / "omnivoice_data" / "current"
+    try:
+        folder = cur.parent / cur.read_text().strip() / "out"
+    except OSError:
+        return None, "omnivoice_data has not been built at home"
+    return (folder, None) if folder.is_dir() else (None, f"{folder} is missing")
+
+
+def ids_check(stages, repo):
+    """(ok, lines): every sample id in the real data folder survives WebDataset's key rule."""
+    folder, why = data_folder(stages, repo)
+    if folder is None:
+        return True, [f"clip ids        : not checked ({why})"]
+    ok, problems, summary = load_bundle_ids().check_ids(folder)
+    if ok:
+        return True, [f"clip ids        : OK, {summary} (no '.', unique, labels cover tokens)"]
+    return False, [f"clip ids        : FAIL in {folder}"] + [f"                  - {p}" for p in problems]
+
+
+def stale_markers(state_dir=None, home=None):
+    """Unverified markers whose checkpoint dir is missing or empty: [(marker, dir)]. Read-only."""
+    root = Path(state_dir) if state_dir else vi_state_dir()
+    out = []
+    mdir = root / "unverified"
+    if not mdir.is_dir():
+        return out
+    for m in sorted(mdir.iterdir()):
+        try:
+            d = Path(m.read_text().strip())
+        except OSError:
+            continue
+        if m.is_file() and str(d) and (not d.is_dir() or not any(d.iterdir())):
+            out.append((m, d))
+    return out
+
+
+def stale_marker_lines():
+    found = stale_markers()
+    if not found:
+        return ["stale markers   : none"]
+    lines = [f"stale markers   : {len(found)} unverified marker(s) name an empty or missing "
+             "checkpoint dir; a plain `vi cloud down` refuses while any marker exists. Nothing is "
+             "deleted here. If you agree they are dead, run for each:"]
+    for m, d in found:
+        lines.append(f"                  python3 jobs/checkpoints.py abandon {d} "
+                     "--reason 'empty failed-attempt dir'")
+    return lines
+
+
 def home_check(stages, repo, home=None, env=None):
     """(ok, lines): the home-side checks on-worker.sh makes after renting, made before renting.
 
@@ -555,7 +677,7 @@ class PaidRun:
                     buf.append(line)
                     if stream:
                         print(line, end="", flush=True)
-                    if train:
+                    if train or watch:
                         self.note_line(line)
                 if watch:
                     self.check_stop()
@@ -571,8 +693,8 @@ class PaidRun:
             raise
         finally:
             self.child = None
-            if train:
-                self.write_progress(force=True)
+            if train or watch:
+                self.write_progress(force=True)  # also leaves stage-tail.log for `status`
         return p.returncode, "".join(buf)
 
     # ----- progress and stop requests ------------------------------------------------------
@@ -667,6 +789,7 @@ class PaidRun:
         a = self.a
         self.disk_ok, disk_gb, _, self.disk_line = disk_check(self.base_config_text())
         self.home_ok, home_lines = home_check(a.stages, a.repo)
+        self.ids_ok, ids_lines = ids_check(a.stages, a.repo)
         countries = a.countries or "(from the config)"
         return [
             f"run id          : {a.run_id}",
@@ -678,6 +801,8 @@ class PaidRun:
             self.disk_line,
             disk_cost_line(disk_gb, a.max_hours),
             *home_lines,
+            *ids_lines,
+            *stale_marker_lines(),
             f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision) not verified (needs network)",
             f"countries       : {countries}",
             f"stage file      : {a.stages}",
@@ -731,6 +856,8 @@ class PaidRun:
         """`vi cloud down`, then close the attempt with its spend. Raises Stop(9) if the worker
         cannot be released."""
         self.in_teardown = True
+        if outcome not in ("done", "up-failed"):
+            self.fetch_diagnostics(at, outcome)
         say("releasing the worker (vi cloud down)")
         rc, out = self.vi_cmd("cloud", "down", stream=True)
         if rc != 0:
@@ -758,6 +885,40 @@ class PaidRun:
             self.close_attempt(at, outcome, spent or 0.0, est)
         self.in_teardown = False
         return spent
+
+    def fetch_diagnostics(self, at, outcome):
+        """Best effort, never raises: pull a bounded diagnostics file from the worker into the run
+        dir before it is destroyed. The whole fetch is cut off after DIAG_TIMEOUT_SECONDS (its
+        process group is killed), so it can delay the destroy by at most that long."""
+        limit = float(os.environ.get("PAID_RUN_DIAG_SECONDS", DIAG_TIMEOUT_SECONDS))
+        dest = self.dir / f"diag-attempt-{at['n'] if at else 0}-{outcome}.txt"
+        say(f"saving worker diagnostics before release (at most {limit:.0f} s): {dest}")
+        data, note = b"", ""
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            p = subprocess.Popen([self.vi, "cloud", "ssh", DIAG_SCRIPT], cwd=self.a.repo,
+                                 env=self.env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                data, _ = p.communicate(timeout=limit)
+                if p.returncode != 0:
+                    note = f"(vi cloud ssh exited {p.returncode})"
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                try:
+                    data, _ = p.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    data = b""
+                note = f"(cut off after {limit:.0f} s; what arrived is kept)"
+            if len(data) > DIAG_MAX_BYTES:
+                data, note = data[:DIAG_MAX_BYTES], note + f" (truncated to {DIAG_MAX_BYTES} bytes)"
+        except BaseException as e:  # noqa: BLE001: nothing here may stop the destroy
+            note = f"(diagnostics fetch failed: {type(e).__name__}: {e})"
+        try:
+            dest.write_bytes(data + (f"\n{note}\n".encode() if note else b""))
+            say(f"diagnostics: {len(data)} bytes saved {note}".rstrip())
+        except OSError as e:
+            say(f"(diagnostics could not be written: {e})")
 
     # ----- resume --------------------------------------------------------------------------
     def settle_previous(self):
@@ -838,6 +999,7 @@ class PaidRun:
                                f"left (under --min-hours {a.min_hours}); not renting again")
                 if cap_left <= 0:
                     raise Stop(EXIT["budget"], f"the ${a.cap:.2f} cap is used up")
+                say(f"===== attempt {n} of {a.max_attempts} at {rfc3339(clock())} =====")
                 say(f"attempt {n}: ${cap_left:.2f} and {hours_left:.2f} h left")
                 self.write_attempt_config(n, hours_left)
                 offer = self.choose_offer(hours_left, cap_left)
@@ -875,6 +1037,7 @@ class PaidRun:
                                "that is not a retryable worker gate; the worker was released, no retry")
                 self.set_phase(at, "train")
             # -- train (new or adopted) --
+            say(f"===== train stage (attempt {at['n']}) at {rfc3339(clock())} =====")
             say("preflight passed; starting the train stage")
             rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_train"],
                                watch=True, train=True)
@@ -998,6 +1161,13 @@ class PaidRun:
                   "rented. Free space at home first. Nothing was rented.", file=sys.stderr,
                   flush=True)
             return EXIT["disk"]
+        if not self.ids_ok:
+            print(f"paid-run: STOPPED (exit {EXIT['ids']}): the clip ids in the data folder would "
+                  "break WebDataset on the worker (see the `clip ids` lines above), so the run "
+                  "would fail after the worker was rented. Rebuild the omnivoice_data stage with "
+                  "the current jobs/omnivoice_data.py first. Nothing was rented.",
+                  file=sys.stderr, flush=True)
+            return EXIT["ids"]
         if self.a.plan:
             say("--plan: nothing was called; exiting")
             return 0
@@ -1014,6 +1184,11 @@ class PaidRun:
         self.s["pid"], self.s["pid_start"] = os.getpid(), proc_start(os.getpid())
         self.stop_file.unlink(missing_ok=True)  # a stop request left by an older run is void
         self.save()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        log = self.dir / "run.log"
+        sys.stdout, sys.stderr = Tee(sys.stdout, log), Tee(sys.stderr, log)
+        say(f"===== run {self.a.run_id} {'resumed' if resumed else 'started'} at "
+            f"{rfc3339(clock())} (pid {os.getpid()}); full output is also in {log} =====")
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, self.signal_handler)
         code, message = EXIT["ok"], "done"

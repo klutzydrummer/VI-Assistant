@@ -93,7 +93,7 @@ free_disk_gb=$(df -Pk "$work" | awk 'NR == 2 {printf "%.1f", $4 / 1048576}')
 
 # VRAM and the static card facts. The under-load clock query is row 31's job
 # and runs inside the row-35 loadbench; this is the idle, pre-venv snapshot.
-vram_gb= driver_version= cuda_version= nvidia_facts='[]'
+vram_gb= driver_version= cuda_version= cuda_header= nvidia_facts='[]'
 if command -v nvidia-smi >/dev/null 2>&1; then
   vram_gb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null |
     head -n1 | python3 -c 'import sys; v = sys.stdin.read().strip()
@@ -102,7 +102,12 @@ try:
 except ValueError:
     print("")' || true)
   driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '\r' || true)
-  cuda_version=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -n1 || true)
+  smi_text=$(nvidia-smi 2>&1 || true)
+  cuda_version=$(printf '%s\n' "$smi_text" | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -n1 || true)
+  # What the failure message shows when no version parses: the raw header line, so a host that
+  # prints `CUDA Version: N/A` is told apart from one that prints no such line at all.
+  cuda_header=$(printf '%s\n' "$smi_text" | grep -m1 'CUDA Version' || true)
+  [ -n "$cuda_header" ] || cuda_header="no 'CUDA Version' line; nvidia-smi began: $(printf '%s\n' "$smi_text" | head -n5 | tr '\n' '|')"
   clock_csv=$(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,power.draw,power.limit,clocks_throttle_reasons.active \
     --format=csv 2>/dev/null || true)
   nvidia_facts=$(PYTHONPATH="$jobs_dir" python3 - "$clock_csv" <<'PY'
@@ -116,7 +121,14 @@ if [ -n "$min_vram" ]; then
   at_least "$vram_gb" "$min_vram" "VRAM (GiB)"
 fi
 if [ -n "$min_cuda" ]; then
-  [ -n "$cuda_version" ] || fail "min_cuda_version is set but nvidia-smi reported no CUDA version"
+  if [ -z "$cuda_version" ]; then
+    [ -n "$cuda_header" ] || cuda_header="nvidia-smi is not installed on this worker"
+    case "$cuda_header" in
+      *N/A*) na=" (it reads N/A: the host driver is not usable from this container)" ;;
+      *) na= ;;
+    esac
+    fail "min_cuda_version is set but nvidia-smi reported no CUDA version; raw header: ${cuda_header}${na}"
+  fi
   version_at_least "$cuda_version" "$min_cuda" "CUDA version"
 fi
 

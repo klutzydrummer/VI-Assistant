@@ -76,6 +76,16 @@ STUB = textwrap.dedent('''\
         else:
             print("no worker rented")
         print(f"credit ${st['credit']:.2f}")
+    elif args[:2] == ["cloud", "ssh"]:
+        log("ssh")
+        mode = sc.get("diag", "ok")
+        if mode == "hang":
+            (D / "diag.pid").write_text(str(os.getpid())); print("partial nvidia-smi line", flush=True); time.sleep(600)
+        if mode == "fail":
+            print("ssh: connection refused", file=sys.stderr); sys.exit(255)
+        if mode == "big":
+            sys.stdout.write("x" * 700000); sys.exit(0)
+        print("== nvidia-smi (raw)\\n| NVIDIA-SMI 550   CUDA Version: N/A |\\n== pip freeze\\ntorch==2.8.0")
     elif args[0] == "dataset" and args[1] == "run":
         stage = args[3]
         log("stage", stage, bool(st["worker"]))
@@ -280,7 +290,8 @@ class Flow(Base):
         u = self.ups()
         self.assertEqual([x["offer"] for x in u], ["1", "2"])  # failed offer excluded
         self.assertEqual(u[1]["cap"], "4.70")
-        self.assertEqual(float(u[1]["max_hours"]), 7.0)
+        # hours left = limit minus real elapsed time; the diagnostics pull adds a fraction of a second
+        self.assertAlmostEqual(float(u[1]["max_hours"]), 7.0, delta=0.01)
         self.assertEqual(len(self.downs()), 2)
         self.assertEqual(self.stages(), ["omnivoice_preflight", "omnivoice_preflight",
                                          "omnivoice_train"])
@@ -979,6 +990,138 @@ class KillAndSignals(Base):
         (self.sd / "omnivoice_preflight.pid").unlink()
         self.assertEqual(self.run_orch(), 0, self.out)
         self.assertEqual(len(self.ups()), 2)
+
+
+class IdsAndMarkers(Base):
+    """The whole-bundle id check (blocks renting) and the read-only stale-marker plan line."""
+
+    def stages_with_data(self, train_ids, dev_ids):
+        st = self.tmp / "stages.toml"
+        st.write_text('corpus = "corpus"\n[stage.omnivoice_preflight]\ninputs = ["omnivoice_data"]\n'
+                      '[stage.omnivoice_preflight.settings]\ncheckpoint_format = "epoch"\n'
+                      'min_home_gb = 1\nhome_gate_reserve_gb = 0\n')
+        base = self.tmp / "corpus" / "stages" / "omnivoice_data"
+        out = base / "abc123" / "out"
+        out.mkdir(parents=True)
+        (base / "current").write_text("abc123")
+        rows = lambda ids: "".join(json.dumps({"id": i}) + "\n" for i in ids)  # noqa: E731
+        (out / "train_manifest.jsonl").write_text(rows(train_ids))
+        (out / "dev_manifest.jsonl").write_text(rows(dev_ids))
+        (out / "style_manifest.jsonl").write_text(rows(dev_ids))
+        (out / "replay_texts.jsonl").write_text('{"text": "x"}\n')
+        return str(st)
+
+    def test_dotted_ids_block_renting_and_plan(self):
+        self.scenario([{}])
+        self.env["HOME"] = str(self.tmp)
+        st = self.stages_with_data(["le2.s1_m", "le2.s2_m"], ["le3.s9_m"])
+        self.assertEqual(self.run_orch(stages=st, plan=True), 12, self.out)
+        self.assertIn("clip ids        : FAIL", self.out)
+        self.assertIn("2 of 2 train id(s)", self.out)
+        self.assertIn("'le2.s1_m'", self.out)
+        self.assertEqual(self.run_orch(stages=st), 12, self.out)
+        self.assertIn("Nothing was rented", self.out)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.tmp / "paid").exists())
+
+    def test_clean_ids_pass(self):
+        self.scenario([dict(spent=0.1, hours=1.0)])
+        self.env["HOME"] = str(self.tmp)
+        st = self.stages_with_data(["le2_s1_m"], ["le3_s9_m"])
+        self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
+        self.assertIn("clip ids        : OK", self.out)
+
+    def test_plan_lists_stale_markers_and_deletes_nothing(self):
+        self.scenario([{}])
+        self.env["HOME"] = str(self.tmp)
+        empty, full = self.tmp / "ck-empty", self.tmp / "ck-full"
+        empty.mkdir()
+        full.mkdir()
+        (full / "model.safetensors").write_bytes(b"x")
+        mdir = self.tmp / "vistate" / "unverified"
+        mdir.mkdir(parents=True)
+        (mdir / "a").write_text(str(empty))
+        (mdir / "b").write_text(str(full))
+        (mdir / "c").write_text(str(self.tmp / "ck-gone"))
+        st = HomeChecks.stages_file(self, 1, 0)
+        self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
+        self.assertIn("stale markers   : 2 unverified marker(s)", self.out)
+        self.assertIn(f"checkpoints.py abandon {empty} ", self.out)
+        self.assertIn("ck-gone", self.out)
+        self.assertNotIn(f"abandon {full} ", self.out)
+        self.assertEqual(sorted(p.name for p in mdir.iterdir()), ["a", "b", "c"])
+        self.assertTrue(empty.is_dir())
+
+
+class RunLogging(Base):
+    """run.log, the pre-destroy diagnostics pull, and stage-tail.log (round 8 item 5)."""
+
+    def paid(self, name):
+        return self.tmp / "paid" / "t1" / name
+
+    def gate_fail_then_pass(self, **extra):
+        self.scenario([dict(preflight="cuda", spent=0.1, hours=0.1), dict(spent=0.2, hours=0.2)],
+                      **extra)
+
+    def test_run_log_has_a_header_per_attempt_and_the_full_output(self):
+        self.gate_fail_then_pass()
+        self.assertEqual(self.run_orch(), 0, self.out)
+        log = self.paid("run.log").read_text()
+        self.assertIn("===== attempt 1 of 3", log)
+        self.assertIn("===== attempt 2 of 3", log)
+        self.assertIn("worker-preflight: CUDA version is 12.4", log)  # the worker's own output
+        self.assertIn("total actual spend", log)
+        self.assertIn("===== train stage", log)
+
+    def test_failed_attempt_leaves_diagnostics_and_a_good_one_does_not(self):
+        self.gate_fail_then_pass()
+        self.assertEqual(self.run_orch(), 0, self.out)
+        diag = self.paid("diag-attempt-1-worker-gate.txt")
+        self.assertIn("CUDA Version: N/A", diag.read_text())
+        self.assertIn("torch==2.8.0", diag.read_text())
+        self.assertEqual(len(list(self.paid("x").parent.glob("diag-attempt-*"))), 1)
+
+    def test_diagnostics_come_before_destroy(self):
+        self.gate_fail_then_pass()
+        self.run_orch()
+        names = [c[0] for c in self.calls() if c[0] in ("ssh", "down")]
+        self.assertEqual(names[:2], ["ssh", "down"])
+
+    def test_hanging_fetch_never_blocks_destroy(self):
+        self.gate_fail_then_pass(diag="hang")
+        self.env["PAID_RUN_DIAG_SECONDS"] = "1"
+        t0 = time.time()
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertLess(time.time() - t0, 30)
+        self.assertGreaterEqual(len(self.downs()), 2)  # both attempts were destroyed
+        text = self.paid("diag-attempt-1-worker-gate.txt").read_text()
+        self.assertIn("cut off after 1 s", text)
+        self.assertIn("partial nvidia-smi line", text)
+        pid = int((self.sd / "diag.pid").read_text())
+        with self.assertRaises(OSError):
+            os.kill(pid, 0)  # the hung fetch process was killed, not left running
+
+    def test_failing_fetch_still_destroys(self):
+        self.gate_fail_then_pass(diag="fail")
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertIn("exited 255", self.paid("diag-attempt-1-worker-gate.txt").read_text())
+        self.assertGreaterEqual(len(self.downs()), 2)
+
+    def test_diagnostics_size_is_bounded(self):
+        self.gate_fail_then_pass(diag="big")
+        self.assertEqual(self.run_orch(), 0, self.out)
+        size = self.paid("diag-attempt-1-worker-gate.txt").stat().st_size
+        self.assertLess(size, load_paid_run().DIAG_MAX_BYTES + 200)
+        self.assertIn("truncated", self.paid("diag-attempt-1-worker-gate.txt").read_text())
+
+    def test_stage_tail_is_written_for_the_preflight_and_status_reads_it(self):
+        self.scenario([dict(preflight="cuda", spent=0.1)], offer_list=offers((1, 0.20, "US", 800)))
+        self.assertEqual(self.run_orch(max_attempts=1), 5, self.out)
+        self.assertIn("worker-preflight: CUDA version", self.paid("stage-tail.log").read_text())
+        rc = subprocess.run([sys.executable, "-I", str(SCRIPT), "status", "--run-id", "t1", "--json"],
+                            env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertTrue(any("worker-preflight: CUDA version" in ln
+                            for ln in json.loads(rc.stdout)["stage_log_tail"]), rc.stdout)
 
 
 if __name__ == "__main__":
