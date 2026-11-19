@@ -280,8 +280,25 @@ ovft_python() {
   local req="$jobs_dir/requirements-omnivoice-worker.txt" venv
   venv="$HOME/.cache/vi/venv-$(sha256sum "$req" | cut -c1-16)"
   if [ ! -x "$venv/bin/python" ]; then
-    python3 -m venv --system-site-packages "$venv"
-    "$venv/bin/python" -m pip install -q -r "$req"
+    # Build into venv.tmp-$$ and rename only on success, so a half-built venv is never reused.
+    # 3 tries, sleeping 30 s then 90 s (VI_PIP_BACKOFF="30 90" overrides, for tests).
+    local tmp="$venv.tmp-$$" try delays rc=1
+    read -r -a delays <<<"${VI_PIP_BACKOFF:-30 90}"
+    for try in 0 1 2; do
+      rm -rf "$tmp"
+      if python3 -m venv --system-site-packages "$tmp" &&
+         "$tmp/bin/python" -m pip install -q --retries 10 --timeout 60 -r "$req"; then
+        rc=0
+        break
+      fi
+      [ "$try" -lt 2 ] && sleep "${delays[$try]:-30}"
+    done
+    if [ "$rc" != 0 ]; then
+      rm -rf "$tmp"
+      echo "worker-preflight: pip install failed (3 tries) for $req" >&2
+      exit 1
+    fi
+    mv "$tmp" "$venv"
   fi
   printf '%s\n' "$venv/bin/python"
 }
@@ -377,12 +394,43 @@ tokenise() {
   tok=$(audio_tokenizer_dir) || return 1
   [ -s "$manifest" ] || { echo "tokenise: $manifest missing or empty" >&2; return 1; }
   mkdir -p "$data_dir/shards/$name"
+  local log="$data_dir/shards/$name/extract.log" rc
+  set +e
   "$PY" -m omnivoice.scripts.extract_audio_tokens \
     --input_jsonl "$manifest" \
     --tar_output_pattern "$data_dir/shards/$name/audios/shard-%06d.tar" \
     --jsonl_output_pattern "$data_dir/shards/$name/txts/shard-%06d.jsonl" \
-    --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors
+    --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  [ "$rc" = 0 ] || { echo "tokenise: extract_audio_tokens exited $rc for $name" >&2; return 1; }
   [ -s "$lst" ] || { echo "tokenise: $lst was not written for $name" >&2; return 1; }
+  tokenise_count_guard "$name" "$manifest" "$log" || { rm -f "$lst"; return 1; }
+}
+
+# tokenise_count_guard NAME MANIFEST LOG: refuse a silently shrunk set. Reads upstream's
+# "Processing Complete - Successful: N, Failed: M, Filtered/Skipped: K" line and compares it with
+# the manifest row count R: fail when N < R, or when M+K > max(2, 1% of R). It only counts; it
+# never chooses, weights or filters clips, and reads no labels.
+tokenise_count_guard() {
+  python3 -I - "$1" "$2" "$3" <<'PY'
+import re, sys
+name, manifest, log = sys.argv[1:4]
+rows = sum(1 for line in open(manifest, encoding="utf-8", errors="replace") if line.strip())
+text = open(log, encoding="utf-8", errors="replace").read()
+m = None
+for m in re.finditer(r"Processing Complete\s*-\s*Successful:\s*(\d+),\s*Failed:\s*(\d+),\s*Filtered/Skipped:\s*(\d+)", text):
+    pass
+if m is None:
+    print(f"voicetune-fresh: tokenise {name}: no 'Processing Complete' line in {log}; "
+          "refusing to train on a set whose size is unknown", file=sys.stderr)
+    sys.exit(1)
+n, f, k = (int(x) for x in m.groups())
+if n < rows or f + k > max(2, rows // 100):
+    print(f"voicetune-fresh: tokenise {name}: {n} of {rows} rows tokenised ({f} failed, {k} skipped); "
+          "refusing to train on a silently shrunk set", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 # prepare_data: steps 0a and 0b, both need CUDA and both write into the data folder.
@@ -402,6 +450,31 @@ prepare_data() {
       --voices "$data_dir/voices" --texts "$data_dir/replay_texts.jsonl" --device cuda
   fi
   tokenise replay "$data_dir/replay/replay_public.jsonl"
+}
+
+# gpu_gate: the first CUDA touch, then the bf16 check, then the pinned library versions in the
+# log. A CUDA init failure or a pre-Ampere card is host-specific, so each prints a
+# "worker-preflight: ..." line that makes the run retry on a new machine; a Python traceback
+# after CUDA works stays non-retryable (a code bug repeats on every host).
+gpu_gate() {
+  local msg
+  if ! msg=$("$PY" -c 'import torch; torch.zeros(1).cuda(); torch.cuda.synchronize()' 2>&1); then
+    echo "worker-preflight: cuda init failed: $(printf '%s' "$msg" | tail -n 1)" >&2
+    exit 1
+  fi
+  if ! "$PY" -c 'import sys, torch; sys.exit(0 if torch.cuda.is_bf16_supported() else 1)'; then
+    echo "worker-preflight: bf16 unsupported on this GPU" >&2
+    exit 1
+  fi
+  "$PY" -c '
+import importlib.metadata as m
+out = []
+for n in ("omnivoice", "torch", "transformers", "accelerate", "webdataset"):
+    try:
+        out.append(f"{n}={m.version(n)}")
+    except m.PackageNotFoundError:
+        out.append(f"{n}=missing")
+print("versions: " + " ".join(out))' || echo "versions: could not read" >&2
 }
 
 # rehearse_kill_resume: the real-GPU kill/resume proof. A 20-step run saving every 10 steps is
@@ -479,6 +552,7 @@ PY
 
 preflight() {
   check_and_gate
+  gpu_gate
   prepare_data
 
   # Five real steps at the full batch (--steps 5 --save-steps 5 writes checkpoint-5), published

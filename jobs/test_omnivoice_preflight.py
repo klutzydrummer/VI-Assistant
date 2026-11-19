@@ -63,6 +63,9 @@ open(os.environ["CALLS"], "a").write(f"tokenise {a.input_jsonl} tokenizer={a.tok
 base = os.path.dirname(os.path.dirname(a.tar_output_pattern))
 os.makedirs(os.path.join(base, "audios"), exist_ok=True)
 open(os.path.join(base, "data.lst"), "w").write("shard-000000.tar shard-000000.jsonl 1 1.0\n")
+rows = sum(1 for l in open(a.input_jsonl) if l.strip())
+ok, bad, skipped = os.environ.get("STUB_TOK_OK"), os.environ.get("STUB_TOK_FAILED", "0"), os.environ.get("STUB_TOK_SKIPPED", "0")
+print(f"Processing Complete - Successful: {ok if ok is not None else rows}, Failed: {bad}, Filtered/Skipped: {skipped}")
 '''
 
 REPLAY_STUB = r'''
@@ -87,7 +90,32 @@ def snapshot_download(repo, revision=None, local_dir=None):
         f"token={os.environ.get('HF_TOKEN')}\n")
     os.makedirs(os.path.join(local_dir, "audio_tokenizer"), exist_ok=True)
     open(os.path.join(local_dir, "config.json"), "w").write("{}")
+    # Sparse files at the pinned sizes (fetch_base_model.SIZE_TABLE / TOTAL_BYTES): no disk used.
+    for rel, size in (("model.safetensors", 2450344112),
+                      ("audio_tokenizer/model.safetensors", 805665628), ("pad.bin", 11460530)):
+        with open(os.path.join(local_dir, rel), "wb") as f:
+            f.truncate(size)
     return local_dir
+'''
+
+
+TORCH_STUB = r'''
+import os
+class _Cuda:
+    @staticmethod
+    def synchronize():
+        pass
+    @staticmethod
+    def is_bf16_supported():
+        return os.environ.get("STUB_BF16", "1") == "1"
+cuda = _Cuda()
+class _T:
+    def cuda(self):
+        if os.environ.get("STUB_CUDA_FAIL"):
+            raise RuntimeError(os.environ["STUB_CUDA_FAIL"])
+        return self
+def zeros(n):
+    return _T()
 '''
 
 
@@ -99,6 +127,7 @@ class PreflightHarness(unittest.TestCase):
         jobs = root / "jobs"
         (jobs / "omnivoice-ft").mkdir(parents=True)
         shutil.copy(JOBS / "voicetune-fresh.sh", jobs / "voicetune-fresh.sh")
+        shutil.copy(JOBS / "requirements-omnivoice-worker.txt", jobs / "requirements-omnivoice-worker.txt")
         shutil.copy(JOBS / "omnivoice-ft" / "fetch_base_model.py", jobs / "omnivoice-ft" / "fetch_base_model.py")
         self._exe(jobs / "worker-return.sh", "exit 0")
         (jobs / "omnivoice-ft" / "train_ft.py").write_text(TRAIN_STUB)
@@ -111,10 +140,11 @@ class PreflightHarness(unittest.TestCase):
         (pylib / "__init__.py").write_text("")
         (pylib / "extract_audio_tokens.py").write_text(TOKENISE_STUB)
         (root / "pylib" / "huggingface_hub.py").write_text(HUB_STUB)
+        (root / "pylib" / "torch.py").write_text(TORCH_STUB)
         bindir = root / "bin"
         bindir.mkdir()
         self._exe(bindir / "python", 'exec python3 "$@"')
-        self._exe(bindir / "accelerate", "shift 3\nexec \"$OVFT_PYTHON\" \"$@\"")
+        self._exe(bindir / "accelerate", "shift 3\nexec \"${OVFT_PYTHON:-python3}\" \"$@\"")
         self._exe(bindir / "nvidia-smi", 'echo "24576, 0"')
         self.data = root / "data"
         (self.data / "voices").mkdir(parents=True)
@@ -365,3 +395,179 @@ class RehearsalTest(PreflightHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardTests(PreflightHarness):
+    """WP1 guards: pip retry, CUDA/bf16 gates, tokenise count guard (failure-modes.md)."""
+
+    def _fake_python3(self, pip_fails):
+        """A python3 on PATH whose `-m venv DIR` writes a shim venv python. The shim's
+        `-m pip install` fails `pip_fails` times (counted in pip.count), then succeeds;
+        it logs whether the final (renamed) venv folder exists at each try."""
+        real = shutil.which("python3")
+        self.pip_log = self.root / "pip.log"
+        self.pip_count = self.root / "pip.count"
+        venv_py = self.root / "venv_python.sh"
+        venv_py.write_text(f"""#!/usr/bin/env bash
+if [ "$1 $2" = "-m pip" ]; then
+  d=$(dirname "$(dirname "$0")"); final=${{d%.tmp-*}}
+  n=$(cat {self.pip_count} 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{self.pip_count}
+  echo "pip try $n args: $* final_exists=$([ "$d" != "$final" ] && [ -d "$final" ] && echo yes || echo no)" >>{self.pip_log}
+  [ "$n" -gt {pip_fails} ]
+  exit $?
+fi
+exec {real} "$@"
+""")
+        self._exe(self.root / "bin" / "python3", f"""if [ "$1 $2" = "-m venv" ]; then
+  for a in "$@"; do d=$a; done
+  mkdir -p "$d/bin"; cp {venv_py} "$d/bin/python"; cp {self.root}/bin/accelerate "$d/bin/accelerate"; chmod +x "$d/bin/python" "$d/bin/accelerate"; exit 0
+fi
+exec {real} "$@"
+""".rstrip("\n"))
+
+    def venvs(self):
+        return sorted(p.name for p in (self.root / "home" / ".cache" / "vi").glob("venv-*"))
+
+    def test_voicetune_pip_retry(self):
+        self._fake_python3(pip_fails=2)
+        r = self.preflight(OVFT_PYTHON=None, VI_PIP_BACKOFF="0 0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = self.pip_log.read_text().splitlines()
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("--retries 10 --timeout 60", lines[0])
+        self.assertTrue(all("final_exists=no" in l for l in lines), lines)  # renamed only after success
+        names = self.venvs()
+        self.assertEqual(len(names), 1, names)
+        self.assertNotIn("tmp", names[0])
+
+    def test_voicetune_pip_retry_final_failure_leaves_no_venv(self):
+        self._fake_python3(pip_fails=99)
+        r = self.preflight(OVFT_PYTHON=None, VI_PIP_BACKOFF="0 0")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("worker-preflight: pip install failed", r.stderr)
+        self.assertEqual(len(self.pip_log.read_text().splitlines()), 3)
+        self.assertEqual(self.venvs(), [])
+
+    def test_voicetune_cuda_init_retry_text(self):
+        r = self.preflight(STUB_CUDA_FAIL="CUDA error: no kernel image")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("worker-preflight: cuda init failed: RuntimeError: CUDA error: no kernel image",
+                      r.stderr)
+        self.assertNotIn("train_ft", [l.split()[0] for l in self.log() if l])
+
+    def test_voicetune_bf16_gate_text(self):
+        r = self.preflight(STUB_BF16="0")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("worker-preflight: bf16 unsupported", r.stderr)
+        self.assertEqual(self.log(), [])
+
+    def test_preflight_logs_library_versions(self):
+        r = self.preflight()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("versions: ", r.stdout + r.stderr)
+
+    def test_voicetune_tokenise_count_guard(self):
+        (self.data / "train_manifest.jsonl").write_text(
+            "".join('{"id": "c%d", "text": "t"}\n' % i for i in range(1961)))
+        r = self.preflight(STUB_TOK_OK="1950", STUB_TOK_FAILED="11")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("voicetune-fresh: tokenise train: 1950 of 1961 rows tokenised "
+                      "(11 failed, 0 skipped); refusing to train on a silently shrunk set", r.stderr)
+        self.assertFalse((self.data / "shards" / "train" / "data.lst").exists())
+        self.assertNotIn("train_ft", [l.split()[0] for l in self.log() if l])
+
+    def test_tokenise_guard_allows_a_complete_set_and_a_missing_summary_fails(self):
+        (self.data / "train_manifest.jsonl").write_text(
+            "".join('{"id": "c%d", "text": "t"}\n' % i for i in range(300)))
+        r = self.preflight(STUB_TOK_OK="300")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_tokenise_guard_refuses_n_below_rows_even_with_zero_failed(self):
+        (self.data / "train_manifest.jsonl").write_text(
+            "".join('{"id": "c%d", "text": "t"}\n' % i for i in range(300)))
+        r = self.preflight(STUB_TOK_OK="299")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("299 of 300 rows tokenised", r.stderr)
+
+
+class FetchBaseModelGuardTest(unittest.TestCase):
+    """fetch_base_model: retries, pinned sizes, atomic rename (jobs/omnivoice-ft)."""
+
+    REV = "c5fdb5ccb189668d56333f77ba2629f4cd7535f4"
+
+    def setUp(self):
+        import importlib.util, sys
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        spec = importlib.util.spec_from_file_location(
+            "fetch_base_model_under_test", JOBS / "omnivoice-ft" / "fetch_base_model.py")
+        self.fb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.fb)
+        self.hub = type(sys)("huggingface_hub")
+        sys.modules["huggingface_hub"] = self.hub
+        self.addCleanup(sys.modules.pop, "huggingface_hub", None)
+        os.environ["VI_FETCH_BACKOFF"] = "0 0 0"
+        self.addCleanup(os.environ.pop, "VI_FETCH_BACKOFF", None)
+
+    @staticmethod
+    def write_files(folder, truncate=False):
+        folder = Path(folder)
+        (folder / "audio_tokenizer").mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text("{}")
+        for rel, size in (("model.safetensors", 2450344112 - (1 if truncate else 0)),
+                          ("audio_tokenizer/model.safetensors", 805665628), ("pad.bin", 11460530)):
+            with open(folder / rel, "wb") as f:
+                f.truncate(size)
+
+    def run_main(self):
+        import contextlib, io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.fb.main(["k2-fsa/OmniVoice", self.REV, str(self.root / "cache")])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_fetch_base_model_retry_and_size(self):
+        calls = []
+
+        def snap(repo, revision=None, local_dir=None):
+            calls.append(local_dir)
+            if len(calls) <= 2:
+                raise TimeoutError("read timed out")
+            self.write_files(local_dir)
+        self.hub.snapshot_download = snap
+        rc, out, err = self.run_main()
+        dest = self.root / "cache" / "k2-fsa--OmniVoice-c5fdb5ccb189"
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c.endswith(".part") for c in calls))
+        self.assertEqual(out.strip(), str(dest))
+        self.assertFalse(dest.with_name(dest.name + ".part").exists())  # renamed atomically
+        # A passing dest is reused without a download.
+        calls.clear()
+        self.assertEqual(self.run_main()[0], 0)
+        self.assertEqual(calls, [])
+
+    def test_truncated_safetensors_is_refused(self):
+        def snap(repo, revision=None, local_dir=None):
+            self.write_files(local_dir, truncate=True)
+        self.hub.snapshot_download = snap
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 1)
+        self.assertIn("worker-preflight: base model download failed", err)
+        self.assertEqual(out, "")
+        self.assertFalse((self.root / "cache" / "k2-fsa--OmniVoice-c5fdb5ccb189").exists())
+
+    def test_a_truncated_existing_dest_is_not_reused(self):
+        dest = self.root / "cache" / "k2-fsa--OmniVoice-c5fdb5ccb189"
+        self.write_files(dest, truncate=True)
+        calls = []
+
+        def snap(repo, revision=None, local_dir=None):
+            calls.append(local_dir)
+            self.write_files(local_dir)
+        self.hub.snapshot_download = snap
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.fb.size_problems(dest, self.REV), [])

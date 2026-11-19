@@ -187,5 +187,27 @@ class ReplayPublicTest(unittest.TestCase):
         assert replay_row["replay"] is True and replay_row["text"] == texts[0]
 
 
+    def test_replay_public_count_guard(self):
+        texts = [f"Line number {i}." for i in range(300)]
+        voices_dir = self.tmp_path / "voices"
+        _write_voices(voices_dir, 2)
+        voices = sorted(voices_dir.glob("*.wav"))
+        bad = {3, 50, 120, 200, 299}
+
+        def flaky(text, ref):
+            if int(text.split()[-1].rstrip(".")) in bad:
+                raise RuntimeError("synth blew up")
+            return wavio.sine(0.02, 24000, 300.0), 24000
+
+        with self.assertRaises(SystemExit) as cm:  # 5 of 300 is 1.67 %, over the 1 % limit
+            RP.generate(self.tmp_path / "out", texts, voices, synth=flaky)
+        self.assertIn("5 of 300 requested lines failed", str(cm.exception))
+        # 3 of 300 is exactly 1 %: allowed, and the manifest holds the 297 that worked.
+        bad.clear()
+        bad.update({1, 2, 3})
+        manifest = RP.generate(self.tmp_path / "out2", texts, voices, synth=flaky)
+        self.assertEqual(len(_read_jsonl(manifest)), 297)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1186,6 +1186,37 @@ class RealPathCheck(Base):
         self.assertIn("--extra-index-url https://download.pytorch.org/whl/cpu",
                       (JOBS / "requirements-omnivoice-home-cpu.txt").read_text())
 
+    @staticmethod
+    def _pin_map(text):
+        """name -> version for every requirement line; index/option lines and comments dropped,
+        a local +cpu tag stripped. A line that is not name==version fails the caller's assert."""
+        out, loose = {}, []
+        for ln in text.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or ln.startswith("-"):
+                continue
+            name, sep, ver = ln.partition("==")
+            if not sep or any(c in ver for c in "<>=!~,"):
+                loose.append(ln)
+                continue
+            out[name.strip().lower()] = ver.split("+")[0].strip()
+        return out, loose
+
+    def test_omnivoice_pins_match(self):
+        worker_text = (JOBS / "requirements-omnivoice-worker.txt").read_text()
+        home_text = (JOBS / "requirements-omnivoice-home-cpu.txt").read_text()
+        worker, w_loose = self._pin_map(worker_text)
+        home, h_loose = self._pin_map(home_text)
+        self.assertEqual(w_loose, [])
+        self.assertEqual(h_loose, [])
+        self.assertGreater(len(worker), 50)
+        self.assertEqual(worker, home)
+        # A mutated copy (one pin differs, or one is loosened) must fail the same comparison.
+        mutated = home_text.replace("torch==2.8.0+cpu", "torch==2.9.0+cpu")
+        self.assertNotEqual(self._pin_map(mutated)[0], worker)
+        loosened = worker_text.replace("torch==2.8.0", "torch>=2.8.0")
+        self.assertNotEqual(self._pin_map(loosened)[1], [])
+
     def test_tokenise_flags_match_the_worker_script(self):
         text = (JOBS / "voicetune-fresh.sh").read_text()
         src = (JOBS / "omnivoice-ft" / "home_realpath_check.py").read_text()

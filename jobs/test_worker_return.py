@@ -1484,5 +1484,96 @@ esac
         self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
 
 
+@unittest.skipUnless(shutil.which("rsync") and shutil.which("zstd"), "rsync and zstd are needed")
+class OnWorkerGuardsTest(unittest.TestCase):
+    """WP1 network guards in on-worker.sh, local mode, with a PATH-shim rsync."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.real_rsync = shutil.which("rsync")
+        (self.root / "settings.json").write_text("{}\n")
+
+    def shim(self, body):
+        path = self.bin / "rsync"
+        path.write_text("#!/usr/bin/env bash\n" + body + "\n")
+        path.chmod(0o755)
+
+    def run_on_worker(self, name="guards", extra_env=None, cmd='printf ok > "$VI_OUT/ok.txt"'):
+        out = self.root / f"out-{name}"
+        env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "VI_WORKER_HOST": "local",
+               "VI_WORKER_ROOT": str(self.root / "worker"), "VI_STAGE": name, "VI_OUT": str(out),
+               "VI_SETTINGS": str(self.root / "settings.json"), "VI_PUSH_BACKOFF": "0 0 0",
+               "VI_PROVE_WAIT": "0", **(extra_env or {})}
+        r = subprocess.run([ON_WORKER, "bash", "-c", cmd], env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert_no_on_worker_left(self, self.root)
+        return r, out
+
+    def test_on_worker_push_retries(self):
+        count = self.root / "rsync.count"
+        self.shim(f"""n=$(cat {count} 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{count}
+if [ "$n" -le 2 ]; then exit 12; fi
+exec {self.real_rsync} "$@"
+""")
+        r, out = self.run_on_worker("retries")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((out / "ok.txt").read_text(), "ok")
+        self.assertIn("rsync exited 12; retry 1/3", r.stderr)
+        self.assertIn("rsync exited 12; retry 2/3", r.stderr)
+
+    def test_push_gives_up_after_four_tries_and_does_not_retry_other_codes(self):
+        count = self.root / "rsync.count"
+        self.shim(f"""n=$(cat {count} 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{count}
+exit 12""")
+        r, _ = self.run_on_worker("giveup")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(int(count.read_text()), 4)
+        count.unlink()
+        self.shim(f"""n=$(cat {count} 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{count}
+exit 1""")
+        r, _ = self.run_on_worker("noretry")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(int(count.read_text()), 1)
+
+    def test_on_worker_return_prove_retry_text(self):
+        sys_path = str(ON_WORKER.parent)
+        import sys as _sys
+        if sys_path not in _sys.path:
+            _sys.path.insert(0, sys_path)
+        import paid_run
+        # The proof push goes to the rsync:// receiver; make only that one fail.
+        self.shim(f"""case "$*" in *rsync://*) exit 10 ;; esac
+exec {self.real_rsync} "$@"
+""")
+        r, _ = self.run_on_worker("prove")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("worker-preflight: return path", r.stderr)
+        self.assertTrue(paid_run.PREFLIGHT_GATE_RE.search(r.stderr))
+        self.assertEqual(paid_run.retryable_gate(r.stderr), "worker-preflight")
+
+    def test_bad_zstd_stream_is_resent_once(self):
+        data = self.root / "data"
+        data.mkdir()
+        (data / "a.bin").write_bytes(os.urandom(64 * 1024))
+        marker = self.root / "corrupted"
+        # After the first copy of a bundle lands, cut it short, so `zstd -t` must fail once.
+        self.shim(f"""{self.real_rsync} "$@"; rc=$?
+for last in "$@"; do :; done
+src=${{@: -2:1}}
+case "$src" in *.tar.zst) if [ ! -e {marker} ]; then touch {marker}; truncate -s 20 "${{last%/}}/$(basename "$src")"; fi ;; esac
+exit $rc""")
+        r, out = self.run_on_worker(
+            "zstd", cmd='cat "$VI_INPUT_DATA/a.bin" | wc -c >"$VI_OUT/size.txt"',
+            extra_env={"VI_INPUT_DATA": str(data), "VI_PACK_MIN_KB": "0",
+                       "VI_BUNDLE_DIR": str(self.root / "bundles")})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("failed zstd -t on the worker; sending it once more", r.stderr)
+        self.assertEqual((out / "size.txt").read_text().strip(), str(64 * 1024))
+
+
 if __name__ == "__main__":
     unittest.main()

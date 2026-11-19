@@ -196,14 +196,32 @@ rebuild_ssh_opts() {
     -o "UserKnownHostsFile=$VI_WORKER_KNOWN_HOSTS" -o ServerAliveInterval=30
     -o ConnectTimeout=20 -o ForwardAgent=no -o ForwardX11=no)
 }
+# push_retry CMD...: run an rsync up to 4 times, sleeping 5, 15, 45 s (VI_PUSH_BACKOFF overrides,
+# for tests) after a transient rsync exit: 5 10 12 23 30 35 255. Any other exit, or the last try,
+# returns that status. --partial (set by the callers) lets a retry resume the file.
+push_retry() {
+  local try rc delays
+  read -r -a delays <<<"${VI_PUSH_BACKOFF:-5 15 45}"
+  for try in 0 1 2 3; do
+    rc=0
+    "$@" || rc=$?
+    [ "$rc" != 0 ] || return 0
+    case $rc in 5|10|12|23|30|35|255) ;; *) return "$rc" ;; esac
+    [ "$try" -lt 3 ] || return "$rc"
+    echo "on-worker.sh: rsync exited $rc; retry $((try + 1))/3 in ${delays[$try]:-5} s" >&2
+    sleep "${delays[$try]:-5}"
+  done
+  return "$rc"
+}
+
 if [ "$VI_WORKER_HOST" = local ]; then
   remote() { bash -c "$1"; }
-  push() { local src=$1 dst=$2; shift 2; rsync -a --timeout=300 "$@" "$src" "$dst"; }
+  push() { local src=$1 dst=$2; shift 2; push_retry rsync -a --timeout=300 "$@" "$src" "$dst"; }
 else
   rebuild_ssh_opts
   target="root@$VI_WORKER_HOST"
   remote() { ssh "${ssh_opts[@]}" "$target" "$1"; }
-  push() { local src=$1 dst=$2; shift 2; rsync -a --timeout=300 -e "ssh ${ssh_opts[*]}" "$@" "$src" "$target:$dst"; }
+  push() { local src=$1 dst=$2; shift 2; push_retry rsync -a --timeout=300 --partial -e "ssh ${ssh_opts[*]}" "$@" "$src" "$target:$dst"; }
   # Keep home's idle clock running while the job does.
   # It stops when this script is gone, even if that was a SIGKILL that skipped
   # cleanup; otherwise it would keep home's idle clock running forever.
@@ -501,7 +519,7 @@ return_prove() {  # BUDGET
     [ $i -ge 5 ] || i=$((i + 1))
   done
   if [ "$ok" != 1 ]; then
-    echo "on-worker.sh: worker could not push through the reverse SSH return tunnel" >&2
+    echo "worker-preflight: return path: worker could not push through the reverse SSH return tunnel" >&2
     [ -f "$return_state/tunnel.log" ] && tail -n 5 "$return_state/tunnel.log" >&2 || true
     return 1
   fi
@@ -678,6 +696,14 @@ if [ "$reattach" = 0 ]; then
     elif [ "$remote_zstd" = 1 ]; then
       remote "mkdir -p $(q "$work/bundles")"
       push "$f" "$work/bundles/" --partial
+      # Test the zstd stream before decoding; on a bad stream delete the partial and send once more.
+      if ! remote "zstd -tq $(q "$work/bundles/${f##*/}")"; then
+        echo "on-worker.sh: bundle ${f##*/} failed zstd -t on the worker; sending it once more" >&2
+        remote "rm -f $(q "$work/bundles/${f##*/}")"
+        push "$f" "$work/bundles/" --partial
+        remote "zstd -tq $(q "$work/bundles/${f##*/}")" ||
+          { echo "on-worker.sh: bundle ${f##*/} is still corrupt after a re-send" >&2; exit 1; }
+      fi
       remote "mkdir -p $(q "$dest") && zstd -dcq $(q "$work/bundles/${f##*/}") | tar -xf - -C $(q "$dest") && rm $(q "$work/bundles/${f##*/}")"
     else
       # No zstd on the worker: still one stream, decompressed here.

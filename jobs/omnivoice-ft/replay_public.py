@@ -130,6 +130,7 @@ def generate(out_dir, lines, voices, synth=None, device="cuda",
     wav_dir = out_dir / "replay-wavs"
     wav_dir.mkdir(parents=True, exist_ok=True)
     rows = []
+    failed = []
     n_generated = 0
     for n, text in enumerate(lines):
         wav_path = wav_dir / f"replay-{n:04d}.wav"
@@ -140,8 +141,13 @@ def generate(out_dir, lines, voices, synth=None, device="cuda",
                 print(f"loaded {base_model} on {device} in {time.time() - t0:.1f}s")
             ref = voices[voice % len(voices)] if voice is not None else voices[n % len(voices)]
             t1 = time.time()
-            samples, sr = synth(text, ref)
-            wavio.write_wav(wav_path, samples, sr)
+            try:
+                samples, sr = synth(text, ref)
+                wavio.write_wav(wav_path, samples, sr)
+            except Exception as e:  # noqa: BLE001 - counted below; the guard decides, not this line
+                failed.append(n)
+                print(f"replay-{n:04d} failed: {type(e).__name__}: {e}", file=sys.stderr)
+                continue
             n_generated += 1
             print(f"replay-{n:04d} {len(samples) / sr:.1f}s audio @ {sr} Hz "
                   f"({time.time() - t1:.1f}s) ref={ref.name}")
@@ -160,6 +166,11 @@ def generate(out_dir, lines, voices, synth=None, device="cuda",
     os.replace(tmp, manifest)
     print(f"{manifest}: {len(rows)} rows ({n_generated} generated, "
           f"{len(rows) - n_generated} reused)")
+    # Count guard: refuse a silent shortfall of more than 1 % of the requested lines. Only
+    # counts lines; it never picks or weights them. A rerun resumes the lines that worked.
+    if len(failed) * 100 > len(lines):
+        raise SystemExit(f"replay_public: {len(failed)} of {len(lines)} requested lines failed "
+                         f"(over 1 %); refusing a silently shrunk replay set")
     return manifest
 
 
