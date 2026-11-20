@@ -238,6 +238,30 @@ def install_fake_realpath(home, rc=0, text="real-path check: OK (3 batches, forw
 
 
 
+GIT = ["git", "-c", "user.name=paid-run-test", "-c", "user.email=test@invalid",
+       "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+
+
+def git_repo_with_record(repo, state_dir, **override):
+    """Make `repo` a one-commit git repository and write a valid green pass record for its HEAD
+    into `state_dir` (what jobs/rehearsal/vast-limits.sh writes); `override` changes fields."""
+    subprocess.run([*GIT, "init", "-q", str(repo)], check=True)
+    subprocess.run([*GIT, "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "t"], check=True)
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+    tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    rec = dict(head=head, tree=tree, expect="green", verdict="PASS", tasks_max=512, fake_nproc=48,
+               cpu_quota="1152%", clips=8, threads="2", nj="2", stage_secs="54",
+               pids_peak="165", events_max="0", base_red="none", time="2026-11-20T00:00:00+00:00",
+               script_version=2)
+    rec.update(override)
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(state_dir) / f"{head}.pass"
+    path.write_text(json.dumps(rec))
+    return head, path
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="paid-run-test."))
@@ -253,7 +277,10 @@ class Base(unittest.TestCase):
             PAID_RUN_SLEEP_SCALE="0", PAID_RUN_SLEEP_LOG=str(self.tmp / "sleeps.log"),
             PAID_RUN_TIMEOUT_SCALE="1", VI_SKIP_HF_CHECK="1",
             VI_PAID_RUN_STATE_DIR=str(self.tmp / "paid"), VI_STATE_DIR=str(self.tmp / "vistate"),
-            VI_CHECKPOINT_ROOT=str(self.tmp / "ckpt"), VI_PLATTER_DIR=str(self.tmp / "platter"))
+            VI_CHECKPOINT_ROOT=str(self.tmp / "ckpt"), VI_PLATTER_DIR=str(self.tmp / "platter"),
+            VI_REHEARSAL_STATE_DIR=str(self.tmp / "rehearsal"))
+        # --repo is self.tmp, so it needs a commit and a pass record for the rehearsal gate.
+        self.head, self.record = git_repo_with_record(self.tmp, self.tmp / "rehearsal")
         self.procs = []
         self.addCleanup(self.reap)
 
@@ -320,6 +347,92 @@ class Base(unittest.TestCase):
                 return
             time.sleep(0.05)
         self.fail(f"{path} never appeared\n")
+
+
+class RehearsalGate(Base):
+    """A real run needs a pass record from jobs/rehearsal/vast-limits.sh for HEAD (exit 15)."""
+
+    def wrap_vi(self):
+        # Every vi invocation, whatever its arguments, leaves a line in any-call.log.
+        wrap = self.tmp / "vi-wrap"
+        wrap.write_text(f"#!/bin/sh\necho \"$*\" >> {self.tmp}/any-call.log\nexec {self.stub} \"$@\"\n")
+        wrap.chmod(0o755)
+        self.env["VI_BIN"] = str(wrap)
+
+    def blocked(self, why, **kw):
+        self.scenario([{}])
+        self.wrap_vi()
+        self.assertEqual(self.run_orch(**kw), 15, self.out)
+        self.assertFalse((self.tmp / "any-call.log").exists())
+        self.assertIn(why, self.out)
+        self.assertIn("jobs/rehearsal/vast-limits.sh --expect green", self.out)
+        self.assertIn("STOPPED (exit 15)", self.out)
+        # The gate comes before any vi/Vast call: the fake vi never ran.
+        self.assertEqual(self.calls(), [])
+
+    def test_valid_record_passes(self):
+        self.scenario([{}])
+        self.wrap_vi()
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertTrue((self.tmp / "any-call.log").exists())  # the wrapper does see real calls
+        self.assertRegex(self.out, r"rehearsal       : ok \(green PASS for [0-9a-f]{12}")
+
+    def test_missing_record_stops_before_any_vast_call(self):
+        self.record.unlink()
+        self.blocked("MISSING: no pass record for HEAD")
+
+    def test_record_for_another_commit_is_stale(self):
+        self.record.rename(self.record.with_name("0" * 40 + ".pass"))
+        self.blocked("STALE: the newest pass record is for 000000000000")
+
+    def test_invalid_json_is_refused(self):
+        self.record.write_text("{not json")
+        self.blocked("INVALID")
+
+    def test_tampered_head_inside_is_refused(self):
+        rec = json.loads(self.record.read_text())
+        rec["head"] = "f" * 40
+        self.record.write_text(json.dumps(rec))
+        self.blocked("INVALID")
+
+    def test_tampered_tree_is_refused(self):
+        rec = json.loads(self.record.read_text())
+        rec["tree"] = "e" * 40
+        self.record.write_text(json.dumps(rec))
+        self.blocked("STALE")
+
+    def test_red_record_is_refused(self):
+        rec = json.loads(self.record.read_text())
+        rec["expect"] = "red"
+        self.record.write_text(json.dumps(rec))
+        self.blocked("not a green PASS record")
+
+    def test_a_new_commit_makes_the_record_stale(self):
+        subprocess.run([*GIT, "-C", str(self.tmp), "commit", "-q", "--allow-empty", "-m", "2"],
+                       check=True)
+        self.blocked("STALE")
+
+    def test_plan_shows_the_gate_and_does_not_fail(self):
+        self.record.unlink()
+        self.scenario([{}])
+        self.assertEqual(self.run_orch(plan=True), 0, self.out)
+        self.assertIn("rehearsal       : MISSING", self.out)
+        self.assertIn("a real run stops here with exit 15", self.out)
+        self.assertEqual(self.calls(), [])
+
+    def test_exit_code_15_is_documented(self):
+        doc = (JOBS.parent / "docs" / "cloud-worker.md").read_text().split("Exit codes:")[1]
+        self.assertIn("15 the home Vast-limits rehearsal", doc[:3000])
+        self.assertIn(" 15 the home Vast-limits rehearsal", SCRIPT.read_text().split("Exit codes:")[1][:2500])
+        self.assertIn("exit 15", (JOBS / "rehearsal" / "README.md").read_text())
+
+    def test_no_bypass_switch(self):
+        self.record.unlink()
+        self.env.update(VI_SKIP_REHEARSAL="1", VI_SKIP_REHEARSAL_CHECK="1",
+                        PAID_RUN_SKIP_REHEARSAL="1")
+        self.blocked("MISSING")
+        src = SCRIPT.read_text()
+        self.assertNotRegex(src, r"SKIP_REHEARSAL|skip.rehearsal|no.rehearsal")
 
 
 class Flow(Base):

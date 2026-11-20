@@ -3,6 +3,7 @@
 They cover argument parsing, the refuse paths (missing venv, low RAM, low disk) and the red/green
 comparator against canned logs. The real rehearsal run is opt-in and is never started here.
 """
+import json
 import os
 import stat
 import subprocess
@@ -28,7 +29,8 @@ INFO [extract_audio_tokens.py:607] Processing Complete - Successful: 8, Failed: 
 def run(*args, env=None, home=None):
     e = dict(os.environ)
     for k in ("FAKE_NPROC", "TASKS_MAX", "CPU_QUOTA", "N_CLIPS", "BUDGET", "VENV", "MANIFEST",
-              "THREADS", "NJ", "VL_MEM_AVAIL_MB", "VL_DISK_FREE_GB"):
+              "THREADS", "NJ", "VL_MEM_AVAIL_MB", "VL_DISK_FREE_GB", "VI_REHEARSAL_STATE_DIR",
+              "VL_RECORD_REPO"):
         e.pop(k, None)
     if home:
         e["HOME"] = home
@@ -197,6 +199,120 @@ class Comparator(Fixture):
     def test_clip_count_is_configurable(self):
         log = GREEN_LOG.replace("Successful: 8", "Successful: 5")
         self.assertEqual(self.judge("green", log, 0, extra=("--clips", "5")).returncode, 0)
+
+
+GIT = ["git", "-c", "user.name=vast-limits-test", "-c", "user.email=test@invalid",
+       "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+
+
+class PassRecord(Fixture):
+    """The pass record jobs/paid_run.py checks: written only for a green PASS with default limits
+    on a clean tracked tree, into VI_REHEARSAL_STATE_DIR (tests only)."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.dir / "repo"
+        subprocess.run([*GIT, "init", "-q", str(self.repo)], check=True)
+        (self.repo / "f.txt").write_text("one\n")
+        subprocess.run([*GIT, "-C", str(self.repo), "add", "f.txt"], check=True)
+        subprocess.run([*GIT, "-C", str(self.repo), "commit", "-q", "-m", "t"], check=True)
+        self.head = self.git("rev-parse", "HEAD")
+        self.state = self.dir / "state" / "rehearsal"
+        self.env.update(VI_REHEARSAL_STATE_DIR=str(self.state), VL_RECORD_REPO=str(self.repo))
+
+    def git(self, *a):
+        return subprocess.run(["git", "-C", str(self.repo), *a], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def record(self, expect="green", log_text=GREEN_LOG, rc=0, extra=(), env=None):
+        log = self.dir / "stage.log"
+        log.write_text(log_text)
+        e = dict(self.env, **(env or {}))
+        return run("--judge", "--record", "--expect", expect, "--log", str(log), "--rc", str(rc),
+                   *extra, env=e)
+
+    def records(self):
+        return sorted(p.name for p in self.state.glob("*")) if self.state.exists() else []
+
+    def test_green_pass_with_defaults_writes_the_record(self):
+        r = self.record()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("pass record written", r.stdout)
+        self.assertEqual(self.records(), [f"{self.head}.pass"])
+        path = self.state / f"{self.head}.pass"
+        rec = json.loads(path.read_text())
+        self.assertEqual(rec["head"], self.head)
+        self.assertEqual(rec["tree"], self.git("rev-parse", "HEAD^{tree}"))
+        self.assertEqual((rec["expect"], rec["verdict"], rec["tasks_max"]), ("green", "PASS", 512))
+        for k in ("fake_nproc", "cpu_quota", "clips", "threads", "nj", "stage_secs", "pids_peak",
+                  "events_max", "base_red", "time", "script_version"):
+            self.assertIn(k, rec)
+        self.assertEqual(rec["base_red"], "none")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o700)
+
+    def test_record_points_at_the_latest_red_log(self):
+        logs = self.base / "vast-limits-logs"
+        logs.mkdir(parents=True)
+        red = logs / "vast-limits-20261120T000000-red.log"
+        red.write_text("red\n")
+        self.assertEqual(self.record().returncode, 0)
+        rec = json.loads((self.state / f"{self.head}.pass").read_text())
+        self.assertEqual(rec["base_red"]["log"], str(red))
+
+    def test_paid_run_gate_accepts_the_written_record(self):
+        self.assertEqual(self.record().returncode, 0)
+        code = ("import importlib.util, sys; s = importlib.util.spec_from_file_location('pr', sys.argv[1]); "
+                "m = importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "ok, line = m.rehearsal_gate(sys.argv[2]); print(line); sys.exit(0 if ok else 1)")
+        r = subprocess.run(["python3", "-I", "-c", code, str(SCRIPT.parent.parent / "paid_run.py"),
+                            str(self.repo)], capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, VI_REHEARSAL_STATE_DIR=str(self.state)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("rehearsal       : ok", r.stdout)
+
+    def test_red_runs_write_nothing(self):
+        r = self.record(expect="red", log_text=R7_RED_LOG, rc=1)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # the red verdict passed...
+        self.assertIn("no pass record written: only --expect green", r.stdout)
+        self.assertEqual(self.records(), [])  # ...and still no record
+
+    def test_failed_green_writes_nothing(self):
+        r = self.record(log_text=R7_RED_LOG, rc=1)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no pass record written: the verdict was FAIL", r.stdout)
+        self.assertEqual(self.records(), [])
+
+    def test_forced_limits_write_nothing(self):
+        cases = {"--threads": (("--threads", "1"), {}), "--nj": (("--nj", "1"), {}),
+                 "--tasks-max": (("--tasks-max", "512"), {}), "THREADS": ((), {"THREADS": "2"}),
+                 "NJ": ((), {"NJ": "2"}), "TASKS_MAX": ((), {"TASKS_MAX": "512"})}
+        for name, (extra, env) in cases.items():
+            with self.subTest(forced=name):
+                r = self.record(extra=extra, env=env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("no pass record written: forced limits were used", r.stdout)
+                self.assertEqual(self.records(), [])
+
+    def test_dirty_tracked_tree_writes_nothing(self):
+        (self.repo / "f.txt").write_text("changed\n")
+        r = self.record()
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("no pass record written: tracked files differ from HEAD", r.stdout)
+        self.assertIn("f.txt", r.stdout)
+        self.assertEqual(self.records(), [])
+
+    def test_untracked_files_do_not_block_the_record(self):
+        (self.repo / "scratch.log").write_text("x\n")
+        self.assertEqual(self.record().returncode, 0)
+        self.assertEqual(self.records(), [f"{self.head}.pass"])
+
+    def test_not_a_git_checkout_writes_nothing(self):
+        self.env["VL_RECORD_REPO"] = str(self.dir / "nowhere")
+        r = self.record()
+        self.assertIn("no pass record written: ", r.stdout)
+        self.assertIn("not a git checkout", r.stdout)
+        self.assertEqual(self.records(), [])
 
 
 class NotPickedUpByDefault(unittest.TestCase):

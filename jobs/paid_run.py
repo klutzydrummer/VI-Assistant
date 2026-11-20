@@ -29,6 +29,8 @@ Exit codes:
   12 a clip id in the data folder would break WebDataset (checked before renting)
   13 the home real-path check did not pass (checked before renting)
   14 the pinned base-model revision is gone or changed on Hugging Face (checked before renting)
+ 15 the home Vast-limits rehearsal has no valid pass record for this HEAD (checked before
+    renting; run `jobs/rehearsal/vast-limits.sh --expect green` on a clean tree)
   1 anything unexpected (worker release is still attempted)
 
 A failed train stage never rents a second machine. It is recovered IN PLACE on the same worker
@@ -783,6 +785,54 @@ def hf_revision_gate(home=None, revision=None, model_info=None, sleep=None):
     return True, [f"{label}ok ({HF_REPO} @ {rev}; pinned file sizes match)"]
 
 
+REHEARSAL_CMD = "jobs/rehearsal/vast-limits.sh --expect green"
+
+
+def rehearsal_state_dir():
+    """Where jobs/rehearsal/vast-limits.sh keeps its pass records. VI_REHEARSAL_STATE_DIR moves
+    it for the tests only; it does not skip the gate."""
+    env = os.environ.get("VI_REHEARSAL_STATE_DIR")
+    return Path(env) if env else Path.home() / ".local" / "state" / "vi" / "rehearsal"
+
+
+def rehearsal_gate(repo):
+    """(ok, line). A real run needs the home Vast-limits rehearsal to have passed, with default
+    limits on a clean tree, for exactly this HEAD: <state dir>/<HEAD sha>.pass must be JSON whose
+    head matches the file name and HEAD and whose tree matches HEAD^{tree}. There is no bypass."""
+    label = "rehearsal       : "
+    fix = f"run `{REHEARSAL_CMD}` on this commit first (about a minute, home CPU only)"
+
+    def git(*args):
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    head, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+    if not head or not tree:
+        return False, f"{label}INVALID: {repo} has no git HEAD to check a pass record for; {fix}"
+    path = rehearsal_state_dir() / f"{head}.pass"
+    if not path.is_file():
+        others = sorted(rehearsal_state_dir().glob("*.pass"), key=lambda q: q.stat().st_mtime)
+        why = (f"STALE: the newest pass record is for {others[-1].stem[:12]}, not HEAD {head[:12]}"
+               if others else f"MISSING: no pass record for HEAD {head[:12]}")
+        return False, f"{label}{why} ({path}); {fix}"
+    try:
+        rec = json.loads(path.read_text())
+        if not isinstance(rec, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        return False, f"{label}INVALID: {path} is not a readable JSON record ({e}); {fix}"
+    if rec.get("head") != head:
+        return False, (f"{label}INVALID: {path} names head {str(rec.get('head'))[:12]}, not HEAD "
+                       f"{head[:12]}; {fix}")
+    if rec.get("tree") != tree:
+        return False, (f"{label}STALE: {path} was written for tree {str(rec.get('tree'))[:12]}, "
+                       f"HEAD's tree is {tree[:12]}; {fix}")
+    if rec.get("expect") != "green" or rec.get("verdict") != "PASS":
+        return False, f"{label}INVALID: {path} is not a green PASS record; {fix}"
+    return True, (f"{label}ok (green PASS for {head[:12]} at {rec.get('time', '?')}, "
+                  f"stage {rec.get('stage_secs', '?')} s, tasks_max {rec.get('tasks_max', '?')})")
+
+
 def push_hours_line(settings, bytes_full=CHECKPOINT_BYTES_CALCULATED,
                     bytes_weights=WEIGHTS_BYTES_CALCULATED):
     """`push ≈ X h at floor` for one full checkpoint and one weights-only checkpoint, at the
@@ -1214,6 +1264,7 @@ class PaidRun:
         self.ids_ok, ids_lines = ids_check(a.stages, a.repo)
         self.realpath_ok, realpath_lines = realpath_check(
             a.stages, a.repo, forward=getattr(a, "realpath_forward", False))
+        self.rehearsal_ok, rehearsal_line = rehearsal_gate(a.repo)
         countries = a.countries or "(from the config)"
         return [
             f"run id          : {a.run_id}",
@@ -1228,6 +1279,8 @@ class PaidRun:
             *ids_lines,
             *realpath_lines,
             *stale_marker_lines(),
+            rehearsal_line + ("" if self.rehearsal_ok else
+                              f" (a real run stops here with exit {EXIT['rehearsal']})"),
             f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision); "
             f"checked against Hugging Face before renting (exit {EXIT['hf']}), not in --plan",
             push_hours_line(stage_settings(a.stages, a.repo, "omnivoice_train")),
@@ -1772,6 +1825,12 @@ class PaidRun:
         if self.a.plan:
             say("--plan: nothing was called; exiting")
             return 0
+        if not self.rehearsal_ok:
+            print(f"paid-run: STOPPED (exit {EXIT['rehearsal']}): the home Vast-limits rehearsal "
+                  "has not passed for this commit (the `rehearsal` line above says why). Run "
+                  f"`{REHEARSAL_CMD}` from the repo with a clean tree, then start this again. "
+                  "Nothing was rented.", file=sys.stderr, flush=True)
+            return EXIT["rehearsal"]
         if os.environ.get("VI_SKIP_HF_CHECK") != "1":
             hf_ok, hf_lines = hf_revision_gate(Path.home())
             for ln in hf_lines:

@@ -44,7 +44,14 @@
 #   --manifest FILE  [MANIFEST]        8-row home manifest (default the realpath-check scratch one)
 #   --threads N      [THREADS]         export OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=N (overrides the limits step)
 #   --nj N           [NJ]              use --nj_per_gpu N instead of the limits step's choice
-#   Test hooks: VL_MEM_AVAIL_MB and VL_DISK_FREE_GB override the measured RAM and disk.
+#   Test hooks: VL_MEM_AVAIL_MB and VL_DISK_FREE_GB override the measured RAM and disk;
+#   VI_REHEARSAL_STATE_DIR moves the pass-record folder; --judge --record and VL_RECORD_REPO run
+#   the pass-record step on a canned log against a scratch repository.
+#
+# Pass record: a green PASS with default limits (no --threads, --nj or --tasks-max, nor THREADS,
+# NJ or TASKS_MAX) on a clean tracked tree writes ~/.local/state/vi/rehearsal/<HEAD sha>.pass
+# (folder 0700, file 0600, JSON). jobs/paid_run.py refuses a real run (exit 15) until a record
+# for its HEAD and tree exists. Any other run prints why it wrote no record.
 #
 # Safety: CPU only (CUDA_VISIBLE_DEVICES=""), nice -n 19, ionice -c2 -n7, refuses under 4 GB free
 # RAM or under 20 GB free /home. Clips are read in place; derived token shards go to a scratch
@@ -56,6 +63,7 @@ set -uo pipefail
 self=$(readlink -f "${BASH_SOURCE[0]}")
 repo=$(cd "$(dirname "$self")/../.." && pwd)
 base=${VI_REHEARSAL_DIR:-$HOME/.cache/vi-rehearsal}
+logdir="$base/vast-limits-logs"
 
 # ---------- verdict (pure function over facts; also reachable as --judge for the tests) ----------
 # judge EXPECT LOG RC EVENTS ORPHANS_STAGE ORPHANS_POST CLIPS FAKE_NPROC
@@ -93,6 +101,69 @@ judge() {
 
 die() { echo "vast-limits: $*" >&2; exit 2; }
 
+# ---------- pass record (the gate jobs/paid_run.py checks before it rents anything) ----------
+# write_pass_record VERDICT THREADS NJ STAGE_SECS PIDS_PEAK EVENTS_MAX LOG
+# Writes $state_dir/<HEAD sha>.pass only for a green PASS with default limits on a clean tracked
+# tree; otherwise prints why no record was written. VI_REHEARSAL_STATE_DIR moves the folder (tests
+# only; paid_run.py reads the same variable).
+script_version=2
+state_dir=${VI_REHEARSAL_STATE_DIR:-$HOME/.local/state/vi/rehearsal}
+write_pass_record() {
+  local verdict=$1 used_threads=$2 used_nj=$3 secs=$4 pk=$5 ev=$6 log=$7 head tree dirty red tmp
+  # VL_RECORD_REPO (tests only) points the git checks at a scratch repository.
+  local repo=${VL_RECORD_REPO:-$repo}
+  if [ "$expect" != green ]; then
+    echo "vast-limits: no pass record written: only --expect green runs write one (this was --expect $expect)"
+    return 0
+  fi
+  if [ "$verdict" != PASS ]; then
+    echo "vast-limits: no pass record written: the verdict was $verdict"
+    return 0
+  fi
+  if [ "${#forced[@]}" -gt 0 ]; then
+    echo "vast-limits: no pass record written: forced limits were used (${forced[*]}); rerun with the defaults"
+    return 0
+  fi
+  if ! head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || ! tree=$(git -C "$repo" rev-parse 'HEAD^{tree}' 2>/dev/null); then
+    echo "vast-limits: no pass record written: $repo is not a git checkout with a commit"
+    return 0
+  fi
+  dirty=$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)
+  if [ -n "$dirty" ]; then
+    echo "vast-limits: no pass record written: tracked files differ from HEAD $head (commit or restore them, then rerun):"
+    printf '%s\n' "$dirty" | head -n 10 | sed 's/^/  /'
+    return 0
+  fi
+  # The latest red-verdict log kept here, as a pointer to the base-red proof (or "none").
+  red=$(find "$logdir" -maxdepth 1 -name 'vast-limits-*-red.log' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2-)
+  ( umask 077; mkdir -p "$state_dir" ) || { echo "vast-limits: no pass record written: could not create $state_dir"; return 0; }
+  chmod 700 "$state_dir"
+  tmp=$(umask 077; mktemp "$state_dir/.$head.pass.XXXXXX") || { echo "vast-limits: no pass record written: could not write in $state_dir"; return 0; }
+  if ! python3 - "$tmp" <<PY
+import json, sys
+red = "${red:-none}"
+rec = {
+    "head": "$head", "tree": "$tree", "expect": "green", "verdict": "PASS",
+    "tasks_max": int("$tasks_max"), "fake_nproc": int("$fake"), "cpu_quota": "$cpu_quota",
+    "clips": int("$clips"), "threads": "$used_threads", "nj": "$used_nj",
+    "stage_secs": "$secs", "pids_peak": "$pk", "events_max": "$ev",
+    "base_red": red if red == "none" else {"log": red, "time": "$(date -Is -r "${red:-/dev/null}" 2>/dev/null)"},
+    "log": "$log", "time": "$(date -Is)", "script": "jobs/rehearsal/vast-limits.sh", "script_version": $script_version,
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(rec, f, indent=1)
+    f.write("\n")
+PY
+  then
+    rm -f "$tmp"
+    echo "vast-limits: no pass record written: could not encode the record"
+    return 0
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$state_dir/$head.pass"
+  echo "vast-limits: pass record written: $state_dir/$head.pass"
+}
+
 # ---------- argument parsing ----------
 expect=green
 mode=main
@@ -105,7 +176,7 @@ venv=${VENV:-$HOME/.cache/vi/home-cpu-venv-3750779e6152a9c4}
 manifest=${MANIFEST:-$HOME/.cache/vi/realpath-check/scratch/train_manifest.jsonl}
 threads=${THREADS:-}
 nj=${NJ:-}
-j_log='' j_rc='' j_events='' j_o_stage=0 j_o_post=0
+j_log='' j_rc='' j_events='' j_o_stage=0 j_o_post=0 j_record=0
 
 need_value() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
@@ -121,6 +192,7 @@ while [ $# -gt 0 ]; do
     --threads) need_value "$@"; threads=$2; shift 2 ;;
     --nj) need_value "$@"; nj=$2; shift 2 ;;
     --judge) mode=judge; shift ;;
+    --record) j_record=1; shift ;;
     --log) need_value "$@"; j_log=$2; shift 2 ;;
     --rc) need_value "$@"; j_rc=$2; shift 2 ;;
     --events) need_value "$@"; j_events=$2; shift 2 ;;
@@ -138,6 +210,12 @@ is_pos_int() { case $1 in ''|*[!0-9]*|0) return 1 ;; *) return 0 ;; esac; }
 for pair in "fake-nproc:$fake" "clips:$clips" "budget:$budget"; do
   is_pos_int "${pair#*:}" || die "--${pair%%:*} must be a positive whole number, not '${pair#*:}'"
 done
+# A run with any forced limit (flag or environment) never writes a pass record: the fixed code must
+# pass with the limits it picks itself.
+forced=()
+[ -z "$tasks_max" ] || forced+=("--tasks-max/TASKS_MAX=$tasks_max")
+[ -z "$threads" ] || forced+=("--threads/THREADS=$threads")
+[ -z "$nj" ] || forced+=("--nj/NJ=$nj")
 [ -z "$tasks_max" ] && { [ "$expect" = red ] && tasks_max=2800 || tasks_max=512; }
 is_pos_int "$tasks_max" || die "--tasks-max must be a positive whole number, not '$tasks_max'"
 [ -z "$threads" ] || is_pos_int "$threads" || die "--threads must be a positive whole number"
@@ -151,7 +229,10 @@ if [ "$mode" = judge ]; then
   facts=$(judge "$expect" "$j_log" "$j_rc" "$j_events" "$j_o_stage" "$j_o_post" "$clips" "$fake")
   jrc=$?
   echo "$facts"
-  [ "$jrc" = 0 ] && echo "verdict: PASS (expect $expect)" || echo "verdict: FAIL (expect $expect)"
+  [ "$jrc" = 0 ] && verdict=PASS || verdict=FAIL
+  echo "verdict: $verdict (expect $expect)"
+  # --record (tests only): run the pass-record step on the canned verdict, as a real run would.
+  [ "$j_record" = 0 ] || write_pass_record "$verdict" "${threads:-2}" "${nj:-2}" judge judge "$j_events" "$j_log"
   exit "$jrc"
 fi
 
@@ -254,7 +335,6 @@ fi
 
 R=$(mktemp -d "$base/vast-limits.XXXXXX")
 unit="vi-vast-limits-$$"
-logdir="$base/vast-limits-logs"
 mkdir -p "$logdir"
 pgid=
 teardown() {
@@ -314,5 +394,8 @@ tr '\r' '\n' <"$R/stage.out" | grep -v '"text"' | grep -v 'Loading weights\|Extr
 facts=$(judge "$expect" "$R/stage.out" "$rc" "$events" "$o_stage" "$o_post" "$clips" "$fake")
 jrc=$?
 verdict=FAIL; [ "$jrc" = 0 ] && verdict=PASS
+used_threads=$(sed -n 's/^vast-limits: limits .* threads=\([^ ]*\) nj=\([^ ]*\) .*/\1/p' "$R/stage.out" | head -n 1)
+used_nj=$(sed -n 's/^vast-limits: limits .* threads=\([^ ]*\) nj=\([^ ]*\) .*/\2/p' "$R/stage.out" | head -n 1)
 echo "vast-limits: $verdict expect=$expect rc=$rc stage_secs=$stage_secs total_secs=$total_secs tasks_max=$tasks_max fake_nproc=$fake pids_max=$pmax pids_peak=$peak events_max=$events orphans_stage=$o_stage orphans_post=$o_post $facts log=$keep"
+write_pass_record "$verdict" "${used_threads:-unknown}" "${used_nj:-unknown}" "$stage_secs" "$peak" "$events" "$keep"
 exit "$jrc"
