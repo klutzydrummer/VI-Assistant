@@ -53,7 +53,7 @@ if [ -z "$PY" ] && [ -x "$STEER_VENV/bin/python" ]; then
     PY="$STEER_VENV/bin/python"
 elif [ -z "$PY" ]; then
     [ -x "$DIR/venv/bin/python" ] || python3 -m venv "$DIR/venv"
-    "$DIR/venv/bin/pip" install -q torch --index-url https://download.pytorch.org/whl/cpu
+    "$DIR/venv/bin/python" -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
     PY="$DIR/venv/bin/python"
 fi
 "$PY" -m pip install -q gguf safetensors numpy huggingface_hub

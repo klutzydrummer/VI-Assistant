@@ -6,6 +6,7 @@ showed why (most likely a `CUDA Version: N/A` header). A fake nvidia-smi feeds s
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -20,10 +21,23 @@ HEADER = ("+--------------------------------------------------------------------
 
 
 class CudaGate(unittest.TestCase):
-    def run_gate(self, smi_body, min_cuda="12.8", **extra):
+    def run_gate(self, smi_body, min_cuda="12.8", local_push=False, **extra):
         tmp = Path(tempfile.mkdtemp(prefix="cuda-gate."))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
         env = dict(os.environ)
+        script = SCRIPT
+        if local_push:
+            # A copy of the script whose push home is a stub, so a host that passes every gate
+            # finishes and writes preflight.json without any network.
+            jobs = tmp / "jobs"
+            jobs.mkdir()
+            shutil.copy(SCRIPT, jobs / SCRIPT.name)
+            shutil.copy(SCRIPT.parent / "worker-limits.sh", jobs / "worker-limits.sh")
+            (jobs / "voicetune.py").write_text("def parse_nvidia_smi_csv(text):\n    return []\n")
+            ret = jobs / "worker-return.sh"
+            ret.write_text("#!/usr/bin/env bash\nexit 0\n")
+            ret.chmod(0o755)
+            script = jobs / SCRIPT.name
         if smi_body is not None:
             fake = tmp / "bin"
             fake.mkdir()
@@ -48,7 +62,8 @@ class CudaGate(unittest.TestCase):
         settings.write_text(json.dumps({"min_cuda_version": min_cuda}))
         env.update(VI_OUT=str(tmp / "job" / "out"), VI_SETTINGS=str(settings), VI_RETURN_PORT="1")
         env.update(extra)
-        return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
+        self.out = tmp / "job" / "out"
+        return subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True,
                               timeout=60)
 
     def test_na_header_is_named_and_still_rejected(self):
@@ -61,7 +76,7 @@ class CudaGate(unittest.TestCase):
     def test_missing_header_shows_the_first_lines(self):
         r = self.run_gate(HEADER.format(cuda="(no cuda field)"))
         self.assertEqual(r.returncode, 1, r.stderr)
-        self.assertIn("no 'CUDA Version' line", r.stderr)
+        self.assertIn("no 'CUDA Version' or 'CUDA UMD Version' line", r.stderr)
         self.assertIn("NVIDIA-SMI 550.54.15", r.stderr)
         self.assertNotIn("reads N/A", r.stderr)
 
@@ -79,6 +94,36 @@ class CudaGate(unittest.TestCase):
         # A passing host would run on into the 100 MiB push, so prove the parse by a floor above it.
         r = self.run_gate(HEADER.format(cuda="CUDA Version: 13.1"), min_cuda="14.0")
         self.assertIn("CUDA version is 13.1, under the required 14.0", r.stderr)
+
+    # Driver 615 prints the CUDA version as `CUDA UMD Version:` beside a `KMD Version:` field;
+    # omnivoice-ft-r8 attempt 1 falsely rejected a CUDA 13.4 host over it. This is its exact header.
+    R8_HEADER = ("+-----------------------------------------------------------------------------+\n"
+                 "| NVIDIA-SMI 615.71.09  KMD Version: 615.71.09  CUDA UMD Version: 13.4  |\n"
+                 "+-----------------------------------------------------------------------------+\n")
+
+    def test_umd_header_passes_a_lower_floor(self):
+        r = self.run_gate(self.R8_HEADER, min_cuda="12.8", local_push=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("reported no CUDA version", r.stderr)
+        self.assertIn("worker-preflight: ok", r.stderr)
+        self.assertEqual(json.loads((self.out / "preflight.json").read_text())["cuda_version"], 13.4)
+
+    def test_umd_header_fails_a_higher_floor_by_number(self):
+        r = self.run_gate(self.R8_HEADER, min_cuda="13.5")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("CUDA version is 13.4, under the required 13.5", r.stderr)
+
+    def test_umd_na_header_is_named_and_rejected(self):
+        r = self.run_gate(self.R8_HEADER.replace("13.4", "N/A"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("raw header: | NVIDIA-SMI 615.71.09  KMD Version: 615.71.09  CUDA UMD Version: N/A",
+                      r.stderr)
+        self.assertIn("reads N/A", r.stderr)
+
+    def test_classic_header_passes_a_lower_floor(self):
+        r = self.run_gate(HEADER.format(cuda="CUDA Version: 12.8"), local_push=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads((self.out / "preflight.json").read_text())["cuda_version"], 12.8)
 
 
 if __name__ == "__main__":

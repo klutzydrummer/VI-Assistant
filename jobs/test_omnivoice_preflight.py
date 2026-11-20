@@ -96,6 +96,13 @@ with open(os.path.join(a.out_dir, "replay_public.jsonl"), "w") as f:
                         "language_id": "en", "replay": True}) + "\n")
 '''
 
+ACCELERATE_LAUNCH_STUB = r'''
+import os, sys
+args = sys.argv[1:]
+assert args[:2] == ["--num_processes", "1"], args
+os.execv(sys.executable, [sys.executable] + args[2:])
+'''
+
 HUB_STUB = r'''
 import os
 import re
@@ -161,7 +168,13 @@ class PreflightHarness(unittest.TestCase):
         bindir = root / "bin"
         bindir.mkdir()
         self._exe(bindir / "python", 'exec python3 "$@"')
-        self._exe(bindir / "accelerate", "shift 3\nexec \"${OVFT_PYTHON:-python3}\" \"$@\"")
+        # accelerate is launched as `$PY -m accelerate.commands.launch --num_processes 1 SCRIPT ...`;
+        # this stub drops the two launcher flags and runs the script in place of the launcher.
+        acc = root / "pylib" / "accelerate" / "commands"
+        acc.mkdir(parents=True)
+        (root / "pylib" / "accelerate" / "__init__.py").write_text("")
+        (acc / "__init__.py").write_text("")
+        (acc / "launch.py").write_text(ACCELERATE_LAUNCH_STUB)
         self._exe(bindir / "nvidia-smi", 'echo "24576, 0"')
         self.data = root / "data"
         (self.data / "voices").mkdir(parents=True)
@@ -460,9 +473,9 @@ class GuardTests(PreflightHarness):
         venv_py = self.root / "venv_python.sh"
         venv_py.write_text(f"""#!/usr/bin/env bash
 if [ "$1 $2" = "-m pip" ]; then
-  d=$(dirname "$(dirname "$0")"); final=${{d%.tmp-*}}
+  d=$(dirname "$(dirname "$0")")
   n=$(cat {self.pip_count} 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{self.pip_count}
-  echo "pip try $n args: $* final_exists=$([ "$d" != "$final" ] && [ -d "$final" ] && echo yes || echo no)" >>{self.pip_log}
+  echo "pip try $n args: $* dir=$d marker=$([ -e "$d/.vi-complete" ] && echo yes || echo no)" >>{self.pip_log}
   [ "$n" -gt {pip_fails} ]
   exit $?
 fi
@@ -470,13 +483,13 @@ exec {real} "$@"
 """)
         self._exe(self.root / "bin" / "python3", f"""if [ "$1 $2" = "-m venv" ]; then
   for a in "$@"; do d=$a; done
-  mkdir -p "$d/bin"; cp {venv_py} "$d/bin/python"; cp {self.root}/bin/accelerate "$d/bin/accelerate"; chmod +x "$d/bin/python" "$d/bin/accelerate"; exit 0
+  mkdir -p "$d/bin"; cp {venv_py} "$d/bin/python"; chmod +x "$d/bin/python"; exit 0
 fi
 exec {real} "$@"
 """.rstrip("\n"))
 
     def venvs(self):
-        return sorted(p.name for p in (self.root / "home" / ".cache" / "vi").glob("venv-*"))
+        return sorted(p.name for p in (self.root / "home" / ".cache" / "vi").glob("venv-*") if p.is_dir())
 
     def test_voicetune_pip_retry(self):
         self._fake_python3(pip_fails=2)
@@ -485,10 +498,13 @@ exec {real} "$@"
         lines = self.pip_log.read_text().splitlines()
         self.assertEqual(len(lines), 3, lines)
         self.assertIn("--retries 10 --timeout 60", lines[0])
-        self.assertTrue(all("final_exists=no" in l for l in lines), lines)  # renamed only after success
-        names = self.venvs()
-        self.assertEqual(len(names), 1, names)
-        self.assertNotIn("tmp", names[0])
+        # Built in place at the final path; the complete marker is absent during every pip try.
+        self.assertTrue(all("marker=no" in l for l in lines), lines)
+        venvs = self.venvs()
+        self.assertEqual(len(venvs), 1, venvs)
+        self.assertNotIn("tmp", venvs[0])
+        self.assertTrue(all(f"dir={self.root / 'home' / '.cache' / 'vi' / venvs[0]} " in l for l in lines), lines)
+        self.assertTrue((self.root / "home" / ".cache" / "vi" / venvs[0] / ".vi-complete").is_file())
 
     def test_voicetune_pip_retry_final_failure_leaves_no_venv(self):
         self._fake_python3(pip_fails=99)

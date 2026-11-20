@@ -147,6 +147,11 @@ STUB = textwrap.dedent('''\
                 print("on-worker.sh: the worker preflight failed; nothing was uploaded", file=sys.stderr); sys.exit(1)
             if r == "upload":
                 print("on-worker.sh: worker upload ETA is 41 min, over the 30 min limit, so nothing was sent", file=sys.stderr); sys.exit(1)
+            if r == "badinterp":
+                # r8 attempt 2: the venv's accelerate console script had a dead shebang
+                print("jobs/voicetune-fresh.sh: /root/.cache/vi/venv-x/bin/accelerate: bad interpreter", file=sys.stderr)
+                print("on-worker.sh: omnivoice_preflight exited with 126 on the worker", file=sys.stderr)
+                print("exit status: 126", file=sys.stderr); sys.exit(1)
             if r == "other":
                 print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
             if r == "ok-then-fail":
@@ -621,6 +626,18 @@ class Flow(Base):
                 self.assertGreaterEqual(len(self.downs()), 1)
                 self.assertIsNone(self.worker(), "worker must be gone")
                 self.assertEqual(self.state()["exit_code"], code)
+
+    def test_non_gate_preflight_failure_names_the_worker_exit_code(self):
+        self.scenario([dict(preflight="badinterp", spent=0.1)])
+        self.assertEqual(self.run_orch(), 4, self.out)
+        self.assertIn("the preflight failed (exit 126 on the worker; the vi CLI exited 1)", self.out)
+        self.assertEqual(len(self.ups()), 1)
+
+    def test_failure_rc_text(self):
+        pr = load_paid_run()
+        self.assertEqual(pr.failure_rc_text(1, "no worker line"), "exit 1")
+        self.assertEqual(pr.failure_rc_text(1, "on-worker.sh: omnivoice_preflight exited with 126 on the worker"),
+                         "exit 126 on the worker; the vi CLI exited 1")
 
     def test_release_failure_is_loud_and_forced_first(self):
         self.scenario([dict(train="fail", spent=0.1)], down_fail="plain")

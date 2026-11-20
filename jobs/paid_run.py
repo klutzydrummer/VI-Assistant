@@ -85,6 +85,19 @@ PREFLIGHT_GATE_RE = re.compile(r"worker-preflight: (?!ok\b)\S")
 UPLOAD_GATE_TEXT = "worker upload ETA"
 
 
+# on-worker.sh names the worker stage's own exit code; the vi CLI wrapping it exits 1 regardless.
+WORKER_RC_RE = re.compile(r"on-worker\.sh: \S+ exited with (\d+) on the worker")
+
+
+def failure_rc_text(rc, out):
+    """How a failed stage's exit is reported: the worker's exit code when on-worker.sh printed it
+    (r8: 126, a bad interpreter), with the vi CLI's own code beside it; else the vi CLI's code."""
+    m = WORKER_RC_RE.findall(out or "")
+    if m and m[-1] != str(rc):
+        return f"exit {m[-1]} on the worker; the vi CLI exited {rc}"
+    return f"exit {rc}"
+
+
 def retryable_gate(out):
     """The gate text that makes a failed preflight stage retry on another offer, or None."""
     if PUSH_GATE_TEXT in out:
@@ -1765,7 +1778,7 @@ class PaidRun:
                         at = None
                         continue
                     self.release(at, "preflight-failed")
-                    raise Stop(EXIT["preflight"], f"the preflight failed (exit {rc}) on a gate "
+                    raise Stop(EXIT["preflight"], f"the preflight failed ({failure_rc_text(rc, out)}) on a gate "
                                "that is not a retryable worker gate; the worker was released, no retry")
                 self.set_phase(at, "train")
             # -- train (new or adopted) --

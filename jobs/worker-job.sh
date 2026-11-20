@@ -34,7 +34,7 @@
 # make that relaunch safe.
 #
 #   worker-job.sh --work DIR --run DIR [--publish DIR] [--retries N] --
-#     accelerate launch --num_processes 1 jobs/omnivoice-ft/train_ft.py ...
+#     python -m accelerate.commands.launch --num_processes 1 jobs/omnivoice-ft/train_ft.py ...
 set -euo pipefail
 
 work= run= publish= retries=${VI_TRAIN_RETRIES:-2}

@@ -392,26 +392,35 @@ ovft_python() {
   fi
   local req="$jobs_dir/requirements-omnivoice-worker.txt" venv
   venv="$HOME/.cache/vi/venv-$(sha256sum "$req" | cut -c1-16)"
-  if [ ! -x "$venv/bin/python" ]; then
-    # Build into venv.tmp-$$ and rename only on success, so a half-built venv is never reused.
-    # 3 tries, sleeping 30 s then 90 s (VI_PIP_BACKOFF="30 90" overrides, for tests).
-    local tmp="$venv.tmp-$$" try delays rc=1
-    read -r -a delays <<<"${VI_PIP_BACKOFF:-30 90}"
-    for try in 0 1 2; do
-      rm -rf "$tmp"
-      if python3 -m venv --system-site-packages "$tmp" &&
-         "$tmp/bin/python" -m pip install -q --retries 10 --timeout 60 -r "$req"; then
-        rc=0
-        break
+  # Built in place at its final path: pip writes console scripts with an absolute shebang to the
+  # venv's own python, so a venv built elsewhere and renamed carries dead shebangs (r8 exit 126).
+  # A half-built venv is never reused: the .vi-complete marker is written last, and a folder
+  # without it is removed and rebuilt. A lock beside the venv keeps two builds from racing.
+  if [ ! -f "$venv/.vi-complete" ]; then
+    mkdir -p "$(dirname "$venv")"
+    exec 7>"$venv.lock"
+    flock 7
+    if [ ! -f "$venv/.vi-complete" ]; then
+      # 3 tries, sleeping 30 s then 90 s (VI_PIP_BACKOFF="30 90" overrides, for tests).
+      local try delays rc=1
+      read -r -a delays <<<"${VI_PIP_BACKOFF:-30 90}"
+      for try in 0 1 2; do
+        rm -rf "$venv"
+        if python3 -m venv --system-site-packages "$venv" &&
+           "$venv/bin/python" -m pip install -q --retries 10 --timeout 60 -r "$req"; then
+          rc=0
+          break
+        fi
+        [ "$try" -lt 2 ] && sleep "${delays[$try]:-30}"
+      done
+      if [ "$rc" != 0 ]; then
+        rm -rf "$venv"
+        echo "worker-preflight: pip install failed (3 tries) for $req" >&2
+        exit 1
       fi
-      [ "$try" -lt 2 ] && sleep "${delays[$try]:-30}"
-    done
-    if [ "$rc" != 0 ]; then
-      rm -rf "$tmp"
-      echo "worker-preflight: pip install failed (3 tries) for $req" >&2
-      exit 1
+      : >"$venv/.vi-complete"
     fi
-    mv "$tmp" "$venv"
+    exec 7>&-
   fi
   printf '%s\n' "$venv/bin/python"
 }
@@ -422,7 +431,10 @@ ovft_python() {
 . "$jobs_dir/worker-limits.sh"
 worker_limits || exit 1
 PY=$(ovft_python)
-ACCELERATE="$(dirname "$PY")/accelerate"
+# accelerate's launcher as a python module (documented at
+# https://huggingface.co/docs/accelerate/basic_tutorials/launch), never the venv's bin/accelerate
+# console script, so the launch never depends on a shebang path.
+ACCELERATE_LAUNCH=("$PY" -m accelerate.commands.launch)
 
 # Base model: use VI_BASE_MODEL when given, otherwise fetch the public k2-fsa/OmniVoice snapshot
 # at a pinned revision (the one replay_public.py's home default points at). The folder is kept
@@ -683,7 +695,7 @@ rehearse_kill_resume() {
   # setsid makes the launcher its own process group, so one kill -9 takes the accelerate
   # process and every dataloader worker with it.
   setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$pidfile" \
-    "$ACCELERATE" launch --num_processes 1 "${trainer[@]}" "${args[@]}" &
+    "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "${trainer[@]}" "${args[@]}" &
   bg=$!
   while [ ! -s "$pidfile" ]; do sleep 0.2; done
   pgid=$(cat "$pidfile")
@@ -724,7 +736,7 @@ print(last)' "$rr/style_metrics.jsonl" 2>/dev/null || echo 0
     sleep 0.5
   done
   [ ! -d "$rr/checkpoint-20" ] || { echo "rehearsal: checkpoint-20 exists after the kill; the kill proved nothing" >&2; return 1; }
-  "$ACCELERATE" launch --num_processes 1 "${trainer[@]}" "${args[@]}" \
+  "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "${trainer[@]}" "${args[@]}" \
     --resume-from-checkpoint "$rr/checkpoint-10"
   "$PY" "${trainer[@]}" --verify-checkpoint "$rr/checkpoint-10" "$rr/checkpoint-20" \
     || { echo "rehearsal: resumed run failed checkpoint verification" >&2; return 1; }
@@ -753,7 +765,7 @@ preflight() {
   # The probe uses the trainer's default batch, the same one train() runs, so it is the largest
   # batch the real run will see; its log carries the VRAM peak line the gate reads.
   mkdir -p "$probe_run"
-  "$ACCELERATE" launch --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
+  "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
     --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
     --output-dir "$probe_run" --steps 5 --save-steps 5 \
     --num-workers "${VI_NUM_WORKERS:-2}" 2>&1 | tee "$probe_run/train.log"
@@ -822,7 +834,7 @@ train() {
   # abort rules. 8>&- keeps the push lock from leaking into the detached
   # trainer, so a killed supervisor really does release it.
   "$jobs_dir/worker-job.sh" --work "$(dirname "$VI_OUT")" --run "$run" \
-    --publish "$publish" -- "$ACCELERATE" launch --num_processes 1 \
+    --publish "$publish" -- "${ACCELERATE_LAUNCH[@]}" --num_processes 1 \
     "$jobs_dir/omnivoice-ft/train_ft.py" \
     --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
     --output-dir "$run" --steps "${VI_TRAIN_STEPS:-5000}" --save-steps "${VI_SAVE_STEPS:-500}" \

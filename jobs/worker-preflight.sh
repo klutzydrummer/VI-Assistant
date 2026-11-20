@@ -122,11 +122,13 @@ except ValueError:
     print("")' || true)
   driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '\r' || true)
   smi_text=$(nvidia-smi 2>&1 || true)
-  cuda_version=$(printf '%s\n' "$smi_text" | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -n1 || true)
+  # Older drivers print `CUDA Version: 12.8` in the header; driver 615 prints
+  # `KMD Version: 615.71.09  CUDA UMD Version: 13.4` instead (omnivoice-ft-r8 attempt 1). Both count.
+  cuda_version=$(printf '%s\n' "$smi_text" | sed -En 's/.*CUDA (UMD )?Version: *([0-9.]+).*/\2/p' | head -n1 || true)
   # What the failure message shows when no version parses: the raw header line, so a host that
   # prints `CUDA Version: N/A` is told apart from one that prints no such line at all.
-  cuda_header=$(printf '%s\n' "$smi_text" | grep -m1 'CUDA Version' || true)
-  [ -n "$cuda_header" ] || cuda_header="no 'CUDA Version' line; nvidia-smi began: $(printf '%s\n' "$smi_text" | head -n5 | tr '\n' '|')"
+  cuda_header=$(printf '%s\n' "$smi_text" | grep -m1 -E 'CUDA (UMD )?Version' || true)
+  [ -n "$cuda_header" ] || cuda_header="no 'CUDA Version' or 'CUDA UMD Version' line; nvidia-smi began: $(printf '%s\n' "$smi_text" | head -n5 | tr '\n' '|')"
   clock_csv=$(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,power.draw,power.limit,clocks_throttle_reasons.active \
     --format=csv 2>/dev/null || true)
   nvidia_facts=$(PYTHONPATH="$jobs_dir" python3 - "$clock_csv" <<'PY'
