@@ -13,6 +13,8 @@
 #   min_cuda_version  CUDA version nvidia-smi reports (the driver's), compared as a number
 #   min_cpu_cores     effective cores (nproc capped by a cgroup cpu.max quota)
 #   min_push_mb_s     worker -> home rate measured by a raw 100 MiB dummy push
+# One gate needs no setting: the tasks row refuses a box whose free task slots (cgroup pids.max,
+# ulimit -u, threads-max) are under what the capped tokeniser needs (jobs/worker-limits.sh).
 # A setting that is absent or empty turns that gate off; the facts are still
 # recorded. nvidia-smi is optional unless min_vram_gb asks for it, so the same
 # script runs on a CPU-only test worker.
@@ -82,6 +84,23 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
   esac
 fi
 [ -z "$min_cores" ] || at_least "$cpu_eff" "$min_cores" "effective CPU cores"
+
+# Tasks row (r7): a cgroup pids.max counts threads as well as processes, and r7's box showed 48
+# CPUs but allowed only a few thousand tasks, so the tokeniser's thread pools could not start.
+# jobs/worker-limits.sh reads pids.max/pids.current at every cgroup level, nproc, cpu.max, the
+# cpuset, ulimit -u and kernel threads-max, and works out the capped thread and worker counts the
+# stage will use; a box with too little room even for those is refused here, before any upload.
+# (The stage's preflight then runs an 8-clip real tokeniser smoke with the same caps; see
+# tokenise_smoke in jobs/voicetune-fresh.sh.)
+# shellcheck source=jobs/worker-limits.sh
+. "$jobs_dir/worker-limits.sh"
+worker_limits_measure
+worker_limits_line >&2
+if [ "$vi_lim_tasks_free" -lt "$vi_lim_need" ]; then
+  fail "tasks: only $vi_lim_tasks_free free task slots (pids.max=$vi_lim_pids_max current=$vi_lim_pids_current ulimit-u=$vi_lim_ulimit_u threads-max=$vi_lim_threads_max), need at least $vi_lim_need for $vi_lim_procs processes"
+fi
+tasks_free=$vi_lim_tasks_free
+[ "$tasks_free" -lt "$vi_unlimited" ] || tasks_free=null
 
 # Free space on the job disk, already net of any kept attempts below $work.
 free_disk_gb=$(df -Pk "$work" | awk 'NR == 2 {printf "%.1f", $4 / 1048576}')
@@ -199,6 +218,9 @@ python3 - "$report" \
   "driver_version=$driver_version" "cuda_version=$cuda_version" "nvidia=$nvidia_facts" \
   "disk_write_mb_s=$disk_write_mb_s" "disk_read_mb_s=$disk_read_mb_s" "disk_direct=$disk_direct" \
   "push_bytes=$push_bytes" "push_seconds=$push_seconds" "push_mb_s=$push_mb_s" \
+  "pids_max=$vi_lim_pids_max" "pids_current=$vi_lim_pids_current" "tasks_free=$tasks_free" \
+  "ulimit_u=$vi_lim_ulimit_u" "threads_max=$vi_lim_threads_max" \
+  "limit_threads=$vi_lim_threads" "limit_nj=$vi_lim_nj" \
   "checked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
 import json, sys
 d = {}

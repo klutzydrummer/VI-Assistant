@@ -552,6 +552,39 @@ if n < rows or f + k > max(2, rows // 100):
 PY
 }
 
+# tokenise_smoke: the tasks row's live half (jobs/worker-preflight.sh does the static half). The
+# first 8 rows of the train manifest, in file order, go through the real tokeniser with the capped
+# threads and worker count, under a 300 s limit, into a scratch folder that is then removed. A
+# failure is treated as a machine problem: it prints a "worker-preflight: tasks ..." line, so the
+# run retries on another box. The smoke's own output stays in $VI_OUT/tasks-smoke.log and out of
+# the job log, so its crash lines are never read as the stage's own (non-retryable) crash.
+# Skipped when shards/train already exists (a reattach or the train mode).
+tokenise_smoke() {
+  local manifest="$data_dir/train_manifest.jsonl" dir="$scratch/tasks-smoke" tok rc=0 t0
+  [ -s "$data_dir/shards/train/data.lst" ] && return 0
+  tok=$(audio_tokenizer_dir) || return 1
+  [ -s "$manifest" ] || { echo "tokenise: $manifest missing or empty" >&2; return 1; }
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  head -n "${VI_SMOKE_ROWS:-8}" "$manifest" >"$dir/smoke.jsonl"
+  t0=$(date +%s)
+  VI_RUN_TIMEOUT_SECONDS=${VI_SMOKE_TIMEOUT_SECONDS:-300} VI_WATCH_SHOW=0 \
+    vi_run_watched "$dir/extract.log" "$PY" -m omnivoice.scripts.extract_audio_tokens \
+    --input_jsonl "$dir/smoke.jsonl" \
+    --tar_output_pattern "$dir/audios/shard-%06d.tar" \
+    --jsonl_output_pattern "$dir/txts/shard-%06d.jsonl" \
+    --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors \
+    --nj_per_gpu "${VI_LIMIT_NJ:-1}" || rc=$?
+  cp "$dir/extract.log" "$VI_OUT/tasks-smoke.log" 2>/dev/null || true
+  if [ "$rc" = 0 ] && tokenise_count_guard smoke "$dir/smoke.jsonl" "$dir/extract.log" 2>/dev/null; then
+    echo "tasks smoke: $(wc -l <"$dir/smoke.jsonl") clips tokenised in $(( $(date +%s) - t0 ))s with threads=${OMP_NUM_THREADS:-?} nj=${VI_LIMIT_NJ:-?}"
+    rm -rf "$dir"
+    return 0
+  fi
+  echo "worker-preflight: tasks: the $(wc -l <"$dir/smoke.jsonl")-clip tokeniser smoke failed (exit $rc after $(( $(date +%s) - t0 ))s, threads=${OMP_NUM_THREADS:-?} nj=${VI_LIMIT_NJ:-?}); its log is $VI_OUT/tasks-smoke.log" >&2
+  return 1
+}
+
 # prepare_data: steps 0a and 0b, both need CUDA and both write into the data folder.
 #   0a  tokenise the train and dev manifests into shards/train and shards/dev
 #   0b  generate the public replay set with Base (replay_public.py --device cuda) into replay/,
@@ -710,6 +743,7 @@ PY
 preflight() {
   check_and_gate
   gpu_gate
+  tokenise_smoke
   prepare_data
 
   # Five real steps at the full batch (--steps 5 --save-steps 5 writes checkpoint-5), published

@@ -161,12 +161,16 @@ worker_limits() {
 vi_run_watched() {
   local log=$1; shift
   local quiet=${VI_FATAL_QUIET_SECONDS:-120} poll=${VI_WATCH_POLL_SECONDS:-2}
-  local limit=${VI_RUN_TIMEOUT_SECONDS:-10800} pid tail_pid rc fatal_at='' size=0 cur now killed=0
+  local limit=${VI_RUN_TIMEOUT_SECONDS:-10800} pid tail_pid='' rc fatal_at='' size=0 cur now killed=0
   : >"$log"
   setsid timeout --kill-after=30 "$limit" "$@" >>"$log" 2>&1 </dev/null &
   pid=$!
-  tail -n +1 -f --pid="$pid" "$log" 2>/dev/null &
-  tail_pid=$!
+  # VI_WATCH_SHOW=0 keeps the output in LOG only (the tasks smoke, whose crash lines must not
+  # reach the job log).
+  if [ "${VI_WATCH_SHOW:-1}" = 1 ]; then
+    tail -n +1 -f --pid="$pid" "$log" 2>/dev/null &
+    tail_pid=$!
+  fi
   while kill -0 "$pid" 2>/dev/null; do
     sleep "$poll"
     now=$(date +%s)
@@ -188,7 +192,7 @@ vi_run_watched() {
   wait "$pid" || rc=$?
   # The command is gone; clear whatever it left in its group (the r7 orphaned Manager).
   kill -KILL -- "-$pid" 2>/dev/null || true
-  wait "$tail_pid" 2>/dev/null || true
+  [ -z "$tail_pid" ] || wait "$tail_pid" 2>/dev/null || true
   [ "$killed" = 0 ] || rc=75
   return "$rc"
 }

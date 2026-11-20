@@ -20,7 +20,7 @@ HEADER = ("+--------------------------------------------------------------------
 
 
 class CudaGate(unittest.TestCase):
-    def run_gate(self, smi_body, min_cuda="12.8"):
+    def run_gate(self, smi_body, min_cuda="12.8", **extra):
         tmp = Path(tempfile.mkdtemp(prefix="cuda-gate."))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
         env = dict(os.environ)
@@ -47,6 +47,7 @@ class CudaGate(unittest.TestCase):
         settings = tmp / "settings.json"
         settings.write_text(json.dumps({"min_cuda_version": min_cuda}))
         env.update(VI_OUT=str(tmp / "job" / "out"), VI_SETTINGS=str(settings), VI_RETURN_PORT="1")
+        env.update(extra)
         return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
                               timeout=60)
 
@@ -82,3 +83,46 @@ class CudaGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TasksRow(unittest.TestCase):
+    """The tasks row refuses a box with too few free task slots (r7: pids.max counts threads)."""
+
+    def run_row(self, pids_max, pids_current, threads_max="4000000", ulimit_u=None):
+        tmp = Path(tempfile.mkdtemp(prefix="tasks-row."))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
+        cg = tmp / "cgroup"
+        cg.mkdir()
+        (cg / "pids.max").write_text(f"{pids_max}\n")
+        (cg / "pids.current").write_text(f"{pids_current}\n")
+        (cg / "cpu.max").write_text("1100000 100000\n")
+        (cg / "cpuset.cpus.effective").write_text("0-47\n")
+        proc = tmp / "proc"
+        (proc / "sys" / "kernel").mkdir(parents=True)
+        (proc / "loadavg").write_text("0.10 0.10 0.10 1/50 999\n")
+        (proc / "sys" / "kernel" / "threads-max").write_text(f"{threads_max}\n")
+        gate = CudaGate("test_na_header_is_named_and_still_rejected")
+        gate.addCleanup = self.addCleanup
+        # A CUDA 13.1 header against a 14.0 floor: a box that passes the tasks row stops at the
+        # CUDA gate, so the test never reaches the network push.
+        return gate.run_gate(HEADER.format(cuda="CUDA Version: 13.1"), min_cuda="14.0",
+                             CGROUP_ROOT=str(cg), VI_LIMITS_PROC=str(proc), VI_LIMITS_NPROC="48")
+
+    def test_too_few_task_slots_fail_the_tasks_row(self):
+        r = self.run_row(pids_max=60, pids_current=30)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertRegex(r.stderr, r"(?m)^worker-preflight: tasks: only 30 free task slots "
+                                   r"\(pids\.max=60 current=30 .*\), need at least 40 for 5 processes$")
+        self.assertRegex(r.stderr, r"(?m)^limits: nproc=48 cpus=11 quota=11 cpuset=48 pids\.max=60 ")
+        self.assertNotIn("CUDA version", r.stderr)
+
+    def test_low_threads_max_also_fails_the_tasks_row(self):
+        r = self.run_row(pids_max="max", pids_current=5, threads_max="70")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("worker-preflight: tasks: only 20 free task slots", r.stderr)
+
+    def test_enough_task_slots_pass_on_to_the_next_gate(self):
+        r = self.run_row(pids_max=2800, pids_current=100)
+        self.assertNotIn("worker-preflight: tasks:", r.stderr)
+        self.assertRegex(r.stderr, r"(?m)^limits: .* tasks_free=2700 -> threads=2 nj=2$")
+        self.assertIn("CUDA version is 13.1, under the required 14.0", r.stderr)

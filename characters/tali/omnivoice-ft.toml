@@ -42,7 +42,7 @@ home_gate_reserve_gb = 27
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
 inputs = ["omnivoice_data"]
 files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
-         "../../jobs/omnivoice_abort.py", "../../jobs/checkpoints.py",
+         "../../jobs/worker-limits.sh", "../../jobs/omnivoice_abort.py", "../../jobs/checkpoints.py",
          "../../jobs/requirements-omnivoice-worker.txt", "../../jobs/omnivoice-ft/train_ft.py",
          "../../jobs/omnivoice-ft/ft_data.py", "../../jobs/omnivoice-ft/infer_listening.py",
          "../../jobs/omnivoice-ft/replay_public.py"]
@@ -75,7 +75,7 @@ min_push_mb_s = 2.5
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "train"]
 inputs = ["omnivoice_data"]
 files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
-         "../../jobs/omnivoice_abort.py", "../../jobs/checkpoints.py",
+         "../../jobs/worker-limits.sh", "../../jobs/omnivoice_abort.py", "../../jobs/checkpoints.py",
          "../../jobs/requirements-omnivoice-worker.txt", "../../jobs/omnivoice-ft/train_ft.py",
          "../../jobs/omnivoice-ft/ft_data.py", "../../jobs/omnivoice-ft/infer_listening.py",
          "../../jobs/omnivoice-ft/replay_public.py"]

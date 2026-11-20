@@ -5,6 +5,7 @@ no GPU, torch or omnivoice is needed. The stubs log every call to $CALLS."""
 import json
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -62,13 +63,22 @@ for k in ("input_jsonl", "tar_output_pattern", "jsonl_output_pattern", "tokenize
     ap.add_argument("--" + k)
 ap.add_argument("--skip_errors", action="store_true")
 a = ap.parse_args()
-open(os.environ["CALLS"], "a").write(f"tokenise {a.input_jsonl} tokenizer={a.tokenizer_path}\n")
+# The tasks smoke (8 rows into a scratch folder) logs as its own kind and ignores the STUB_TOK_*
+# counts; STUB_SMOKE_RC makes it crash like r7's tokeniser did.
+smoke = "tasks-smoke" in a.input_jsonl
+open(os.environ["CALLS"], "a").write(f"{'tokenise-smoke' if smoke else 'tokenise'} {a.input_jsonl} tokenizer={a.tokenizer_path}\n")
+if smoke and os.environ.get("STUB_SMOKE_RC"):
+    print("Traceback (most recent call last):")
+    print("concurrent.futures.process.BrokenProcessPool: A process in the pool was terminated")
+    sys.exit(int(os.environ["STUB_SMOKE_RC"]))
 open(os.environ["CALLS"] + ".env", "a").write(f"nj={a.nj_per_gpu} omp={os.environ.get('OMP_NUM_THREADS')} openblas={os.environ.get('OPENBLAS_NUM_THREADS')}\n")
 base = os.path.dirname(os.path.dirname(a.tar_output_pattern))
 os.makedirs(os.path.join(base, "audios"), exist_ok=True)
 open(os.path.join(base, "data.lst"), "w").write("shard-000000.tar shard-000000.jsonl 1 1.0\n")
 rows = sum(1 for l in open(a.input_jsonl) if l.strip())
 ok, bad, skipped = os.environ.get("STUB_TOK_OK"), os.environ.get("STUB_TOK_FAILED", "0"), os.environ.get("STUB_TOK_SKIPPED", "0")
+if smoke:
+    ok, bad, skipped = None, "0", "0"
 print(f"Processing Complete - Successful: {ok if ok is not None else rows}, Failed: {bad}, Filtered/Skipped: {skipped}")
 '''
 
@@ -88,6 +98,7 @@ with open(os.path.join(a.out_dir, "replay_public.jsonl"), "w") as f:
 
 HUB_STUB = r'''
 import os
+import re
 def snapshot_download(repo, revision=None, local_dir=None):
     open(os.environ["CALLS"], "a").write(
         f"snapshot_download {repo} {revision} offline={os.environ.get('HF_HUB_OFFLINE')} "
@@ -105,6 +116,7 @@ def snapshot_download(repo, revision=None, local_dir=None):
 
 TORCH_STUB = r'''
 import os
+import re
 class _Cuda:
     @staticmethod
     def synchronize():
@@ -199,7 +211,9 @@ class PrepareDataTest(PreflightHarness):
         kinds = [l.split()[0] for l in log]
         first_train = kinds.index("train_ft")
         self.assertEqual(kinds[:first_train],
-                         ["tokenise", "tokenise", "replay_public", "tokenise"])
+                         ["tokenise-smoke", "tokenise", "tokenise", "replay_public", "tokenise"])
+        self.assertIn("tasks-smoke/smoke.jsonl", log[0])
+        log = log[1:]
         self.assertIn(f"tokenise {self.data}/train_manifest.jsonl", log[0])
         self.assertIn(f"tokenise {self.data}/dev_manifest.jsonl", log[1])
         self.assertIn("device=cuda", log[2])
@@ -209,6 +223,24 @@ class PrepareDataTest(PreflightHarness):
         self.assertIn(f"tokenise {self.data}/replay/replay_public.jsonl", log[3])
         for name in ("train", "dev", "replay"):
             self.assertTrue((self.data / "shards" / name / "data.lst").is_file(), name)
+
+    def test_tasks_smoke_failure_is_a_retryable_machine_gate(self):
+        # The smoke's crash lines stay in its own log; the job output carries only the
+        # worker-preflight line paid_run.py retries on, and nothing past the smoke runs.
+        r = self.preflight(STUB_SMOKE_RC="1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertRegex(r.stderr, r"(?m)^worker-preflight: tasks: the \d+-clip tokeniser smoke failed \(exit 1")
+        self.assertNotRegex(r.stdout + r.stderr, r"Traceback|BrokenProcessPool")
+        self.assertIn("BrokenProcessPool", (self.root / "work" / "out" / "tasks-smoke.log").read_text())
+        self.assertEqual([l.split()[0] for l in self.log()], ["tokenise-smoke"])
+
+    def test_tasks_smoke_uses_the_capped_limits(self):
+        r = self.preflight()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r"(?m)^limits: .* -> threads=[12] nj=[12]$")
+        self.assertRegex(r.stdout, r"(?m)^tasks smoke: \d+ clips tokenised in \d+s with threads=[12] nj=[12]$")
+        env = (Path(str(self.calls) + ".env")).read_text().splitlines()
+        self.assertTrue(env and all(re.match(r"nj=[12] omp=[12] openblas=[12]$", l) for l in env), env)
 
     def test_placeholder_tokenizer_falls_back_to_the_base_snapshot(self):
         self.preflight()
@@ -333,6 +365,19 @@ class FloorsInConfigTest(unittest.TestCase):
                 self.assertEqual(st["min_push_mb_s"], 2.5, (name, stage))
                 if name == "omnivoice-ft.toml":
                     self.assertEqual(st["min_vram_gb"], 23.5, (name, stage))
+
+    def test_every_stage_that_ships_the_worker_scripts_ships_worker_limits(self):
+        # voicetune-fresh.sh and worker-preflight.sh both source worker-limits.sh on the worker.
+        import tomllib
+        chars = JOBS.parent / "characters" / "tali"
+        seen = 0
+        for name in ("voicetune.toml", "omnivoice-ft.toml"):
+            for stage, cfg in tomllib.loads((chars / name).read_text())["stage"].items():
+                files = cfg.get("files", [])
+                if any(f.endswith(("/voicetune-fresh.sh", "/worker-preflight.sh")) for f in files):
+                    seen += 1
+                    self.assertIn("../../jobs/worker-limits.sh", files, (name, stage))
+        self.assertEqual(seen, 4)
 
     def test_omnivoice_stage_input_matches_the_scripts_variable(self):
         import tomllib

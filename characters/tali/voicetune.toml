@@ -50,7 +50,8 @@ home_gate_reserve_gb = 27
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "preflight"]
 inputs = ["voicetune_data"]
 files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
-         "../../jobs/voicetune.py", "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
+         "../../jobs/worker-limits.sh", "../../jobs/voicetune.py", "../../jobs/checkpoints.py",
+         "../../jobs/requirements-tune.txt"]
 manual = true
 
 [stage.voicetune_preflight.settings]
@@ -77,7 +78,8 @@ min_cpu_cores = 8
 command = ["../../jobs/on-worker.sh", "bash", "jobs/voicetune-fresh.sh", "train"]
 inputs = ["voicetune_data"]
 files = ["../../jobs/voicetune-fresh.sh", "../../jobs/worker-job.sh", "../../jobs/worker-preflight.sh",
-         "../../jobs/voicetune.py", "../../jobs/checkpoints.py", "../../jobs/requirements-tune.txt"]
+         "../../jobs/worker-limits.sh", "../../jobs/voicetune.py", "../../jobs/checkpoints.py",
+         "../../jobs/requirements-tune.txt"]
 manual = true
 
 [stage.voicetune_train.settings]
