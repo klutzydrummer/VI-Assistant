@@ -142,7 +142,7 @@ STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
-            release=9, budget=10, disk=11, ids=12, realpath=13, hf=14, other=1)
+            release=9, budget=10, disk=11, ids=12, realpath=13, hf=14, rehearsal=15, other=1)
 
 # ---- retries, timeouts and recovery bounds (every wait goes through nap(), so tests never wait) ----
 OUTER_RETRY_SECONDS = 20          # F-NET-1: one more try of `offers` / `status` after this long
@@ -150,6 +150,13 @@ RELEASE_BACKOFF = (10, 20, 40, 80)  # F-REL-1: waits between `down --force` trie
 QUERY_TIMEOUT_SECONDS = 180       # F-CLK-1: offers / status
 DOWN_TIMEOUT_SECONDS = 300        # a hung `down` would bill forever
 PREFLIGHT_TIMEOUT_SECONDS = 90 * 60
+# r7: the tokeniser's pool died (pthread_create failed -> BrokenProcessPool) and the stage then
+# printed nothing for hours. A fatal line followed by this long with no new output ends the
+# preflight as a non-retryable failure (fork F2: a crash is a code or limits bug, not a bad
+# offer). The same words as VI_FATAL_RE in jobs/worker-limits.sh. PAID_RUN_FATAL_QUIET_SECONDS
+# overrides the wait for tests.
+FATAL_RE = re.compile(r"BrokenProcessPool|pthread_create failed|can't start new thread|Traceback")
+FATAL_QUIET_SECONDS = 180
 UP_EXTRA_SECONDS = 5 * 60         # `up` may take boot_minutes plus this
 DEFAULT_BOOT_MINUTES = 15
 INPLACE_MAX_RESTARTS = 2          # F-RES-1 / F-TRN-2: in-place train restarts on the same worker
@@ -211,6 +218,16 @@ for v in "$HOME"/.cache/vi/venv-*; do
   echo "-- $v"
   timeout 15 "$v/bin/python" -m pip freeze 2>&1 | head -n 400
 done
+echo "== limits (r7: a cgroup pids.max that counts threads)"
+ulimit -a 2>&1 | head -n 30
+echo "nproc: $(nproc 2>&1)"
+for f in pids.max pids.current cpu.max cpuset.cpus.effective; do
+  echo "/sys/fs/cgroup/$f: $(head -c 200 /sys/fs/cgroup/$f 2>&1)"
+done
+echo "threads-max: $(cat /proc/sys/kernel/threads-max 2>&1)"
+echo "threads on the machine: $(ps -eLf 2>/dev/null | wc -l)"
+echo "-- job tree (pid ppid threads state wait command)"
+timeout 10 ps -eo pid,ppid,nlwp,stat,wchan:20,cmd 2>&1 | grep -E 'PID|vi-jobs|omnivoice|python|accelerate|timeout|on-worker' | grep -v grep | head -n 80
 echo "== job and stage logs (newest two job dirs, last 20 KB of each log)"
 for d in $(ls -dt "${VI_WORKER_ROOT:-/root/vi-jobs}"/*/ 2>/dev/null | head -n 2); do
   for f in "$d"job.log "$d"out/*.log "$d"out/*/*.log; do
@@ -732,6 +749,12 @@ def hf_revision_gate(home=None, revision=None, model_info=None, sleep=None):
             break
         except Exception as e:  # noqa: BLE001: classified below
             last = e
+            if isinstance(e, ImportError):  # ModuleNotFoundError included
+                # Retrying cannot fix a missing library, and a cached snapshot does not prove
+                # the pinned revision still exists, so this is a hard stop (r7 lost its gate here).
+                return False, [f"{label}could not be checked: {type(e).__name__}: {e}. Install "
+                               f"huggingface_hub for this interpreter ({sys.executable} -m pip "
+                               "install --user huggingface_hub) and run again. Nothing was rented."]
             if type(e).__name__ in ("RevisionNotFoundError", "RepositoryNotFoundError",
                                     "EntryNotFoundError", "GatedRepoError"):
                 return False, [f"{label}NOT FOUND: {HF_REPO} @ {rev} ({type(e).__name__}: {e}); the "
@@ -929,6 +952,7 @@ class PaidRun:
         self.path = state_root() / f"{args.run_id}.json"
         self.child = None
         self.timed_out = False
+        self.fatal_line = self.fatal_stopped = None
         self.last_facts = {}
         self.worker_maybe_up = False
         self.in_teardown = False
@@ -979,14 +1003,18 @@ class PaidRun:
         env.update(getattr(self, "extra_env", {}))
         return env
 
-    def run(self, argv, stream=True, watch=False, train=False, timeout=None):
+    def run(self, argv, stream=True, watch=False, train=False, timeout=None, fatal_quiet=None):
         """Run a command, returning (returncode, combined stdout+stderr text). With watch=True a
         stop request is noticed even while the command prints nothing; train=True also reads the
         trainer's progress and checkpoint acks from its output. A `timeout` (seconds, scaled by
         PAID_RUN_TIMEOUT_SCALE) kills the command's whole process group: rc 124, and
-        self.timed_out is set for the caller."""
+        self.timed_out is set for the caller. With `fatal_quiet` (seconds) a fatal line
+        (FATAL_RE, seen by note_line) followed by that long with no output also kills the group:
+        rc 124, and self.fatal_stopped holds the fatal line."""
         self.timed_out = False
+        self.fatal_line, self.fatal_stopped = None, None
         limit = timeout_scale(timeout) if timeout else None
+        last_line_at = time.monotonic()
         deadline = time.monotonic() + limit if limit else None
         p = subprocess.Popen(argv, cwd=self.a.repo, env=self.env(), text=True, bufsize=1,
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1010,6 +1038,7 @@ class PaidRun:
                 if line is None:
                     break
                 if line:
+                    last_line_at = time.monotonic()
                     buf.append(line)
                     if stream:
                         print(line, end="", flush=True)
@@ -1017,6 +1046,20 @@ class PaidRun:
                         self.note_line(line)
                 if watch:
                     self.check_stop()
+                if fatal_quiet and self.fatal_line \
+                        and time.monotonic() - last_line_at >= fatal_quiet:
+                    self.fatal_stopped = self.fatal_line
+                    msg = (f"paid-run: a fatal line ({self.fatal_line.strip()[:200]}) and no output "
+                           f"for {fatal_quiet:.0f} s; killing the stage's process group\n")
+                    buf.append(msg)
+                    if stream:
+                        print(msg, end="", flush=True)
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except OSError:
+                        p.kill()
+                    p.wait()
+                    return 124, "".join(buf)
                 if deadline is not None and time.monotonic() > deadline:
                     self.timed_out = True
                     msg = (f"paid-run: {' '.join(map(str, argv[:4]))} timed out after {limit:.0f} s; "
@@ -1055,6 +1098,8 @@ class PaidRun:
     # ----- progress and stop requests ------------------------------------------------------
     def note_line(self, line):
         self.tail.append(line.rstrip("\n"))
+        if FATAL_RE.search(line):
+            self.fatal_line = line
         got = parse_step(line)
         if got:
             self.step, self.total = got
@@ -1553,8 +1598,17 @@ class PaidRun:
                     at = None
                     continue
                 self.set_phase(at, "preflight")
+                quiet = float(os.environ.get("PAID_RUN_FATAL_QUIET_SECONDS", FATAL_QUIET_SECONDS))
                 rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"],
-                                   watch=True, timeout=PREFLIGHT_TIMEOUT_SECONDS)
+                                   watch=True, timeout=PREFLIGHT_TIMEOUT_SECONDS, fatal_quiet=quiet)
+                fatal = self.fatal_stopped  # release() runs other commands, which reset it
+                if rc != 0 and fatal:
+                    self.release(at, "preflight-failed")
+                    raise Stop(EXIT["preflight"], "the preflight printed a fatal line ("
+                               f"{fatal.strip()[:200]}) and then nothing for "
+                               f"{quiet:.0f} s, so it was stopped. A crash is not a per-offer gate: "
+                               "the worker was released, no retry; the diag-attempt file in the run "
+                               "folder holds the worker's limits and job tree.")
                 if rc != 0:
                     gate = retryable_gate(out) or ("stage-timeout" if self.timed_out else None)
                     if gate:
@@ -1724,8 +1778,8 @@ class PaidRun:
                 say(ln)
             if not hf_ok:
                 print(f"paid-run: STOPPED (exit {EXIT['hf']}): the pinned base-model revision could "
-                      "not be confirmed on Hugging Face and is not in the home cache. Nothing was "
-                      "rented.", file=sys.stderr, flush=True)
+                      "not be confirmed on Hugging Face (the `hf revision` line above says why). "
+                      "Nothing was rented.", file=sys.stderr, flush=True)
                 return EXIT["hf"]
         try:
             resumed = self.load_or_create()

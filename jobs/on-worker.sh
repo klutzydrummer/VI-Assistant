@@ -87,6 +87,16 @@ poll_seconds=${VI_POLL_SECONDS:-30}
 lost_limit=$(( ${VI_LOST_MINUTES:-30} * 60 ))
 stall_minutes=${VI_STALL_MINUTES:-30}
 stall_seconds=$((stall_minutes * 60))
+# The home loop's stall limit: while the stage runs and nothing is being pushed, no file in its
+# work folder may go unchanged for longer (job.log grows with every printed line). r7's preflight
+# sat silent for hours after its tokeniser pool died, so a preflight gets 10 minutes and the
+# train stage, whose quiet stretches (checkpoint saves, listening sets) are longer, 60.
+# VI_PREFLIGHT_STALL_SECONDS and VI_TRAIN_STALL_SECONDS override them (tests use a few seconds).
+case " $* " in
+  *" preflight "*) stage_mode=preflight; progress_seconds=${VI_PREFLIGHT_STALL_SECONDS:-600} ;;
+  *) stage_mode=train; progress_seconds=${VI_TRAIN_STALL_SECONDS:-3600} ;;
+esac
+case $progress_seconds in ''|*[!0-9]*|0) progress_seconds=600 ;; esac
 pending_hold=$(( ${VI_PENDING_HOLD:-120} * 60 ))
 watchdog_script=${VI_WATCHDOG_SCRIPT:-/root/vi-watchdog.sh}
 watchdog_log=${VI_WATCHDOG_LOG:-/var/log/vi-watchdog.log}
@@ -779,7 +789,7 @@ echo VI-PENDING \"\$(ls pending 2>/dev/null | tr '\n' ' ')\"
 echo VI-REPUSH \"\$(ls repush 2>/dev/null | tr '\n' ' ')\"
 echo VI-BAD \"\$(ls bad 2>/dev/null | tr '\n' ' ')\"
 echo VI-WATCHDOG \$(pgrep -f vi-watchdog.sh >/dev/null 2>&1 && echo 1 || echo 0)
-echo VI-PROGRESS \$(find . -mindepth 1 -newermt \"@\$(( \$(date +%s) - $stall_seconds ))\" -print -quit 2>/dev/null | grep -q . && echo 1 || echo 0)
+echo VI-PROGRESS \$(find . -mindepth 1 -newermt \"@\$(( \$(date +%s) - $progress_seconds ))\" -print -quit 2>/dev/null | grep -q . && echo 1 || echo 0)
 vi_size=\$(stat -c %s job.log 2>/dev/null || echo 0)
 echo VI-SIZE \$vi_size
 echo VI-LOG"
@@ -1050,6 +1060,15 @@ hs_loop() {
             stage_finished "$stage_rc"
             return
           fi
+        elif [ "$stage_alive" = 1 ] && [ "$(sv VI-PROGRESS)" = 0 ] && [ "$(sv VI-PUSH)" != 1 ]; then
+          # Nothing in the work folder changed within the stall limit: the job is hung (r7: a
+          # dead tokeniser pool behind an orphaned Manager). Stop its whole session on the worker
+          # so home does not wait out the stage timeout, and fail the stage.
+          echo "on-worker.sh: ALERT: $VI_STAGE ($stage_mode) wrote nothing for ${progress_seconds}s, over its stall limit; stopping it on the worker" >&2
+          remote "p=\$(cat $(q "$work/stage.pid") 2>/dev/null) && [ -n \"\$p\" ] && { kill -TERM -- -\"\$p\" 2>/dev/null; sleep 2; kill -KILL -- -\"\$p\" 2>/dev/null; }; true" >/dev/null 2>&1 || true
+          [ -z "$pending" ] && stage_failed=1
+          stage_finished 1
+          return
         elif [ "$stage_alive" = 0 ] && [ "$lock$train" = "00" ] && [ -z "$pending" ]; then
           if [ -n "$(sv VI-JOB-RC)" ]; then
             echo "on-worker.sh: ALERT: the stage supervisor ended without stage.rc while the trainer finished (exit $(sv VI-JOB-RC)); keeping the worker copy for inspection" >&2

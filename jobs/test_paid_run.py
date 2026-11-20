@@ -121,6 +121,17 @@ STUB = textwrap.dedent('''\
         if stage == "omnivoice_preflight":
             r = a.get("preflight", "pass")
             if r == "hang": hang()
+            if r == "fatal":
+                # r7: the tokeniser pool dies, then the stage prints nothing and never ends
+                print("Traceback (most recent call last):", flush=True)
+                print("concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly", flush=True)
+                hang()
+            if r == "fatal-then-talk":
+                # a fatal word followed by steady output is not a stall
+                print("Traceback (most recent call last): (a retried pip step)", flush=True)
+                for _ in range(8):
+                    time.sleep(0.5); print("still working", flush=True)
+                print("preflight: ok"); sys.exit(0)
             if r == "push":
                 print("worker-preflight: worker push (MB/s) is 1.80, under the required 2.5", file=sys.stderr)
                 print("on-worker.sh: the worker preflight failed; nothing was uploaded", file=sys.stderr); sys.exit(1)
@@ -1420,6 +1431,63 @@ class Resilience(Base):
         self.assertTrue(ok)
         self.assertIn("WARNING", lines[0])
         self.assertEqual(pr.EXIT["hf"], 14)
+
+    def test_paid_run_fatal_line_stops_attempt(self):
+        self.env["PAID_RUN_FATAL_QUIET_SECONDS"] = "2"
+        self.scenario([dict(preflight="fatal"), {}])
+        t0 = time.monotonic()
+        rc = self.run_orch()
+        took = time.monotonic() - t0
+        print(f"\nfast-fail: fatal preflight line + 2 s quiet -> exit {rc} after {took:.1f}s")
+        self.assertEqual(rc, 4, self.out)
+        self.assertIn("printed a fatal line", self.out)
+        self.assertIn("BrokenProcessPool", self.out)
+        self.assertEqual(len(self.ups()), 1)  # not retried on another offer
+        self.assertGreaterEqual(len(self.downs()), 1)
+        self.assertEqual(self.state()["attempts"][-1]["outcome"], "preflight-failed")
+        self.assertLess(took, 30)
+
+    def test_paid_run_fatal_word_with_steady_output_is_not_a_stall(self):
+        self.env["PAID_RUN_FATAL_QUIET_SECONDS"] = "2"
+        self.scenario([dict(preflight="fatal-then-talk")])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertNotIn("printed a fatal line", self.out)
+
+    def test_diag_script_has_limits_section(self):
+        pr = load_paid_run()
+        d = pr.DIAG_SCRIPT
+        for want in ("ulimit -a", "nproc", "/sys/fs/cgroup/$f", "pids.max", "pids.current",
+                     "cpu.max", "cpuset.cpus.effective", "/proc/sys/kernel/threads-max",
+                     "ps -eLf", "pid,ppid,nlwp,stat,wchan:20,cmd"):
+            self.assertIn(want, d)
+        r = subprocess.run(["bash", "-n"], input=d, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(["bash"], input=d, text=True, capture_output=True, timeout=60,
+                           env=dict(os.environ, VI_WORKER_ROOT=str(self.tmp / "none")))
+        self.assertIn("== limits", r.stdout)
+        self.assertRegex(r.stdout, r"threads-max: \d+")
+        self.assertRegex(r.stdout, r"threads on the machine: \d+")
+        self.assertEqual(pr.EXIT["rehearsal"], 15)
+
+    def test_hf_gate_import_error_is_hard_fail(self):
+        # r7: huggingface_hub missing from the home python3 was retried, then waved through on
+        # the cached snapshot. A missing library is now a hard stop with an install hint.
+        pr = load_paid_run()
+        rev = "a" * 40
+        home = self.tmp / "home"
+        (home / ".cache" / "huggingface" / "hub" / "models--k2-fsa--OmniVoice" / "snapshots" / rev).mkdir(parents=True)
+        for exc in (ImportError("cannot import name 'HfApi'"),
+                    ModuleNotFoundError("No module named 'huggingface_hub'")):
+            tries, waits = [], []
+            def missing(*_):
+                tries.append(1)
+                raise exc
+            ok, lines = pr.hf_revision_gate(home, rev, missing, waits.append)
+            self.assertFalse(ok, lines)
+            self.assertEqual((len(tries), waits), (1, []))
+            self.assertIn(type(exc).__name__, lines[0])
+            self.assertIn("pip install --user huggingface_hub", lines[0])
+            self.assertNotIn("WARNING", lines[0])
 
     def test_paid_run_up_offer_gone_retries(self):
         self.scenario([dict(up="gone"), {}])

@@ -636,6 +636,39 @@ class WorkerReturnTest(unittest.TestCase):
                     self.assertEqual((out / "ok.txt").read_text(), "ok")
                 self.assertFalse(port_open(port), f"receiver still listening after {'failure' if fail else 'success'}")
 
+    def test_hs_loop_stall_fails_preflight(self):
+        # r7: the preflight's tokeniser hung with no output for hours. A preflight stage that
+        # writes nothing for its stall limit is stopped on the worker and fails, quickly.
+        settings = self.root / "settings.json"
+        settings.write_text("{}\n")
+        out = self.root / "stall-out"
+        port = free_port()
+        marker = self.root / "stall-job.pid"
+        env = {
+            **os.environ,
+            "VI_WORKER_HOST": "local",
+            "VI_WORKER_ROOT": str(self.root / "local-worker"),
+            "VI_STAGE": "stall-preflight",
+            "VI_OUT": str(out),
+            "VI_SETTINGS": str(settings),
+            "VI_RETURN_PORT": str(port),
+            "VI_POLL_SECONDS": "1",
+            "VI_PREFLIGHT_STALL_SECONDS": "3",
+        }
+        # `preflight` is the job's mode word, as in `voicetune-fresh.sh preflight`.
+        job = f'echo $$ > {marker}; echo started; exec sleep 600'
+        t0 = time.monotonic()
+        result = subprocess.run([str(ON_WORKER), "bash", "-c", job, "preflight"], env=env,
+                                capture_output=True, text=True, timeout=120)
+        took = time.monotonic() - t0
+        print(f"\nfast-fail: silent preflight stage, 3 s stall limit -> exit {result.returncode} after {took:.1f}s")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("(preflight) wrote nothing for 3s, over its stall limit", result.stderr)
+        self.assertLess(took, 60)
+        pid = int(marker.read_text().strip())
+        self.assert_process_gone(pid, "stalled preflight job")
+        self.assertFalse(port_open(port))
+
     def test_tunnel_stopped_after_success_and_failure(self):
         # Stub `ssh` so on-worker.sh's non-local path runs its "worker" commands
         # locally, and its reverse-tunnel invocation records its PID and holds
