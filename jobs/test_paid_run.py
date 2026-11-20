@@ -742,7 +742,9 @@ class HomeChecks(Base):
         self.assertEqual(self.run_orch(stages=self.stages_file(1, 0), plan=True), 0, self.out)
         self.assertIn("home disk       : omnivoice_preflight:", self.out)
         self.assertIn("floor 1 + reserve 0 GiB: OK", self.out)
-        self.assertIn("(pinned revision); checked against Hugging Face before renting (exit 14), not in --plan", self.out)
+        self.assertIn("(pinned revision); checked against Hugging Face before renting (exit 14); "
+                      "--plan runs the check offline", self.out)
+        self.assertIn("hf check code   : OK offline on canned Hub replies", self.out)
 
     def test_bundle_cache_empty_and_warm_notes(self):
         self.scenario([{}])
@@ -1537,18 +1539,23 @@ class Resilience(Base):
         rev = prefix + "0" * (40 - len(prefix))
         home = self.tmp / "home"
         home.mkdir()
-        good = lambda *_: type("I", (), {"siblings": [type("S", (), {"rfilename": n, "size": z})()
-                                                      for n, z in table.items()]})()
+        good = lambda *_: type("I", (), {"sha": rev, "siblings": [
+            type("S", (), {"rfilename": n, "size": z})() for n, z in table.items()]})()
         waits = []
         ok, lines = pr.hf_revision_gate(home, rev, good, waits.append)
         self.assertTrue(ok, lines)
         self.assertEqual(waits, [])
         # sizes changed upstream
-        bad = lambda *_: type("I", (), {"siblings": [{"rfilename": n, "size": z + 1}
-                                                     for n, z in table.items()]})()
+        bad = lambda *_: type("I", (), {"sha": rev, "siblings": [{"rfilename": n, "size": z + 1}
+                                                                 for n, z in table.items()]})()
         ok, lines = pr.hf_revision_gate(home, rev, bad, waits.append)
         self.assertFalse(ok)
         self.assertIn("CHANGED upstream", lines[0])
+        # the revision resolves to another commit
+        other = lambda *_: type("I", (), {"sha": "f" * 40, "siblings": []})()
+        ok, lines = pr.hf_revision_gate(home, rev, other, waits.append)
+        self.assertFalse(ok)
+        self.assertIn("MISMATCH", lines[0])
         # revision gone: fails at once, no retry
         def gone(*_):
             raise RevisionNotFoundError("404")
@@ -1626,8 +1633,98 @@ class Resilience(Base):
             self.assertFalse(ok, lines)
             self.assertEqual((len(tries), waits), (1, []))
             self.assertIn(type(exc).__name__, lines[0])
-            self.assertIn("pip install --user huggingface_hub", lines[0])
+            self.assertIn("needs only the Python standard library", lines[0])
             self.assertNotIn("WARNING", lines[0])
+
+    def test_hf_offline_check_catches_a_broken_check(self):
+        pr = load_paid_run()
+        ok, line = pr.hf_offline_check()
+        self.assertTrue(ok, line)
+        def broken(*_):
+            raise ModuleNotFoundError("No module named 'huggingface_hub'")
+        pr.load_size_table = broken  # stands in for any import or parse failure in the check
+        ok, line = pr.hf_offline_check()
+        self.assertFalse(ok)
+        self.assertIn("BROKEN offline", line)
+        self.assertIn("ModuleNotFoundError", line)
+
+    def test_hf_gate_under_system_python_against_stub_hub(self):
+        # r8: the card runs the system python3 -I, which has no third-party modules. Run the real
+        # fetch and parse code there against a local stub of the Hub, so a stray import fails here.
+        import http.server
+        import threading
+        py = "/run/current-system/sw/bin/python3"
+        py = py if Path(py).exists() else sys.executable
+        pr = load_paid_run()
+        table, prefix = pr.load_size_table()
+        rev = pr.base_model_revision()
+        self.assertTrue(rev.startswith(prefix), rev)
+        replies = {}
+
+        class Hub(http.server.BaseHTTPRequestHandler):
+            def reply(self):
+                code, body, hdrs = replies["commits" if "/commits/" in self.path else "paths"]
+                self.send_response(code)
+                for k, v in hdrs.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(json.dumps(body).encode())
+            do_GET = do_POST = reply
+
+            def log_message(self, *_):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Hub)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        home = self.tmp / "home"
+        home.mkdir()
+        code = textwrap.dedent(f"""
+            import importlib.util, sys
+            spec = importlib.util.spec_from_file_location("pr", {str(SCRIPT)!r})
+            pr = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(pr)
+            pr.HF_API = sys.argv[1]
+            ok, lines = pr.hf_revision_gate({str(home)!r}, {rev!r}, sleep=lambda s: None)
+            print(lines[0])
+            sys.exit(0 if ok else pr.EXIT["hf"])
+            """)
+
+        def gate(api):
+            r = subprocess.run([py, "-I", "-c", code, api], capture_output=True, text=True,
+                               timeout=120)
+            return r.returncode, r.stdout + r.stderr
+
+        api = f"http://127.0.0.1:{srv.server_address[1]}/api/models"
+        sizes = [{"type": "file", "path": n, "size": z} for n, z in table.items()]
+        replies.update(commits=(200, [{"id": rev}], {}), paths=(200, sizes, {}))
+        rc, out = gate(api)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("pinned file sizes match", out)
+        replies["commits"] = (200, [{"id": "f" * 40}], {})
+        rc, out = gate(api)
+        self.assertEqual(rc, 14, out)
+        self.assertIn("MISMATCH", out)
+        replies["commits"] = (404, {"error": "Invalid rev id"},
+                              {"X-Error-Code": "RevisionNotFound", "X-Error-Message": "Invalid rev id"})
+        rc, out = gate(api)
+        self.assertEqual(rc, 14, out)
+        self.assertIn("NOT FOUND", out)
+        replies.update(commits=(200, [{"id": rev}], {}),
+                       paths=(200, [dict(f, size=f["size"] + 1) for f in sizes], {}))
+        rc, out = gate(api)
+        self.assertEqual(rc, 14, out)
+        self.assertIn("CHANGED upstream", out)
+        replies["commits"] = (503, {"error": "busy"}, {})
+        rc, out = gate(api)
+        self.assertEqual(rc, 14, out)
+        self.assertIn("could not be checked after 3 tries (HTTPError", out)
+        srv.shutdown()
+        srv.server_close()
+        rc, out = gate(api)  # nothing listens: connection refused
+        self.assertEqual(rc, 14, out)
+        self.assertIn("could not be checked after 3 tries (URLError", out)
+        self.assertNotIn("Traceback", out)
 
     def test_paid_run_up_offer_gone_retries(self):
         self.scenario([dict(up="gone"), {}])

@@ -66,8 +66,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO / "jobs" / "paid-run" / "omnivoice-run-cloud.toml"
@@ -169,6 +172,7 @@ BOOT_FAIL_RE = re.compile(r"no ssh after|disappeared while booting|failed to sta
                           re.I)
 INPLACE_MIN_DISK_GB = 5.0         # a worker with less free disk than this is treated as ENOSPC
 HF_REPO = "k2-fsa/OmniVoice"
+HF_API = "https://huggingface.co/api/models"  # the tests point it at a local stub server
 HF_TRIES = 3
 HF_TIMEOUT_SECONDS = 60
 HF_BACKOFF = (5, 15)
@@ -729,10 +733,76 @@ def load_size_table():
     return dict(mod.SIZE_TABLE), mod.DEFAULT_REVISION_PREFIX
 
 
-def hf_model_info(repo, revision, timeout):
-    """HfApi().model_info(...); the one network call of the gate (tests replace it)."""
-    from huggingface_hub import HfApi
-    return HfApi().model_info(repo, revision=revision, files_metadata=True, timeout=timeout)
+class RevisionNotFoundError(Exception):
+    """The Hub answered 404 for the pinned revision (X-Error-Code: RevisionNotFound)."""
+
+
+class RepositoryNotFoundError(Exception):
+    """The Hub answered 401 or 403: the repo is gone, private or gated."""
+
+
+def hf_fetch(url, body, timeout):
+    """GET url (POST when body is a dict) and return the parsed JSON reply. Standard library only,
+    because the paid run starts under the system python3 -I, which has no huggingface_hub (r8)."""
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        why = e.headers.get("X-Error-Message") or e.reason
+        if e.code == 404:
+            raise RevisionNotFoundError(f"HTTP 404 {e.headers.get('X-Error-Code', '')}: {why}")
+        if e.code in (401, 403):
+            raise RepositoryNotFoundError(f"HTTP {e.code}: {why}")
+        raise  # 5xx, 429 and the like are retried as network failures
+
+
+def hf_model_info(repo, revision, timeout, fetch=None):
+    """The one network step of the gate (tests replace it): the commit the pinned revision
+    resolves to, and the sizes of the pinned files at that commit.
+
+    Both endpoints are in the official Hub API spec, https://huggingface.co/.well-known/openapi.md
+    (linked from https://huggingface.co/docs/hub/api, read 2026-11-20):
+      GET  /api/models/{namespace}/{repo}/commits/{rev}     -> [{"id": <commit sha>, ...}]
+      POST /api/models/{namespace}/{repo}/paths-info/{rev}  {"paths": [...]}
+                                                            -> [{"path": ..., "size": ...}]
+    The spec lists no response fields, so the field names were checked against live replies on
+    2026-11-20: commits gives 404 with X-Error-Code RevisionNotFound for an unknown revision,
+    an unknown repo gives 401, and paths-info leaves out paths it does not have."""
+    fetch = fetch or hf_fetch
+    base = f"{HF_API}/{repo}"
+    commits = fetch(f"{base}/commits/{revision}?limit=1", None, timeout)
+    sha = commits[0]["id"] if commits else None
+    table, _ = load_size_table()
+    files = fetch(f"{base}/paths-info/{sha or revision}", {"paths": sorted(table)}, timeout)
+    return SimpleNamespace(sha=sha, siblings=[{"rfilename": f.get("path"), "size": f.get("size")}
+                                              for f in files])
+
+
+def hf_offline_check(revision=None):
+    """(ok, line) for --plan: runs the whole gate on canned Hub replies, with no network, so a
+    missing module or a broken parser shows up before anything is rented."""
+    rev = revision or base_model_revision()
+    urls = []
+
+    def canned(url, body, timeout):
+        urls.append(url)
+        if "/commits/" in url:
+            return [{"id": rev, "title": "canned"}]
+        table, _ = load_size_table()
+        return [{"type": "file", "path": p, "size": table[p]} for p in body["paths"]]
+
+    try:
+        ok, lines = hf_revision_gate(revision=rev, sleep=lambda _s: None,
+                                     model_info=lambda r, v, t: hf_model_info(r, v, t, canned))
+    except Exception as e:  # noqa: BLE001: any crash here would crash the real gate too
+        ok, lines = False, [f"{type(e).__name__}: {e}"]
+    label = "hf check code   : "
+    if ok and len(urls) == 2:
+        return True, f"{label}OK offline on canned Hub replies (no network call in --plan)"
+    return False, (f"{label}BROKEN offline ({lines[0].removeprefix('hf revision    : ')}); the "
+                   f"real check before renting would stop with exit {EXIT['hf']}")
 
 
 def hf_revision_gate(home=None, revision=None, model_info=None, sleep=None):
@@ -754,9 +824,9 @@ def hf_revision_gate(home=None, revision=None, model_info=None, sleep=None):
             if isinstance(e, ImportError):  # ModuleNotFoundError included
                 # Retrying cannot fix a missing library, and a cached snapshot does not prove
                 # the pinned revision still exists, so this is a hard stop (r7 lost its gate here).
-                return False, [f"{label}could not be checked: {type(e).__name__}: {e}. Install "
-                               f"huggingface_hub for this interpreter ({sys.executable} -m pip "
-                               "install --user huggingface_hub) and run again. Nothing was rented."]
+                return False, [f"{label}could not be checked: {type(e).__name__}: {e}. The check "
+                               "needs only the Python standard library, so this is a bug in "
+                               "jobs/paid_run.py; fix it and run again. Nothing was rented."]
             if type(e).__name__ in ("RevisionNotFoundError", "RepositoryNotFoundError",
                                     "EntryNotFoundError", "GatedRepoError"):
                 return False, [f"{label}NOT FOUND: {HF_REPO} @ {rev} ({type(e).__name__}: {e}); the "
@@ -769,6 +839,10 @@ def hf_revision_gate(home=None, revision=None, model_info=None, sleep=None):
                           f"cache holds the snapshot {snap}"]
         return False, [f"{label}could not be checked after {HF_TRIES} tries ({type(last).__name__}: "
                        f"{last}) and the home cache has no snapshot at {snap}. Nothing was rented."]
+    sha = getattr(info, "sha", None)
+    if not sha or not sha.startswith(rev):
+        return False, [f"{label}MISMATCH: {HF_REPO} @ {rev} resolved to commit {sha}, not the "
+                       "pinned one. Nothing was rented."]
     table, prefix = load_size_table()
     if not rev.startswith(prefix):
         return True, [f"{label}ok ({HF_REPO} @ {rev} exists; the pinned size table is for {prefix}, "
@@ -1275,6 +1349,7 @@ class PaidRun:
         self.realpath_ok, realpath_lines = realpath_check(
             a.stages, a.repo, forward=getattr(a, "realpath_forward", False))
         self.rehearsal_ok, rehearsal_line = rehearsal_gate(a.repo)
+        self.hf_code_ok, hf_code_line = hf_offline_check()
         countries = a.countries or "(from the config)"
         return [
             f"run id          : {a.run_id}",
@@ -1292,7 +1367,9 @@ class PaidRun:
             rehearsal_line + ("" if self.rehearsal_ok else
                               f" (a real run stops here with exit {EXIT['rehearsal']})"),
             f"base model      : k2-fsa/OmniVoice @ {base_model_revision()} (pinned revision); "
-            f"checked against Hugging Face before renting (exit {EXIT['hf']}), not in --plan",
+            f"checked against Hugging Face before renting (exit {EXIT['hf']}); --plan runs "
+            "the check offline",
+            hf_code_line,
             push_hours_line(stage_settings(a.stages, a.repo, "omnivoice_train")),
             f"countries       : {countries}",
             f"stage file      : {a.stages}",
@@ -1832,6 +1909,11 @@ class PaidRun:
                   "the home setup it names, then run --plan again. Nothing was rented.",
                   file=sys.stderr, flush=True)
             return EXIT["realpath"]
+        if not self.hf_code_ok:
+            print(f"paid-run: STOPPED (exit {EXIT['hf']}): the Hugging Face revision check "
+                  "fails even on canned replies (the `hf check code` line above says why), so "
+                  "the real check could not run. Nothing was rented.", file=sys.stderr, flush=True)
+            return EXIT["hf"]
         if self.a.plan:
             say("--plan: nothing was called; exiting")
             return 0
