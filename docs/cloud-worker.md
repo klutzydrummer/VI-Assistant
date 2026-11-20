@@ -15,7 +15,7 @@ Heavy jobs run on a GPU rented from Vast.ai. The worker keeps nothing that matte
 
 ## Keeping the budget safe
 Two guards, so a forgotten worker can't drain the credit:
-1. **On the worker.** `jobs/worker-onstart.sh` runs at boot and starts a watchdog. It destroys the instance after `idle_minutes` with no running job and no ssh session, or `max_hours` after boot whatever it's doing. This works while the home machine is asleep. It calls the Vast API with the instance's own `CONTAINER_API_KEY`; if destroying fails it stops the instance instead, which ends the GPU charge but still bills disk until `vi cloud down` or the next `vi cloud up` cleans it up.
+1. **On the worker.** `jobs/worker-onstart.sh` runs at boot and starts a watchdog. It destroys the instance after `idle_minutes` with no running job and no ssh session, or `max_hours` after boot whatever it's doing. This works while the home machine is asleep. It calls the Vast API with the instance's own `CONTAINER_API_KEY`; if destroying fails it stops the instance instead, which ends the GPU charge but still bills disk until `vi cloud down` or the next `vi cloud up` cleans it up. Ssh sessions do not see the container's environment, so the boot script saves the `CONTAINER_*` variables to `/root/.vi-env` (mode 600). A watchdog that `on-worker.sh` restarts over ssh reads that file and defaults its job root to `/root/vi-jobs`.
 2. **At home.** `vi cloud reap` applies the same limits from home's own clock. Its idle release first checks the worker over ssh for an interactive session (`who`) or another established ssh connection (`ss`); only a worker it can see is idle is released, and `max_hours` still releases regardless. Run it from a timer:
 
    ```nix

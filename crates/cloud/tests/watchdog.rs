@@ -59,6 +59,21 @@ impl Rig {
     /// Run the watchdog until it exits or `ms` passes, then return the fake
     /// curl calls it made, one per line.
     fn run(&self, ms: u64) -> String {
+        self.run_as(ms, false)
+    }
+
+    /// Like `run`, but the way on-worker.sh restarts a missing watchdog over
+    /// ssh: no `R` and no Vast `CONTAINER_*` vars in the environment. The
+    /// production paths point at this rig's root and env file.
+    fn run_over_ssh(&self, ms: u64) -> String {
+        self.run_as(ms, true)
+    }
+
+    fn env_file(&self) -> PathBuf {
+        self.root.parent().unwrap().join("vi-env")
+    }
+
+    fn run_as(&self, ms: u64, over_ssh: bool) -> String {
         let rendered = onstart::render(&self.config);
         let body = rendered
             .split_once("cat >/root/vi-watchdog.sh <<'EOF'\n")
@@ -68,19 +83,26 @@ impl Rig {
             .expect("the heredoc end")
             .0;
         let script = self.root.parent().unwrap().join("watchdog.sh");
-        fs::write(
-            &script,
-            body.replace("/var/log/vi-watchdog.log", &self.log.display().to_string()),
-        )
-        .unwrap();
+        let body = body
+            .replace("/var/log/vi-watchdog.log", &self.log.display().to_string())
+            .replace("/root/.vi-env", &self.env_file().display().to_string())
+            .replace("/root/vi-jobs", &self.root.display().to_string());
+        fs::write(&script, body).unwrap();
         let path = format!(
             "{}:{}",
             self.root.parent().unwrap().join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let mut child = Command::new("bash")
-            .arg(&script)
-            .env("R", &self.root)
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .env_remove("CONTAINER_ID")
+            .env_remove("CONTAINER_API_KEY");
+        if over_ssh {
+            cmd.env_remove("R");
+        } else {
+            cmd.env("R", &self.root);
+        }
+        let mut child = cmd
             .env("CALLS", &self.calls)
             .env("PUT_FAILS", &self.put_fails)
             .env("PATH", path)
@@ -393,4 +415,27 @@ fn recovery_window_after_stopped_at_then_stop_again() {
     // This boot started more than RECOVERY_MINUTES (30) ago.
     rig.set_stamp(".this-boot", now() - 31 * 60);
     assert_eq!(methods(&rig.run(400)), vec!["PUT"]);
+}
+
+#[test]
+fn ssh_restarted_watchdog_reads_saved_root_and_vast_env() {
+    let rig = Rig::new(Config {
+        idle_minutes: 30,
+        max_hours: 1.0,
+        ..Config::default()
+    });
+    // The boot script saves `export -p` lines for the CONTAINER_* vars.
+    fs::write(
+        rig.env_file(),
+        "declare -x CONTAINER_API_KEY=\"k\"\ndeclare -x CONTAINER_ID=\"4242\"\n",
+    )
+    .unwrap();
+    // A fresh boot must not be released: an empty R used to read /.boot as
+    // empty, which counts as 0 and released on max-hours at once.
+    assert_eq!(rig.run_over_ssh(400), "");
+    rig.set_stamp(".boot", now() - 7200);
+    let calls = rig.run_over_ssh(400);
+    assert_eq!(methods(&calls), vec!["DELETE"]);
+    assert!(calls.contains("/instances/4242/"), "{calls}");
+    assert!(calls.contains("Authorization: Bearer k"), "{calls}");
 }

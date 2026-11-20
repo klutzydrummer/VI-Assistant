@@ -40,8 +40,20 @@ mod tests {
             "{script}"
         );
         assert!(script.contains("BOOT=$(cat $R/.boot)"), "{script}");
-        // The LIVE logic stays under the boot script's size cap.
-        assert!(script.len() < 2500, "{} bytes", script.len());
+        // A watchdog restarted over ssh has neither R nor Vast's CONTAINER_*
+        // vars (ssh sessions do not see the container env), so the boot
+        // script saves them and the watchdog falls back to both.
+        assert!(
+            script.contains("export -p|grep ' CONTAINER_'>/root/.vi-env"),
+            "{script}"
+        );
+        assert!(
+            script.contains("R=${R:-/root/vi-jobs};. /root/.vi-env"),
+            "{script}"
+        );
+        // The LIVE logic stays well under Vast's 4048-character onstart field
+        // (docs.vast.ai/api-reference/creating-instances-with-api).
+        assert!(script.len() < 2700, "{} bytes", script.len());
     }
 
     #[test]

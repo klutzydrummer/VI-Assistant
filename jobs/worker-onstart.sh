@@ -1,14 +1,16 @@
 #!/bin/bash
-# vi-worker boot: job tools, host keys, release watchdog.
+# vi-worker boot: tools, host keys, watchdog.
 export R=/root/vi-jobs
 mkdir -p $R && touch $R/.active
 [ -s $R/.boot ] || date +%s >$R/.boot
 date +%s >$R/.this-boot
 for t in rsync curl pgrep gcc sox setsid flock; do command -v $t >/dev/null || missing=1; done
 [ -n "$missing" ] && { apt-get update -qq; apt-get install -y -qq rsync curl procps gcc sox util-linux; } >/var/log/vi-onstart.log 2>&1
-# No ssh port: home gets it from the authenticated instance API.
+# No port here; home reads it from the API.
 for f in /etc/ssh/ssh_host_*_key.pub; do [ -e "$f" ] || continue; echo "VI-HOSTKEY $(date +%s) $(ssh-keygen -lf "$f")"; done | tee -a /var/log/vi-hostkey.log
+(umask 077;export -p|grep ' CONTAINER_'>/root/.vi-env)
 cat >/root/vi-watchdog.sh <<'EOF'
+R=${R:-/root/vi-jobs};. /root/.vi-env 2>/dev/null # ssh restarts lack both
 IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(cat $R/.boot)
 PH=$((${PENDING_HOLD:-120} * 60)) RM=${RECOVERY_MINUTES:-30}
 API=https://console.vast.ai/api/v0/instances/$CONTAINER_ID/
