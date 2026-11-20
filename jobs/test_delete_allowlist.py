@@ -47,6 +47,7 @@ ALLOWLIST = [
     ("jobs/on-worker.sh", r'rm \$\(q "\$work/bundles/', "the worker job's unpacked bundle copy"),
     ("jobs/on-worker.sh", r'rm -f \$\(q "\$work/bundles/', "the worker job's own half-sent bundle, deleted so the one re-send starts clean"),
     ("jobs/voicetune-fresh.sh", r'rm -rf "\$tmp"', "the venv.tmp-$$ build folder this run created beside its hashed venv"),
+    ("jobs/voicetune-fresh.sh", r'rm -rf "\$scratch/tasks-smoke"', "the tasks smoke's own scratch folder (<parent of VI_OUT>/voicetune-fresh/tasks-smoke, VI_OUT required), made by this run"),
     ("jobs/voicetune-fresh.sh", r'rm -f "\$lst"', "the data.lst of the shard set this run just tokenised, removed when the count guard refuses it"),
     ("jobs/refscreen.py", r"shutil\.rmtree\(root, ignore_errors=True\)", "the run's own out/shortlist dir"),
     ("jobs/voicearms.py", r"shutil\.rmtree\(root, ignore_errors=True\)", "the run's own out/listen dir"),

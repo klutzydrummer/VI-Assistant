@@ -564,7 +564,8 @@ tokenise_smoke() {
   [ -s "$data_dir/shards/train/data.lst" ] && return 0
   tok=$(audio_tokenizer_dir) || return 1
   [ -s "$manifest" ] || { echo "tokenise: $manifest missing or empty" >&2; return 1; }
-  rm -rf "$dir"
+  # Only the smoke's own scratch folder beside the stage output is ever removed here.
+  rm -rf "$scratch/tasks-smoke"
   mkdir -p "$dir"
   head -n "${VI_SMOKE_ROWS:-8}" "$manifest" >"$dir/smoke.jsonl"
   t0=$(date +%s)
@@ -578,7 +579,7 @@ tokenise_smoke() {
   cp "$dir/extract.log" "$VI_OUT/tasks-smoke.log" 2>/dev/null || true
   if [ "$rc" = 0 ] && tokenise_count_guard smoke "$dir/smoke.jsonl" "$dir/extract.log" 2>/dev/null; then
     echo "tasks smoke: $(wc -l <"$dir/smoke.jsonl") clips tokenised in $(( $(date +%s) - t0 ))s with threads=${OMP_NUM_THREADS:-?} nj=${VI_LIMIT_NJ:-?}"
-    rm -rf "$dir"
+    rm -rf "$scratch/tasks-smoke"
     return 0
   fi
   echo "worker-preflight: tasks: the $(wc -l <"$dir/smoke.jsonl")-clip tokeniser smoke failed (exit $rc after $(( $(date +%s) - t0 ))s, threads=${OMP_NUM_THREADS:-?} nj=${VI_LIMIT_NJ:-?}); its log is $VI_OUT/tasks-smoke.log" >&2

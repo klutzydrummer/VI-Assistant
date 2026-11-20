@@ -32,9 +32,11 @@ result matches what you expected. `--help` lists every option; each also has an 
 variable (`FAKE_NPROC`, `TASKS_MAX`, `CPU_QUOTA`, `N_CLIPS`, `BUDGET`, `VENV`, `MANIFEST`,
 `THREADS`, `NJ`).
 
-It runs the real `tokenise` function from `jobs/voicetune-fresh.sh` (its real `tee` pipeline and
-count guard) and the real upstream `omnivoice.scripts.extract_audio_tokens`, on 8 real home clips,
-on CPU. `voicetune-fresh.sh` is not edited: the script cuts the `tokenise`,
+It runs the real `tokenise` function from `jobs/voicetune-fresh.sh` (its real watched launcher,
+`vi_run_watched`, and its count guard) and the real upstream
+`omnivoice.scripts.extract_audio_tokens`, on 8 real home clips, on CPU. Before that it sources
+`jobs/worker-limits.sh` and runs `worker_limits`, exactly as the worker does, so the real limits
+rule picks the thread and worker counts. `voicetune-fresh.sh` is not edited: the script cuts the `tokenise`,
 `tokenise_count_guard` and `audio_tokenizer_dir` functions out of the file by name, so a later fix
 to them is rehearsed automatically. If a fix moves logic into another function that `tokenise`
 calls, name it in `EXTRA_FUNCS`.
@@ -56,10 +58,38 @@ passes only when all of these hold: exit 0, exactly one `Processing Complete` li
 `can't start new thread` or `Traceback` line, and no process left in the scope after the stage
 returns. Both verdicts also require that nothing survives teardown.
 
-To rehearse a fix without editing the stage, force the caps from outside: `--threads 2 --nj 2`
-exports `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=2` and adds `--nj_per_gpu 2` to the upstream call
-(through a small python wrapper). That passes at `--tasks-max 512` even on the unfixed base, which
-shows the cap works and the base only lacks it.
+To try other caps, force them from outside: `--threads N` exports
+`OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=N` over what the limits step chose, and `--nj N` sets
+`VI_LIMIT_NJ=N`, which `tokenise` passes as `--nj_per_gpu`. A forced run is only an experiment: it
+never writes a pass record.
+
+### Pass record and the paid-run gate (exit 15)
+
+A run writes a pass record only when all of these hold:
+
+- it was `--expect green` and the verdict was PASS;
+- it used the default limits: no `--threads`, `--nj` or `--tasks-max`, and no `THREADS`, `NJ` or
+  `TASKS_MAX` in the environment (the fixed code has to pass with the limits it picks itself);
+- the tracked files match HEAD (`git status --porcelain --untracked-files=no` is empty; untracked
+  files do not matter).
+
+The record is `~/.local/state/vi/rehearsal/<HEAD sha>.pass` (folder mode 0700, file 0600, written
+to a temporary file and renamed). It is JSON with the head and tree shas, `tasks_max`,
+`fake_nproc`, `cpu_quota`, `clips`, the threads and worker count used, `stage_secs`, `pids_peak`,
+`events_max`, `base_red` (the newest red-run log kept in `vast-limits-logs`, with its time, or
+`"none"`), the time and the script version. Any other run prints `no pass record written:` and the
+reason.
+
+`jobs/paid_run.py` checks the record for the HEAD of its `--repo` before it makes any `vi` or
+Vast call. The record must exist, be valid JSON, name that HEAD both in its file name and inside,
+match `git rev-parse HEAD^{tree}`, and be a green PASS. Otherwise a real run stops with exit 15
+(nothing rented) and says whether the record is missing, stale (made for another commit or tree)
+or invalid, and which command to run. `--plan` shows the same `rehearsal` line and does not fail
+on it. There is no switch to skip the gate. `VI_REHEARSAL_STATE_DIR` moves the record folder for
+the tests only, in both scripts.
+
+So the order before a paid run is: commit, run `jobs/rehearsal/vast-limits.sh --expect green`,
+then start `paid_run.py`. Any new commit needs a new green run (about a minute).
 
 ### Safety
 
@@ -80,9 +110,11 @@ a red and a green pair to fit in about 5 to 8 minutes.
 
 ### Expected result today
 
-On a base without the fixes (`5287635` and its descendants until the limits and tokenise fixes
-land), `--expect red` passes and `--expect green` fails. That is the point: green going from fail
-to pass is the proof of the fix.
+On a base without the fixes (`5287635`, and `74f37a3` where this script was added), `--expect
+red` passes and `--expect green` fails. With the limits fixes (`jobs/worker-limits.sh`, the watched
+tokenise launcher), `--expect green` passes with the default limits and writes the pass record,
+and `--expect red` fails its verdict by design: at `--tasks-max 2800` the capped stage no longer
+reproduces r7. Green going from fail to pass is the proof of the fix.
 
 ### What it does not cover
 
