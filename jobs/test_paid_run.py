@@ -434,6 +434,33 @@ class RehearsalGate(Base):
         src = SCRIPT.read_text()
         self.assertNotRegex(src, r"SKIP_REHEARSAL|skip.rehearsal|no.rehearsal")
 
+    def write_state(self, attempts):
+        (self.tmp / "paid").mkdir(parents=True, exist_ok=True)
+        (self.tmp / "paid" / "t1.json").write_text(json.dumps(dict(
+            run_id="t1", cap=5.0, max_hours=8.0, max_attempts=3, created=0, status="interrupted",
+            exit_code=8, message="", attempts=attempts, failed_offers=[], failed_sigs=[],
+            spent_total=0.0, hours_total=0.0)))
+
+    def test_resume_with_live_worker_says_it_keeps_billing(self):
+        self.record.rename(self.record.with_name("0" * 40 + ".pass"))
+        self.write_state([dict(n=1, offer=7, dph=0.2, phase="train", started=0, ended=None,
+                               hours=None, credit_start=20.0)])
+        self.blocked("STALE")
+        self.assertIn("KEEPS BILLING", self.out)
+        self.assertIn("billing", self.out)
+        self.assertIn("`vi cloud down --force`", self.out)
+        self.assertIn("offer 7", self.out)
+        self.assertNotIn("Nothing was rented", self.out)
+
+    def test_resume_with_closed_attempts_keeps_the_plain_message(self):
+        self.record.rename(self.record.with_name("0" * 40 + ".pass"))
+        self.write_state([dict(n=1, offer=7, dph=0.2, phase="train", started=0, ended=10,
+                               hours=0.01, outcome="up-failed", spent=0.0)])
+        self.blocked("STALE")
+        self.assertIn("Nothing was rented", self.out)
+        self.assertNotIn("billing", self.out.lower().split("stopped (exit 15)")[1])
+        self.assertNotIn("down --force", self.out)
+
 
 class Flow(Base):
     def test_plan_mode_calls_nothing(self):

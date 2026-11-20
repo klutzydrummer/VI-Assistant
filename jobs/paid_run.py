@@ -1039,6 +1039,16 @@ class PaidRun:
                       credit_after_run=None)
         return False
 
+    def recorded_live_attempt(self):
+        """The open attempt in this run's state file (its worker may still bill), or None. Reads
+        the file only; no vi or Vast call."""
+        try:
+            s = json.loads(self.path.read_text())
+            return next((at for at in s.get("attempts") or []
+                         if isinstance(at, dict) and at.get("ended") is None), None)
+        except (OSError, ValueError, AttributeError):
+            return None
+
     def save(self):
         self.dir.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
@@ -1826,10 +1836,18 @@ class PaidRun:
             say("--plan: nothing was called; exiting")
             return 0
         if not self.rehearsal_ok:
+            live = self.recorded_live_attempt()
+            if live is None:
+                tail = "Nothing was rented."
+            else:
+                tail = (f"This run's state file shows attempt {live.get('n')} (offer "
+                        f"{live.get('offer')}) never closed, so its worker may still be up. It "
+                        "KEEPS BILLING until brought down; this stop does not release it. Bring it "
+                        "down now with `vi cloud down --force`, then check `vi cloud status`.")
             print(f"paid-run: STOPPED (exit {EXIT['rehearsal']}): the home Vast-limits rehearsal "
                   "has not passed for this commit (the `rehearsal` line above says why). Run "
                   f"`{REHEARSAL_CMD}` from the repo with a clean tree, then start this again. "
-                  "Nothing was rented.", file=sys.stderr, flush=True)
+                  + tail, file=sys.stderr, flush=True)
             return EXIT["rehearsal"]
         if os.environ.get("VI_SKIP_HF_CHECK") != "1":
             hf_ok, hf_lines = hf_revision_gate(Path.home())
