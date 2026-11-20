@@ -415,6 +415,12 @@ ovft_python() {
   fi
   printf '%s\n' "$venv/bin/python"
 }
+# Thread caps and the tokeniser worker count for this box (jobs/worker-limits.sh), exported before
+# any Python starts so the tokeniser, replay_public.py and train_ft.py all inherit them. Too few
+# free task slots prints a "worker-preflight: tasks ..." line, which retries on another machine.
+# shellcheck source=jobs/worker-limits.sh
+. "$jobs_dir/worker-limits.sh"
+worker_limits || exit 1
 PY=$(ovft_python)
 ACCELERATE="$(dirname "$PY")/accelerate"
 
@@ -507,15 +513,15 @@ tokenise() {
   tok=$(audio_tokenizer_dir) || return 1
   [ -s "$manifest" ] || { echo "tokenise: $manifest missing or empty" >&2; return 1; }
   mkdir -p "$data_dir/shards/$name"
-  local log="$data_dir/shards/$name/extract.log" rc
-  set +e
-  "$PY" -m omnivoice.scripts.extract_audio_tokens \
+  local log="$data_dir/shards/$name/extract.log" rc=0
+  # Watched, in its own process group, with the worker count from jobs/worker-limits.sh: a fatal
+  # pool crash stops it within VI_FATAL_QUIET_SECONDS instead of hanging, and no orphan is left.
+  vi_run_watched "$log" "$PY" -m omnivoice.scripts.extract_audio_tokens \
     --input_jsonl "$manifest" \
     --tar_output_pattern "$data_dir/shards/$name/audios/shard-%06d.tar" \
     --jsonl_output_pattern "$data_dir/shards/$name/txts/shard-%06d.jsonl" \
-    --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors 2>&1 | tee "$log"
-  rc=${PIPESTATUS[0]}
-  set -e
+    --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors \
+    --nj_per_gpu "${VI_LIMIT_NJ:-1}" || rc=$?
   [ "$rc" = 0 ] || { echo "tokenise: extract_audio_tokens exited $rc for $name" >&2; return 1; }
   [ -s "$lst" ] || { echo "tokenise: $lst was not written for $name" >&2; return 1; }
   tokenise_count_guard "$name" "$manifest" "$log" || { rm -f "$lst"; return 1; }

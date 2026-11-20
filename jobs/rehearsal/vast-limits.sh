@@ -9,13 +9,17 @@
 # forever behind `| tee`. The stub rehearsal (run.sh) never loads real numpy/scipy, and the home
 # real-path check runs on 4 CPUs with a huge task limit, so neither could see it.
 #
-# What it does: runs the REAL `tokenise` function from jobs/voicetune-fresh.sh (its real tee
-# pipeline, its real count guard) on N_CLIPS real home clips with the real upstream
+# What it does: runs the REAL `tokenise` function from jobs/voicetune-fresh.sh (its real watched launcher
+# and its real count guard) on N_CLIPS real home clips with the real upstream
 # omnivoice.scripts.extract_audio_tokens, on CPU, inside
 # `systemd-run --user --scope -p TasksMax=N` (a cgroup pids.max, like a container's pids limit),
 # with an LD_PRELOAD shim (jobs/rehearsal/fakenproc.c) that makes the process see FAKE_NPROC CPUs.
 # voicetune-fresh.sh is not edited: its three tokenise functions are cut out of the file by name
-# and run by this script's stage mode, so a later fix to them is rehearsed automatically.
+# (plus any named in EXTRA_FUNCS) and run by this script's stage mode after it sources
+# jobs/worker-limits.sh and runs worker_limits, the same two steps voicetune-fresh.sh takes before
+# any Python. So the rehearsal exercises the real limits rule, the real watched launcher
+# (vi_run_watched) and the real tokenise body, and a later fix to any of them is rehearsed
+# automatically.
 #
 # Verdicts:
 #   --expect red    passes only if the r7 failure shows: `pthread_create failed ... of <CPUS>`
@@ -38,8 +42,8 @@
 #   --budget S       [BUDGET=300]      seconds before the stage is killed (red hang ends here)
 #   --venv DIR       [VENV]            home CPU venv (default ~/.cache/vi/home-cpu-venv-3750779e6152a9c4)
 #   --manifest FILE  [MANIFEST]        8-row home manifest (default the realpath-check scratch one)
-#   --threads N      [THREADS]         export OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=N (rehearses a fix)
-#   --nj N           [NJ]              add --nj_per_gpu N to the upstream call, via a python wrapper
+#   --threads N      [THREADS]         export OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS=N (overrides the limits step)
+#   --nj N           [NJ]              use --nj_per_gpu N instead of the limits step's choice
 #   Test hooks: VL_MEM_AVAIL_MB and VL_DISK_FREE_GB override the measured RAM and disk.
 #
 # Safety: CPU only (CUDA_VISIBLE_DEVICES=""), nice -n 19, ionice -c2 -n7, refuses under 4 GB free
@@ -155,17 +159,20 @@ fi
 if [ "$mode" = inner-stage ]; then
   : "${VL_R:?}" "${VL_SHIM:?}" "${VL_VENV:?}" "${VL_MANIFEST:?}" "${VL_TOKENIZER:?}"
   export LD_PRELOAD=$VL_SHIM FAKE_NPROC=$fake CUDA_VISIBLE_DEVICES=""
+  # The worker's own limits step, exactly as voicetune-fresh.sh runs it before any Python: it reads
+  # this scope's cgroup (pids.max, cpu.max) and the shim's CPU count, prints the limits line, and
+  # exports the thread caps and VI_LIMIT_NJ. A refusal ends the stage like it ends the worker's.
+  # shellcheck source=jobs/worker-limits.sh
+  . "$repo/jobs/worker-limits.sh"
+  worker_limits || exit 1
+  # --threads / --nj below override what the limits step chose (forced-cap runs, never recorded).
   if [ -n "$threads" ]; then
     export OMP_NUM_THREADS=$threads OPENBLAS_NUM_THREADS=$threads MKL_NUM_THREADS=$threads NUMEXPR_NUM_THREADS=$threads
   fi
+  # tokenise passes --nj_per_gpu "$VI_LIMIT_NJ", so a forced worker count only replaces that.
+  [ -z "$nj" ] || export VI_LIMIT_NJ=$nj
   # shellcheck disable=SC2034  # PY, data_dir and friends are read by the eval'd tokenise functions
   PY="$VL_VENV/bin/python"
-  if [ -n "$nj" ]; then
-    # tokenise passes a fixed flag list, so --nj_per_gpu is appended by this wrapper, only here.
-    printf '#!/usr/bin/env bash\nexec %q "$@" --nj_per_gpu %q\n' "$VL_VENV/bin/python" "$nj" >"$VL_R/py-wrapper.sh"
-    chmod +x "$VL_R/py-wrapper.sh"
-    PY="$VL_R/py-wrapper.sh"
-  fi
   data_dir="$VL_R/data"
   mkdir -p "$data_dir"
   export VI_AUDIO_TOKENIZER=$VL_TOKENIZER
@@ -177,7 +184,7 @@ if [ "$mode" = inner-stage ]; then
     defs+="$def"$'\n'
   done
   eval "$defs"
-  echo "vast-limits: limits fake_nproc=$fake tasks_max=$tasks_max threads=${threads:-unset} nj=${nj:-default}"
+  echo "vast-limits: limits fake_nproc=$fake tasks_max=$tasks_max threads=${OMP_NUM_THREADS:-unset} nj=${VI_LIMIT_NJ:-unset} forced_threads=${threads:-no} forced_nj=${nj:-no}"
   set -euo pipefail
   tokenise rehearsal "$VL_MANIFEST"
   exit $?

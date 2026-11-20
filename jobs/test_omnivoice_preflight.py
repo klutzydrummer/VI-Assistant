@@ -58,11 +58,12 @@ TOKENISE_STUB = r'''
 import argparse, os, sys
 ap = argparse.ArgumentParser()
 for k in ("input_jsonl", "tar_output_pattern", "jsonl_output_pattern", "tokenizer_path",
-          "samples_per_shard"):
+          "samples_per_shard", "nj_per_gpu"):
     ap.add_argument("--" + k)
 ap.add_argument("--skip_errors", action="store_true")
 a = ap.parse_args()
 open(os.environ["CALLS"], "a").write(f"tokenise {a.input_jsonl} tokenizer={a.tokenizer_path}\n")
+open(os.environ["CALLS"] + ".env", "a").write(f"nj={a.nj_per_gpu} omp={os.environ.get('OMP_NUM_THREADS')} openblas={os.environ.get('OPENBLAS_NUM_THREADS')}\n")
 base = os.path.dirname(os.path.dirname(a.tar_output_pattern))
 os.makedirs(os.path.join(base, "audios"), exist_ok=True)
 open(os.path.join(base, "data.lst"), "w").write("shard-000000.tar shard-000000.jsonl 1 1.0\n")
@@ -130,6 +131,7 @@ class PreflightHarness(unittest.TestCase):
         jobs = root / "jobs"
         (jobs / "omnivoice-ft").mkdir(parents=True)
         shutil.copy(JOBS / "voicetune-fresh.sh", jobs / "voicetune-fresh.sh")
+        shutil.copy(JOBS / "worker-limits.sh", jobs / "worker-limits.sh")
         shutil.copy(JOBS / "requirements-omnivoice-worker.txt", jobs / "requirements-omnivoice-worker.txt")
         shutil.copy(JOBS / "omnivoice-ft" / "fetch_base_model.py", jobs / "omnivoice-ft" / "fetch_base_model.py")
         self._exe(jobs / "worker-return.sh", "exit 0")
