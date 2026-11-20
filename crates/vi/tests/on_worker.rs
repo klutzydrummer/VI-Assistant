@@ -1367,9 +1367,12 @@ fn wj_reduces_workers_only_when_oom_kill_counter_rises() {
 }
 
 /// Stand-ins for the OmniVoice worker environment that `voicetune-fresh.sh train`
-/// needs: a python that does nothing, an `accelerate` beside it that is the
-/// long-running trainer (`sleep SECS`), and an `nvidia-smi` that passes the
-/// VRAM gate. Returns the stub dir (put it first on PATH) and the python path.
+/// needs: a python that does nothing except when run as the accelerate
+/// launcher (`python -m accelerate.commands.launch ...`, how the script starts
+/// training), where it is the long-running trainer (`sleep SECS`), and an
+/// `nvidia-smi` that passes the VRAM gate. There is deliberately no
+/// `bin/accelerate`: the script must not call the console script by path.
+/// Returns the stub dir (put it first on PATH) and the python path.
 fn omnivoice_train_stubs(dir: &Path, trainer_secs: u32) -> (PathBuf, PathBuf) {
     let stubs = dir.join("stubs");
     fs::create_dir_all(&stubs).unwrap();
@@ -1378,10 +1381,12 @@ fn omnivoice_train_stubs(dir: &Path, trainer_secs: u32) -> (PathBuf, PathBuf) {
         fs::write(&p, body).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     };
-    write_exe("python", "#!/bin/sh\nexit 0\n".to_string());
     write_exe(
-        "accelerate",
-        format!("#!/bin/sh\nexec sleep {trainer_secs}\n"),
+        "python",
+        format!(
+            "#!/bin/sh\nif [ \"$1 $2\" = \"-m accelerate.commands.launch\" ]; then\n  \
+             exec sleep {trainer_secs}\nfi\nexit 0\n"
+        ),
     );
     write_exe("nvidia-smi", "#!/bin/sh\necho '81920, 0'\n".to_string());
     let py = stubs.join("python");
@@ -1444,8 +1449,8 @@ fn trainer_survives_vf_kill() {
     let out_dir = work.join("out");
     fs::create_dir_all(&out_dir).unwrap();
 
-    // Stand-ins for the OmniVoice venv: the accelerate stub is the
-    // long-running trainer, the rest pass the VRAM gate.
+    // Stand-ins for the OmniVoice venv: the python stub run as the accelerate
+    // launcher is the long-running trainer, the rest pass the VRAM gate.
     let (stubs, py) = omnivoice_train_stubs(dir.path(), 30);
 
     let mut child = omnivoice_train_cmd(&vf, &stubs, &py, &out_dir, &data, &home)

@@ -443,7 +443,13 @@ def build_wheelhouse(out_dir: str):
     _wheel(out_dir, "vi-rehearsal-stub", {
         "vi_rehearsal_stub.py": me,
         "vi_rehearsal_stub.pth": "import vi_rehearsal_stub; vi_rehearsal_stub.intercept()\n"})
-    _wheel(out_dir, "accelerate", {"accelerate/__init__.py": "STUB = True\n"}, stub,
+    _wheel(out_dir, "accelerate", {
+        "accelerate/__init__.py": "STUB = True\n",
+        "accelerate/commands/__init__.py": "",
+        # voicetune-fresh.sh runs `python -m accelerate.commands.launch ...` (no console script).
+        "accelerate/commands/launch.py":
+            "import sys\nfrom vi_rehearsal_stub import accelerate_main\n"
+            "if __name__ == '__main__':\n    sys.argv[1:1] = ['launch']\n    accelerate_main()\n"}, stub,
            {"accelerate": "vi_rehearsal_stub:accelerate_main"})
     _wheel(out_dir, "omnivoice", {
         "omnivoice/__init__.py": "STUB = True\n",
