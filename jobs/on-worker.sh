@@ -715,11 +715,12 @@ exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$wor
 [ -n "$checkpoint" ] && exports+=" VI_CHECKPOINT=$(q "$work/checkpoint")"
 [ -n "$durable" ] && exports+=" VI_PUBLISH=vi-publish"
 # The hours left in the run's cap, so the worker's ETA warning measures against the real budget.
-[ -z "${VI_HOURS_LEFT:-}" ] || exports+=" VI_HOURS_LEFT=$(q "$VI_HOURS_LEFT")"
+# Added just before the launch (below), less the time this script has already spent (preflight,
+# upload): debug-pass.sh cuts each stage's limit to it (r21).
 if [ "$debug_pass" = 1 ]; then
   exports+=" VI_DEBUG_PASS=1 VI_DEBUG_PREFLIGHT_RC=$(q "${pre_rc:-0}")"
   # The debug pass's own knobs (stage list, time limits, imports) travel to the worker too.
-  for var in $(compgen -e | grep -E '^VI_DEBUG_(STAGES|TIMEOUT_[0-9]+|IMPORTS|NO_CUDA|EXCERPT_LINES|HEARTBEAT_SECONDS|POLL_SECONDS)$' || true); do
+  for var in $(compgen -e | grep -E '^VI_DEBUG_(STAGES|TIMEOUT_[0-9]+|IMPORTS|NO_CUDA|EXCERPT_LINES|HEARTBEAT_SECONDS|POLL_SECONDS|MARGIN_SECONDS)$' || true); do
     exports+=" $var=$(q "${!var}")"
   done
 fi
@@ -800,6 +801,12 @@ fi
 # killed home process left running; launching it again would run the job twice
 # and overwrite the surviving stage's pid and exit code.
 if [ "$reattach" = 0 ]; then
+  if [ -n "${VI_HOURS_LEFT:-}" ]; then
+    hours_left=$(awk -v h="$VI_HOURS_LEFT" -v s="$SECONDS" \
+      'BEGIN { if (h !~ /^[0-9]*\.?[0-9]+$/) exit 1; x = h - s / 3600; printf "%.4f", (x > 0 ? x : 0) }') \
+      || hours_left=$VI_HOURS_LEFT
+    exports+=" VI_HOURS_LEFT=$(q "$hours_left")"
+  fi
   active=$(q "$root/.active")
   stage_script="echo \$\$ > $(q "$work/stage.pid")
 cd $(q "$work") || exit 70

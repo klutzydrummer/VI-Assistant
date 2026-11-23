@@ -279,6 +279,30 @@ fn wait_stage(child: &mut Child, secs: u64) -> ExitStatus {
     }
 }
 
+/// `wait_stage`, but a timeout panics with the supervisor's stderr so a CI
+/// hang shows where it stopped (round 21: the sigstop test hung once in CI
+/// with nothing to go on).
+fn wait_stage_or_dump(child: &mut Child, secs: u64, err_path: &Path) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let err = err_text(err_path);
+            let tail: Vec<&str> = err.lines().rev().take(60).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            panic!(
+                "the stage run did not finish within {secs}s; last stderr lines:\n{}",
+                tail.join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn pgrep_f(pattern: &str) -> Vec<u32> {
     let out = Command::new("pgrep")
         .args(["-f", pattern])
@@ -1725,7 +1749,7 @@ echo done > "$VI_OUT/done.txt""#
     wait_until("the receiver did not die", 10, || !pid_alive(receiver));
     std::thread::sleep(Duration::from_secs(4));
     drop(paused);
-    let status = wait_stage(&mut child, 120);
+    let status = wait_stage_or_dump(&mut child, 120, &err_path);
     let err = err_text(&err_path);
     assert!(status.success(), "{err}");
     assert!(
@@ -2349,7 +2373,8 @@ fn onworker_refuses_weights_only_newest() {
 }
 
 /// Round 12 fix 2: the hours left that the orchestrator sets for the run reach
-/// the stage on the worker.
+/// the stage on the worker. Round 21: less the time on-worker.sh already spent
+/// before the launch (preflight, upload), so debug-pass.sh's deadline is real.
 #[test]
 fn on_worker_forwards_hours_left() {
     if !have_rsync() {
@@ -2367,10 +2392,12 @@ fn on_worker_forwards_hours_left() {
         String::from_utf8_lossy(&out.stderr)
     );
     let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
-    assert_eq!(
-        fs::read_to_string(got.join("hours.txt")).unwrap().trim(),
-        "3.25"
-    );
+    let text = fs::read_to_string(got.join("hours.txt")).unwrap();
+    let hours = text.trim();
+    // printed with 4 decimals after the elapsed time is taken off
+    assert_eq!(hours.split('.').nth(1).map(str::len), Some(4), "{hours}");
+    let h: f64 = hours.parse().unwrap();
+    assert!((3.15..=3.25).contains(&h), "{hours}");
 }
 
 /// The work dir the run left behind, if any (a successful run removes it).
