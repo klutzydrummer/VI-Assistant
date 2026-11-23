@@ -590,7 +590,7 @@ class Nofile(unittest.TestCase):
         r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("now 8192 8192 8192", r.stdout)
-        self.assertRegex(r.stdout, r"nofile-soft=8192 nofile-hard=8192 -> threads=")
+        self.assertRegex(r.stdout, r"nofile-soft=8192 nofile-hard=8192 tasks_free=\S+ -> threads=")
 
     def test_job_scripts_raise_nofile_before_work(self):
         fresh = (JOBS / "voicetune-fresh.sh").read_text()

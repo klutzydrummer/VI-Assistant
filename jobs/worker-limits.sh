@@ -155,7 +155,7 @@ worker_limits_measure() {
 worker_limits_line() {
   local free=$vi_lim_tasks_free
   [ "$free" -lt "$vi_unlimited" ] || free=unlimited
-  echo "limits: nproc=$vi_lim_nproc cpus=$vi_lim_cpus quota=$vi_lim_quota cpuset=$vi_lim_cpuset pids.max=$vi_lim_pids_max current=$vi_lim_pids_current ulimit-u=$vi_lim_ulimit_u threads-max=$vi_lim_threads_max tasks_free=$free nofile-soft=${vi_lim_nofile_soft:-$(ulimit -Sn)} nofile-hard=${vi_lim_nofile_hard:-$(ulimit -Hn)} -> threads=$vi_lim_threads nj=$vi_lim_nj"
+  echo "limits: nproc=$vi_lim_nproc cpus=$vi_lim_cpus quota=$vi_lim_quota cpuset=$vi_lim_cpuset pids.max=$vi_lim_pids_max current=$vi_lim_pids_current ulimit-u=$vi_lim_ulimit_u threads-max=$vi_lim_threads_max nofile-soft=${vi_lim_nofile_soft:-$(ulimit -Sn)} nofile-hard=${vi_lim_nofile_hard:-$(ulimit -Hn)} tasks_free=$free -> threads=$vi_lim_threads nj=$vi_lim_nj"
 }
 
 # worker_limits: raise the open-file soft limit (vi_raise_nofile), measure, print the limits line, export the thread caps and VI_LIMIT_NJ. Returns 1
