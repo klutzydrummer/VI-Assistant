@@ -50,11 +50,11 @@ change the cap, hours or attempts):
 (at most 10 minutes), releases the worker and exits 8. `stop --now` sends SIGTERM to the recorded
 paid_run process, which releases the worker at once.
 
-Debug pass (one rental, every step tried, nothing retried):
+Debug pass (one rental, or two only after a confirmed host drop; every step tried):
 
     python3 -I jobs/paid_run.py --debug-pass --run-id ID --cap USD --max-hours H [--plan]
 
-rents the cheapest qualifying offer ONCE and runs 12 stages, each with its own time limit,
+rents the cheapest qualifying offer and runs 12 stages, each with its own time limit,
 carrying on past failures: 1 host/driver/CUDA and 2 disk and limits (jobs/debug-probe.sh over
 `vi cloud ssh`), then the stage `omnivoice_debug` (jobs/debug-pass.sh through on-worker.sh, so
 the real tunnel, receiver and token push) for 3 upload, 4 venv and launchers, 5 Base fetch,
@@ -121,6 +121,26 @@ def failure_rc_text(rc, out):
         if m and m[-1] != str(rc):
             return f"exit {m[-1]} {where}; the vi CLI exited {rc}"
     return f"exit {rc}"
+
+
+# A host drop (r18): the worker's ssh ended from its side or nothing listens any more. ssh's own
+# exit 255 or one of these lines is only a suspicion; host_drop() confirms it with a status check.
+HOST_DROP_RE = re.compile(r"closed by remote host|Connection refused|Connection reset by peer|"
+                          r"Connection timed out|No route to host|kex_exchange_identification|"
+                          r"Broken pipe|connection unexpectedly closed")
+DROP_EXIT_RE = re.compile(r"(?:exited with|exiting with|exit status:) 255\b")
+
+
+def drop_signal(rc, out):
+    """The first sign that ssh lost the host, or None. Only ever applied to work that did NOT
+    report its own result: a stage or gate that printed FAIL failed our own check, never a drop."""
+    out = out or ""
+    m = HOST_DROP_RE.search(out)
+    if m:
+        return m.group(0)
+    if rc == 255 or DROP_EXIT_RE.search(out):
+        return "ssh exit 255"
+    return None
 
 
 def retryable_gate(out):
@@ -248,6 +268,13 @@ CONFIG_DEFAULT_DISK_GB = 60.0
 # before a FAILED worker is destroyed a bounded diagnostics file is pulled into the run dir.
 RUN_LOG_MAX_BYTES = 200 * 1024 * 1024
 DIAG_MAX_BYTES = 256 * 1024
+# A1: host-side evidence from the Vast CLI before a failed worker is destroyed. Each call is cut
+# off after this long; VI_VASTAI_BIN overrides the binary (tests use a stub). The CLI reads its
+# own key; this script never reads or prints the key or the CLI's config/state files.
+VAST_EVIDENCE_SECONDS = 30.0
+VAST_LOG_TAIL = 200
+# C: a debug pass rents at most this many workers; the second only after a confirmed host drop.
+DEBUG_MAX_RENTALS = 2
 DIAG_TIMEOUT_SECONDS = 25.0
 # Run on the worker through `vi cloud ssh`; every part is bounded by head/tail and `timeout`.
 DIAG_SCRIPT = r"""
@@ -597,6 +624,28 @@ DEBUG_EXCERPT_RE = re.compile(r"debug-pass:   \| (.*)")
 DEBUG_PROBE_FLOORS = (("min_vram_gb", "DEBUG_MIN_VRAM_GB"), ("min_cuda_version", "DEBUG_MIN_CUDA"),
                       ("min_disk_gb", "DEBUG_MIN_DISK_GB"), ("min_ram_gb", "DEBUG_MIN_RAM_GB"),
                       ("min_cpu_cores", "DEBUG_MIN_CORES"))
+
+
+def parse_vast_instance(text):
+    """{"status", "msg"} from `vastai show instance <id> --raw` JSON (a dict, a one-item list or
+    {"instances": ...}); empty when it cannot be read."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return {}
+    stack = [doc]
+    while stack:
+        d = stack.pop(0)
+        if isinstance(d, dict):
+            if "actual_status" in d or "status_msg" in d:
+                st = d.get("actual_status")
+                msg = d.get("status_msg")
+                return dict(status=str(st) if st is not None else "none",
+                            msg=" ".join(str(msg).split())[:300] if msg else None)
+            stack += list(d.values())
+        elif isinstance(d, list):
+            stack += d
+    return {}
 
 
 def debug_worst_case(cap, disk_gb, hours):
@@ -1446,8 +1495,14 @@ class PaidRun:
         if getattr(a, "debug_pass", False):
             total, gpu, disk = debug_worst_case(a.cap, disk_gb, a.max_hours)
             flow = [
-                "mode            : --debug-pass (ONE rental, no retry on another offer; every "
-                "stage is tried and a failure never stops the next one)",
+                f"mode            : --debug-pass (up to {DEBUG_MAX_RENTALS} rentals: a second one "
+                "ONLY after a confirmed host drop (ssh lost the host and the instance status check "
+                "agrees), never after our own check failing; every stage is tried and a failure "
+                "never stops the next one)",
+                "host drop       : before release, `vastai show instance <id> --raw` and "
+                "`vastai logs <id>` are saved in the run folder; the stage reads HOST-DROP "
+                "(status X); that worker is released and one more offer is rented only if the "
+                "cap left covers $/hr x the hours left",
                 "flow            : offers -> cheapest qualifying offer -> up -> 1 host-cuda, "
                 "2 disk-limits (debug-probe.sh over `vi cloud ssh`) -> stage omnivoice_debug "
                 "(3 upload + token handshake, 4 venv + launchers, 5 base-model, 6 tokenise, "
@@ -1455,10 +1510,10 @@ class PaidRun:
                 "(always, even after a failure)",
                 f"debug data      : the first {a.debug_rows} train rows of omnivoice_data "
                 "(jobs/debug_slice.py, by position only), plus 4 dev, 2 style, 8 replay texts",
-                f"worst case      : ${total:.2f} = cap ${gpu:.2f} (an offer is rented only if "
-                f"$/hr x {a.max_hours:g} h <= ${a.cap:.2f}) + disk ${disk:.2f} ({disk_gb:g} GB x "
-                f"${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month / {HOURS_PER_MONTH} h x "
-                f"{a.max_hours:g} h)",
+                f"worst case      : ${total:.2f} = cap ${gpu:.2f} for both rentals together (an "
+                f"offer is rented only if $/hr x the hours left <= the cap left of ${a.cap:.2f}) "
+                f"+ disk ${disk:.2f} ({disk_gb:g} GB x ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month "
+                f"/ {HOURS_PER_MONTH} h x {a.max_hours:g} h, the hours of both rentals together)",
                 "                  formula: worst case = cap + disk_gb x 1.00 / 730 x max_hours; "
                 "a typical pass should take under 30 min, so it costs about $/hr x 0.5",
                 f"results         : {self.dir}/debug-summary.txt and .json; exit 0 only if "
@@ -1479,7 +1534,9 @@ class PaidRun:
             f"run id          : {a.run_id}",
             f"cap (all tries) : ${a.cap:.2f}",
             f"max hours (all) : {a.max_hours} h",
-            (f"max attempts    : 1 (a debug pass rents once)" if getattr(a, "debug_pass", False)
+            (f"max attempts    : up to {DEBUG_MAX_RENTALS} rentals (a second only after a "
+             "confirmed host drop, inside the same cap and hours; never a third)"
+             if getattr(a, "debug_pass", False)
              else f"max attempts    : {a.max_attempts} (every attempt counts, including a rental "
                   "that failed to start)"),
             f"vi binary       : {self.vi}",
@@ -1548,6 +1605,8 @@ class PaidRun:
         self.in_teardown = True
         if outcome not in ("done", "up-failed", "train-vanished"):
             self.fetch_diagnostics(at, outcome)
+        if outcome not in ("done", "debug-done", "orphan") and not (at or {}).get("vast_file"):
+            self.vast_evidence(at, outcome)
         say("releasing the worker (vi cloud down)")
         rc, out = self.vi_cmd("cloud", "down", stream=True)
         if rc != 0:
@@ -1617,6 +1676,96 @@ class PaidRun:
             say(f"diagnostics: {len(data)} bytes saved {note}".rstrip())
         except OSError as e:
             say(f"(diagnostics could not be written: {e})")
+
+    def vast_evidence(self, at, why):
+        """A1, best effort, never raises: `vastai show instance <id> --raw` (actual_status,
+        status_msg) and `vastai logs <id>` into the run dir, before the worker is destroyed.
+        Returns {"status", "msg", "id", "file"}; status is None when it could not be read. Only
+        the Vast CLI is run: its key and its config and state files are never read here."""
+        info = dict(status=None, msg=None, id=None, file=None)
+        try:
+            n = at["n"] if at else 0
+            dest = self.dir / f"vast-attempt-{n}-{why}.txt"
+            info["file"] = str(dest)
+            parts = []
+            limit = float(os.environ.get("PAID_RUN_VAST_SECONDS", VAST_EVIDENCE_SECONDS))
+            vastai = os.environ.get("VI_VASTAI_BIN")
+            ident = (at or {}).get("instance") or self.instance_id()
+            info["id"] = ident
+            if ident is None:
+                parts.append("(no instance id from `vi cloud status`; nothing to ask Vast about)")
+            elif not vastai and os.environ.get("PAID_RUN_CLOCK_FILE"):
+                # a test clock is set but no stub CLI: never let a test reach the real Vast
+                parts.append("(skipped: test clock in use and VI_VASTAI_BIN is unset)")
+            else:
+                vastai = vastai or "vastai"
+                for cmd in (["show", "instance", str(ident), "--raw"],
+                            ["logs", str(ident), "--tail", str(VAST_LOG_TAIL)]):
+                    say(f"saving Vast's view of instance {ident} (at most {limit:.0f} s): "
+                        f"vastai {' '.join(cmd)}")
+                    try:
+                        r = subprocess.run([vastai, *cmd], stdin=subprocess.DEVNULL,
+                                           capture_output=True, timeout=limit,
+                                           env={**os.environ, "PAGER": "cat"})
+                        text = (r.stdout + r.stderr)[:DIAG_MAX_BYTES].decode(errors="replace")
+                        parts.append(f"== vastai {' '.join(cmd)} (exit {r.returncode})\n{text}")
+                        if cmd[0] == "show" and r.returncode == 0:
+                            info.update(parse_vast_instance(r.stdout.decode(errors="replace")))
+                    except subprocess.TimeoutExpired:
+                        parts.append(f"== vastai {' '.join(cmd)}: cut off after {limit:.0f} s")
+                    except OSError as e:
+                        parts.append(f"== vastai {' '.join(cmd)}: could not run ({e})")
+            head = (f"instance {ident}: actual_status {info['status'] or 'unknown'}; "
+                    f"status_msg {info['msg'] or '-'}")
+            self.dir.mkdir(parents=True, exist_ok=True)
+            dest.write_text(head + "\n" + "\n".join(parts) + "\n")
+            say(f"Vast evidence: {head} -> {dest}")
+            if at is not None:
+                at.update(instance=ident, vast_status=info["status"], vast_msg=info["msg"],
+                          vast_file=str(dest))
+                self.save()
+        except BaseException as e:  # noqa: BLE001: nothing here may stop the destroy
+            say(f"(Vast evidence could not be saved: {type(e).__name__}: {e})")
+        return info
+
+    def host_drop(self, at, rc, out):
+        """A2: (confirmed, text) when output that did not report its own result shows ssh losing
+        the host; (False, None) when there is no sign of that. A drop is confirmed only by an
+        instance status check: Vast's actual_status (A1 evidence, saved now) or, failing that,
+        `vi cloud status`; then it must be not running, or a fresh `vi cloud ssh true` must fail
+        the same way. Our own check failures print their own FAIL and never get here."""
+        sig = drop_signal(rc, out)
+        if sig is None:
+            return False, None
+        say(f"ssh may have lost the host ({sig}); checking the instance status")
+        ev = self.vast_evidence(at, "host-drop-check")
+        status, msg = ev.get("status"), ev.get("msg")
+        if status is None:
+            try:
+                r2, o2 = self.run([self.vi, "cloud", "status"], stream=False,
+                                  timeout=QUERY_TIMEOUT_SECONDS)
+                m = re.search(r"^worker \d+ (\w+)", o2, re.M) if r2 == 0 else None
+                status = m.group(1) if m else ("gone" if r2 == 0 else None)
+            except Exception:  # noqa: BLE001
+                status = None
+        try:
+            r3, o3 = self.run([self.vi, "cloud", "ssh", "true"], stream=False, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            r3, o3 = None, repr(e)
+        again = drop_signal(r3, o3) if r3 != 0 else None
+        again_text = "ssh again: ok" if r3 == 0 else f"ssh again: {again or f'exit {r3}'}"
+        if status is not None and (status.lower() != "running" or again):
+            text = (f"HOST-DROP (status {status}{f': {msg}' if msg else ''}); {sig}; {again_text}"
+                    f"; Vast evidence in {ev.get('file') or 'the run folder'}")
+            say(text)
+            if at is not None:
+                at["host_drop"] = text
+                self.save()
+            return True, text
+        text = (f"ssh lost the connection ({sig}), but this is not a confirmed host drop "
+                f"(status {status or 'unknown'}; {again_text})")
+        say(text)
+        return False, text
 
     # ----- resume --------------------------------------------------------------------------
     def settle_previous(self):
@@ -1884,7 +2033,14 @@ class PaidRun:
                             f"of ${a.cap:.2f}, {self.s['hours_total']:.2f} of {a.max_hours} h")
                         at = None
                         continue
-                    self.release(at, "preflight-failed")
+                    # A2: name a host drop as one (the full run never rents again for it)
+                    dropped, drop_text = (False, None) if self.timed_out else \
+                        self.host_drop(at, rc, out)
+                    self.release(at, "host-drop" if dropped else "preflight-failed")
+                    if dropped:
+                        raise Stop(EXIT["preflight"], f"the preflight lost its worker: {drop_text}; "
+                                   f"{failure_rc_text(rc, out)}. The worker was released; the "
+                                   "full run never rents again after a host drop")
                     raise Stop(EXIT["preflight"], f"the preflight failed ({failure_rc_text(rc, out)}) on a gate "
                                "that is not a retryable worker gate; the worker was released, no retry")
                 self.set_phase(at, "train")
@@ -1924,15 +2080,25 @@ class PaidRun:
                       for key, var in DEBUG_PROBE_FLOORS if key in st)
         rc, out = self.run([self.vi, "cloud", "ssh", env + DEBUG_PROBE_SCRIPT.read_text()],
                            stream=False, timeout=DEBUG_PROBE_SECONDS)
+        timed_out = self.timed_out
         found = parse_debug_output(out)
+        drop = None
         for n in (1, 2):
             if n in found:
                 res, detail, ex = found[n]
                 self.debug_record(n, res, detail, ex)
-            else:
-                why = (f"hit its {DEBUG_PROBE_SECONDS} s limit" if self.timed_out
-                       else f"`vi cloud ssh` exited {rc} without a stage {n} line")
-                self.debug_record(n, "FAIL", f"({why})", out.strip().splitlines()[-8:])
+                continue
+            if not timed_out and drop is None:
+                drop = self.host_drop(self.open_attempt(), rc, out)
+            if drop and drop[0]:
+                self.debug_record(n, "HOST-DROP", drop[1].removeprefix("HOST-DROP "),
+                                  out.strip().splitlines()[-8:])
+                self.dropped = drop[1]
+                continue
+            why = (f"hit its {DEBUG_PROBE_SECONDS} s limit" if timed_out
+                   else f"`vi cloud ssh` exited {rc} without a stage {n} line"
+                   + (f"; {drop[1]}" if drop and drop[1] else ""))
+            self.debug_record(n, "FAIL", f"({why})", out.strip().splitlines()[-8:])
 
     def debug_worker_stages(self, at):
         """Stages 3 to 11: the stage omnivoice_debug (on-worker.sh + jobs/debug-pass.sh)."""
@@ -1948,6 +2114,7 @@ class PaidRun:
         timed_out = self.timed_out
         found = parse_debug_output(out)
         tail = [ln for ln in out.strip().splitlines() if "debug-pass:" not in ln][-10:]
+        drop = None
         for n in range(3, 12):
             if n in found:
                 res, detail, ex = found[n]
@@ -1955,9 +2122,18 @@ class PaidRun:
             elif self.debug_gate(n):
                 # Its prerequisites passed, yet no line: the worker stage stopped or was cut off
                 # first (for stage 3: on-worker.sh never started debug-pass.sh, e.g. the return
-                # path or the token push failed; its own message is in the excerpt).
+                # path or the token push failed; its own message is in the excerpt). A2: if ssh
+                # lost the host and the status check confirms it, that is a HOST-DROP.
+                if not timed_out and drop is None:
+                    drop = self.host_drop(at, rc, out)
+                if drop and drop[0]:
+                    self.debug_record(n, "HOST-DROP", drop[1].removeprefix("HOST-DROP ")
+                                      + f"; the stage ended ({failure_rc_text(rc, out)})", tail)
+                    self.dropped = drop[1]
+                    continue
                 why = (f"the debug stage hit its {limit:.0f} s limit first" if timed_out else
-                       f"never reported; the stage ended ({failure_rc_text(rc, out)}) first")
+                       f"never reported; the stage ended ({failure_rc_text(rc, out)}) first"
+                       + (f"; {drop[1]}" if drop and drop[1] else ""))
                 self.debug_record(n, "FAIL", f"({why})", tail)
         self.debug_home_checks()
 
@@ -2016,13 +2192,34 @@ class PaidRun:
                                           excerpt=[])
                 for n, _, _ in DEBUG_STAGES]
         self.dir.mkdir(parents=True, exist_ok=True)
-        doc = dict(run_id=self.a.run_id, rental=self.debug.get(0), stages=rows,
+        rentals = []
+        for at in self.s["attempts"]:
+            status = (at.get("host_drop") or (f"released ({at['outcome']})" if at.get("outcome")
+                                              else "open"))
+            rentals.append(dict(n=at["n"], offer=at["offer"], instance=at.get("instance"),
+                                dph=at.get("dph"), status=status, spent=at.get("spent"),
+                                spent_estimated=at.get("spent_estimated", False),
+                                vast_status=at.get("vast_status"), vast_file=at.get("vast_file"),
+                                stages=at.get("debug_stages")))
+        doc = dict(run_id=self.a.run_id, rental=self.debug.get(0), rentals=rentals,
+                   note=self.debug_note, stages=rows,
                    spent_total=self.s["spent_total"], hours_total=self.s["hours_total"],
                    cap=self.s["cap"], max_hours=self.s["max_hours"],
                    listening_set_note="for human listening only; never scored")
         (self.dir / "debug-summary.json").write_text(json.dumps(doc, indent=1) + "\n")
         lines = [f"debug pass {self.a.run_id}: spent ${self.s['spent_total']:.2f} of "
-                 f"${self.s['cap']:.2f}, {self.s['hours_total']:.2f} h"]
+                 f"${self.s['cap']:.2f} cap in {len(rentals)} rental(s) (at most "
+                 f"{DEBUG_MAX_RENTALS}), {self.s['hours_total']:.2f} of {self.s['max_hours']} h"]
+        for r in rentals:
+            spent = "?" if r["spent"] is None else f"${r['spent']:.2f}" + (
+                " (estimated)" if r["spent_estimated"] else "")
+            lines.append(f"  rental {r['n']}      : offer {r['offer']}, instance "
+                         f"{r['instance'] or '?'}, {r['status']}, spent {spent}")
+        if self.debug_note:
+            lines.append(f"  note          : {self.debug_note}")
+        if len(rentals) > 1:
+            lines.append(f"  stages below are rental {rentals[-1]['n']}'s; rental 1's are in "
+                         "debug-summary.json (rentals[0].stages)")
         if self.debug.get(0):
             r = self.debug[0]
             lines.append(f"  rental        : {r['result']} {r['detail']}".rstrip())
@@ -2037,48 +2234,91 @@ class PaidRun:
         say(f"full summary with log excerpts: {self.dir / 'debug-summary.txt'}")
         return rows
 
-    def execute_debug(self):
-        """One rental; stages 1-12, each tried; the worker is always released (stage 12)."""
+    def debug_rent_and_run(self, n):
+        """One debug rental (attempt n): offer -> up -> stages 1-11. Returns the HOST-DROP text
+        when a confirmed host drop (A2) cut it short, else None. The worker is left up."""
         a = self.a
+        self.dropped = None
+        cap_left, hours_left = self.remaining()
+        say(f"===== debug pass rental {n} at {rfc3339(clock())}: ${cap_left:.2f}, "
+            f"{hours_left:.2f} h left =====")
+        self.write_attempt_config(n, hours_left)
+        offer = self.choose_offer(hours_left, cap_left)
+        say(f"cheapest offer: {offer['id']} {offer['gpu']} {offer['loc']} ${offer['dph']:.3f}/hr")
+        if n > 1:  # the first rental's stage table is kept in its attempt record
+            self.debug = {}
+        at = dict(n=n, offer=offer["id"], sig=offer["sig"], dph=offer["dph"],
+                  machine=offer["machine"], host=offer["host"], phase="up", started=clock(),
+                  ended=None, cap=round(cap_left, 4), hours=None, credit_start=self.credit())
+        self.s["attempts"].append(at)
+        self.save()
+        self.worker_maybe_up = True
+        boot_s = config_boot_minutes(self.base_config_text()) * 60 + UP_EXTRA_SECONDS
+        rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
+                            f"{cap_left:.2f}", "--until", rfc3339(clock() + hours_left * 3600),
+                            "--yes"], watch=True, timeout=boot_s)
+        m = re.search(r"^worker (\d+) ready", out, re.M)
+        if m:
+            at["instance"] = m.group(1)
+            self.save()
+        if rc != 0:
+            self.debug_record(0, "FAIL", f"(`vi cloud up` exited {rc}"
+                              f"{', boot timed out' if self.timed_out else ''})",
+                              out.strip().splitlines()[-8:])
+        else:
+            self.debug_record(0, "PASS", f"(offer {offer['id']} at ${offer['dph']:.3f}/hr"
+                              f"{f', instance {m.group(1)}' if m else ''})")
+            self.set_phase(at, "debug")
+            self.debug_probe()
+            if not self.dropped:  # after a drop in 1-2 the worker stages cannot reach it either
+                self.debug_worker_stages(at)
+        for k in range(1, 12):
+            if k not in self.debug:
+                self.debug_gate(k)
+        return self.dropped
+
+    def execute_debug(self):
+        """Stages 1-12, each tried; the worker is always released (stage 12). One rental, plus
+        ONE more only after a confirmed host drop (C), inside the same cap and hours."""
         self.debug = {}
+        self.dropped = None
+        self.debug_note = None
         failure = None
         try:
             self.settle_previous()
             if self.s["attempts"]:
-                raise Stop(EXIT["budget"], "a debug pass rents once and this run id already has "
-                           "an attempt; start a new --run-id")
+                raise Stop(EXIT["budget"], "a debug pass is never resumed and this run id already "
+                           "has an attempt; start a new --run-id")
             if self.s["credit_before_run"] is None:
                 self.s["credit_before_run"] = self.credit()
                 self.save()
             if self.stop_file.exists():
                 raise StopRequested("stop requested; nothing was rented")
-            cap_left, hours_left = self.remaining()
-            say(f"===== debug pass at {rfc3339(clock())}: ${cap_left:.2f}, {hours_left:.2f} h =====")
-            self.write_attempt_config(1, hours_left)
-            offer = self.choose_offer(hours_left, cap_left)
-            say(f"cheapest offer: {offer['id']} {offer['gpu']} {offer['loc']} ${offer['dph']:.3f}/hr")
-            at = dict(n=1, offer=offer["id"], sig=offer["sig"], dph=offer["dph"],
-                      machine=offer["machine"], host=offer["host"], phase="up", started=clock(),
-                      ended=None, cap=round(cap_left, 4), hours=None, credit_start=self.credit())
-            self.s["attempts"].append(at)
-            self.save()
-            self.worker_maybe_up = True
-            boot_s = config_boot_minutes(self.base_config_text()) * 60 + UP_EXTRA_SECONDS
-            rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
-                                f"{cap_left:.2f}", "--until", rfc3339(clock() + 3600), "--yes"],
-                               watch=True, timeout=boot_s)
-            if rc != 0:
-                self.debug_record(0, "FAIL", f"(`vi cloud up` exited {rc}"
-                                  f"{', boot timed out' if self.timed_out else ''})",
-                                  out.strip().splitlines()[-8:])
-            else:
-                self.debug_record(0, "PASS", f"(offer {offer['id']} at ${offer['dph']:.3f}/hr)")
-                self.set_phase(at, "debug")
-                self.debug_probe()
-                self.debug_worker_stages(at)
-            for n in range(1, 12):
-                if n not in self.debug:
-                    self.debug_gate(n)
+            if self.debug_rent_and_run(1):
+                # C: a confirmed host drop on rental 1 -> evidence, release, then at most one more
+                at = self.open_attempt()
+                at["debug_stages"] = [self.debug[k] for k in sorted(self.debug)]
+                self.s["failed_offers"].append(at["offer"])
+                self.s["failed_sigs"].append(at["sig"])
+                self.mark_machine(at, host_too=True)
+                spent = self.release(at, "host-drop")
+                say(f"rental 1 released after the host drop: ${spent or 0:.2f} spent; total "
+                    f"${self.s['spent_total']:.2f} of ${self.s['cap']:.2f}")
+                if self.stop_file.exists():
+                    self.debug_note = "stop requested after the host drop; no second rental"
+                else:
+                    try:
+                        if self.debug_rent_and_run(DEBUG_MAX_RENTALS):
+                            self.debug_note = (f"rental {DEBUG_MAX_RENTALS} also lost its host; a "
+                                               f"debug pass rents at most {DEBUG_MAX_RENTALS} "
+                                               "workers, so there is no third")
+                    except Stop as e:
+                        if e.code != EXIT["budget"] or len(self.s["attempts"]) > 1:
+                            raise
+                        self.debug_note = (f"no second rental: {e.message}. The cap left "
+                                           f"(${self.remaining()[0]:.2f}) does not cover one")
+                if self.debug_note:
+                    say(self.debug_note)
         except (Stop, Interrupted, Exception) as e:  # noqa: BLE001: stage 12 still runs
             failure = e
             say(f"debug pass stopped early: {getattr(e, 'message', None) or e!r}")
@@ -2086,7 +2326,13 @@ class PaidRun:
             if self.worker_maybe_up:
                 try:
                     self.in_teardown = True
-                    spent = self.release(self.open_attempt(), "debug-done")
+                    at = self.open_attempt()
+                    if at is not None:
+                        at["debug_stages"] = [self.debug[k] for k in sorted(self.debug)]
+                    bad = any(r["result"] != "PASS" for r in self.debug.values())
+                    outcome = ("host-drop" if self.dropped else
+                               "debug-failed" if bad or failure is not None else "debug-done")
+                    spent = self.release(at, outcome)
                     self.debug_record(12, "PASS", f"(worker released; ${spent or 0:.2f} spent)")
                 except Stop as e:
                     self.debug_record(12, "FAIL", f"({e.message})")
@@ -2094,6 +2340,9 @@ class PaidRun:
                         EXIT["release"] else e
                 finally:
                     self.in_teardown = False
+            elif self.s["attempts"]:
+                self.debug_record(12, "PASS", f"(every worker released; "
+                                  f"${self.s['spent_total']:.2f} spent in all)")
             else:
                 self.debug_record(12, "PASS", "(no worker was up)")
             rows = self.debug_write_summary()

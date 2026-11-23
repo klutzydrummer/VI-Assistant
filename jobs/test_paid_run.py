@@ -96,6 +96,9 @@ STUB = textwrap.dedent('''\
         print(f"credit ${st['credit']:.2f}")
     elif args[:2] == ["cloud", "ssh"]:
         log("ssh")
+        if st["worker"] and st.get("dropped") == st["worker"]["id"]:
+            # r18: once the host dropped, nothing listens on the ssh port any more
+            print("ssh: connect to host h port 1: Connection refused", file=sys.stderr); sys.exit(255)
         if "INPLACE_CHECK" in " ".join(args):
             seq = sc.get("inplace", [{}]); n = st.get("inplace_n", 0); st["inplace_n"] = n + 1; save()
             f = dict(gpu="ok", disk_free_gb="80", procs="0", abort="none", enospc="0", ckpt="1000")
@@ -157,6 +160,11 @@ STUB = textwrap.dedent('''\
                 print("exit status: 126", file=sys.stderr); sys.exit(1)
             if r == "other":
                 print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
+            if r == "drop":
+                st["dropped"] = st["worker"]["id"]; save()
+                print("Connection to 38.34.175.110 closed by remote host.", file=sys.stderr)
+                print("on-worker.sh: exiting with 255", file=sys.stderr)
+                print("error: stage omnivoice_preflight failed: exit status: 255", file=sys.stderr); sys.exit(1)
             if r == "ok-then-fail":
                 print("worker-preflight: ok (VRAM 23.9 GiB, push 9 MB/s)", file=sys.stderr)
                 print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
@@ -211,6 +219,35 @@ STUB = textwrap.dedent('''\
             print("train: done")
     else:
         print("stub: unknown", args, file=sys.stderr); sys.exit(2)
+''')
+
+
+# A stub `vastai` (VI_VASTAI_BIN): `show instance ID --raw` and `logs ID` from the stub vi's state.
+VASTAI_STUB = textwrap.dedent('''\
+    #!/usr/bin/env python3
+    import json, os, sys
+    from pathlib import Path
+    D = Path(os.environ["STUB_DIR"])
+    sc = json.loads((D / "scenario.json").read_text())
+    stp = D / "state.json"
+    st = json.loads(stp.read_text()) if stp.exists() else {"worker": None, "ups": 0}
+    (D / "calls.log").open("a").write(json.dumps(["vastai", sys.argv[1:]]) + "\\n")
+    a = sc["attempts"][min(max(st.get("ups", 1), 1) - 1, len(sc["attempts"]) - 1)]
+    if sc.get("vastai") == "fail" or a.get("vastai") == "fail":
+        print("failed with error 500: server error", file=sys.stderr); sys.exit(1)
+    if sc.get("vastai") == "hang":
+        import time; time.sleep(600)
+    args = sys.argv[1:]
+    ident = int(args[2] if args[:2] == ["show", "instance"] else args[1])
+    dropped = st.get("dropped") == ident
+    if args[:2] == ["show", "instance"]:
+        status = a.get("vast_status", "exited" if dropped else "running")
+        print(json.dumps({"id": ident, "actual_status": status, "intended_status": "running",
+                          "status_msg": "container exited unexpectedly" if dropped else "success"}))
+    elif args[0] == "logs":
+        print("container log line 1\\nsshd: Received signal 15; terminating." if dropped else "ok")
+    else:
+        print("vastai stub: unknown", args, file=sys.stderr); sys.exit(2)
 ''')
 
 
@@ -279,8 +316,11 @@ class Base(unittest.TestCase):
         self.stub.chmod(0o755)
         self.sd = self.tmp / "stub"
         self.sd.mkdir()
+        self.vastai = self.tmp / "vastai"
+        self.vastai.write_text(VASTAI_STUB)
+        self.vastai.chmod(0o755)
         self.env = dict(
-            os.environ, VI_BIN=str(self.stub), STUB_DIR=str(self.sd),
+            os.environ, VI_BIN=str(self.stub), STUB_DIR=str(self.sd), VI_VASTAI_BIN=str(self.vastai),
             PAID_RUN_CLOCK_FILE=str(self.tmp / "clock"),
             PAID_RUN_SLEEP_SCALE="0", PAID_RUN_SLEEP_LOG=str(self.tmp / "sleeps.log"),
             PAID_RUN_TIMEOUT_SCALE="1", VI_SKIP_HF_CHECK="1",
@@ -652,6 +692,30 @@ class Flow(Base):
         self.assertEqual(pr.failure_rc_text(1, "no worker line"), "exit 1")
         self.assertEqual(pr.failure_rc_text(1, "on-worker.sh: omnivoice_preflight exited with 126 on the worker"),
                          "exit 126 on the worker; the vi CLI exited 1")
+
+    def test_host_drop_in_the_full_run_is_named_and_never_rents_again(self):
+        # A2 in the full run: HOST-DROP (status X) in the stop message, A1 evidence saved before
+        # the destroy, and no second rental (C is debug-pass only)
+        self.scenario([dict(preflight="drop"), dict()])
+        self.assertEqual(self.run_orch(), 4, self.out)
+        self.assertEqual(len(self.ups()), 1, self.out)
+        self.assertIn("HOST-DROP (status exited: container exited unexpectedly)", self.out)
+        self.assertIn("exit 255 from on-worker.sh; the vi CLI exited 1", self.out)
+        self.assertIn("never rents again after a host drop", self.out)
+        names = [c[0] for c in self.calls()]
+        self.assertLess(names.index("vastai"), names.index("down"), "evidence must come first")
+        ev = list((self.tmp / "paid" / "t1").glob("vast-attempt-1-*.txt"))
+        self.assertTrue(ev, self.out)
+        self.assertIn("actual_status exited", ev[0].read_text())
+        self.assertIn("sshd: Received signal 15", ev[0].read_text())
+
+    def test_own_failure_is_not_a_host_drop_and_vastai_is_still_asked(self):
+        # A1 runs on any worker failure; A2 never calls an ordinary failure a host drop
+        self.scenario([dict(preflight="other")])
+        self.assertEqual(self.run_orch(), 4, self.out)
+        self.assertNotIn("HOST-DROP", self.out)
+        self.assertIn("vastai", [c[0] for c in self.calls()])
+        self.assertTrue(list((self.tmp / "paid" / "t1").glob("vast-attempt-1-preflight-failed.txt")))
 
     def test_failure_rc_text_round19_passthrough(self):
         # r18: ssh lost the host, on-worker.sh exited 255 under set -e, and the summary said 1

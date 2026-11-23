@@ -25,8 +25,16 @@ NEEDS = {4: (3,), 5: (4,), 6: (4, 5), 7: (4, 5), 8: (6, 7), 9: (8,), 10: (8,), 1
 
 DEBUG_BRANCH = '''\
     if stage == "omnivoice_debug":
-        r = sc.get("debug", "pass")
+        r = a.get("debug", sc.get("debug", "pass"))
         log("debug_env", os.environ.get("VI_DEBUG_PASS"), os.environ.get("VI_DEBUG_ROWS"))
+        if r == "drop":
+            # r18: the host closes ssh during the upload, then stops listening; on-worker.sh exits
+            # 255 under set -e before debug-pass.sh starts, and the vi CLI exits 1
+            st["dropped"] = st["worker"]["id"]; save()
+            print("Connection to 38.34.175.110 closed by remote host.", file=sys.stderr)
+            print("rsync: connection unexpectedly closed (0 bytes received so far) [sender]", file=sys.stderr)
+            print("on-worker.sh: exiting with 255", file=sys.stderr)
+            print("error: stage omnivoice_debug failed: exit status: 255", file=sys.stderr); sys.exit(1)
         if r == "silent":
             print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
         names = %r
@@ -70,8 +78,11 @@ DEBUG_BRANCH = '''\
 
 PROBE_BRANCH = '''\
     if "debug-pass: stage 1" in " ".join(args):
-        p = sc.get("probe", "pass")
+        p = att().get("probe", sc.get("probe", "pass"))
         log("probe", "DEBUG_MIN_VRAM_GB" in " ".join(args))
+        if p == "drop":
+            st["dropped"] = st["worker"]["id"]; save()
+            print("Connection to 38.34.175.110 closed by remote host.", file=sys.stderr); sys.exit(255)
         if p == "hang":
             (D / "probe.pid").write_text(str(os.getpid())); time.sleep(600)
         if p == "nothing":
@@ -325,6 +336,106 @@ class AlwaysDestroyed(DebugBase):
         self.assertNotEqual(res[3], "PASS")
 
 
+class HostDrop(DebugBase):
+    """Round 19 A1+A2+C: a confirmed host drop saves Vast's view, then ONE more rental."""
+
+    def scen2(self, first, second=None, cap_spent=(0.30, 0.42), **extra):
+        self.scenario([dict(spent=cap_spent[0], **first), dict(spent=cap_spent[1], **(second or {}))],
+                      corpus=str(self.tmp / "corpus"), **extra)
+
+    def evidence(self, n=1):
+        return sorted((self.tmp / "paid" / "t1").glob(f"vast-attempt-{n}-*.txt"))
+
+    def test_worker_drop_saves_evidence_then_rents_once_more(self):
+        self.scen2(dict(debug="drop"))
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2, self.out)
+        self.assertEqual(len(self.downs()), 2, self.out)
+        sm = self.summary()
+        r1, r2 = sm["rentals"]
+        self.assertTrue(r1["status"].startswith("HOST-DROP (status exited"), r1)
+        self.assertEqual((r1["instance"], r2["instance"]), ("101", "102"))
+        self.assertAlmostEqual(r1["spent"], 0.30)
+        self.assertAlmostEqual(r2["spent"], 0.42)
+        self.assertAlmostEqual(sm["spent_total"], 0.72)
+        st1 = {r["stage"]: r for r in r1["stages"]}
+        self.assertEqual(st1[3]["result"], "HOST-DROP")
+        self.assertNotIn("never reported", st1[3]["detail"])
+        self.assertIn("exit 255 from on-worker.sh", st1[3]["detail"])
+        self.assertEqual(self.results()[3], "PASS")  # the table shown is rental 2's
+        # A1: Vast's view was saved before the first destroy
+        ev = self.evidence(1)
+        self.assertTrue(ev, self.out)
+        self.assertIn("actual_status exited", ev[0].read_text())
+        names = [c[0] for c in self.calls()]
+        self.assertLess(names.index("vastai"), names.index("down"))
+        self.assertIn(["vastai", ["show", "instance", "101", "--raw"]], self.calls())
+        self.assertIn(["vastai", ["logs", "101", "--tail", "200"]], self.calls())
+        text = (self.tmp / "paid" / "t1" / "debug-summary.txt").read_text()
+        self.assertIn("rental 1      : offer 1, instance 101, HOST-DROP (status exited", text)
+        self.assertIn("rental 2      : offer 2, instance 102, released", text)
+        self.assertIn("spent $0.72 of $5.00 cap in 2 rental(s)", text)
+        self.assertIn("HOST-DROP (status exited", self.out)
+
+    def test_two_drops_never_rent_a_third(self):
+        self.scenario([dict(spent=0.3, debug="drop"), dict(spent=0.3, debug="drop"), dict(spent=0.3)],
+                      corpus=str(self.tmp / "corpus"))
+        self.assertEqual(self.run_debug(), 16, self.out)
+        self.assertEqual(len(self.ups()), 2, "a third rental happened: " + self.out)
+        self.assertIsNone(self.worker())
+        self.assertIn("no third", self.summary()["note"])
+        self.assertEqual(self.results()[3], "HOST-DROP")
+        self.assertTrue(self.evidence(2))
+
+    def test_probe_drop_rents_once_more_without_running_worker_stages_on_the_dead_host(self):
+        self.scen2(dict(probe="drop"))
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2, self.out)
+        r1 = {r["stage"]: r["result"] for r in self.summary()["rentals"][0]["stages"]}
+        self.assertEqual((r1[1], r1[2]), ("HOST-DROP", "HOST-DROP"))
+        self.assertEqual(self.stages(), ["omnivoice_debug"], "a worker stage ran on the dead host")
+
+    def test_our_own_failures_never_rent_again(self):
+        for extra in (dict(debug_fail=[4]), dict(debug="silent"), dict(probe="fail1")):
+            with self.subTest(**{k: str(v) for k, v in extra.items()}):
+                self.setUp()
+                self.scen2({}, **extra)
+                self.assertEqual(self.run_debug(), 16, self.out)
+                self.assertEqual(len(self.ups()), 1, "a second rental after our own failure")
+                self.assertNotIn("HOST-DROP", self.results().values())
+                self.assertFalse(self.summary()["rentals"][0]["status"].startswith("HOST-DROP"))
+
+    def test_unconfirmed_ssh_loss_is_not_a_drop(self):
+        # ssh said "connection refused" once, but the instance runs and ssh works again
+        self.scen2({}, probe="nothing")
+        self.assertEqual(self.run_debug(), 16, self.out)
+        self.assertEqual(len(self.ups()), 1, self.out)
+        self.assertIn("not a confirmed host drop", self.details()[1])
+        self.assertIn("status running", self.details()[1])
+
+    def test_second_rental_only_if_the_cap_left_covers_it(self):
+        self.scen2(dict(debug="drop"), cap_spent=(0.95, 0.1))
+        self.assertEqual(self.run_debug(cap=1, max_hours=1), 16, self.out)
+        self.assertEqual(len(self.ups()), 1, self.out)
+        note = self.summary()["note"]
+        self.assertIn("no second rental", note)
+        self.assertIn("no offer fits what is left", note)
+        self.assertIn("every worker released", self.details()[12])
+
+    def test_vastai_failing_or_hanging_never_blocks_the_destroy(self):
+        for mode in ("fail", "hang"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.env["PAID_RUN_VAST_SECONDS"] = "1"
+                self.scen2(dict(debug="drop"), vastai=mode)
+                self.run_debug()
+                self.assertEqual(len(self.downs()), 2, self.out)
+                self.assertIsNone(self.worker())
+                # without Vast's status, `vi cloud status` (running) plus a refused ssh confirms it
+                self.assertTrue(self.summary()["rentals"][0]["status"]
+                                .startswith("HOST-DROP (status running"), self.out)
+
+
 class Plan(DebugBase):
     def test_debug_plan_offline_exit_0_with_worst_case(self):
         self.scen()
@@ -337,7 +448,10 @@ class Plan(DebugBase):
         self.assertEqual(rc, 0, self.out)
         self.assertIn("worst case", self.out)
         self.assertIn("cap $3.00", self.out)
-        self.assertIn("a debug pass rents once", self.out)
+        self.assertIn("up to 2 rentals", self.out)
+        self.assertIn("a second only after a confirmed host drop", self.out)
+        self.assertIn("never a third", self.out)
+        self.assertIn("cap $3.00 for both rentals together", self.out)
         self.assertIn("--plan: nothing was called", self.out)
         self.assertFalse((self.tmp / "any-call.log").exists(), "--plan called vi")
         self.assertEqual(self.calls(), [])
@@ -352,7 +466,7 @@ class Plan(DebugBase):
     def test_plain_plan_still_exit_0(self):
         self.scen()
         self.assertEqual(self.run_orch(plan=True), 0, self.out)
-        self.assertNotIn("a debug pass rents once", self.out)
+        self.assertNotIn("up to 2 rentals", self.out)
 
     def test_debug_rows_must_be_positive(self):
         self.scen()
