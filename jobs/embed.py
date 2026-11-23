@@ -47,6 +47,7 @@ from vi_job import (
     Checkpoint,
     ensure_packages,
     fake_models,
+    free,
     load_clips,
     log,
     out_dir,
@@ -279,18 +280,6 @@ def packages(fake):
         except PackageNotFoundError:
             pass
     return found
-
-
-def free():
-    import gc
-
-    gc.collect()
-    try:
-        import torch
-
-        torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 if __name__ == "__main__":

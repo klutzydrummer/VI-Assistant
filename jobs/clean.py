@@ -28,7 +28,6 @@ Settings: backend ("fake" for tests), asr, speaker, batch, asr_max_tokens, misma
 far_voice_mads, limit.
 """
 
-import gc
 import json
 import os
 import re
@@ -43,6 +42,7 @@ from vi_job import (
     Checkpoint,
     ensure_packages,
     fake_models,
+    free,
     load_clips,
     log,
     out_dir,
@@ -67,16 +67,6 @@ SPEAKER_GROUP_MIN = 20
 # time in 30 s pieces. Under 30 s, with room for prep's resampling.
 WHISPER_WHOLE_S = 29.5
 LENGTH_BANDS = [(SPEAKER_REFERENCE_MIN_S, 3.0), (3.0, 6.0), (6.0, None)]
-
-
-def free():
-    gc.collect()
-    try:
-        import torch
-
-        torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 def main():
