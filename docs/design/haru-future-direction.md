@@ -13,7 +13,7 @@ Both are ideas to weigh, not decisions. No model has been chosen, and no run is 
 
 From the [GitHub README](https://github.com/higurashi-ai/Haru), the [model card](https://huggingface.co/higurashi-ai/Haru-4B) and the [technical blog](https://blog.higurashi.ai/melte/haru4b/):
 
-- **License:** Apache-2.0 for code and weights. It is not a non-commercial license. Third-party notices are in the repo's `THIRD_PARTY_NOTICES.md`.
+- **License:** Apache-2.0 for code and weights. It is not a non-commercial license. Third-party notices are in the Haru repo's `THIRD_PARTY_NOTICES.md`.
 - **Full-duplex:** it listens and speaks in the same frame (133 ms).
 - **Size:** the model card names a Qwen3.5-4B text backbone, but the Hub metadata shows 5B parameters. The sources do not reconcile the two, so the exact total is **unverified**.
 - **Input and output:** user audio at 24 kHz in; model audio plus text out.

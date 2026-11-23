@@ -2,7 +2,7 @@
 
 > Saved from the project's shared folder. The plan it reviewed (draft 5) became [corpus-pipeline.md](corpus-pipeline.md) draft 6, with every finding Brandon accepted on 2026-10-14 folded in.
 
-Reviewed 2026-10-14 for Brandon, at his request. Documents reviewed: `design/embedding-clustering-plan.md` (draft 5) and `design/corpus-build-primer.md`, both read in full, plus the "Rethinking the Tali dataset plan" thread, `docs/design/corpus-format.md`, `crates/harvest/src/scenes.toml`, `jobs/discover.py` and `jobs/checks.py` at main 604412c.
+Reviewed 2026-10-14 for Brandon, at his request. Documents reviewed: `design/embedding-clustering-plan.md` (draft 5; became `corpus-pipeline.md`) and `design/corpus-build-primer.md`, both read in full, plus the "Rethinking the Tali dataset plan" thread, `docs/design/corpus-format.md`, `crates/harvest/src/scenes.toml`, `jobs/discover.py` and `jobs/checks.py` at main 604412c.
 
 Everything here is a **proposal**. Nothing has been edited, built or run. The plan thread folds in only what Brandon approves.
 

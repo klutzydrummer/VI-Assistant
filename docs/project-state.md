@@ -206,11 +206,13 @@ Brandon rated a blind set of omnivoice against moss15 (26 line groups, two model
 
 ## Where to find more
 
-- **In this repo:** `README.md`, `docs/cloud-worker.md`, `docs/vectors.md`, `docs/design/qwen3tts-finetune-guide.md`, `docs/design/must-have-moods.md`, `docs/design/labelling-run-plan.md`, `docs/design/after-labels-plan.md` and `docs/design/voice-consistency-check.md`.
+- **In this repo:** `README.md`, `docs/cloud-worker.md`, `docs/vectors.md`, `docs/design/qwen3tts-finetune-guide.md`, `docs/design/must-have-moods.md`, `docs/design/labelling-run-plan.md`, `docs/design/after-labels-plan.md` and `docs/design/voice-consistency-check.md`. Also: `docs/design/effect-detector.md` (finding radio and other effects on clips), `docs/design/mood-state-director.md` (moods, states and voice direction) and `docs/design/vast-ssh-primer.md` (Vast.ai SSH and CLI checks, and diagnosing an instance that accepts no SSH).
 - **On Brandon's PC (gitignored):** `corpus/tali/`, including `analysis/` (after-labels, refscreen and RVC results, plus the duds table at `analysis/refscreen_rvc/duds.md`), `stages/` (voicearms and the fine-tune runs) and `persona/`.
 - **Private to Brandon's Claude account:**
   - the "Tali voice plan" page;
   - the live "VI Assistant State" page, which this file mirrors;
   - research notes on steering Qwen3-TTS and Qwen3.8-27B, voicearms against the literature, suit and accent options, and fan Tali voice recreations.
+
+  Some docs refer to notes that live only there (for example `what-brandon-wants.md` and the `/mnt/project-files/` research pages); they are not in the repo.
 
   Ask him for copies if you need them.

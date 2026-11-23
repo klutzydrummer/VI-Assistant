@@ -66,5 +66,8 @@ See `docs/cloud-worker.md`.
 - `crates/cloud`: rents, watches and releases the Vast.ai GPU worker
 - `crates/llm`: the dialogue model: llama.cpp embedded, with control vectors blended per turn
 - `crates/vi`: the command-line tool
+- `crates/review`: the review hub web app
+- `crates/harvest`: extracting lines and audio from the games
+- `crates/dataset`: the corpus format
 - `jobs/`: scripts that run on the worker, including `on-worker.sh`, which runs a dataset stage there
 - `docs/`: design notes, including how to extract game audio

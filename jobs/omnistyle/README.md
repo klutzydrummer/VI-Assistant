@@ -108,7 +108,7 @@ The five-seed confirmation with those defaults (seeds 0-4, no overrides) passes 
 but fails on seeds 0 and 3: on seed 3 two styles share the same modal code (`b_distinct=3`), and on seed 0
 the modal codes of styles 0 and 1 decode toward other styles. Modal-code purity on the failing seeds is
 0.12-0.52. So the fix is not seed-robust; FSQ check (b) remains a 3/5 result (the old configuration passed
-2/5). `workers/smoke/fsq-fix-report.md` has the per-seed tables and the purity details.
+2/5). `workers/smoke/fsq-fix-report.md` (not kept in the repo) has the per-seed tables and the purity details.
 
 ## Continuous bottleneck (shipped default, 2026-11-13)
 
@@ -128,5 +128,5 @@ Phase-2 lr 5e-4 and `style_quantizer="none"` are the defaults in `smoke_style.tr
 `train_style.run_training`. `train_style.py` also carries a training-time collapse guard: it probes the
 code's between/within separation every 100 micro-steps after a 200-step warm start, and if the ratio stays
 below 0.5 for two consecutive probes it abandons the attempt and retrains from scratch with seed + attempt
-(up to three attempts). `workers/smoke/contin-fix-report.md` has the arm table, the five-seed table, the
+(up to three attempts). `workers/smoke/contin-fix-report.md` (not kept in the repo) has the arm table, the five-seed table, the
 guard details and the environment notes.
