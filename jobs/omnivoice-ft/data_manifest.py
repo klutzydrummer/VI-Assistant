@@ -49,7 +49,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a")
-SCHEMA_FIELDS = ("id", "audio_path", "text", "language_id")
 
 _BRACKETS = re.compile(r"\[[^\]]*\]")
 _WS = re.compile(r"\s+")
