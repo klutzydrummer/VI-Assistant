@@ -8,6 +8,7 @@ jobs/debug-pass.sh does. Scenario key `probe` picks the probe answer and `debug`
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,8 @@ DEBUG_BRANCH = '''\
     if stage == "omnivoice_debug":
         r = a.get("debug", sc.get("debug", "pass"))
         log("debug_env", os.environ.get("VI_DEBUG_PASS"), os.environ.get("VI_DEBUG_ROWS"))
+        log("debug_hours_left", os.environ.get("VI_HOURS_LEFT"))
+        tick(a.get("debug_tick", 0))
         if r == "drop":
             # r18: the host closes ssh during the upload, then stops listening; on-worker.sh exits
             # 255 under set -e before debug-pass.sh starts, and the vi CLI exits 1
@@ -40,6 +43,7 @@ DEBUG_BRANCH = '''\
         names = %r
         needs = %r
         fail = set(sc.get("debug_fail", []))
+        no_time = set(a.get("debug_no_time", sc.get("debug_no_time", [])))
         res = {}
         for n in range(3, 12):
             if r == "hang" and n == 5:
@@ -49,6 +53,10 @@ DEBUG_BRANCH = '''\
                 res[n] = "SKIP"
                 print(f"debug-pass: stage {n} {names[n]}: SKIP-dependent (needs stage {bad[0]} "
                       f"{names[bad[0]]}, which did not pass)", flush=True)
+            elif n in no_time:
+                res[n] = "SKIP-no-time"
+                print(f"debug-pass: stage {n} {names[n]}: SKIP-no-time (100 s left before the "
+                      "rental's deadline; needs 120 s)", flush=True)
             elif n in fail:
                 res[n] = "FAIL"
                 print(f"debug-pass: stage {n} {names[n]}: FAIL (exit 1, 3 s)", flush=True)
@@ -411,7 +419,7 @@ class HostDrop(DebugBase):
         self.assertEqual(self.run_debug(), 16, self.out)
         self.assertEqual(len(self.ups()), 1, self.out)
         self.assertIn("not a confirmed host drop", self.details()[1])
-        self.assertIn("status running", self.details()[1])
+        self.assertIn("Vast said running", self.details()[1])
 
     def test_second_rental_only_if_the_cap_left_covers_it(self):
         self.scen2(dict(debug="drop"), cap_spent=(0.95, 0.1))
@@ -422,18 +430,141 @@ class HostDrop(DebugBase):
         self.assertIn("no offer fits what is left", note)
         self.assertIn("every worker released", self.details()[12])
 
-    def test_vastai_failing_or_hanging_never_blocks_the_destroy(self):
+    def test_vastai_failing_or_hanging_never_blocks_the_destroy_and_is_never_a_drop(self):
+        # r21 F1: home's own Vast API failing is not a host drop, so no second rental either
         for mode in ("fail", "hang"):
             with self.subTest(mode=mode):
                 self.setUp()
                 self.env["PAID_RUN_VAST_SECONDS"] = "1"
                 self.scen2(dict(debug="drop"), vastai=mode)
-                self.run_debug()
-                self.assertEqual(len(self.downs()), 2, self.out)
+                self.assertEqual(self.run_debug(), 16, self.out)
+                self.assertEqual(len(self.ups()), 1, self.out)
+                self.assertEqual(len(self.downs()), 1, self.out)
                 self.assertIsNone(self.worker())
-                # without Vast's status, `vi cloud status` (running) plus a refused ssh confirms it
-                self.assertTrue(self.summary()["rentals"][0]["status"]
-                                .startswith("HOST-DROP (status running"), self.out)
+                self.assertFalse(self.summary()["rentals"][0]["status"].startswith("HOST-DROP"),
+                                 self.out)
+                self.assertNotIn("HOST-DROP", self.results().values())
+                self.assertIn("could not read the instance status from Vast", self.details()[3])
+
+    def show_calls(self, ident):
+        return [c for c in self.calls() if c == ["vastai", ["show", "instance", str(ident), "--raw"]]]
+
+    def test_drop_needs_two_vast_reads_at_least_60_s_apart(self):
+        # r21 F1: two `vastai show instance` reads, a 60 s wait between them, both before the destroy
+        self.scen2(dict(debug="drop"))
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertEqual(len(self.show_calls(101)), 2, self.out)
+        sleeps = (self.tmp / "sleeps.log").read_text().split()
+        self.assertIn(60.0, [float(x) for x in sleeps], sleeps)
+        names = [c[0] if c[0] != "vastai" else " ".join(c[1][:2]) for c in self.calls()]
+        first_down = names.index("down")
+        self.assertEqual(names[:first_down].count("show instance"), 2, names)
+
+    def test_second_read_running_or_failing_is_not_a_drop(self):
+        for seq in (["exited", "running"], ["exited", "FAIL"], ["FAIL", "exited"]):
+            with self.subTest(seq=seq):
+                self.setUp()
+                self.scen2(dict(debug="drop", vast_status_seq=seq))
+                self.assertEqual(self.run_debug(), 16, self.out)
+                self.assertEqual(len(self.ups()), 1, self.out)
+                self.assertNotIn("HOST-DROP", self.results().values())
+                self.assertIn("not a confirmed host drop", self.details()[3])
+
+    def test_debug_pass_sets_lost_minutes_5_and_r9_keeps_the_default(self):
+        self.scen()
+        self.run_debug()
+        lost = [c for c in self.calls() if c[0] == "lost_minutes"]
+        self.assertEqual(lost, [["lost_minutes", "omnivoice_debug", "5"]], self.out)
+        self.setUp()
+        self.scenario([dict(spent=0.4)])
+        self.run_orch()
+        lost = [c[2] for c in self.calls() if c[0] == "lost_minutes"]
+        self.assertTrue(lost, self.out)
+        self.assertEqual(set(lost), {None}, "r9 must keep on-worker.sh's 30 min default")
+
+
+class AbandonDebugMarkers(DebugBase):
+    """r21 F4: after the release, an `omnivoice_debug-*` unverified marker whose checkpoint dir is
+    empty or missing is abandoned (jobs/checkpoints.py abandon); a non-empty debug dir and any
+    other stage's marker are never touched. Fake marker dirs only (VI_STATE_DIR is the test's)."""
+
+    def make_markers(self):
+        mdir = Path(self.env["VI_STATE_DIR"]) / "unverified"
+        mdir.mkdir(parents=True, exist_ok=True)
+        ck = self.tmp / "ck"
+        dirs = dict(missing=ck / "omnivoice_debug" / "gone", empty=ck / "omnivoice_debug" / "empty",
+                    full=ck / "omnivoice_debug" / "full", other=ck / "omnivoice_train" / "empty")
+        dirs["empty"].mkdir(parents=True)
+        dirs["full"].mkdir(parents=True)
+        (dirs["full"] / "checkpoint-5").mkdir()
+        dirs["other"].mkdir(parents=True)
+        names = dict(missing="omnivoice_debug-gone", empty="omnivoice_debug-empty",
+                     full="omnivoice_debug-full", other="omnivoice_train-empty")
+        for k, d in dirs.items():
+            (mdir / names[k]).write_text(f"{d}\n")
+        return mdir, dirs, names
+
+    def check(self, mdir, dirs, names):
+        left = sorted(x.name for x in mdir.iterdir())
+        self.assertEqual(left, ["omnivoice_debug-full", "omnivoice_train-empty"], self.out)
+        self.assertTrue((dirs["empty"] / "ABANDONED").is_file(), self.out)
+        self.assertFalse((dirs["full"] / "ABANDONED").exists())
+        self.assertTrue((dirs["full"] / "checkpoint-5").is_dir())
+        self.assertFalse((dirs["other"] / "ABANDONED").exists())
+        self.assertFalse(dirs["missing"].exists())
+        self.assertIn("abandoned 2 empty debug marker(s)", self.out)
+
+    def test_release_abandons_only_empty_or_missing_debug_markers(self):
+        mdir, dirs, names = self.make_markers()
+        self.scen()
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.check(mdir, dirs, names)
+
+    def test_abandon_also_runs_after_a_failed_pass(self):
+        mdir, dirs, names = self.make_markers()
+        self.scen(debug_fail=[8])
+        self.assertEqual(self.run_debug(), 16, self.out)
+        self.check(mdir, dirs, names)
+
+
+class RentalHours(DebugBase):
+    """r21 F2: each debug rental has its own hours (--max-hours is per rental); the $ cap stays
+    shared, and a stage the worker had no time for reads SKIP-no-time, not FAIL."""
+
+    def test_second_rental_gets_its_own_hours(self):
+        # rental 1 uses 1.0 h of 1.25 before its host drops; rental 2 still gets 1.25 h
+        self.scenario([dict(spent=0.25, debug="drop", hours=1.0), dict(spent=0.3)],
+                      corpus=str(self.tmp / "corpus"))
+        self.assertEqual(self.run_debug(cap=1, max_hours=1.25), 0, self.out)
+        ups = self.ups()
+        self.assertEqual(len(ups), 2, self.out)
+        self.assertEqual([u["max_hours"] for u in ups], ["1.2500", "1.2500"], self.out)
+        left = [float(c[1]) for c in self.calls() if c[0] == "debug_hours_left"]
+        self.assertEqual(len(left), 2, self.out)
+        self.assertGreater(left[1], 1.2, "rental 2's worker was told only the shared hours left")
+        self.assertIn("1.25 h per rental", self.out)
+
+    def test_cap_is_still_shared_and_must_cover_price_x_rental_hours(self):
+        # $1 cap, rental 1 spent $0.80: offer 2 at $0.25/hr x 1.25 h = $0.31 > $0.20 left
+        self.scenario([dict(spent=0.80, debug="drop"), dict(spent=0.1)],
+                      offer_list=tp.offers((1, 0.20, "US", 800), (2, 0.25, "DE", 900)),
+                      corpus=str(self.tmp / "corpus"))
+        self.assertEqual(self.run_debug(cap=1, max_hours=1.25), 16, self.out)
+        self.assertEqual(len(self.ups()), 1, self.out)
+        self.assertIn("no second rental", self.summary()["note"])
+        self.assertIn("1.25 h", self.summary()["note"])
+
+    def test_skip_no_time_is_shown_apart_from_fail(self):
+        self.scen(debug_no_time=[9, 10, 11])
+        self.assertEqual(self.run_debug(), 16, self.out)
+        res, det = self.results(), self.details()
+        self.assertEqual([res[n] for n in (9, 10, 11)], ["SKIP-no-time"] * 3, self.out)
+        self.assertIn("left before the rental's deadline", det[9])
+        self.assertNotIn("FAIL", [res[n] for n in range(1, 13)])
+        text = (self.tmp / "paid" / "t1" / "debug-summary.txt").read_text()
+        self.assertIn(" 9 ckpt-push   : SKIP-no-time", text)
+        self.assertIn("3 stage(s) were not started for lack of time (SKIP-no-time), which is "
+                      "not a failure of the stage", text)
 
 
 class Plan(DebugBase):
@@ -452,16 +583,33 @@ class Plan(DebugBase):
         self.assertIn("a second only after a confirmed host drop", self.out)
         self.assertIn("never a third", self.out)
         self.assertIn("cap $3.00 for both rentals together", self.out)
+
+    def test_debug_plan_describes_two_rentals_of_their_own_hours(self):
+        # r21 F2: 2 x 1.25 h; GPU worst case 2 x 1.25 h x $0.31 (max_dph) = $0.78, inside $1
+        self.scen()
+        self.assertEqual(self.run_debug(plan=True, cap=1, max_hours=1.25), 0, self.out)
+        self.assertIn("max hours       : 1.25 h per rental (2 x 1.25 h at most)", self.out)
+        self.assertIn("GPU $0.78 (2 rentals x 1.25 h x $0.310/hr max_dph, inside the $1.00 cap)",
+                      self.out)
+        self.assertRegex(self.out, r"worst case      : \$\d\.\d\d total = GPU \$0\.78 \(.*\) "
+                                   r"\+ disk \$0\.\d\d")
+        self.assertNotIn("max hours (all)", self.out)
         self.assertIn("--plan: nothing was called", self.out)
         self.assertFalse((self.tmp / "any-call.log").exists(), "--plan called vi")
         self.assertEqual(self.calls(), [])
 
     def test_worst_case_formula(self):
         pr = tp.load_paid_run()
-        total, cap, disk = pr.debug_worst_case(3.0, 125, 1.0)
-        self.assertAlmostEqual(cap, 3.0)
-        self.assertAlmostEqual(disk, 125 * 1.00 / 730 * 1.0)
-        self.assertAlmostEqual(total, cap + disk)
+        # two rentals of 1.25 h each: GPU min(cap, 2 x 1.25 x max_dph), disk for 2 x 1.25 h
+        total, gpu, disk = pr.debug_worst_case(3.0, 125, 1.25, 0.31)
+        self.assertAlmostEqual(gpu, 2 * 1.25 * 0.31)
+        self.assertAlmostEqual(disk, 125 * 1.00 / 730 * 2.5)
+        self.assertAlmostEqual(total, gpu + disk)
+        # no max_dph in the config: the cap is the GPU worst case
+        total, gpu, disk = pr.debug_worst_case(3.0, 125, 1.25, None)
+        self.assertAlmostEqual(gpu, 3.0)
+        # a cap under 2 x hours x max_dph still bounds the GPU part
+        self.assertAlmostEqual(pr.debug_worst_case(0.5, 125, 1.25, 0.31)[1], 0.5)
 
     def test_plain_plan_still_exit_0(self):
         self.scen()
@@ -551,6 +699,125 @@ class Scripts(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         for n, name in ((1, "host-cuda"), (2, "disk-limits")):
             self.assertRegex(r.stdout, rf"debug-pass: stage {n} {name}: (PASS|FAIL)")
+
+
+class DriverScript(unittest.TestCase):
+    """r21 F2 + F3: the real jobs/debug-pass.sh driver at home with a fake venv python (no GPU,
+    no network). A copy runs from a temp jobs folder so NEEDS can be loosened per test; the
+    worker functions it cuts out of voicetune-fresh.sh and worker-limits.sh are the real ones."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="debug-driver."))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
+        self.jobs = self.tmp / "jobs"
+        self.jobs.mkdir()
+        for f in ("voicetune-fresh.sh", "worker-limits.sh"):
+            (self.jobs / f).symlink_to(JOBS / f)
+        self.work = self.tmp / "work"
+        self.out = self.work / "out"
+        self.out.mkdir(parents=True)
+        self.data = self.tmp / "data"
+        self.data.mkdir()
+        (self.data / "data_config.json").write_text("{}")
+        self.state = self.work / "voicetune-fresh" / "debug-state"
+        self.probe_run = self.work / "voicetune-fresh" / "probe-run"
+
+    def script(self, needs=None):
+        text = (JOBS / "debug-pass.sh").read_text()
+        if needs is not None:
+            old = 'NEEDS=([3]="" [4]="3" [5]="4" [6]="4 5" [7]="4 5" [8]="6 7" [9]="8" [10]="8" [11]="8")'
+            self.assertIn(old, text, "debug-pass.sh NEEDS changed; update this test")
+            text = text.replace(old, needs)
+        path = self.jobs / "debug-pass.sh"
+        path.write_text(text)
+        return path
+
+    def fake_venv(self, trainer_body):
+        """A venv python whose `-m accelerate.commands.launch ... train_ft.py` runs trainer_body."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        py = self.tmp / "fakepy"
+        py.write_text("#!/bin/bash\ncase \"$*\" in *train_ft.py*) " + trainer_body
+                      + " ;; esac\nexit 0\n")
+        py.chmod(0o755)
+        (self.state / "py").write_text(f"{py}\n")
+        base = self.tmp / "base"
+        base.mkdir(exist_ok=True)
+        (self.state / "base").write_text(f"{base}\n")
+
+    def run_driver(self, stages, needs=None, timeout=120, **env):
+        e = dict(os.environ, VI_OUT=str(self.out), VI_INPUT_OMNIVOICE_DATA=str(self.data),
+                 VI_DEBUG_STAGES=stages, VI_DEBUG_POLL_SECONDS="1", VI_DEBUG_EXCERPT_LINES="40")
+        for k in ("VI_HOURS_LEFT", "VI_DEBUG_MARGIN_SECONDS"):
+            e.pop(k, None)
+        e.update(env)
+        p = subprocess.run(["bash", str(self.script(needs))], env=e, text=True, timeout=timeout,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.output = p.stdout
+        self.assertEqual(p.returncode, 0, self.output)
+        return {r["stage"]: r for r in
+                json.loads((self.out / "debug" / "summary.json").read_text())["stages"]}
+
+    def test_f3_stage8_cut_off_mid_run_keeps_its_progress_lines(self):
+        # base: train.log was only cat'ed after the trainer ended, so a killed stage 8 left an
+        # empty stage log and the FAIL line had no excerpt
+        self.fake_venv("echo 'train_ft: step 1/5 loss 3.1'; echo 'train_ft: step 2/5 loss 3.0'; "
+                       "sleep 60")
+        res = self.run_driver("8", needs='NEEDS=([8]="")', VI_DEBUG_TIMEOUT_8="4")
+        self.assertEqual(res[8]["result"], "FAIL", self.output)
+        log = (self.out / "debug" / "08-train-steps.log").read_text()
+        self.assertIn("train_ft: step 2/5", log)
+        self.assertIn("debug-pass:   | train_ft: step 2/5", self.output)
+        self.assertIn("train_ft: step 1/5", (self.probe_run / "train.log").read_text())
+
+    def test_f3_stage8_trainer_failure_still_fails_the_stage(self):
+        self.fake_venv("echo 'train_ft: step 1/5'; echo 'boom' >&2; exit 3")
+        res = self.run_driver("8", needs='NEEDS=([8]="")')
+        self.assertEqual(res[8]["result"], "FAIL", self.output)
+        self.assertEqual(res[8]["rc"], 3, self.output)
+        log = (self.out / "debug" / "08-train-steps.log").read_text()
+        self.assertIn("boom", log)
+        self.assertIn("train_ft.py exited 3", log)
+
+    def test_f2_no_time_left_is_skip_no_time_not_run(self):
+        # 0.2 h left minus a 700 s margin leaves 20 s, under stage 3's minimum
+        res = self.run_driver("3", VI_HOURS_LEFT="0.2", VI_DEBUG_MARGIN_SECONDS="700")
+        self.assertEqual(res[3]["result"], "SKIP-no-time", self.output)
+        self.assertRegex(self.output, r"debug-pass: stage 3 upload: SKIP-no-time \(\d+ s left")
+        self.assertNotIn("stage 3 upload: running", self.output)
+
+    def test_f2_limit_is_cut_to_the_time_left(self):
+        # 0.2 h = 720 s left, 600 s margin: a 1000 s limit becomes about 120 s
+        self.run_driver("3", VI_HOURS_LEFT="0.2", VI_DEBUG_MARGIN_SECONDS="600",
+                        VI_DEBUG_TIMEOUT_3="1000")
+        m = __import__("re").search(r"stage 3 upload: running \(limit (\d+) s", self.output)
+        self.assertTrue(m, self.output)
+        self.assertTrue(100 <= int(m.group(1)) <= 120, self.output)
+
+    def test_f2_without_hours_left_the_limits_are_unchanged(self):
+        self.run_driver("3")
+        self.assertIn("stage 3 upload: running (limit 60 s", self.output)
+
+    def test_f2_stage9_limit_comes_from_the_measured_push_rate(self):
+        # checkpoint-5 of 2 GB (sparse) at the preflight's 1.0 MB/s: 1.5 x 2e9 / 1e6 = 3000 s
+        ck = self.probe_run / "checkpoint-5"
+        ck.mkdir(parents=True)
+        with open(ck / "model.safetensors", "wb") as f:
+            f.truncate(2 * 10**9)
+        (self.out / "preflight.json").write_text(json.dumps({"push_mb_s": "1.0"}))
+        self.run_driver("9", needs='NEEDS=([9]="")')
+        self.assertIn("stage 9 ckpt-push: running (limit 3000 s", self.output)
+        self.assertIn("1.0 MB/s", self.output)
+
+    def test_f2_stage9_limit_has_a_600_s_floor_and_falls_back_without_a_rate(self):
+        ck = self.probe_run / "checkpoint-5"
+        ck.mkdir(parents=True)
+        (ck / "x").write_bytes(b"x" * 1000)
+        (self.out / "preflight.json").write_text(json.dumps({"push_mb_s": "9.0"}))
+        self.run_driver("9", needs='NEEDS=([9]="")')
+        self.assertIn("stage 9 ckpt-push: running (limit 600 s", self.output)
+        (self.out / "preflight.json").unlink()
+        self.run_driver("9", needs='NEEDS=([9]="")')
+        self.assertIn("stage 9 ckpt-push: running (limit 600 s", self.output)
 
 
 class Nofile(unittest.TestCase):

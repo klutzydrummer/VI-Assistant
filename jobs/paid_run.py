@@ -622,7 +622,10 @@ DEBUG_PROBE_SECONDS = 180
 DEBUG_RELEASE_MARGIN_SECONDS = 10 * 60
 # r21: on-worker.sh gives up on an unreachable worker after this many minutes in the debug pass.
 DEBUG_LOST_MINUTES = 5
-DEBUG_LINE_RE = re.compile(r"debug-pass: stage (\d+) ([\w-]+): (PASS|FAIL|SKIP-dependent)\b ?(.*)")
+# r21: SKIP-no-time = debug-pass.sh did not start the stage because the rental's hours ran out;
+# it is shown apart from FAIL (the stage itself was never tried).
+DEBUG_LINE_RE = re.compile(
+    r"debug-pass: stage (\d+) ([\w-]+): (PASS|FAIL|SKIP-dependent|SKIP-no-time)(?=\s|$) ?(.*)")
 DEBUG_EXCERPT_RE = re.compile(r"debug-pass:   \| (.*)")
 # Settings of the debug stage -> the floors debug-probe.sh reads.
 DEBUG_PROBE_FLOORS = (("min_vram_gb", "DEBUG_MIN_VRAM_GB"), ("min_cuda_version", "DEBUG_MIN_CUDA"),
@@ -652,12 +655,24 @@ def parse_vast_instance(text):
     return {}
 
 
-def debug_worst_case(cap, disk_gb, hours):
-    """(total, gpu, disk) worst-case dollars of a debug pass. The GPU part is at most the cap: an
-    offer is rented only if its $/hr x the hours left fits the cap, `vi cloud up` gets the same
-    cap, and every step is cut off inside the hours. Disk is billed on top (disk_cost_line)."""
-    disk = disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours
-    return cap + disk, cap, disk
+def debug_worst_case(cap, disk_gb, hours, max_dph=None):
+    """(total, gpu, disk) worst-case dollars of a debug pass of up to DEBUG_MAX_RENTALS rentals of
+    `hours` each (r21: the hours are per rental). The GPU part is at most 2 x hours x max_dph (the
+    config's price ceiling) and never more than the shared cap: an offer is rented only if its
+    $/hr x the rental's hours fits the cap left, and `vi cloud up` gets that cap. Disk is billed
+    on top for both rentals' hours (disk_cost_line)."""
+    gpu = cap if max_dph is None else min(cap, DEBUG_MAX_RENTALS * hours * max_dph)
+    disk = disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours * DEBUG_MAX_RENTALS
+    return gpu + disk, gpu, disk
+
+
+def config_max_dph(text):
+    """search.max_dph of a cloud config ($/hr ceiling of an offer), or None when it is not set."""
+    m = re.search(r"^\s*max_dph\s*=\s*([0-9.]+)", text or "", re.M)
+    try:
+        return float(m.group(1)) if m else None
+    except ValueError:
+        return None
 
 
 def parse_debug_output(text):
@@ -1497,16 +1512,26 @@ class PaidRun:
         self.hf_code_ok, hf_code_line = hf_offline_check()
         countries = a.countries or "(from the config)"
         if getattr(a, "debug_pass", False):
-            total, gpu, disk = debug_worst_case(a.cap, disk_gb, a.max_hours)
+            max_dph = config_max_dph(self.base_config_text())
+            total, gpu, disk = debug_worst_case(a.cap, disk_gb, a.max_hours, max_dph)
+            h, k = a.max_hours, DEBUG_MAX_RENTALS
+            gpu_why = (f"GPU ${gpu:.2f} ({k} rentals x {h:g} h x ${max_dph:.3f}/hr max_dph, "
+                       f"inside the ${a.cap:.2f} cap)" if max_dph is not None
+                       and gpu < a.cap - 1e-9 else
+                       f"GPU ${gpu:.2f} (the cap for both rentals together"
+                       + (")" if max_dph is None else
+                          f"; {k} x {h:g} h x ${max_dph:.3f}/hr max_dph would be more)"))
             flow = [
                 f"mode            : --debug-pass (up to {DEBUG_MAX_RENTALS} rentals: a second one "
-                "ONLY after a confirmed host drop (ssh lost the host and the instance status check "
-                "agrees), never after our own check failing; every stage is tried and a failure "
+                "ONLY after a confirmed host drop (ssh lost the host and two Vast status reads "
+                f"{HOST_DROP_RECHECK_SECONDS} s apart agree), never after our own check failing; every stage is tried and a failure "
                 "never stops the next one)",
                 "host drop       : before release, `vastai show instance <id> --raw` and "
                 "`vastai logs <id>` are saved in the run folder; the stage reads HOST-DROP "
-                "(status X); that worker is released and one more offer is rented only if the "
-                "cap left covers $/hr x the hours left",
+                "(status X) only when ssh lost the host and two Vast reads at least "
+                f"{HOST_DROP_RECHECK_SECONDS} s apart both say not running; that worker is "
+                f"released and one more offer is rented only if the cap left covers $/hr x "
+                f"{h:g} h (each rental has its own {h:g} h; the $ cap is shared)",
                 "flow            : offers -> cheapest qualifying offer -> up -> 1 host-cuda, "
                 "2 disk-limits (debug-probe.sh over `vi cloud ssh`) -> stage omnivoice_debug "
                 "(3 upload + token handshake, 4 venv + launchers, 5 base-model, 6 tokenise, "
@@ -1514,12 +1539,17 @@ class PaidRun:
                 "(always, even after a failure)",
                 f"debug data      : the first {a.debug_rows} train rows of omnivoice_data "
                 "(jobs/debug_slice.py, by position only), plus 4 dev, 2 style, 8 replay texts",
-                f"worst case      : ${total:.2f} = cap ${gpu:.2f} for both rentals together (an "
-                f"offer is rented only if $/hr x the hours left <= the cap left of ${a.cap:.2f}) "
-                f"+ disk ${disk:.2f} ({disk_gb:g} GB x ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month "
-                f"/ {HOURS_PER_MONTH} h x {a.max_hours:g} h, the hours of both rentals together)",
-                "                  formula: worst case = cap + disk_gb x 1.00 / 730 x max_hours; "
-                "a typical pass should take under 30 min, so it costs about $/hr x 0.5",
+f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
+                f"({disk_gb:g} GB x ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month / "
+                f"{HOURS_PER_MONTH} h x {k} x {h:g} h); cap ${a.cap:.2f} for both rentals "
+                f"together (an offer is rented only if $/hr x {h:g} h <= the cap left)",
+                "                  formula: worst case = min(cap, 2 x max_hours x max_dph) + "
+                "disk_gb x 1.00 / 730 x 2 x max_hours; a typical pass should take under 30 min, "
+                "so it costs about $/hr x 0.5",
+                "time per rental : each stage's limit is cut to the rental's time left minus a "
+                "15 min margin; a stage with too little time left reads SKIP-no-time (not "
+                "started, shown apart from FAIL); stage 9's limit is 1.5 x checkpoint bytes / "
+                "the push rate the preflight measured, at least 600 s",
                 f"results         : {self.dir}/debug-summary.txt and .json; exit 0 only if "
                 f"every stage passed, else {EXIT['debug']}",
             ]
@@ -1537,16 +1567,19 @@ class PaidRun:
         return [
             f"run id          : {a.run_id}",
             f"cap (all tries) : ${a.cap:.2f}",
-            f"max hours (all) : {a.max_hours} h",
+(f"max hours       : {a.max_hours:g} h per rental ({DEBUG_MAX_RENTALS} x "
+             f"{a.max_hours:g} h at most)" if getattr(a, "debug_pass", False)
+             else f"max hours (all) : {a.max_hours} h"),
             (f"max attempts    : up to {DEBUG_MAX_RENTALS} rentals (a second only after a "
-             "confirmed host drop, inside the same cap and hours; never a third)"
+             "confirmed host drop, inside the same cap, with its own hours; never a third)"
              if getattr(a, "debug_pass", False)
              else f"max attempts    : {a.max_attempts} (every attempt counts, including a rental "
                   "that failed to start)"),
             f"vi binary       : {self.vi}",
             f"run config      : {a.config}",
             self.disk_line,
-            disk_cost_line(disk_gb, a.max_hours),
+            disk_cost_line(disk_gb, a.max_hours * (DEBUG_MAX_RENTALS if getattr(
+                a, "debug_pass", False) else 1)),
             *home_lines,
             *ids_lines,
             *realpath_lines,
@@ -1644,8 +1677,37 @@ class PaidRun:
             spent, est = round((at.get("dph") or 0) * (clock() - at["started"]) / 3600, 4), True
         if at is not None:
             self.close_attempt(at, outcome, spent or 0.0, est)
+        if getattr(self.a, "debug_pass", False):
+            self.abandon_empty_debug_markers()
         self.in_teardown = False
         return spent
+
+    def abandon_empty_debug_markers(self):
+        """r21 F4: after a debug worker is released, its `omnivoice_debug-*` unverified marker
+        names a checkpoint dir that is empty or missing (the debug pass keeps nothing), and that
+        marker would make the next plain `vi cloud down` refuse. Abandon exactly those with
+        `jobs/checkpoints.py abandon` (stale_markers() decides empty/missing). A non-empty debug
+        dir and every other stage's marker are left alone. Best effort, never raises."""
+        done = 0
+        for m, d in stale_markers():
+            if not m.name.startswith(f"{DEBUG_STAGE}-"):
+                continue
+            try:
+                r = subprocess.run([sys.executable, str(REPO / "jobs" / "checkpoints.py"),
+                                    "abandon", str(d), "--reason",
+                                    f"debug pass {self.a.run_id}: empty debug checkpoint dir "
+                                    "after release"], env=self.env(), capture_output=True,
+                                   text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as e:
+                say(f"could not abandon the debug marker {m.name}: {e!r}")
+                continue
+            if r.returncode == 0:
+                done += 1
+            else:
+                say(f"could not abandon the debug marker {m.name}: "
+                    f"{(r.stdout + r.stderr).strip()[-300:]}")
+        if done:
+            say(f"abandoned {done} empty debug marker(s) (jobs/checkpoints.py abandon; files kept)")
 
     def fetch_diagnostics(self, at, outcome):
         """Best effort, never raises: pull a bounded diagnostics file from the worker into the run
@@ -2112,9 +2174,10 @@ class PaidRun:
             self.debug_record(n, "FAIL", f"({why})", out.strip().splitlines()[-8:])
 
     def debug_worker_stages(self, at):
-        """Stages 3 to 11: the stage omnivoice_debug (on-worker.sh + jobs/debug-pass.sh)."""
-        _, hours_left = self.remaining()
-        left_s = hours_left * 3600 - (clock() - at["started"])
+        """Stages 3 to 11: the stage omnivoice_debug (on-worker.sh + jobs/debug-pass.sh). r21: the
+        time is this rental's own --max-hours since it started, not the hours shared with
+        rental 1; debug-pass.sh cuts each stage to it (VI_HOURS_LEFT) and prints SKIP-no-time."""
+        left_s = self.a.max_hours * 3600 - (clock() - at["started"])
         limit = max(60.0, left_s - DEBUG_RELEASE_MARGIN_SECONDS)
         self.extra_env = {**getattr(self, "extra_env", {}),
                           "VI_HOURS_LEFT": f"{max(left_s, 60) / 3600:.2f}",
@@ -2222,7 +2285,8 @@ class PaidRun:
         (self.dir / "debug-summary.json").write_text(json.dumps(doc, indent=1) + "\n")
         lines = [f"debug pass {self.a.run_id}: spent ${self.s['spent_total']:.2f} of "
                  f"${self.s['cap']:.2f} cap in {len(rentals)} rental(s) (at most "
-                 f"{DEBUG_MAX_RENTALS}), {self.s['hours_total']:.2f} of {self.s['max_hours']} h"]
+                 f"{DEBUG_MAX_RENTALS}), {self.s['hours_total']:.2f} h in all "
+                 f"({self.s['max_hours']} h per rental)"]
         for r in rentals:
             spent = "?" if r["spent"] is None else f"${r['spent']:.2f}" + (
                 " (estimated)" if r["spent_estimated"] else "")
@@ -2239,6 +2303,11 @@ class PaidRun:
         for r in rows:
             lines.append(f"  {r['stage']:>2} {r['name']:<12}: {r['result']} {r['detail']}".rstrip())
             lines += [f"       | {x}" for x in r["excerpt"]]
+        no_time = [r for r in rows if r["result"] == "SKIP-no-time"]
+        if no_time:
+            lines.append(f"  {len(no_time)} stage(s) were not started for lack of time "
+                         "(SKIP-no-time), which is not a failure of the stage: the rental's "
+                         f"{self.s['max_hours']} h ran out first")
         (self.dir / "debug-summary.txt").write_text("\n".join(lines) + "\n")
         say("===== debug pass summary =====")
         for ln in lines:
@@ -2249,10 +2318,12 @@ class PaidRun:
 
     def debug_rent_and_run(self, n):
         """One debug rental (attempt n): offer -> up -> stages 1-11. Returns the HOST-DROP text
-        when a confirmed host drop (A2) cut it short, else None. The worker is left up."""
+        when a confirmed host drop (A2) cut it short, else None. The worker is left up. r21: each
+        rental gets its own --max-hours; only the $ cap is shared, so the offer must fit
+        $/hr x max_hours inside the cap left."""
         a = self.a
         self.dropped = None
-        cap_left, hours_left = self.remaining()
+        cap_left, hours_left = self.remaining()[0], a.max_hours
         say(f"===== debug pass rental {n} at {rfc3339(clock())}: ${cap_left:.2f}, "
             f"{hours_left:.2f} h left =====")
         self.write_attempt_config(n, hours_left)
@@ -2292,11 +2363,13 @@ class PaidRun:
 
     def execute_debug(self):
         """Stages 1-12, each tried; the worker is always released (stage 12). One rental, plus
-        ONE more only after a confirmed host drop (C), inside the same cap and hours."""
+        ONE more only after a confirmed host drop (C), inside the same $ cap; each rental has its
+        own --max-hours (r21)."""
         self.debug = {}
         self.dropped = None
         self.debug_note = None
         failure = None
+        a_h = self.a.max_hours
         try:
             self.settle_previous()
             if self.s["attempts"]:
@@ -2329,7 +2402,8 @@ class PaidRun:
                         if e.code != EXIT["budget"] or len(self.s["attempts"]) > 1:
                             raise
                         self.debug_note = (f"no second rental: {e.message}. The cap left "
-                                           f"(${self.remaining()[0]:.2f}) does not cover one")
+                                           f"(${self.remaining()[0]:.2f}) does not cover one "
+                                           f"for {a_h:g} h")
                 if self.debug_note:
                     say(self.debug_note)
         except (Stop, Interrupted, Exception) as e:  # noqa: BLE001: stage 12 still runs
