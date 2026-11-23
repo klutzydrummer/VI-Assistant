@@ -23,13 +23,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::corpus::{current_out, Error};
-use crate::server::Reply;
+use crate::server::{now, Reply};
 
 const PAGE: &str = include_str!("gold.html");
 
@@ -359,13 +358,6 @@ pub fn handle(g: &mut Gold, post: bool, url: &str, body: &str) -> Reply {
         }
         _ => Reply::NotFound,
     }
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

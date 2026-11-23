@@ -30,14 +30,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::corpus::{current_out, Error};
-use crate::server::{decode, Reply};
+use crate::queue::sha256_hex;
+use crate::server::{decode, now, Reply};
 
 const PAGE: &str = include_str!("purity.html");
 
@@ -174,13 +173,6 @@ pub struct Purity {
     pub selected: Vec<String>,
 }
 
-fn sha(id: &str) -> String {
-    Sha256::digest(id.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// A hash of every formed clip's cluster, the same as jobs/classes.py's
 /// `fingerprint`, so the page and the classes stage agree on the run.
 fn fingerprint(memberships: &[Membership]) -> String {
@@ -190,7 +182,7 @@ fn fingerprint(memberships: &[Membership]) -> String {
         .iter()
         .map(|m| format!("{}\t{}\n", m.id, m.cluster))
         .collect();
-    sha(&text)[..12].to_string()
+    sha256_hex(&text)[..12].to_string()
 }
 
 fn read_values(path: &Path) -> Result<Vec<Value>, Error> {
@@ -344,7 +336,7 @@ impl Purity {
             typical.sort_by(|a, b| {
                 own(b)
                     .total_cmp(&own(a))
-                    .then_with(|| sha(&a.id).cmp(&sha(&b.id)))
+                    .then_with(|| sha256_hex(&a.id).cmp(&sha256_hex(&b.id)))
             });
             let want = REFERENCES.min(typical.len() / 4);
             let mut refs: Vec<String> = Vec::new();
@@ -381,9 +373,9 @@ impl Purity {
                 .map(|convs| {
                     let mut convs: Vec<Vec<String>> = convs.into_values().collect();
                     for c in &mut convs {
-                        c.sort_by_key(|id| sha(id));
+                        c.sort_by_key(|id| sha256_hex(id));
                     }
-                    convs.sort_by_key(|c| sha(&c[0]));
+                    convs.sort_by_key(|c| sha256_hex(&c[0]));
                     interleave(convs)
                 })
                 .collect();
@@ -400,7 +392,7 @@ impl Purity {
                             <= FOIL_MAX_RESPONSIBILITY
                 })
                 .collect();
-            pool.sort_by_key(|m| sha(&m.id));
+            pool.sort_by_key(|m| sha256_hex(&m.id));
             let mut chosen = Vec::new();
             for target in members.iter().step_by(FOIL_EVERY - 1) {
                 let want = duration(target);
@@ -1041,13 +1033,6 @@ pub fn handle(p: &mut Purity, post: bool, url: &str, body: &str) -> Reply {
         }
         _ => Reply::NotFound,
     }
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

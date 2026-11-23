@@ -21,19 +21,21 @@ pub const POSITIVE_FROM: f32 = 0.6;
 /// Size of the calibration sample reviewed first.
 pub const CALIBRATION: usize = 150;
 
+/// Lower-case hex SHA-256 of an id.
+pub(crate) fn sha256_hex(id: &str) -> String {
+    Sha256::digest(id.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The calibration sample: of the given ids, the `n` whose lowercase hex
 /// SHA-256 sorts first, in that order. A uniform random sample that any tool
 /// can recompute from the ids alone (the calibrate stage does).
 pub fn calibration<'a>(ids: impl IntoIterator<Item = &'a str>, n: usize) -> Vec<&'a str> {
     let mut keyed: Vec<(String, &str)> = ids
         .into_iter()
-        .map(|id| {
-            let hex: String = Sha256::digest(id.as_bytes())
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            (hex, id)
-        })
+        .map(|id| (sha256_hex(id), id))
         .collect();
     keyed.sort();
     keyed.into_iter().take(n).map(|(_, id)| id).collect()
