@@ -773,27 +773,44 @@ fn cheap_checks_run_before_any_input_upload() {
     assert!(!work.join(".speedtest").exists());
 }
 
-/// Row 34: the dummy push rate is a gate, and it runs before any input.
+/// Row 34, round 19: the dummy push rate is a WARNING, never a gate. A slow push prints the
+/// measured rate and the checkpoint push time, then the stage uploads and runs as usual.
 #[test]
-fn slow_push_fails_before_upload() {
+fn slow_push_warns_and_carries_on() {
     if !have_rsync() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    // 100 MiB in a simulated 50 s is 2.10 MB/s, under the 2.5 MB/s floor.
+    // 100 MiB in a simulated 50 s is 2.10 MB/s, under the 2.5 MB/s warning rate; one
+    // 7.35 GB checkpoint at that rate is about 58 min, over max_upload_minutes = 30.
+    let envs = [("VI_FAKE_PUSH_SECONDS", "50".to_string())];
+    let job = "echo ran > \"$VI_OUT/ran.txt\"";
+    let settings = "warn_push_mb_s = 2.5\ncheckpoint_bytes = 7351032336\nmax_upload_minutes = 30";
+    let out = run_settings(dir.path(), job, settings, &envs);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("worker-preflight WARNING: slow push"), "{stderr}");
+    assert!(stderr.contains("push 2.1 MB/s measured"), "{stderr}");
+    assert!(stderr.contains("~ 58 min at this rate"), "{stderr}");
+    assert!(!stderr.contains("worker push (MB/s)"), "{stderr}");
+    assert!(!stderr.contains("worker preflight failed"), "{stderr}");
+    let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
+    assert_eq!(fs::read_to_string(got.join("ran.txt")).unwrap(), "ran\n");
+}
+
+/// The legacy setting name min_push_mb_s is read as the same warning threshold.
+#[test]
+fn legacy_push_floor_only_warns() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
     let envs = [("VI_FAKE_PUSH_SECONDS", "50".to_string())];
     let job = "echo ran > \"$VI_OUT/ran.txt\"";
     let out = run_settings(dir.path(), job, "min_push_mb_s = 2.5", &envs);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "{stderr}");
-    assert!(stderr.contains("worker push (MB/s)"), "{stderr}");
-    assert!(
-        stderr.contains("worker preflight failed; nothing was uploaded"),
-        "{stderr}"
-    );
-    let work = kept_work(dir.path());
-    assert_eq!(fs::read_dir(work.join("inputs")).unwrap().count(), 0);
-    assert!(!work.join("out/ran.txt").exists(), "the stage ran anyway");
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("worker-preflight WARNING: slow push"), "{stderr}");
 }
 
 /// Row 34: the speed test file is home only long enough to time the push; the

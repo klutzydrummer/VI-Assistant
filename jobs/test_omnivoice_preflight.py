@@ -367,7 +367,7 @@ class VramGateTest(PreflightHarness):
 
 
 class FloorsInConfigTest(unittest.TestCase):
-    def test_every_stage_uses_the_2_5_push_floor_and_omnivoice_the_23_5_vram_floor(self):
+    def test_every_stage_warns_below_2_5_push_and_omnivoice_uses_the_23_5_vram_floor(self):
         import tomllib
         chars = JOBS.parent / "characters" / "tali"
         for name, stages in (("voicetune.toml", ("voicetune_preflight", "voicetune_train")),
@@ -375,7 +375,9 @@ class FloorsInConfigTest(unittest.TestCase):
             cfg = tomllib.loads((chars / name).read_text())
             for stage in stages:
                 st = cfg["stage"][stage]["settings"]
-                self.assertEqual(st["min_push_mb_s"], 2.5, (name, stage))
+                # round 19: a warning threshold, not a floor; the old gate name is gone
+                self.assertEqual(st["warn_push_mb_s"], 2.5, (name, stage))
+                self.assertNotIn("min_push_mb_s", st, (name, stage))
                 if name == "omnivoice-ft.toml":
                     self.assertEqual(st["min_vram_gb"], 23.5, (name, stage))
 

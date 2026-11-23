@@ -17,7 +17,8 @@
 #   gate-disk      a worker with too little free disk fails the worker preflight
 #   gate-ram       a worker with too little RAM fails the worker preflight
 #   gate-cuda      a CUDA 12.4 driver fails the worker preflight
-#   gate-push      a 2.37 MB/s push fails the 2.5 MB/s floor
+#   gate-push      a 2.37 MB/s push only WARNS (round 19): the inputs are still sent and the
+#                  stage goes on (the worker disk gate then ends it cheaply)
 #   receiver-down  the return path never proves; nothing is sent
 #   receiver       the restricted receiver itself: token push, munged symlinks, write-only,
 #                  no delete
@@ -172,14 +173,14 @@ sc_gate_vram() {
 }
 
 # A cheap gate must fail inside worker-preflight, before the 100 MiB push, the input upload or
-# the marker: no bundle bytes, no inputs folder, no marker, no push-speed line.
+# the marker: no bundle bytes, no inputs folder, no marker, no push line.
 gate_before_upload() {  # NAME
   local L="$R/s/$1/log"
   check "preflight failure stops before inputs" has "$L" "the worker preflight failed; nothing was uploaded"
   check "no data folder was sent" test -z "$(find "$R/worker/$1" -path '*/inputs/*' -print -quit)"
   check "no marker was written" test -z "$(find "$R/state/$1/unverified" -type f -print -quit 2>/dev/null)"
   check "the push test never ran" test ! -e "$R/s/$1/out/preflight.json"
-  check "no push-speed line was logged" hasnt "$L" "worker push (MB/s)"
+  check "no push line was logged" hasnt "$L" "MB/s measured"
 }
 
 sc_gate_disk() {
@@ -213,11 +214,18 @@ sc_gate_cuda() {
 }
 
 sc_gate_push() {
-  run_stage gate-push omnivoice_preflight preflight VI_FAKE_PUSH_SECONDS=44.2; local rc=$?
+  # A 2.37 MB/s push is under warn_push_mb_s; it must warn and carry on. VI_MIN_DISK_GB then
+  # stops voicetune-fresh.sh at its own disk check, after the upload, so no venv is built here.
+  run_stage gate-push omnivoice_preflight preflight VI_FAKE_PUSH_SECONDS=44.2 VI_MIN_DISK_GB=100000
   show_log gate-push
   local L="$R/s/gate-push/log"
-  check "a 2.37 MB/s worker fails (exit $rc)" test "$rc" -ne 0
-  check "the push gate names the 2.5 floor" has "$L" "worker push (MB/s) is 2.37, under the required 2.5"
+  check "a 2.37 MB/s push only warns" has "$L" "worker-preflight WARNING: slow push, carrying on"
+  check "the warning prints the measured rate" has "$L" "push 2.37 MB/s measured"
+  check "the warning prints the checkpoint push time" has "$L" "one full checkpoint (7.35 GB) ~ 52 min at this rate"
+  check "no push refusal" hasnt "$L" "worker push (MB/s)"
+  check "the preflight did not fail" hasnt "$L" "the worker preflight failed"
+  check "the inputs were sent anyway" test -n "$(find "$R/worker/gate-push" -path '*/inputs/*' -print -quit)"
+  check "the stage got as far as its own disk check" has "$L" "check: worker disk"
   check "the 24467 MiB card passed the VRAM gate" hasnt "$L" "VRAM (GiB) is"
 }
 
@@ -491,10 +499,13 @@ sc_debug_pass() {
   WORKER_SCRIPT=jobs/debug-pass.sh run_stage debug-pass omnivoice_debug "" \
     VI_DEBUG_PASS=1 VI_DEBUG_ROWS=16 VI_DEBUG_NO_CUDA=1 VI_INFER_DEVICE=cpu \
     VI_DEBUG_IMPORTS="accelerate omnivoice webdataset soundfile huggingface_hub tensorboard" \
-    VI_DEBUG_POLL_SECONDS=1 VI_DEBUG_HEARTBEAT_SECONDS=20 VI_DEBUG_SLICE_DIR="$R/debug-slice"
+    VI_DEBUG_POLL_SECONDS=1 VI_DEBUG_HEARTBEAT_SECONDS=20 VI_DEBUG_SLICE_DIR="$R/debug-slice" \
+    VI_FAKE_PUSH_SECONDS=44.2
   local rc=$?
   show_log debug-pass
   check "debug stage exit 0 (got $rc)" test "$rc" -eq 0
+  check "a slow push only warns in a debug pass too" has "$L" "worker-preflight WARNING: slow push, carrying on"
+  check "the debug preflight did not fail on the push" hasnt "$L" "the worker preflight failed"
   for n in "3 upload" "4 venv" "5 base-model" "6 tokenise" "7 cuda-load" "8 train-steps" \
            "9 ckpt-push" "10 listening" "11 resume"; do
     check "stage $n passes" has "$L" "debug-pass: stage $n: PASS"

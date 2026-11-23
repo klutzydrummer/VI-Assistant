@@ -60,11 +60,12 @@ min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
 # jobs/worker-preflight.sh gates the worker before any input is sent. The push
-# floor covers the rate row 35 derives for a real epoch (about 6.9 MB/s from the
-# 2026-11-04 steady step time and 3.9 GB epoch; Brandon lowered the floor to 2.5 MB/s on 2026-11-17); the disk floor mirrors the offer
-# search's proposed minimum, and the probe here is the real measurement.
+# rate is a WARNING only since round 19 (2026-11-23): below warn_push_mb_s the
+# preflight prints the measured rate and carries on, because home's uplink, not
+# the worker, usually sets it. The disk floor mirrors the offer search's
+# proposed minimum, and the probe here is the real measurement.
 min_vram_gb = 44
-min_push_mb_s = 2.5
+warn_push_mb_s = 2.5
 min_disk_mb_s = 500
 min_cpu_cores = 8
 
@@ -88,8 +89,8 @@ min_home_gb = 50
 home_gate_reserve_gb = 27
 max_upload_minutes = 30
 # Same worker gates as the preflight stage: a train run must not start on a card,
-# disk, CPU allocation or push rate the preflight would have refused.
+# disk or CPU allocation the preflight would have refused (push is a warning).
 min_vram_gb = 44
-min_push_mb_s = 2.5
+warn_push_mb_s = 2.5
 min_disk_mb_s = 500
 min_cpu_cores = 8

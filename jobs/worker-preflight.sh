@@ -12,7 +12,12 @@
 #   min_ram_gb        MemTotal, GiB (an advertised 30 GB host reads 28.6, so use 28)
 #   min_cuda_version  CUDA version nvidia-smi reports (the driver's), compared as a number
 #   min_cpu_cores     effective cores (nproc capped by a cgroup cpu.max quota)
-#   min_push_mb_s     worker -> home rate measured by a raw 100 MiB dummy push
+#   warn_push_mb_s    worker -> home rate measured by a raw 100 MiB dummy push. This one is a
+#                     WARNING only, never a refusal (the home uplink, not the worker, usually
+#                     sets the rate; round 19 measured 0.7-1.9 MB/s on speedtest and 2.4-5.6 MB/s
+#                     on real pushes). The older name min_push_mb_s is read the same way.
+#   checkpoint_bytes  size of one full checkpoint, for the expected push time printed next to
+#                     max_upload_minutes and VI_HOURS_LEFT (the run's hours left, if home sent it)
 # One gate needs no setting: the tasks row refuses a box whose free task slots (cgroup pids.max,
 # ulimit -u, threads-max) are under what the capped tokeniser needs (jobs/worker-limits.sh).
 # A setting that is absent or empty turns that gate off; the facts are still
@@ -41,7 +46,10 @@ min_cores=$(setting min_cpu_cores)
 min_disk_gb=$(setting min_disk_gb)
 min_ram=$(setting min_ram_gb)
 min_cuda=$(setting min_cuda_version)
-min_push=$(setting min_push_mb_s)
+warn_push=$(setting warn_push_mb_s)
+[ -n "$warn_push" ] || warn_push=$(setting min_push_mb_s)
+ckpt_bytes=$(setting checkpoint_bytes)
+upload_minutes=$(setting max_upload_minutes)
 
 fail() {
   echo "worker-preflight: $*" >&2
@@ -209,8 +217,44 @@ if [ -n "${VI_FAKE_PUSH_SECONDS:-}" ]; then
 fi
 push_mb_s=$(rate_mb_s "$push_bytes" "$ms")
 push_seconds=$(python3 -c 'import sys; print(round(int(sys.argv[1]) / 1000, 3))' "$ms")
-if [ -n "$min_push" ]; then
-  at_least "$push_mb_s" "$min_push" "worker push (MB/s)"
+# The push rate never refuses a worker. Print it with the expected time for one full checkpoint
+# against the stage's max_upload_minutes and the run's hours left, and warn when it is slow.
+push_note=$(python3 - "$push_mb_s" "$warn_push" "$ckpt_bytes" "$upload_minutes" "${VI_HOURS_LEFT:-}" <<'PY'
+import sys
+rate, warn, ckpt, limit, hours = sys.argv[1:6]
+rate = float(rate)
+def num(x):
+    try:
+        return float(x)
+    except ValueError:
+        return None
+warn, ckpt, limit, hours = num(warn), num(ckpt), num(limit), num(hours)
+parts = [f"push {rate:g} MB/s measured"]
+slow = warn is not None and rate < warn
+minutes = None
+if ckpt and rate > 0:
+    minutes = ckpt / (rate * 1e6) / 60
+    parts.append(f"one full checkpoint ({ckpt / 1e9:.2f} GB) ~ {minutes:.0f} min at this rate")
+    if limit is not None:
+        parts.append(f"max_upload_minutes {limit:g}")
+        slow = slow or minutes > limit
+    if hours is not None:
+        parts.append(f"{hours:g} h left in the run")
+        slow = slow or minutes > hours * 60
+if warn is not None:
+    parts.append(f"warning below {warn:g} MB/s")
+print(("WARNING " if slow else "ok ") + ("" if minutes is None else f"{minutes:.1f}") + "|" + "; ".join(parts))
+PY
+) || push_note="ok |push $push_mb_s MB/s measured"
+push_flag=${push_note%%|*}
+push_text=${push_note#*|}
+push_ckpt_minutes=${push_flag#* }
+push_warning=false
+if [ "${push_flag%% *}" = WARNING ]; then
+  push_warning=true
+  echo "worker-preflight WARNING: slow push, carrying on (it never refuses a worker): $push_text" >&2
+else
+  echo "worker-preflight push: $push_text" >&2
 fi
 
 # Written only after every gate passes, so a present report means "checked".
@@ -220,6 +264,7 @@ python3 - "$report" \
   "driver_version=$driver_version" "cuda_version=$cuda_version" "nvidia=$nvidia_facts" \
   "disk_write_mb_s=$disk_write_mb_s" "disk_read_mb_s=$disk_read_mb_s" "disk_direct=$disk_direct" \
   "push_bytes=$push_bytes" "push_seconds=$push_seconds" "push_mb_s=$push_mb_s" \
+  "push_warning=$push_warning" "push_checkpoint_minutes=$push_ckpt_minutes" \
   "pids_max=$vi_lim_pids_max" "pids_current=$vi_lim_pids_current" "tasks_free=$tasks_free" \
   "ulimit_u=$vi_lim_ulimit_u" "threads_max=$vi_lim_threads_max" \
   "limit_threads=$vi_lim_threads" "limit_nj=$vi_lim_nj" \
