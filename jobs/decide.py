@@ -48,8 +48,8 @@ import time
 from pathlib import Path
 
 import checks
-from textscore import free, load_lines, load_moods, pinned
-from vi_job import Checkpoint, ensure_packages, fake_models, log, out_dir, settings, unit_hash, write_jsonl
+from textscore import load_lines, load_moods, pinned
+from vi_job import Checkpoint, ensure_packages, fake_models, free, log, out_dir, settings, unit_hash, write_jsonl
 
 MODELS = {
     "kev": {"repo": "jaredpalmer/kev-9b", "revision": None},

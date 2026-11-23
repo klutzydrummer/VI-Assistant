@@ -52,6 +52,7 @@ from vi_job import (
     ensure_venv,
     env_path,
     fake_models,
+    free,
     log,
     out_dir,
     read_jsonl,
@@ -567,18 +568,6 @@ def packages(fake):
         except PackageNotFoundError:
             pass
     return found
-
-
-def free():
-    import gc
-
-    gc.collect()
-    try:
-        import torch
-
-        torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 if __name__ == "__main__":

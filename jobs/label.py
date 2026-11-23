@@ -26,7 +26,6 @@ quant, weights, audio_map, scene_priors, audio_llm_axes (axes to verify),
 verify_top, verify_low, limit.
 """
 
-import gc
 import hashlib
 import json
 import tempfile
@@ -40,6 +39,7 @@ from vi_job import (
     ensure_packages,
     env_path,
     fake_models,
+    free,
     load_axes,
     load_clips,
     log,
@@ -52,16 +52,6 @@ from vi_job import (
 )
 
 AUDIO_LLM_CONFIDENCE = 0.6
-
-
-def free():
-    gc.collect()
-    try:
-        import torch
-
-        torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 def main():

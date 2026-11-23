@@ -20,7 +20,6 @@ audio_llm, batch, quant, compare (how many clips to also caption with their
 words shown), min_cluster, limit.
 """
 
-import gc
 import json
 import math
 import tempfile
@@ -34,6 +33,7 @@ from vi_job import (
     Checkpoint,
     ensure_packages,
     fake_models,
+    free,
     load_axes,
     load_clips,
     log,
@@ -44,16 +44,6 @@ from vi_job import (
     write_embeddings,
     write_jsonl,
 )
-
-
-def free():
-    gc.collect()
-    try:
-        import torch
-
-        torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 def main():

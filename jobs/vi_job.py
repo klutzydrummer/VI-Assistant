@@ -8,6 +8,7 @@ This module uses only the standard library, so the fusion logic and the
 fake-model test runs work anywhere, including CI.
 """
 
+import gc
 import hashlib
 import json
 import os
@@ -43,6 +44,16 @@ def out_dir():
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+
+
+def free():
+    gc.collect()
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 def read_jsonl(path):
