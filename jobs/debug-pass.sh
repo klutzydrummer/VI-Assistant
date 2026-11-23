@@ -27,8 +27,14 @@
 #   debug-pass: stage N NAME: PASS (S s)
 #   debug-pass: stage N NAME: FAIL (exit RC, S s)          RC 124 means it hit its time limit
 #   debug-pass: stage N NAME: SKIP-dependent (needs stage M NAME, which did not pass)
+#   debug-pass: stage N NAME: SKIP-no-time (S s left before the rental's deadline; needs M s)
 # Each stage's full log is $VI_OUT/debug/NN-NAME.log, and $VI_OUT/debug/summary.json holds every
 # result. The script exits 0 whatever happened, so on-worker.sh always brings the output home.
+#
+# Time budget (r21): VI_HOURS_LEFT is the rental's hours left when this script starts. Each stage's
+# limit is min(LIMITS[n], deadline - now - VI_DEBUG_MARGIN_SECONDS); a stage that would get less
+# than its MIN_LIMITS[n] is not started and reads SKIP-no-time. Stage 9's limit is
+# 1.5 x checkpoint-5 bytes / the push MB/s worker-preflight.sh measured, at least 600 s.
 #
 # Knobs: VI_DEBUG_STAGES (default "3 4 5 6 7 8 9 10 11"), VI_DEBUG_TIMEOUT_<N> (seconds),
 # VI_DEBUG_IMPORTS (the modules stage 4 imports), VI_DEBUG_NO_CUDA=1 (the home rehearsal: stage 7
@@ -59,6 +65,8 @@ NAMES=([3]=upload [4]=venv [5]=base-model [6]=tokenise [7]=cuda-load [8]=train-s
 NEEDS=([3]="" [4]="3" [5]="4" [6]="4 5" [7]="4 5" [8]="6 7" [9]="8" [10]="8" [11]="8")
 # Seconds. Stage 4 builds torch into a venv, which is the slow one on a fresh box.
 LIMITS=([3]=60 [4]=1200 [5]=900 [6]=600 [7]=600 [8]=900 [9]=600 [10]=600 [11]=600)
+# Seconds. A stage is started only if the rental's deadline leaves it at least this long.
+MIN_LIMITS=([3]=30 [4]=300 [5]=120 [6]=60 [7]=120 [8]=120 [9]=120 [10]=120 [11]=120)
 
 # ----- the real worker functions ----------------------------------------------------------
 cut_functions() {
@@ -188,11 +196,12 @@ stage_8() {
   local rc=0
   # The trainer's default batch_tokens and KL weight (the real run's), 5 steps. The minimum
   # batches-per-epoch guard is off only because the debug slice is deliberately small.
-  "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
+  # Teed live into the stage log, so a stage cut off by its limit still shows how far it got.
+  PYTHONUNBUFFERED=1 "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
     --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
     --output-dir "$probe_run" --steps 5 --save-steps 5 --logging-steps 1 \
-    --min-batches-per-epoch 0 --num-workers "${VI_NUM_WORKERS:-2}" >"$probe_run/train.log" 2>&1 || rc=$?
-  cat "$probe_run/train.log"
+    --min-batches-per-epoch 0 --num-workers "${VI_NUM_WORKERS:-2}" 2>&1 \
+    | tee "$probe_run/train.log" || rc=$?
   [ "$rc" = 0 ] || { echo "train_ft.py exited $rc" >&2; exit "$rc"; }
   [ -f "$probe_run/checkpoint-5/SHA256SUMS" ] || { echo "no checkpoint-5 with SHA256SUMS" >&2; exit 1; }
   grep -E 'kl|KL|replay' "$probe_run/train.log" | tail -n 3 || true
@@ -272,6 +281,37 @@ if ! worker_limits; then
 fi
 echo "debug-pass: worker stages ${order[*]} start at $(date -u +%FT%TZ)"
 
+# The rental's deadline on this box's clock, from the hours paid_run.py had left (forwarded by
+# on-worker.sh, which takes off its own time first). The margin covers paid_run cutting the stage
+# off DEBUG_RELEASE_MARGIN_SECONDS (600 s) early plus the output's trip home.
+deadline=
+margin=${VI_DEBUG_MARGIN_SECONDS:-900}
+case $margin in ''|*[!0-9]*) margin=900 ;; esac
+if [ -n "${VI_HOURS_LEFT:-}" ]; then
+  deadline=$(awk -v h="$VI_HOURS_LEFT" -v t="$(date +%s)" 'BEGIN { if (h ~ /^[0-9]*\.?[0-9]+$/) printf "%d", t + h * 3600 }')
+  [ -z "$deadline" ] || echo "debug-pass: rental deadline $(date -u -d "@$deadline" +%FT%TZ) (VI_HOURS_LEFT $VI_HOURS_LEFT h); every stage stops ${margin} s before it"
+fi
+
+# Stage 9's limit: 1.5 x the checkpoint's bytes at the push rate the preflight measured, >= 600 s.
+# Sets limit and prints how it was found.
+stage9_limit() {
+  local bytes rate
+  limit=${LIMITS[9]}
+  bytes=$(du -sb "$probe_run/checkpoint-5" 2>/dev/null | cut -f1)
+  rate=$(python3 -I -c 'import json, sys
+try:
+    r = float(json.load(open(sys.argv[1])).get("push_mb_s") or 0)
+except (OSError, ValueError, TypeError, AttributeError):
+    r = 0
+print(r if r > 0 else "")' "$VI_OUT/preflight.json" 2>/dev/null || true)
+  if [ -z "$bytes" ] || [ -z "$rate" ]; then
+    echo "debug-pass: stage 9 limit stays ${limit} s (no checkpoint-5 size or no measured push rate)"
+    return
+  fi
+  limit=$(awk -v b="$bytes" -v r="$rate" 'BEGIN { x = int(1.5 * b / (r * 1e6) + 0.999); print (x < 600 ? 600 : x) }')
+  echo "debug-pass: stage 9 limit ${limit} s from the measured push: 1.5 x $bytes bytes at $rate MB/s (at least 600 s)"
+}
+
 for n in "${order[@]}"; do
   name=${NAMES[$n]:-}
   [ -n "$name" ] || { echo "debug-pass: unknown stage $n; skipped"; continue; }
@@ -286,8 +326,19 @@ for n in "${order[@]}"; do
     continue
   fi
   limit=${LIMITS[$n]}
+  [ "$n" != 9 ] || stage9_limit
   over="VI_DEBUG_TIMEOUT_$n"
   [ -z "${!over:-}" ] || limit=${!over}
+  if [ -n "$deadline" ]; then
+    left=$(( deadline - $(date +%s) - margin ))
+    if [ "$left" -lt "${MIN_LIMITS[$n]}" ]; then
+      result[$n]=SKIP-no-time; seconds[$n]=0; rcs[$n]=
+      why[$n]="$(( left < 0 ? 0 : left )) s left before the rental's deadline; needs ${MIN_LIMITS[$n]} s"
+      echo "debug-pass: stage $n $name: SKIP-no-time (${why[$n]})"
+      continue
+    fi
+    [ "$left" -ge "$limit" ] || limit=$left
+  fi
   echo "debug-pass: stage $n $name: running (limit ${limit} s; log $log)"
   t0=$(date +%s)
   # GNU timeout signals the whole process group of the stage, so its Python children go too.
