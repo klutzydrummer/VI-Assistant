@@ -272,6 +272,8 @@ DIAG_MAX_BYTES = 256 * 1024
 # off after this long; VI_VASTAI_BIN overrides the binary (tests use a stub). The CLI reads its
 # own key; this script never reads or prints the key or the CLI's config/state files.
 VAST_EVIDENCE_SECONDS = 30.0
+# r21: a host drop needs two Vast status reads this far apart that both say not running.
+HOST_DROP_RECHECK_SECONDS = 60
 VAST_LOG_TAIL = 200
 # C: a debug pass rents at most this many workers; the second only after a confirmed host drop.
 DEBUG_MAX_RENTALS = 2
@@ -618,6 +620,8 @@ DEBUG_PROBE_SCRIPT = REPO / "jobs" / "debug-probe.sh"
 DEBUG_PROBE_SECONDS = 180
 # The worker stage is cut off this long before the run's hours end, so `down` still fits.
 DEBUG_RELEASE_MARGIN_SECONDS = 10 * 60
+# r21: on-worker.sh gives up on an unreachable worker after this many minutes in the debug pass.
+DEBUG_LOST_MINUTES = 5
 DEBUG_LINE_RE = re.compile(r"debug-pass: stage (\d+) ([\w-]+): (PASS|FAIL|SKIP-dependent)\b ?(.*)")
 DEBUG_EXCERPT_RE = re.compile(r"debug-pass:   \| (.*)")
 # Settings of the debug stage -> the floors debug-probe.sh reads.
@@ -1730,40 +1734,47 @@ class PaidRun:
 
     def host_drop(self, at, rc, out):
         """A2: (confirmed, text) when output that did not report its own result shows ssh losing
-        the host; (False, None) when there is no sign of that. A drop is confirmed only by an
-        instance status check: Vast's actual_status (A1 evidence, saved now) or, failing that,
-        `vi cloud status`; then it must be not running, or a fresh `vi cloud ssh true` must fail
-        the same way. Our own check failures print their own FAIL and never get here."""
+        the host; (False, None) when there is no sign of that. r21: a drop is confirmed only by
+        TWO Vast status reads (`vastai show instance`, saved as A1 evidence) at least
+        HOST_DROP_RECHECK_SECONDS apart that both say not running. If home cannot read the status
+        from Vast (its own API call failed or hung), that is never a drop: our failure to ask is
+        not evidence about the host. `vi cloud ssh true` is tried once more for the record only.
+        Our own check failures print their own FAIL and never get here."""
         sig = drop_signal(rc, out)
         if sig is None:
             return False, None
-        say(f"ssh may have lost the host ({sig}); checking the instance status")
-        ev = self.vast_evidence(at, "host-drop-check")
-        status, msg = ev.get("status"), ev.get("msg")
-        if status is None:
-            try:
-                r2, o2 = self.run([self.vi, "cloud", "status"], stream=False,
-                                  timeout=QUERY_TIMEOUT_SECONDS)
-                m = re.search(r"^worker \d+ (\w+)", o2, re.M) if r2 == 0 else None
-                status = m.group(1) if m else ("gone" if r2 == 0 else None)
-            except Exception:  # noqa: BLE001
-                status = None
+        say(f"ssh may have lost the host ({sig}); checking the instance status with Vast")
+        reads = []
+        for i in range(2):
+            if i:
+                say(f"Vast says {reads[0][0]}; asking again in {HOST_DROP_RECHECK_SECONDS} s "
+                    "before calling it a host drop")
+                nap(HOST_DROP_RECHECK_SECONDS)
+            ev = self.vast_evidence(at, "host-drop-check" if i == 0 else "host-drop-recheck")
+            reads.append((ev.get("status"), ev.get("msg"), ev.get("file")))
+            if reads[-1][0] is None or reads[-1][0].lower() == "running":
+                break
         try:
             r3, o3 = self.run([self.vi, "cloud", "ssh", "true"], stream=False, timeout=60)
         except Exception as e:  # noqa: BLE001
             r3, o3 = None, repr(e)
         again = drop_signal(r3, o3) if r3 != 0 else None
         again_text = "ssh again: ok" if r3 == 0 else f"ssh again: {again or f'exit {r3}'}"
-        if status is not None and (status.lower() != "running" or again):
-            text = (f"HOST-DROP (status {status}{f': {msg}' if msg else ''}); {sig}; {again_text}"
-                    f"; Vast evidence in {ev.get('file') or 'the run folder'}")
+        seen = ", then ".join(st or "unknown" for st, _, _ in reads)
+        if len(reads) == 2 and all(st is not None and st.lower() != "running" for st, _, _ in reads):
+            status, msg, f = reads[-1]
+            text = (f"HOST-DROP (status {status}{f': {msg}' if msg else ''}); {sig}; Vast said "
+                    f"{seen} {HOST_DROP_RECHECK_SECONDS} s apart; {again_text}"
+                    f"; Vast evidence in {f or 'the run folder'}")
             say(text)
             if at is not None:
                 at["host_drop"] = text
                 self.save()
             return True, text
+        why = ("home could not read the instance status from Vast, so this is not a host drop"
+               if reads[-1][0] is None else f"Vast said {seen}")
         text = (f"ssh lost the connection ({sig}), but this is not a confirmed host drop "
-                f"(status {status or 'unknown'}; {again_text})")
+                f"({why}; {again_text})")
         say(text)
         return False, text
 
@@ -2107,7 +2118,9 @@ class PaidRun:
         limit = max(60.0, left_s - DEBUG_RELEASE_MARGIN_SECONDS)
         self.extra_env = {**getattr(self, "extra_env", {}),
                           "VI_HOURS_LEFT": f"{max(left_s, 60) / 3600:.2f}",
-                          "VI_DEBUG_PASS": "1", "VI_DEBUG_ROWS": str(self.a.debug_rows)}
+                          "VI_DEBUG_PASS": "1", "VI_DEBUG_ROWS": str(self.a.debug_rows),
+                          # r21: give up on a lost worker after 5 min, not r9's 30
+                          "VI_LOST_MINUTES": str(DEBUG_LOST_MINUTES)}
         self.set_phase(at, "debug")
         rc, out = self.run([self.vi, "dataset", "run", self.a.stages, DEBUG_STAGE, "--force"],
                            watch=True, timeout=limit)

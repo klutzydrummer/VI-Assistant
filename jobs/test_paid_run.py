@@ -116,6 +116,7 @@ STUB = textwrap.dedent('''\
     elif args[0] == "dataset" and args[1] == "run":
         stage = args[3]
         log("stage", stage, bool(st["worker"]))
+        log("lost_minutes", stage, os.environ.get("VI_LOST_MINUTES"))
         a = att()
         if not st["worker"]:
             print("error: no worker", file=sys.stderr); sys.exit(1)
@@ -235,6 +236,13 @@ VASTAI_STUB = textwrap.dedent('''\
     a = sc["attempts"][min(max(st.get("ups", 1), 1) - 1, len(sc["attempts"]) - 1)]
     if sc.get("vastai") == "fail" or a.get("vastai") == "fail":
         print("failed with error 500: server error", file=sys.stderr); sys.exit(1)
+    # "vast_status_seq": one answer per `show instance` call ("FAIL" = an API error), last repeats
+    seq, nf = a.get("vast_status_seq"), D / "vast-show-count"
+    if seq and sys.argv[1:3] == ["show", "instance"]:
+        k = int(nf.read_text()) if nf.exists() else 0; nf.write_text(str(k + 1))
+        if seq[min(k, len(seq) - 1)] == "FAIL":
+            print("failed with error 500: server error", file=sys.stderr); sys.exit(1)
+        a = {**a, "vast_status": seq[min(k, len(seq) - 1)]}
     if sc.get("vastai") == "hang":
         import time; time.sleep(600)
     args = sys.argv[1:]
