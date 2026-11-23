@@ -71,13 +71,7 @@ def main():
     scorer = voicearms.FakeScorer() if fake else voicesteer.Scorer(s)
     her = scorer.her(neutral)
 
-    def cached(path, make):
-        if path.exists():
-            return json.loads(path.read_text())
-        v = make()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(v))
-        return v
+    cached = voicearms.cached
 
     def speak(mood, cond, spec):
         rows = []

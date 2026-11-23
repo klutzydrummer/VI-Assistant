@@ -77,6 +77,15 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 LADDER = [1.0, 0.5, 0.25, 0.1, 0.05]
 
 
+def cached(path, make):
+    if path.exists():
+        return json.loads(path.read_text())
+    v = make()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(v))
+    return v
+
+
 def main():
     import numpy as np
 
@@ -131,14 +140,6 @@ def main():
     scorer = FakeScorer() if fake else voicesteer.Scorer(s)
     layer_sets = [parse_layers(x, tts.n_layers) for x in s.get("layer_sets", ["14", "18", "21", "24", "21-25"])]
     her = scorer.her(neutral)
-
-    def cached(path, make):
-        if path.exists():
-            return json.loads(path.read_text())
-        v = make()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(v))
-        return v
 
     def speak(mood, cond, spec, idxs):
         """Generate (or reuse) the lines and return their scores, in idxs order."""
