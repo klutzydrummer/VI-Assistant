@@ -50,6 +50,15 @@
 # (VI_WORKER_ROOT), for tests.
 set -euo pipefail
 
+# Open files: raise the soft limit to the hard one (at most 65536) for this process and its rsyncs;
+# the detached stage on the worker does the same below, and the job scripts once more.
+nofile_hard=$(ulimit -Hn 2>/dev/null) || nofile_hard=
+case $nofile_hard in unlimited) nofile_hard=65536 ;; ''|*[!0-9]*) nofile_hard= ;; esac
+[ -z "$nofile_hard" ] || [ "$nofile_hard" -le 65536 ] || nofile_hard=65536
+if [ -n "$nofile_hard" ] && [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt "$nofile_hard" ]; then
+  ulimit -Sn "$nofile_hard" 2>/dev/null || true
+fi
+
 jobs_dir=$(cd "$(dirname "$0")" && pwd)
 puts=()
 while [ "${1-}" = --put ]; do
@@ -597,6 +606,10 @@ return_stop() {
 }
 
 cleanup() {
+  local exit_rc=$?
+  # Name this script's own exit code (r18: an ssh exit 255 killed the script under set -e, and the
+  # summary only saw the vi CLI's exit 1). jobs/paid_run.py's failure_rc_text reads this line.
+  [ "$exit_rc" = 0 ] || echo "on-worker.sh: exiting with $exit_rc" >&2
   [ -n "${heartbeat-}" ] && kill "$heartbeat" 2>/dev/null
   stop_tunnel_loop
   stop_push_loop
@@ -647,14 +660,14 @@ if [ -n "$checkpoint" ]; then
 fi
 
 # Cheap checks on the worker (setsid/flock, VRAM, disk, cores, RAM, GPU facts,
-# a disk probe and a raw 100 MiB push home) before the 8 MB upload estimate or
+# a disk probe and a raw 100 MiB push home, timed: a slow push only warns) before the 8 MB upload estimate or
 # any input. A reattach sends no inputs and is recovery of an already-checked
 # worker, so it skips the checks. The dummy's home copy is deleted at once,
 # before the runner ever looks at the stage output; the worker's own copy is
 # deleted by the preflight script.
 if [ "$reattach" = 0 ]; then
   pre_rc=0
-  remote "VI_OUT=$(q "$work/out") VI_RETURN_PORT=$(q "$worker_port") VI_SETTINGS=$(q "$work/settings.json") VI_FAKE_PUSH_SECONDS=$(q "${VI_FAKE_PUSH_SECONDS:-}") bash $(q "$work/jobs/worker-preflight.sh")" || pre_rc=$?
+  remote "VI_OUT=$(q "$work/out") VI_RETURN_PORT=$(q "$worker_port") VI_SETTINGS=$(q "$work/settings.json") VI_FAKE_PUSH_SECONDS=$(q "${VI_FAKE_PUSH_SECONDS:-}") VI_HOURS_LEFT=$(q "${VI_HOURS_LEFT:-}") bash $(q "$work/jobs/worker-preflight.sh")" || pre_rc=$?
 fi
 # The dummy is pushed home only to be timed. Delete it before the runner ever
 # looks at the stage output, and on a reattach too, in case an earlier start
@@ -786,6 +799,8 @@ if [ "$reattach" = 0 ]; then
   active=$(q "$root/.active")
   stage_script="echo \$\$ > $(q "$work/stage.pid")
 cd $(q "$work") || exit 70
+h=\$(ulimit -Hn); case \$h in unlimited) h=65536 ;; esac
+case \$h in ''|*[!0-9]*) ;; *) [ \$h -le 65536 ] || h=65536; [ \$(ulimit -Sn) = unlimited ] || [ \$(ulimit -Sn) -ge \$h ] || ulimit -Sn \$h 2>/dev/null ;; esac
 export $exports
 $cmd
 rc=\$?

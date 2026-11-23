@@ -91,10 +91,10 @@ from types import SimpleNamespace
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO / "jobs" / "paid-run" / "omnivoice-run-cloud.toml"
 DEFAULT_STAGES = "characters/tali/omnivoice-ft.toml"
-PUSH_GATE_TEXT = "worker push (MB/s)"
 # Every failed cheap gate of jobs/worker-preflight.sh prints `worker-preflight: <what failed>`
-# (disk, RAM, CUDA, VRAM, cores, push speed, missing tools). They are facts about one offer, so
-# the next offer may pass; the success line `worker-preflight: ok` is not a failure.
+# (disk, RAM, CUDA, VRAM, cores, missing tools). They are facts about one offer, so the next offer
+# may pass; the success line `worker-preflight: ok` is not a failure. The push rate is no gate
+# (round 19): its `worker-preflight WARNING:` / `worker-preflight push:` lines never match.
 PREFLIGHT_GATE_RE = re.compile(r"worker-preflight: (?!ok\b)\S")
 # on-worker.sh prints this when the timed 8 MB probe says the inputs would take longer than
 # max_upload_minutes: also a per-offer fact (this worker's line), also before anything is sent.
@@ -103,21 +103,28 @@ UPLOAD_GATE_TEXT = "worker upload ETA"
 
 # on-worker.sh names the worker stage's own exit code; the vi CLI wrapping it exits 1 regardless.
 WORKER_RC_RE = re.compile(r"on-worker\.sh: \S+ exited with (\d+) on the worker")
+# on-worker.sh's EXIT trap names its own non-zero exit (r18: ssh's 255 under set -e), and the vi
+# runner's error names the stage command's exit status (`stage X failed: exit status: N`).
+ON_WORKER_EXIT_RE = re.compile(r"on-worker\.sh: exiting with (\d+)")
+STAGE_STATUS_RE = re.compile(r"failed: exit status: (\d+)")
 
 
 def failure_rc_text(rc, out):
-    """How a failed stage's exit is reported: the worker's exit code when on-worker.sh printed it
-    (r8: 126, a bad interpreter), with the vi CLI's own code beside it; else the vi CLI's code."""
-    m = WORKER_RC_RE.findall(out or "")
-    if m and m[-1] != str(rc):
-        return f"exit {m[-1]} on the worker; the vi CLI exited {rc}"
+    """How a failed stage's exit is reported: the worker stage's exit code when on-worker.sh
+    printed it (r8: 126, a bad interpreter), else on-worker.sh's own exit code (r18: 255, ssh
+    lost the host), else the stage command's exit status from the vi runner's error, each with
+    the vi CLI's own code beside it; else the vi CLI's code."""
+    out = out or ""
+    for regex, where in ((WORKER_RC_RE, "on the worker"), (ON_WORKER_EXIT_RE, "from on-worker.sh"),
+                         (STAGE_STATUS_RE, "from the stage command")):
+        m = regex.findall(out)
+        if m and m[-1] != str(rc):
+            return f"exit {m[-1]} {where}; the vi CLI exited {rc}"
     return f"exit {rc}"
 
 
 def retryable_gate(out):
     """The gate text that makes a failed preflight stage retry on another offer, or None."""
-    if PUSH_GATE_TEXT in out:
-        return "push-speed"
     if UPLOAD_GATE_TEXT in out:
         return "upload-ETA"
     if PREFLIGHT_GATE_RE.search(out):
@@ -988,12 +995,15 @@ def rehearsal_gate(repo):
 
 def push_hours_line(settings, bytes_full=CHECKPOINT_BYTES_CALCULATED,
                     bytes_weights=WEIGHTS_BYTES_CALCULATED):
-    """`push ≈ X h at floor` for one full checkpoint and one weights-only checkpoint, at the
-    stage's min_push_mb_s. The sizes are CALCULATED (3 x the 2,450,344,112-byte weights file),
-    not measured; jobs/checkpoints.py only enforces lower bounds."""
-    floor = float((settings or {}).get("min_push_mb_s", 2.5))
+    """`push ≈ X h at warn rate` for one full checkpoint and one weights-only checkpoint, at the
+    stage's warn_push_mb_s (a warning threshold since round 19, never a refusal; the worker
+    preflight prints the real measured rate at run time). The sizes are CALCULATED (3 x the
+    2,450,344,112-byte weights file), not measured; jobs/checkpoints.py only enforces lower bounds."""
+    st = settings or {}
+    floor = float(st.get("warn_push_mb_s", st.get("min_push_mb_s", 2.5)))
     full, weights = bytes_full / (floor * 1e6) / 3600, bytes_weights / (floor * 1e6) / 3600
-    return (f"push time       : push ≈ {full:.2f} h at floor ({floor:g} MB/s) per full checkpoint "
+    return (f"push time       : push ≈ {full:.2f} h at warn rate ({floor:g} MB/s, a warning, "
+            f"not a gate; measured at run time) per full checkpoint "
             f"({bytes_full / 1e9:.2f} GB), {weights:.2f} h per weights-only one "
             f"({bytes_weights / 1e9:.2f} GB); sizes calculated, not measured (jobs/checkpoints.py "
             f"floors {'2.0 GB weights + 4.0 GB optimizer'})")
@@ -1458,9 +1468,10 @@ class PaidRun:
             flow = [
                 "flow            : offers -> cheapest not-failed offer -> up -> preflight stage "
                 "(tunnel, receiver, token push, gates) -> train stage -> verify -> down",
-                "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores, "
-                "push speed) or the upload-ETA gate retries on the next offer; every other "
-                "failure releases the worker and stops",
+                "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores) "
+                "or the upload-ETA gate retries on the next offer; a slow push is only a warning "
+                "(measured MB/s and checkpoint push time are printed); every other failure "
+                "releases the worker and stops",
                 f"keeps at home   : checkpoints {', '.join(map(str, EXPECTED_STEPS))}; listening sets "
                 f"{', '.join(map(str, LISTENING_STEPS))} in {a.platter}",
             ]
@@ -1868,7 +1879,7 @@ class PaidRun:
                         self.mark_machine(at, host_too=kind == "cuda")
                         if kind == "memory":
                             self.raise_vram_floor("a memory gate failed")
-                        spent = self.release(at, "push-gate" if gate == "push-speed" else "worker-gate")
+                        spent = self.release(at, "worker-gate")
                         say(f"attempt {n} cost ${spent:.2f}; total ${self.s['spent_total']:.2f} "
                             f"of ${a.cap:.2f}, {self.s['hours_total']:.2f} of {a.max_hours} h")
                         at = None

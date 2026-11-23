@@ -133,8 +133,11 @@ STUB = textwrap.dedent('''\
                     time.sleep(0.5); print("still working", flush=True)
                 print("preflight: ok"); sys.exit(0)
             if r == "push":
-                print("worker-preflight: worker push (MB/s) is 1.80, under the required 2.5", file=sys.stderr)
-                print("on-worker.sh: the worker preflight failed; nothing was uploaded", file=sys.stderr); sys.exit(1)
+                # round 19: a slow push is only a warning; the preflight carries on and passes
+                print("worker-preflight WARNING: slow push, carrying on (it never refuses a worker): "
+                      "push 1.8 MB/s measured; one full checkpoint (7.35 GB) ~ 68 min at this rate; "
+                      "max_upload_minutes 30; warning below 2.5 MB/s", file=sys.stderr)
+                print("worker-preflight: ok (VRAM 23.9 GiB, push 1.8 MB/s)", file=sys.stderr)
             gates = dict(
                 vram="VRAM (GiB) is 15.6, under the required 23.5",
                 disk="free disk (GiB) is 60.1, under the required 100",
@@ -506,8 +509,17 @@ class Flow(Base):
                 import tomllib
                 self.assertEqual(len(tomllib.loads(toml)["clip"]), 2)
 
-    def test_2_push_gate_fails_once_then_passes(self):
+    def test_2_slow_push_only_warns_and_never_retries(self):
+        # round 19: the push rate is no gate; one rental, the train stage runs, exit 0
         self.scenario([dict(preflight="push", spent=0.30, hours=1.0), dict(spent=0.90, hours=2.0)])
+        self.assertEqual(self.run_orch(), 0, self.out)
+        self.assertEqual([x["offer"] for x in self.ups()], ["1"])
+        self.assertEqual(self.stages(), ["omnivoice_preflight", "omnivoice_train"])
+        self.assertEqual(self.state()["failed_offers"], [])
+        self.assertNotIn("cheap worker gate", self.out)
+
+    def test_2a_cheap_gate_fails_once_then_passes(self):
+        self.scenario([dict(preflight="disk", spent=0.30, hours=1.0), dict(spent=0.90, hours=2.0)])
         self.assertEqual(self.run_orch(), 0, self.out)
         u = self.ups()
         self.assertEqual([x["offer"] for x in u], ["1", "2"])  # failed offer excluded
@@ -549,11 +561,13 @@ class Flow(Base):
         self.assertIsNone(paid_run.retryable_gate("worker-preflight: ok (VRAM 23.9 GiB)"))
         self.assertEqual(paid_run.retryable_gate("worker-preflight: RAM (GiB) is 1, under"),
                          "worker-preflight")
-        self.assertEqual(paid_run.retryable_gate("worker-preflight: worker push (MB/s) is 1"),
-                         "push-speed")
+        # round 19: the push lines are a warning and a fact, never a retryable gate
+        self.assertIsNone(paid_run.retryable_gate(
+            "worker-preflight WARNING: slow push, carrying on (it never refuses a worker): push 1 MB/s"))
+        self.assertIsNone(paid_run.retryable_gate("worker-preflight push: push 9 MB/s measured"))
 
     def test_2b_second_offer_same_machine_skipped(self):
-        self.scenario([dict(preflight="push", spent=0.1), dict(spent=0.1)],
+        self.scenario([dict(preflight="disk", spent=0.1), dict(spent=0.1)],
                       offer_list=offers((1, 0.20, "US", 800)))
         # After attempt 1 the list shows a relisted id 5 for the same machine plus a different one.
         # The stub switches lists on its own state (the first destroyed worker), so no timing matters.
@@ -563,8 +577,8 @@ class Flow(Base):
         self.assertEqual(self.run_orch(), 0, self.out)
         self.assertEqual([x["offer"] for x in self.ups()], ["1", "6"])
 
-    def test_3_push_gate_fails_every_attempt(self):
-        self.scenario([dict(preflight="push", spent=0.2, hours=0.5)])
+    def test_3_cheap_gate_fails_every_attempt(self):
+        self.scenario([dict(preflight="disk", spent=0.2, hours=0.5)])
         self.assertEqual(self.run_orch(max_attempts=3), 5, self.out)
         self.assertEqual([x["offer"] for x in self.ups()], ["1", "2", "3"])
         self.assertEqual(len(self.downs()), 3)
@@ -574,26 +588,26 @@ class Flow(Base):
 
     def test_4_cap_carried_across_attempts_and_refused_when_too_small(self):
         # attempt 1 burns $1.80 of $2.00; attempt 2 would need 8h*$0.25=$2.00 > $0.20 left
-        self.scenario([dict(preflight="push", spent=1.80, hours=0.1)])
+        self.scenario([dict(preflight="disk", spent=1.80, hours=0.1)])
         self.assertEqual(self.run_orch(cap=2, max_hours=8), 10, self.out)
         self.assertEqual(len(self.ups()), 1)
         self.assertIn("no offer fits what is left", self.out)
         self.assertIsNone(self.worker())
 
     def test_4b_remaining_cap_is_passed_to_second_up(self):
-        self.scenario([dict(preflight="push", spent=1.00, hours=0.5), dict(spent=0.5, hours=1.0)])
+        self.scenario([dict(preflight="disk", spent=1.00, hours=0.5), dict(spent=0.5, hours=1.0)])
         self.assertEqual(self.run_orch(cap=3, max_hours=4), 0, self.out)
         self.assertEqual(self.ups()[1]["cap"], "2.00")
 
     def test_5_hours_carried_and_enforced(self):
         # attempt 1 uses 7.8 of 8 h: 0.2 h left, under --min-hours 0.5, so no second rental
-        self.scenario([dict(preflight="push", spent=0.5, hours=7.8)])
+        self.scenario([dict(preflight="disk", spent=0.5, hours=7.8)])
         self.assertEqual(self.run_orch(cap=10, max_hours=8), 10, self.out)
         self.assertEqual(len(self.ups()), 1)
         self.assertIn("not renting again", self.out)
 
     def test_5b_remaining_hours_in_second_config(self):
-        self.scenario([dict(preflight="push", spent=0.5, hours=3.0), dict(spent=0.5, hours=1.0)])
+        self.scenario([dict(preflight="disk", spent=0.5, hours=3.0), dict(spent=0.5, hours=1.0)])
         self.assertEqual(self.run_orch(cap=10, max_hours=8), 0, self.out)
         self.assertAlmostEqual(float(self.ups()[1]["max_hours"]), 5.0, places=1)
 
@@ -638,6 +652,40 @@ class Flow(Base):
         self.assertEqual(pr.failure_rc_text(1, "no worker line"), "exit 1")
         self.assertEqual(pr.failure_rc_text(1, "on-worker.sh: omnivoice_preflight exited with 126 on the worker"),
                          "exit 126 on the worker; the vi CLI exited 1")
+
+    def test_failure_rc_text_round19_passthrough(self):
+        # r18: ssh lost the host, on-worker.sh exited 255 under set -e, and the summary said 1
+        pr = load_paid_run()
+        self.assertEqual(pr.failure_rc_text(1, "on-worker.sh: exiting with 255"),
+                         "exit 255 from on-worker.sh; the vi CLI exited 1")
+        self.assertEqual(pr.failure_rc_text(1, "error: stage omnivoice_debug failed: exit status: 255"),
+                         "exit 255 from the stage command; the vi CLI exited 1")
+        self.assertEqual(pr.failure_rc_text(1, "on-worker.sh: s exited with 3 on the worker\n"
+                                               "on-worker.sh: exiting with 3"),
+                         "exit 3 on the worker; the vi CLI exited 1")
+
+    def test_on_worker_exit_code_reaches_the_summary_text(self):
+        # Real on-worker.sh on a local "worker" (no ssh, no Vast): a stage exiting 255 or 3 is
+        # named on stderr, and failure_rc_text reports that code, not the vi CLI's 1.
+        pr = load_paid_run()
+        for code in (255, 3):
+            with self.subTest(code=code), tempfile.TemporaryDirectory(dir=self.tmp) as t:
+                t = Path(t)
+                (t / "out").mkdir()
+                (t / "settings.json").write_text("{}")
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("VI_RETURN_PORT", "VI_WORKER", "VI_WORKER_PORT")}
+                env.update(HOME=str(t / "home"), VI_STAGE="s", VI_OUT=str(t / "out"),
+                           VI_SETTINGS=str(t / "settings.json"), VI_WORKER_HOST="local",
+                           VI_WORKER_ROOT=str(t / "worker"), VI_STATE_DIR=str(t / "state"),
+                           VI_POLL_SECONDS="1", VI_BIN="false")
+                r = subprocess.run([str(JOBS / "on-worker.sh"), "sh", "-c", f"exit {code}"],
+                                   env=env, capture_output=True, text=True, timeout=300)
+                self.assertEqual(r.returncode, code, r.stderr)
+                self.assertIn(f"on-worker.sh: s exited with {code} on the worker", r.stderr)
+                self.assertIn(f"on-worker.sh: exiting with {code}", r.stderr)
+                self.assertEqual(pr.failure_rc_text(1, r.stderr),
+                                 f"exit {code} on the worker; the vi CLI exited 1")
 
     def test_release_failure_is_loud_and_forced_first(self):
         self.scenario([dict(train="fail", spent=0.1)], down_fail="plain")
@@ -1939,7 +1987,7 @@ class Resilience(Base):
     def test_paid_run_plan_push_hours(self):
         self.scenario([{}])
         self.assertEqual(self.run_orch(plan=True), 0)
-        self.assertIn("push ≈ 0.82 h at floor (2.5 MB/s) per full checkpoint (7.35 GB)", self.out)
+        self.assertIn("push ≈ 0.82 h at warn rate (2.5 MB/s, a warning, not a gate; measured at run time) per full checkpoint (7.35 GB)", self.out)
         self.assertIn("calculated, not measured", self.out)
         self.assertEqual(self.calls(), [])
         pr = load_paid_run()
