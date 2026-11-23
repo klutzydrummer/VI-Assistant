@@ -51,8 +51,6 @@ import style_data as SD  # noqa: E402
 from style_omnivoice import StyleOmniVoice  # noqa: E402
 from train_ft import verify_checkpoint  # noqa: E402
 
-FRAME_RATE = 25  # OmniVoice's audio tokenizer frame rate (primer)
-
 
 # ---------------------------------------------------------------------------
 # Configuration
