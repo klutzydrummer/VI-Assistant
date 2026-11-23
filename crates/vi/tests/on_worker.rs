@@ -785,7 +785,7 @@ fn slow_push_warns_and_carries_on() {
     // 7.35 GB checkpoint at that rate is about 58 min, over max_upload_minutes = 30.
     let envs = [("VI_FAKE_PUSH_SECONDS", "50".to_string())];
     let job = "echo ran > \"$VI_OUT/ran.txt\"";
-    let settings = "warn_push_mb_s = 2.5\ncheckpoint_bytes = 7351032336\nmax_upload_minutes = 30";
+    let settings = "warn_push_mb_s = 2.5, checkpoint_bytes = 7351032336, max_upload_minutes = 30";
     let out = run_settings(dir.path(), job, settings, &envs);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
