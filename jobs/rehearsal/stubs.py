@@ -340,6 +340,7 @@ def extract_audio_tokens_main():
     ap.add_argument("--tokenizer_path", required=True)
     ap.add_argument("--samples_per_shard", type=int, default=1000)
     ap.add_argument("--skip_errors", action="store_true")
+    ap.add_argument("--nj_per_gpu", type=int, default=1)
     a = ap.parse_args()
     if not os.path.isfile(os.path.join(a.tokenizer_path, "config.json")):
         raise SystemExit(f"stub extract_audio_tokens: no tokenizer at {a.tokenizer_path}")
@@ -369,6 +370,10 @@ def extract_audio_tokens_main():
     with open(os.path.join(out_dir, "data.lst"), "w") as f:
         f.writelines(l + "\n" for l in lst)
     _log(f"tokenised {len(rows)} rows into {out_dir}")
+    # voicetune-fresh.sh reads upstream's summary line to learn the set's size.
+    ok = sum(int(l.rsplit(" ", 1)[1]) for l in lst)
+    print(f"INFO [extract_audio_tokens.py:607] Processing Complete - Successful: {ok}, "
+          f"Failed: {len(rows) - ok}, Filtered/Skipped: 0, Shards written: {len(lst)}", flush=True)
 
 
 _BASE_PLUS_EXT = re.compile(r"^((?:.*/|)[^.]+)[.]([^/]*)$")  # webdataset 1.0.2 base_plus_ext
@@ -405,6 +410,13 @@ def snapshot_download(repo_id, revision=None, local_dir=None, **_):
     json.dump({"stub": True}, open(os.path.join(local_dir, "audio_tokenizer", "config.json"), "w"))
     json.dump({"stub": True, "repo": repo_id, "revision": revision},
               open(os.path.join(local_dir, "config.json"), "w"))
+    # fetch_base_model.py checks the pinned revision's weight sizes (SIZE_TABLE, TOTAL_BYTES).
+    # Sparse files of exactly those sizes pass it while using no real disk; nothing reads them.
+    for rel, size in (("model.safetensors", 2_450_344_112),
+                      ("audio_tokenizer/model.safetensors", 805_665_628),
+                      ("stub-padding.bin", 3_267_470_260 - 2_450_344_112 - 805_665_628 + 4096)):
+        with open(os.path.join(local_dir, rel), "wb") as f:
+            f.truncate(size)
     _log(f"snapshot_download {repo_id}@{revision} -> {local_dir}")
     return local_dir
 
@@ -414,10 +426,29 @@ def snapshot_download(repo_id, revision=None, local_dir=None, **_):
 # ---------------------------------------------------------------------------
 
 
-def _wheel(out_dir: str, dist: str, files: Dict[str, str], requires=(), scripts=None):
+def _norm(dist: str) -> str:
+    """PEP 503 name normalisation (what pip compares), with `_` for a wheel file name."""
+    return re.sub(r"[-_.]+", "-", dist).lower()
+
+
+def worker_pins(path: Optional[str] = None) -> Dict[str, str]:
+    """{normalised name: version} for every `name==version` line of the worker requirements
+    (jobs/requirements-omnivoice-worker.txt), so the stub wheels satisfy the real pinned list."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                                "requirements-omnivoice-worker.txt")
+    pins = {}
+    for line in open(path, encoding="utf-8"):
+        m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*==\s*([^\s;#]+)", line)
+        if m:
+            pins[_norm(m.group(1))] = m.group(2)
+    return pins
+
+
+def _wheel(out_dir: str, dist: str, files: Dict[str, str], requires=(), scripts=None,
+           version: str = STUB_VERSION):
     norm = dist.replace("-", "_")
-    info = f"{norm}-{STUB_VERSION}.dist-info"
-    meta = f"Metadata-Version: 2.1\nName: {dist}\nVersion: {STUB_VERSION}\nSummary: rehearsal stub\n"
+    info = f"{norm}-{version}.dist-info"
+    meta = f"Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\nSummary: rehearsal stub\n"
     meta += "".join(f"Requires-Dist: {r}\n" for r in requires)
     files = dict(files)
     files[f"{info}/METADATA"] = meta
@@ -431,15 +462,25 @@ def _wheel(out_dir: str, dist: str, files: Dict[str, str], requires=(), scripts=
         record.append(f"{path},sha256={digest},{len(data)}")
     record.append(f"{info}/RECORD,,")
     files[f"{info}/RECORD"] = "\n".join(record) + "\n"
-    with zipfile.ZipFile(os.path.join(out_dir, f"{norm}-{STUB_VERSION}-py3-none-any.whl"), "w") as z:
+    with zipfile.ZipFile(os.path.join(out_dir, f"{norm}-{version}-py3-none-any.whl"), "w") as z:
         for path, text in files.items():
             z.writestr(path, text)
 
 
 def build_wheelhouse(out_dir: str):
+    """Offline wheels for the real `pip install -r requirements-omnivoice-worker.txt`. Each pinned
+    package gets a wheel at its pinned version: the stubbed ones carry the stub code below, every
+    other one is metadata only (installs, imports nothing; e.g. there is no torch stub)."""
     os.makedirs(out_dir, exist_ok=True)
     me = open(os.path.abspath(__file__), encoding="utf-8").read()
     stub = ["vi-rehearsal-stub"]
+    pins = worker_pins()
+    done = set()
+    real_wheel = globals()["_wheel"]
+
+    def _wheel(out_dir, dist, files, requires=(), scripts=None):  # noqa: F811 (pinned version)
+        done.add(_norm(dist))
+        real_wheel(out_dir, dist, files, requires, scripts, pins.get(_norm(dist), STUB_VERSION))
     _wheel(out_dir, "vi-rehearsal-stub", {
         "vi_rehearsal_stub.py": me,
         "vi_rehearsal_stub.pth": "import vi_rehearsal_stub; vi_rehearsal_stub.intercept()\n"})
@@ -462,6 +503,8 @@ def build_wheelhouse(out_dir: str):
         "huggingface_hub/__init__.py": "from vi_rehearsal_stub import snapshot_download\n"}, stub)
     for name in ("tensorboard", "webdataset", "soundfile"):
         _wheel(out_dir, name, {f"{name}/__init__.py": "STUB = True\n"})
+    for name in sorted(set(pins) - done):
+        _wheel(out_dir, name, {})
 
 
 NVIDIA_SMI = r'''#!/usr/bin/env bash

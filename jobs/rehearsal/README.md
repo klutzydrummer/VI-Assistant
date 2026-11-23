@@ -4,6 +4,14 @@ Two local rehearsals live here. Neither rents anything or touches Vast.
 
 - `run.sh` is the stub rehearsal of the whole worker flow (no GPU, no network, synthetic data). See
   its header for the scenarios.
+  The `debug-pass` scenario runs `paid_run.py --debug-pass`'s worker side (`jobs/debug-probe.sh`
+  for stages 1-2, then `jobs/debug-pass.sh` through `on-worker.sh` for stages 3-11) on the CPU
+  stubs. It checks that every stage passes, that the listening set and checkpoint-5 come home and
+  verify, and that no receiver is left running. The stub wheelhouse also builds a metadata-only
+  wheel at the exact pinned version of every `requirements-omnivoice-worker.txt` line, so the real
+  `pip install -r` succeeds offline. The stub Base download writes sparse files at the pinned
+  weight sizes, which use no real disk. The `preflight` scenario still stops at `gpu_gate`, because
+  that step needs a real torch and CUDA and there is no torch stub.
 - `vast-limits.sh` is the Vast-conditions gate described below. It is opt-in and is not in
   `run.sh`'s default scenario list or in GitHub CI, because it needs real clips and the 2 GB home
   CPU venv.

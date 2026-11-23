@@ -115,6 +115,38 @@ python3 -I jobs/paid_run.py --run-id omnivoice-ft-1 --cap 5.00 --max-hours 8 \
 - The worker requirements are pinned (`jobs/requirements-omnivoice-worker.txt`, resolved with `uv pip compile` for Python 3.11, which is what the image's conda ships per the pytorch v2.8.0 Dockerfile, `ARG PYTHON_VERSION=3.11`). torch and torchaudio 2.8.0 are listed but come from the image (`2.8.0+cu128` satisfies `==2.8.0`).
 - Tests: `jobs/test_paid_run.py` (stub `vi`, no Vast, no network).
 
+### Debug pass (`--debug-pass`)
+
+A debug pass rents ONE worker and tries every step of the real flow on a small slice, in 12 separately timed stages, so a single short rental shows every problem at once instead of one per paid run. Unlike a real run it never stops at the first failure. Each stage prints `PASS`, `FAIL` (with the last lines of its log) or `SKIP-dependent` (naming the earlier stage it needs), and stage 12 always destroys the worker, even after a failure, a timeout or an exception.
+
+| Stage | What it proves |
+| --- | --- |
+| 1 host-cuda | `nvidia-smi` runs, the CUDA version and VRAM meet the stage's floors |
+| 2 disk-limits | free disk, `ulimit -n` (nofile), `/dev/shm`, cores and RAM |
+| 3 upload | the reverse tunnel, receiver and random-token push, then the slice upload |
+| 4 venv | the pinned venv builds; the key imports, `python -m accelerate.commands.launch` and the tokeniser entry point work |
+| 5 base-model | the pinned Base revision downloads and its size table matches |
+| 6 tokenise | the slice tokenises and passes the count guard |
+| 7 cuda-load | the CUDA gate, then the replay set generated on the GPU |
+| 8 train-steps | a few real train steps through accelerate, with the KL reference at the real `batch_tokens`, and the peak GPU memory |
+| 9 ckpt-push | checkpoint-5 is saved, pushed home and verified at home |
+| 10 listening | a small listening set from checkpoint-5 comes home |
+| 11 resume | training resumes from checkpoint-5 |
+| 12 down | the worker is destroyed |
+
+```sh
+python3 -I jobs/paid_run.py --debug-pass --run-id omnivoice-debug-1 --cap 3.00 --max-hours 1 \
+    --config jobs/paid-run/omnivoice-run-cloud.toml [--debug-rows 128] [--countries eu]
+```
+
+- **Approval.** A debug pass is a paid rental, so it needs Brandon's explicit approval of that run's cap and hours, given exactly like a real run (a one-click `paseo send` card to the agent that runs it). Approval for one pass does not cover a second, and a failed pass is never retried on another offer.
+- **Cost.** `--plan` prints the worst case without calling anything: `worst case = cap + disk_gb x 1.00 / 730 x max_hours`. An offer is rented only if its `$/hr x max_hours` fits the cap, and disk is billed on top (assumed $1.00/GB/month). With `--cap 3.00 --max-hours 1` and 125 GB that is $3.17. A typical pass should finish in under 30 minutes, so it costs about half the offer's hourly price.
+- **Data.** `--debug-rows` (default 128) train rows are taken from the start of `omnivoice_data` by position only (`jobs/debug_slice.py`), plus 4 dev, 2 style and 8 replay rows. No labels are read and nothing is selected. The slice is built under home's cache and goes only to the rented worker, like the real run's data.
+- **Listening set.** Stage 10's clips come from a 5-step checkpoint. They show that generation works end to end and say nothing about voice quality. They are for human listening only and are never scored.
+- **Results.** These are `~/.local/state/vi/paid-run/<run-id>/debug-summary.txt` and `.json`, plus the worker's own summary in the stage output. The exit code is 0 only when every stage passed, and 16 otherwise. The same gates as a real run apply first: rehearsal (exit 15), base-model revision (exit 14), disk (exit 11) and data ids (exit 12).
+- **Rehearsal.** `jobs/rehearsal/run.sh debug-pass` runs stages 1 to 11 at home on the CPU stubs (no Vast, no GPU), including the real handshake, receiver, venv build and checkpoint verification.
+- **Tests.** `jobs/test_debug_pass.py` uses a stub `vi` and never calls Vast.
+
 ### Status and stop
 
 Agents can read a run's progress and ask it to stop safely. Neither command can change the cap, the hours limit, or the attempt count, and neither rents or retries anything.

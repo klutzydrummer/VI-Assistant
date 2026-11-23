@@ -67,6 +67,37 @@ min_cuda_version = "12.8"
 min_cpu_cores = 4
 min_push_mb_s = 2.5
 
+# GPU, manual, run only by `jobs/paid_run.py --debug-pass` (approved and capped like any paid
+# run). jobs/debug-pass.sh runs every worker step separately (venv and launchers, Base fetch,
+# tokenise, CUDA load and replay, 5 training steps with the KL reference, checkpoint push,
+# listening set, resume) and keeps going past failures, so one short rental shows every
+# environment bug at once. on-worker.sh uploads only a small slice of omnivoice_data
+# (jobs/debug_slice.py, first rows by position). Settings match the preflight's, except that the
+# pushed checkpoint count is whatever stage 9 got home (on-worker.sh sets it in a debug pass).
+[stage.omnivoice_debug]
+command = ["../../jobs/on-worker.sh", "bash", "jobs/debug-pass.sh"]
+inputs = ["omnivoice_data"]
+files = ["../../jobs/debug-pass.sh", "../../jobs/debug-probe.sh", "../../jobs/debug_slice.py",
+         "../../jobs/voicetune-fresh.sh", "../../jobs/worker-preflight.sh",
+         "../../jobs/worker-limits.sh", "../../jobs/checkpoints.py",
+         "../../jobs/requirements-omnivoice-worker.txt", "../../jobs/omnivoice-ft/train_ft.py",
+         "../../jobs/omnivoice-ft/ft_data.py", "../../jobs/omnivoice-ft/infer_listening.py",
+         "../../jobs/omnivoice-ft/replay_public.py", "../../jobs/omnivoice-ft/fetch_base_model.py"]
+manual = true
+
+[stage.omnivoice_debug.settings]
+checkpoint_format = "omnivoice"
+expect_epochs = 1
+min_home_gb = 50
+home_gate_reserve_gb = 27
+max_upload_minutes = 30
+min_vram_gb = 23.5
+min_disk_gb = 100
+min_ram_gb = 28
+min_cuda_version = "12.8"
+min_cpu_cores = 4
+min_push_mb_s = 2.5
+
 # GPU, manual, only after the preflight checkpoint is verified and Brandon okays the paid run.
 # Runs 5000 steps through worker-job.sh (survives the stage session dying, restarts a crash with
 # --resume-from-checkpoint), pushes each checkpoint-<step> home, aborts on NaN loss or a fired

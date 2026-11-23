@@ -33,6 +33,9 @@
 #                  rerun (reattach), then the final pushes, prune and listening sets
 #   enospc         a "No space left on device" trainer failure is not retried
 #   nan            a NaN loss aborts the run and is not retried
+#   debug-pass     the paid_run --debug-pass stages a CPU can run: debug-probe.sh (1-2) against the
+#                  stub nvidia-smi, then on-worker.sh + debug-pass.sh (3-11) on the stubs; every
+#                  stage must PASS and the summary and listening set must come home
 #
 # Everything lives under ${VI_REHEARSAL_DIR:-~/.cache/vi-rehearsal}/run.XXXXXX (not /tmp, which
 # is small here). Listeners bind 127.0.0.1 only; each scenario checks that no receiver it
@@ -46,7 +49,7 @@ mkdir -p "$base"
 R=$(mktemp -d "$base/run.XXXXXX")
 echo "rehearsal: working in $R"
 
-all=(gate-home gate-vram gate-disk gate-ram gate-cuda gate-push receiver-down receiver ckpt-push-real receiver-restart base-fail disk-full preflight train enospc nan)
+all=(gate-home gate-vram gate-disk gate-ram gate-cuda gate-push receiver-down receiver ckpt-push-real receiver-restart base-fail disk-full preflight train enospc nan debug-pass)
 [ $# -gt 0 ] && scenarios=("$@") || scenarios=("${all[@]}")
 
 avail_mb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
@@ -88,7 +91,8 @@ PY
 
 # run_stage NAME STAGE MODE [ENV=VALUE...]: one `vi dataset run` of a GPU stage, the way
 # crates/vi runs it, against the local worker. The log is $R/s/NAME/log; the exit status is
-# returned. Set BG=1 to start it in the background (its pid in $stage_pid).
+# returned. Set BG=1 to start it in the background (its pid in $stage_pid). WORKER_SCRIPT
+# replaces jobs/voicetune-fresh.sh (an empty MODE then passes no argument).
 run_stage() {
   local name=$1 stage=$2 mode=$3; shift 3
   local sd="$R/s/$name"
@@ -111,12 +115,12 @@ run_stage() {
   )
   if [ "${BG:-}" = 1 ]; then
     (cd "$repo/characters/tali" && exec env "${envs[@]}" nice -n 19 ionice -c2 -n7 \
-      ../../jobs/on-worker.sh bash jobs/voicetune-fresh.sh "$mode") >>"$sd/log" 2>&1 &
+      ../../jobs/on-worker.sh bash "${WORKER_SCRIPT:-jobs/voicetune-fresh.sh}" ${mode:+"$mode"}) >>"$sd/log" 2>&1 &
     stage_pid=$!
     return 0
   fi
   (cd "$repo/characters/tali" && exec env "${envs[@]}" nice -n 19 ionice -c2 -n7 \
-    ../../jobs/on-worker.sh bash jobs/voicetune-fresh.sh "$mode") >>"$sd/log" 2>&1
+    ../../jobs/on-worker.sh bash "${WORKER_SCRIPT:-jobs/voicetune-fresh.sh}" ${mode:+"$mode"}) >>"$sd/log" 2>&1
 }
 
 show_log() {  # NAME
@@ -225,7 +229,7 @@ sc_receiver_down() {
   local L="$R/s/receiver-down/log"
   check "an unreachable receiver fails the run (exit $rc)" test "$rc" -ne 0
   check "the return path is proved before anything is sent" has "$L" "the return path did not come up; nothing will be sent"
-  check "worker preflight never ran" hasnt "$L" "worker-preflight"
+  check "worker preflight never ran" hasnt "$L" "worker-preflight: ok"
   check "no data folder was sent" test -z "$(find "$R/worker/receiver-down" -path '*/inputs/*' -print -quit)"
 }
 
@@ -470,6 +474,37 @@ sc_nan() {
   check "a NaN loss fails the stage (exit $rc)" test "$rc" -ne 0
   check "the abort rule fired" has "$L" "train abort:"
   check "worker-job.sh did not retry the abort" has "$L" "abort.json exists; not retrying"
+}
+
+# The debug pass, minus the rental: stages 1-2 are jobs/debug-probe.sh run here against the stub
+# nvidia-smi (paid_run sends the same file over `vi cloud ssh`), stages 3-11 are the real
+# on-worker.sh + jobs/debug-pass.sh on the stubs. No torch stub exists, so stage 4 imports only
+# the stubbed packages, and VI_DEBUG_NO_CUDA=1 skips the GPU gate (the stub GPU is checked by 1).
+sc_debug_pass() {
+  local P="$R/s/debug-pass/probe.log" L="$R/s/debug-pass/log" out="$R/s/debug-pass/out/debug" n
+  mkdir -p "$R/s/debug-pass"
+  env HOME="$R/home" PATH="$R/fakebin:$PATH" DEBUG_MIN_VRAM_GB=20 DEBUG_MIN_CUDA=12.8 \
+    DEBUG_DISK_PATH="$R" bash "$repo/jobs/debug-probe.sh" >"$P" 2>&1
+  sed "s/^/  [debug-probe] /" "$P"
+  check "stage 1 host-cuda passes on the stub GPU" has "$P" "debug-pass: stage 1 host-cuda: PASS"
+  check "stage 2 disk-limits passes" has "$P" "debug-pass: stage 2 disk-limits: PASS"
+  WORKER_SCRIPT=jobs/debug-pass.sh run_stage debug-pass omnivoice_debug "" \
+    VI_DEBUG_PASS=1 VI_DEBUG_ROWS=16 VI_DEBUG_NO_CUDA=1 VI_INFER_DEVICE=cpu \
+    VI_DEBUG_IMPORTS="accelerate omnivoice webdataset soundfile huggingface_hub tensorboard" \
+    VI_DEBUG_POLL_SECONDS=1 VI_DEBUG_HEARTBEAT_SECONDS=20 VI_DEBUG_SLICE_DIR="$R/debug-slice"
+  local rc=$?
+  show_log debug-pass
+  check "debug stage exit 0 (got $rc)" test "$rc" -eq 0
+  for n in "3 upload" "4 venv" "5 base-model" "6 tokenise" "7 cuda-load" "8 train-steps" \
+           "9 ckpt-push" "10 listening" "11 resume"; do
+    check "stage $n passes" has "$L" "debug-pass: stage $n: PASS"
+  done
+  check "the upload was the small slice, not the whole data folder" has "$L" "debug_slice:"
+  check "the worker summary came home" test -s "$out/summary.json"
+  check "the listening set came home" test -n "$(find "$out/listening" -name '*.wav' 2>/dev/null | head -n 1)"
+  check "the listening set says human listening only" has "$out/listening/LISTEN-README.txt" "human listening"
+  check "checkpoint-5 verifies home" env VI_MIN_MODEL_BYTES=1 VI_MIN_OPTIMIZER_BYTES=1 \
+    python3 "$repo/jobs/checkpoints.py" --format omnivoice verify-epoch "$(durable_dir debug-pass omnivoice_debug)" 5
 }
 
 for cur in "${scenarios[@]}"; do

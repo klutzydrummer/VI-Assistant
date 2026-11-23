@@ -390,7 +390,7 @@ class FloorsInConfigTest(unittest.TestCase):
                 if any(f.endswith(("/voicetune-fresh.sh", "/worker-preflight.sh")) for f in files):
                     seen += 1
                     self.assertIn("../../jobs/worker-limits.sh", files, (name, stage))
-        self.assertEqual(seen, 4)
+        self.assertEqual(seen, 5)  # voicetune x2, omnivoice preflight, train and debug
 
     def test_omnivoice_stage_input_matches_the_scripts_variable(self):
         import tomllib

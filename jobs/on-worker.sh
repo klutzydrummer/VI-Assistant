@@ -92,8 +92,14 @@ stall_seconds=$((stall_minutes * 60))
 # sat silent for hours after its tokeniser pool died, so a preflight gets 10 minutes and the
 # train stage, whose quiet stretches (checkpoint saves, listening sets) are longer, 60.
 # VI_PREFLIGHT_STALL_SECONDS and VI_TRAIN_STALL_SECONDS override them (tests use a few seconds).
+# A debug pass (jobs/debug-pass.sh, from `paid_run.py --debug-pass`) keeps going past failed
+# steps so one rental shows every problem: it gets the preflight's 10-minute stall limit, a small
+# slice of each input, and a failed worker preflight is noted rather than fatal.
+debug_pass=0
+case " $* " in *"debug-pass.sh"*) debug_pass=1 ;; esac
+[ "${VI_DEBUG_PASS:-0}" = 1 ] && debug_pass=1
 case " $* " in
-  *" preflight "*) stage_mode=preflight; progress_seconds=${VI_PREFLIGHT_STALL_SECONDS:-600} ;;
+  *" preflight "*|*"debug-pass.sh"*) stage_mode=preflight; progress_seconds=${VI_PREFLIGHT_STALL_SECONDS:-600} ;;
   *) stage_mode=train; progress_seconds=${VI_TRAIN_STALL_SECONDS:-3600} ;;
 esac
 case $progress_seconds in ''|*[!0-9]*|0) progress_seconds=600 ;; esac
@@ -120,6 +126,19 @@ fi
 # sequential file per input. Stage outputs never change, so a bundle is kept
 # in VI_BUNDLE_DIR, keyed by the folder's path and file listing, and a rerun
 # (or the run after `vi cloud up`) reuses it.
+# Debug pass: swap each input for its first rows (jobs/debug_slice.py, by position only, no
+# labels read), built under home's cache, so the upload and the tokenise step stay small.
+if [ "$debug_pass" = 1 ]; then
+  slice_root=${VI_DEBUG_SLICE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/vi/debug-slice}
+  for var in $(compgen -e | grep '^VI_INPUT_' || true); do
+    if [ -f "${!var}/data_config.json" ]; then
+      dst="$slice_root/${var#VI_INPUT_}"
+      python3 -I "$jobs_dir/debug_slice.py" "${!var}" "$dst" --train-rows "${VI_DEBUG_ROWS:-128}" || exit 1
+      export "$var=$dst"
+    fi
+  done
+fi
+
 bundle_dir=${VI_BUNDLE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/vi/bundles}
 pack_min_kb=${VI_PACK_MIN_KB:-1024}
 declare -A bundle=()
@@ -642,8 +661,12 @@ fi
 # was killed between its push and this line.
 rm -f "$VI_OUT/.speedtest"
 if [ "$reattach" = 0 ] && [ "$pre_rc" != 0 ]; then
-  echo "on-worker.sh: the worker preflight failed; nothing was uploaded" >&2
-  exit 1
+  if [ "$debug_pass" = 1 ]; then
+    echo "on-worker.sh: the worker preflight failed (exit $pre_rc); debug pass: carrying on to show what else fails" >&2
+  else
+    echo "on-worker.sh: the worker preflight failed; nothing was uploaded" >&2
+    exit 1
+  fi
 fi
 
 if [ "$reattach" = 0 ]; then
@@ -676,6 +699,13 @@ exports="VI_STAGE=$(q "$VI_STAGE") VI_OUT=$(q "$work/out") VI_SETTINGS=$(q "$wor
 [ -n "$durable" ] && exports+=" VI_PUBLISH=vi-publish"
 # The hours left in the run's cap, so the worker's ETA warning measures against the real budget.
 [ -z "${VI_HOURS_LEFT:-}" ] || exports+=" VI_HOURS_LEFT=$(q "$VI_HOURS_LEFT")"
+if [ "$debug_pass" = 1 ]; then
+  exports+=" VI_DEBUG_PASS=1 VI_DEBUG_PREFLIGHT_RC=$(q "${pre_rc:-0}")"
+  # The debug pass's own knobs (stage list, time limits, imports) travel to the worker too.
+  for var in $(compgen -e | grep -E '^VI_DEBUG_(STAGES|TIMEOUT_[0-9]+|IMPORTS|NO_CUDA|EXCERPT_LINES|HEARTBEAT_SECONDS|POLL_SECONDS)$' || true); do
+    exports+=" $var=$(q "${!var}")"
+  done
+fi
 
 if [ "$reattach" = 0 ]; then
   # Preflight: time a small upload and stop before sending the inputs if they'd
@@ -1146,6 +1176,11 @@ if [ "$final_ok" = 1 ]; then
       exit 1
     fi
     expect_epochs=0
+  fi
+  # A debug pass publishes at most its probe checkpoint, and only if its stage 9 got that far:
+  # verify whatever came home, so the marker clears and `vi cloud down` is not refused.
+  if [ "$debug_pass" = 1 ] && [ -n "$durable" ]; then
+    expect_epochs=$( { compgen -G "$durable/$ckpt_prefix-*" || true; } | wc -l)
   fi
   if [ -n "$durable" ]; then
     if ! nice -n 19 ionice -c2 -n7 python3 "$jobs_dir/checkpoints.py" --format "$ckpt_format" verify "$durable" --expect "$expect_epochs" $weights_only_older_flag; then

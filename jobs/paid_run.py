@@ -31,6 +31,7 @@ Exit codes:
   14 the pinned base-model revision is gone or changed on Hugging Face (checked before renting)
  15 the home Vast-limits rehearsal has no valid pass record for this HEAD (checked before
     renting; run `jobs/rehearsal/vast-limits.sh --expect green` on a clean tree)
+ 16 --debug-pass ran to the end, but at least one of its stages did not pass (worker released)
   1 anything unexpected (worker release is still attempted)
 
 A failed train stage never rents a second machine. It is recovered IN PLACE on the same worker
@@ -49,8 +50,23 @@ change the cap, hours or attempts):
 (at most 10 minutes), releases the worker and exits 8. `stop --now` sends SIGTERM to the recorded
 paid_run process, which releases the worker at once.
 
-Heavy work happens inside `vi dataset run` (stages `omnivoice_preflight`, `omnivoice_train`).
-No Vast credential file is read here; only the `vi` CLI is called.
+Debug pass (one rental, every step tried, nothing retried):
+
+    python3 -I jobs/paid_run.py --debug-pass --run-id ID --cap USD --max-hours H [--plan]
+
+rents the cheapest qualifying offer ONCE and runs 12 stages, each with its own time limit,
+carrying on past failures: 1 host/driver/CUDA and 2 disk and limits (jobs/debug-probe.sh over
+`vi cloud ssh`), then the stage `omnivoice_debug` (jobs/debug-pass.sh through on-worker.sh, so
+the real tunnel, receiver and token push) for 3 upload, 4 venv and launchers, 5 Base fetch,
+6 tokenise, 7 CUDA load and replay, 8 five training steps with the KL reference, 9 checkpoint push
+(verified at home here), 10 listening set (checked at home here), 11 resume, and 12 down, which
+always runs. A stage whose prerequisite failed prints SKIP-dependent. The results go to
+<state dir>/<run-id>/debug-summary.{txt,json}; exit 0 only if every stage passed, else 16. The
+same pre-rent gates as a real run apply, and --plan prints the worst-case dollars.
+
+Heavy work happens inside `vi dataset run` (stages `omnivoice_preflight`, `omnivoice_train`,
+and `omnivoice_debug` for --debug-pass). No Vast credential file is read here; only the `vi`
+CLI is called.
 """
 
 import argparse
@@ -160,7 +176,8 @@ STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 EXIT = dict(ok=0, args=2, up=3, preflight=4, push=5, train=6, verify=7, interrupted=8,
-            release=9, budget=10, disk=11, ids=12, realpath=13, hf=14, rehearsal=15, other=1)
+            release=9, budget=10, disk=11, ids=12, realpath=13, hf=14, rehearsal=15, debug=16,
+            other=1)
 
 # ---- retries, timeouts and recovery bounds (every wait goes through nap(), so tests never wait) ----
 OUTER_RETRY_SECONDS = 20          # F-NET-1: one more try of `offers` / `status` after this long
@@ -552,6 +569,55 @@ def disk_cost_line(disk_gb, hours):
             f"instance is destroyed; worst case for {disk_gb:g} GB over {hours:g} h is about "
             f"${cost:.2f} at an assumed ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month (estimate; "
             "the real storage_cost is only known from the live offer)")
+
+
+# ---- the debug pass (--debug-pass) ---------------------------------------------------------
+DEBUG_STAGE = "omnivoice_debug"
+# (number, name, the stages it needs). 0 is the rental itself; 12 (down) needs nothing.
+DEBUG_STAGES = (
+    (1, "host-cuda", (0,)), (2, "disk-limits", (0,)), (3, "upload", (0,)),
+    (4, "venv", (3,)), (5, "base-model", (4,)), (6, "tokenise", (4, 5)),
+    (7, "cuda-load", (4, 5)), (8, "train-steps", (6, 7)), (9, "ckpt-push", (8,)),
+    (10, "listening", (8,)), (11, "resume", (8,)), (12, "down", ()))
+DEBUG_NAMES = {n: name for n, name, _ in DEBUG_STAGES} | {0: "rental"}
+DEBUG_PROBE_SCRIPT = REPO / "jobs" / "debug-probe.sh"
+DEBUG_PROBE_SECONDS = 180
+# The worker stage is cut off this long before the run's hours end, so `down` still fits.
+DEBUG_RELEASE_MARGIN_SECONDS = 10 * 60
+DEBUG_LINE_RE = re.compile(r"debug-pass: stage (\d+) ([\w-]+): (PASS|FAIL|SKIP-dependent)\b ?(.*)")
+DEBUG_EXCERPT_RE = re.compile(r"debug-pass:   \| (.*)")
+# Settings of the debug stage -> the floors debug-probe.sh reads.
+DEBUG_PROBE_FLOORS = (("min_vram_gb", "DEBUG_MIN_VRAM_GB"), ("min_cuda_version", "DEBUG_MIN_CUDA"),
+                      ("min_disk_gb", "DEBUG_MIN_DISK_GB"), ("min_ram_gb", "DEBUG_MIN_RAM_GB"),
+                      ("min_cpu_cores", "DEBUG_MIN_CORES"))
+
+
+def debug_worst_case(cap, disk_gb, hours):
+    """(total, gpu, disk) worst-case dollars of a debug pass. The GPU part is at most the cap: an
+    offer is rented only if its $/hr x the hours left fits the cap, `vi cloud up` gets the same
+    cap, and every step is cut off inside the hours. Disk is billed on top (disk_cost_line)."""
+    disk = disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours
+    return cap + disk, cap, disk
+
+
+def parse_debug_output(text):
+    """{n: (result, detail, [excerpt lines])} from the `debug-pass: stage N ...` lines of a
+    command's output. The last status line of a stage wins; the excerpt lines that follow a
+    status line belong to it."""
+    found, cur = {}, None
+    for line in (text or "").splitlines():
+        m = DEBUG_LINE_RE.search(line)
+        if m:
+            cur = int(m.group(1))
+            found[cur] = (m.group(3), m.group(4).strip(), [])
+            continue
+        m = DEBUG_EXCERPT_RE.search(line)
+        if m and cur in found:
+            found[cur][2].append(m.group(1))
+            continue
+        if "debug-pass: stage" in line:  # a "running" or "still running" line ends an excerpt
+            cur = None
+    return found
 
 
 def base_model_revision(script=GATE_SCRIPT):
@@ -1209,7 +1275,10 @@ class PaidRun:
                     return 124, "".join(buf)
                 if deadline is not None and time.monotonic() > deadline:
                     self.timed_out = True
-                    msg = (f"paid-run: {' '.join(map(str, argv[:4]))} timed out after {limit:.0f} s; "
+                    # Each argument is cut short and kept on one line: `vi cloud ssh` gets a whole script as
+                    # one argument, and its echo lines must not be read back as stage results.
+                    shown = " ".join(" ".join(str(x).split())[:80] for x in argv[:4])
+                    msg = (f"paid-run: {shown} timed out after {limit:.0f} s; "
                            "killing its process group\n")
                     buf.append(msg)
                     if stream:
@@ -1364,11 +1433,44 @@ class PaidRun:
         self.rehearsal_ok, rehearsal_line = rehearsal_gate(a.repo)
         self.hf_code_ok, hf_code_line = hf_offline_check()
         countries = a.countries or "(from the config)"
+        if getattr(a, "debug_pass", False):
+            total, gpu, disk = debug_worst_case(a.cap, disk_gb, a.max_hours)
+            flow = [
+                "mode            : --debug-pass (ONE rental, no retry on another offer; every "
+                "stage is tried and a failure never stops the next one)",
+                "flow            : offers -> cheapest qualifying offer -> up -> 1 host-cuda, "
+                "2 disk-limits (debug-probe.sh over `vi cloud ssh`) -> stage omnivoice_debug "
+                "(3 upload + token handshake, 4 venv + launchers, 5 base-model, 6 tokenise, "
+                "7 cuda-load, 8 train-steps, 9 ckpt-push, 10 listening, 11 resume) -> 12 down "
+                "(always, even after a failure)",
+                f"debug data      : the first {a.debug_rows} train rows of omnivoice_data "
+                "(jobs/debug_slice.py, by position only), plus 4 dev, 2 style, 8 replay texts",
+                f"worst case      : ${total:.2f} = cap ${gpu:.2f} (an offer is rented only if "
+                f"$/hr x {a.max_hours:g} h <= ${a.cap:.2f}) + disk ${disk:.2f} ({disk_gb:g} GB x "
+                f"${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month / {HOURS_PER_MONTH} h x "
+                f"{a.max_hours:g} h)",
+                "                  formula: worst case = cap + disk_gb x 1.00 / 730 x max_hours; "
+                "a typical pass should take under 30 min, so it costs about $/hr x 0.5",
+                f"results         : {self.dir}/debug-summary.txt and .json; exit 0 only if "
+                f"every stage passed, else {EXIT['debug']}",
+            ]
+        else:
+            flow = [
+                "flow            : offers -> cheapest not-failed offer -> up -> preflight stage "
+                "(tunnel, receiver, token push, gates) -> train stage -> verify -> down",
+                "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores, "
+                "push speed) or the upload-ETA gate retries on the next offer; every other "
+                "failure releases the worker and stops",
+                f"keeps at home   : checkpoints {', '.join(map(str, EXPECTED_STEPS))}; listening sets "
+                f"{', '.join(map(str, LISTENING_STEPS))} in {a.platter}",
+            ]
         return [
             f"run id          : {a.run_id}",
             f"cap (all tries) : ${a.cap:.2f}",
             f"max hours (all) : {a.max_hours} h",
-            f"max attempts    : {a.max_attempts} (every attempt counts, including a rental that failed to start)",
+            (f"max attempts    : 1 (a debug pass rents once)" if getattr(a, "debug_pass", False)
+             else f"max attempts    : {a.max_attempts} (every attempt counts, including a rental "
+                  "that failed to start)"),
             f"vi binary       : {self.vi}",
             f"run config      : {a.config}",
             self.disk_line,
@@ -1387,13 +1489,7 @@ class PaidRun:
             f"countries       : {countries}",
             f"stage file      : {a.stages}",
             f"state file      : {self.path}",
-            "flow            : offers -> cheapest not-failed offer -> up -> preflight stage "
-            "(tunnel, receiver, token push, gates) -> train stage -> verify -> down",
-            "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores, "
-            "push speed) or the upload-ETA gate retries on the next offer; every other "
-            "failure releases the worker and stops",
-            f"keeps at home   : checkpoints {', '.join(map(str, EXPECTED_STEPS))}; listening sets "
-            f"{', '.join(map(str, LISTENING_STEPS))} in {a.platter}",
+            *flow,
         ]
 
     # ----- config --------------------------------------------------------------------------
@@ -1793,6 +1889,212 @@ class PaidRun:
                            "not check out:\n  " + "\n  ".join(problems))
             return spent
 
+    # ----- the debug pass ------------------------------------------------------------------
+    def debug_record(self, n, result, detail="", excerpt=()):
+        self.debug[n] = dict(stage=n, name=DEBUG_NAMES[n], result=result, detail=detail,
+                             excerpt=list(excerpt)[-12:])
+        say(f"debug-pass: stage {n} {DEBUG_NAMES[n]}: {result}{' ' + detail if detail else ''}")
+
+    def debug_gate(self, n):
+        """True when stage n may run; otherwise records SKIP-dependent naming what failed."""
+        needs = next(d for m, _, d in DEBUG_STAGES if m == n)
+        for m in needs:
+            if self.debug.get(m, {}).get("result") != "PASS":
+                self.debug_record(n, "SKIP-dependent",
+                                  f"(needs stage {m} {DEBUG_NAMES[m]}, which did not pass)"
+                                  if m else "(needs the rental, which failed)")
+                return False
+        return True
+
+    def debug_probe(self):
+        """Stages 1 and 2: jobs/debug-probe.sh over `vi cloud ssh` with the stage's floors."""
+        st = stage_settings(self.a.stages, self.a.repo, DEBUG_STAGE) or {}
+        env = "".join(f"export {var}={shlex.quote(str(st[key]))}; "
+                      for key, var in DEBUG_PROBE_FLOORS if key in st)
+        rc, out = self.run([self.vi, "cloud", "ssh", env + DEBUG_PROBE_SCRIPT.read_text()],
+                           stream=False, timeout=DEBUG_PROBE_SECONDS)
+        found = parse_debug_output(out)
+        for n in (1, 2):
+            if n in found:
+                res, detail, ex = found[n]
+                self.debug_record(n, res, detail, ex)
+            else:
+                why = (f"hit its {DEBUG_PROBE_SECONDS} s limit" if self.timed_out
+                       else f"`vi cloud ssh` exited {rc} without a stage {n} line")
+                self.debug_record(n, "FAIL", f"({why})", out.strip().splitlines()[-8:])
+
+    def debug_worker_stages(self, at):
+        """Stages 3 to 11: the stage omnivoice_debug (on-worker.sh + jobs/debug-pass.sh)."""
+        _, hours_left = self.remaining()
+        left_s = hours_left * 3600 - (clock() - at["started"])
+        limit = max(60.0, left_s - DEBUG_RELEASE_MARGIN_SECONDS)
+        self.extra_env = {**getattr(self, "extra_env", {}),
+                          "VI_HOURS_LEFT": f"{max(left_s, 60) / 3600:.2f}",
+                          "VI_DEBUG_PASS": "1", "VI_DEBUG_ROWS": str(self.a.debug_rows)}
+        self.set_phase(at, "debug")
+        rc, out = self.run([self.vi, "dataset", "run", self.a.stages, DEBUG_STAGE, "--force"],
+                           watch=True, timeout=limit)
+        timed_out = self.timed_out
+        found = parse_debug_output(out)
+        tail = [ln for ln in out.strip().splitlines() if "debug-pass:" not in ln][-10:]
+        for n in range(3, 12):
+            if n in found:
+                res, detail, ex = found[n]
+                self.debug_record(n, res, detail, ex)
+            elif self.debug_gate(n):
+                # Its prerequisites passed, yet no line: the worker stage stopped or was cut off
+                # first (for stage 3: on-worker.sh never started debug-pass.sh, e.g. the return
+                # path or the token push failed; its own message is in the excerpt).
+                why = (f"the debug stage hit its {limit:.0f} s limit first" if timed_out else
+                       f"never reported; the stage ended ({failure_rc_text(rc, out)}) first")
+                self.debug_record(n, "FAIL", f"({why})", tail)
+        self.debug_home_checks()
+
+    def debug_home_dirs(self):
+        """(newest checkpoint run dir, newest stage output debug dir) at home, or None each."""
+        root = Path(self.a.checkpoint_root) / DEBUG_STAGE
+        runs = [d for d in root.glob("*") if d.is_dir()] if root.is_dir() else []
+        ck = max(runs, key=lambda d: d.stat().st_mtime) if runs else None
+        corpus_dir = None
+        try:
+            import tomllib
+            sp = Path(self.a.stages)
+            sp = sp if sp.is_absolute() else Path(self.a.repo) / sp
+            corpus_dir = sp.parent / tomllib.loads(sp.read_text()).get("corpus", ".")
+        except (ImportError, OSError, ValueError):
+            pass
+        outs = []
+        if corpus_dir is not None:
+            base = corpus_dir / "stages" / DEBUG_STAGE
+            outs = [d for d in list(base.glob("*/out/debug")) + list(base.glob(".tmp-*/out/debug"))
+                    if d.is_dir()]
+        out = max(outs, key=lambda d: d.stat().st_mtime) if outs else None
+        return ck, out
+
+    def debug_home_checks(self):
+        """Stage 9 and 10 pass only if their results are really at home."""
+        ck, out = self.debug_home_dirs()
+        if self.debug.get(9, {}).get("result") == "PASS":
+            if ck is None:
+                self.debug_record(9, "FAIL", "(the worker pushed, but no checkpoint run folder "
+                                  f"is under {self.a.checkpoint_root}/{DEBUG_STAGE})")
+            else:
+                r = subprocess.run([sys.executable, str(REPO / "jobs" / "checkpoints.py"),
+                                    "--format", "omnivoice", "verify-epoch", str(ck), "5"],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    self.debug_record(9, "FAIL", f"(checkpoint-5 in {ck} did not verify at home)",
+                                      (r.stdout + r.stderr).strip().splitlines()[-6:])
+                else:
+                    self.debug_record(9, "PASS", f"(checkpoint-5 verified at home in {ck})")
+        if self.debug.get(10, {}).get("result") == "PASS":
+            wavs = sorted((out / "listening").rglob("*.wav")) if out is not None else []
+            if not wavs:
+                self.debug_record(10, "FAIL", "(the worker made it, but no listening wav came "
+                                  "home in the stage output)")
+            else:
+                self.debug_record(10, "PASS", f"({len(wavs)} wav files at home in "
+                                  f"{out / 'listening'}; for human listening only, not scored)")
+        if out is not None and (out / "summary.json").is_file():
+            self.dir.mkdir(parents=True, exist_ok=True)
+            (self.dir / "debug-worker-summary.json").write_bytes((out / "summary.json").read_bytes())
+
+    def debug_write_summary(self):
+        rows = [self.debug.get(n) or dict(stage=n, name=DEBUG_NAMES[n], result="FAIL",
+                                          detail="(never ran: the debug pass stopped early)",
+                                          excerpt=[])
+                for n, _, _ in DEBUG_STAGES]
+        self.dir.mkdir(parents=True, exist_ok=True)
+        doc = dict(run_id=self.a.run_id, rental=self.debug.get(0), stages=rows,
+                   spent_total=self.s["spent_total"], hours_total=self.s["hours_total"],
+                   cap=self.s["cap"], max_hours=self.s["max_hours"],
+                   listening_set_note="for human listening only; never scored")
+        (self.dir / "debug-summary.json").write_text(json.dumps(doc, indent=1) + "\n")
+        lines = [f"debug pass {self.a.run_id}: spent ${self.s['spent_total']:.2f} of "
+                 f"${self.s['cap']:.2f}, {self.s['hours_total']:.2f} h"]
+        if self.debug.get(0):
+            r = self.debug[0]
+            lines.append(f"  rental        : {r['result']} {r['detail']}".rstrip())
+        for r in rows:
+            lines.append(f"  {r['stage']:>2} {r['name']:<12}: {r['result']} {r['detail']}".rstrip())
+            lines += [f"       | {x}" for x in r["excerpt"]]
+        (self.dir / "debug-summary.txt").write_text("\n".join(lines) + "\n")
+        say("===== debug pass summary =====")
+        for ln in lines:
+            if not ln.startswith("       |"):
+                say(ln)
+        say(f"full summary with log excerpts: {self.dir / 'debug-summary.txt'}")
+        return rows
+
+    def execute_debug(self):
+        """One rental; stages 1-12, each tried; the worker is always released (stage 12)."""
+        a = self.a
+        self.debug = {}
+        failure = None
+        try:
+            self.settle_previous()
+            if self.s["attempts"]:
+                raise Stop(EXIT["budget"], "a debug pass rents once and this run id already has "
+                           "an attempt; start a new --run-id")
+            if self.s["credit_before_run"] is None:
+                self.s["credit_before_run"] = self.credit()
+                self.save()
+            if self.stop_file.exists():
+                raise StopRequested("stop requested; nothing was rented")
+            cap_left, hours_left = self.remaining()
+            say(f"===== debug pass at {rfc3339(clock())}: ${cap_left:.2f}, {hours_left:.2f} h =====")
+            self.write_attempt_config(1, hours_left)
+            offer = self.choose_offer(hours_left, cap_left)
+            say(f"cheapest offer: {offer['id']} {offer['gpu']} {offer['loc']} ${offer['dph']:.3f}/hr")
+            at = dict(n=1, offer=offer["id"], sig=offer["sig"], dph=offer["dph"],
+                      machine=offer["machine"], host=offer["host"], phase="up", started=clock(),
+                      ended=None, cap=round(cap_left, 4), hours=None, credit_start=self.credit())
+            self.s["attempts"].append(at)
+            self.save()
+            self.worker_maybe_up = True
+            boot_s = config_boot_minutes(self.base_config_text()) * 60 + UP_EXTRA_SECONDS
+            rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
+                                f"{cap_left:.2f}", "--until", rfc3339(clock() + 3600), "--yes"],
+                               watch=True, timeout=boot_s)
+            if rc != 0:
+                self.debug_record(0, "FAIL", f"(`vi cloud up` exited {rc}"
+                                  f"{', boot timed out' if self.timed_out else ''})",
+                                  out.strip().splitlines()[-8:])
+            else:
+                self.debug_record(0, "PASS", f"(offer {offer['id']} at ${offer['dph']:.3f}/hr)")
+                self.set_phase(at, "debug")
+                self.debug_probe()
+                self.debug_worker_stages(at)
+            for n in range(1, 12):
+                if n not in self.debug:
+                    self.debug_gate(n)
+        except (Stop, Interrupted, Exception) as e:  # noqa: BLE001: stage 12 still runs
+            failure = e
+            say(f"debug pass stopped early: {getattr(e, 'message', None) or e!r}")
+        finally:
+            if self.worker_maybe_up:
+                try:
+                    self.in_teardown = True
+                    spent = self.release(self.open_attempt(), "debug-done")
+                    self.debug_record(12, "PASS", f"(worker released; ${spent or 0:.2f} spent)")
+                except Stop as e:
+                    self.debug_record(12, "FAIL", f"({e.message})")
+                    failure = failure if isinstance(failure, Stop) and failure.code == \
+                        EXIT["release"] else e
+                finally:
+                    self.in_teardown = False
+            else:
+                self.debug_record(12, "PASS", "(no worker was up)")
+            rows = self.debug_write_summary()
+        if failure is not None:
+            raise failure
+        bad = [r for r in rows if r["result"] != "PASS"]
+        if bad:
+            raise Stop(EXIT["debug"], f"the debug pass finished; {len(bad)} of {len(rows)} stages "
+                       "did not pass (" + ", ".join(f"{r['stage']} {r['name']}" for r in bad)
+                       + f"). The worker was released. Details: {self.dir / 'debug-summary.txt'}")
+        say("debug pass: every stage passed")
+
     # ----- home results --------------------------------------------------------------------
     def run_dir(self):
         root = Path(self.a.checkpoint_root) / "omnivoice_train"
@@ -1976,7 +2278,7 @@ class PaidRun:
         code, message = EXIT["ok"], "done"
         try:
             try:
-                self.execute()
+                (self.execute_debug if getattr(self.a, "debug_pass", False) else self.execute)()
             except Stop as e:
                 code, message = e.code, e.message
             except Interrupted as e:
@@ -2148,6 +2450,11 @@ def parse(argv):
     p.add_argument("--platter", default=os.environ.get("VI_PLATTER_DIR", str(
         REPO / "corpus" / "tali" / "stages" / "omnivoice_train" / "current" / "out" / "platter")))
     p.add_argument("--plan", action="store_true", help="print the plan and exit; no vi calls")
+    p.add_argument("--debug-pass", action="store_true",
+                   help="rent once and try every worker stage separately, carrying on past "
+                        "failures (stage omnivoice_debug); the worker is always released")
+    p.add_argument("--debug-rows", type=int, default=128,
+                   help="train rows in the debug pass's data slice (default 128)")
     p.add_argument("--realpath-forward", action="store_true",
                    help="also run one forward+backward step of the real model in the home real-path "
                         "check (needs 12 GB free RAM; otherwise it stops at the collated batch)")
@@ -2158,6 +2465,8 @@ def parse(argv):
         p.error("--cap, --max-hours and --max-attempts must be positive")
     if not Path(a.config).is_file():
         p.error(f"--config {a.config} is not a file")
+    if a.debug_rows < 1:
+        p.error("--debug-rows must be at least 1")
     return a
 
 
