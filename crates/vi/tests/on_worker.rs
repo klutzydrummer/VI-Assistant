@@ -789,7 +789,10 @@ fn slow_push_warns_and_carries_on() {
     let out = run_settings(dir.path(), job, settings, &envs);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("worker-preflight WARNING: slow push"), "{stderr}");
+    assert!(
+        stderr.contains("worker-preflight WARNING: slow push"),
+        "{stderr}"
+    );
     assert!(stderr.contains("push 2.1 MB/s measured"), "{stderr}");
     assert!(stderr.contains("~ 58 min at this rate"), "{stderr}");
     assert!(!stderr.contains("worker push (MB/s)"), "{stderr}");
@@ -810,7 +813,10 @@ fn legacy_push_floor_only_warns() {
     let out = run_settings(dir.path(), job, "min_push_mb_s = 2.5", &envs);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("worker-preflight WARNING: slow push"), "{stderr}");
+    assert!(
+        stderr.contains("worker-preflight WARNING: slow push"),
+        "{stderr}"
+    );
 }
 
 /// Row 34: the speed test file is home only long enough to time the push; the
