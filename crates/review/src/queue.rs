@@ -33,10 +33,7 @@ pub(crate) fn sha256_hex(id: &str) -> String {
 /// SHA-256 sorts first, in that order. A uniform random sample that any tool
 /// can recompute from the ids alone (the calibrate stage does).
 pub fn calibration<'a>(ids: impl IntoIterator<Item = &'a str>, n: usize) -> Vec<&'a str> {
-    let mut keyed: Vec<(String, &str)> = ids
-        .into_iter()
-        .map(|id| (sha256_hex(id), id))
-        .collect();
+    let mut keyed: Vec<(String, &str)> = ids.into_iter().map(|id| (sha256_hex(id), id)).collect();
     keyed.sort();
     keyed.into_iter().take(n).map(|(_, id)| id).collect()
 }
