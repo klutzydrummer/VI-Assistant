@@ -189,7 +189,7 @@ impl VectorBank {
                 limits.remove(&name).unwrap_or_default(),
             )
             .map_err(|e| format!("{}: {e}", path.display()))?;
-            v.hash = hex(&Sha256::digest(&bytes));
+            v.hash = crate::registry::hex(&Sha256::digest(&bytes));
             if let Some(sha) = g.metadata.get(MODEL_SHA_KEY).and_then(|v| v.as_str()) {
                 bank.built_for.insert(name.clone(), sha.to_string());
             }
@@ -316,10 +316,6 @@ impl SplitMix {
     fn gaussian(&mut self) -> f64 {
         (-2.0 * self.unit().ln()).sqrt() * (std::f64::consts::TAU * self.unit()).cos()
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A `cvector-generator`-style file with the same direction on every layer.
