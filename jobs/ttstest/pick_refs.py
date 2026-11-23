@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wavio  # noqa: E402
+from verify import sha256_file  # noqa: E402
 
 SEED = "tts-test-2026-11-10"
 SR = 24000
@@ -38,14 +39,6 @@ GAMES = ("le2", "le3")
 OPENSLR_URL = "https://www.openslr.org/141/"
 SHARD_URL = "https://huggingface.co/datasets/mythicinfinity/libritts_r/resolve/main/data/dev.clean/dev.clean-00000-of-00004.parquet"
 LIBRIVOX_URL = "https://librivox.org/pages/public-domain/"
-
-
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
 
 
 def hash_key(seed, clip_id):

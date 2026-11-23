@@ -16,7 +16,6 @@ reference files `<refs>/v<voice>.wav` and transcripts in `<refs>/refs.json`.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -29,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wavio  # noqa: E402
+from verify import sha256_file  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 MODELS = ("omnivoice", "moss15", "qwen3base", "stub")
@@ -166,14 +166,6 @@ def stub_faults_after(model, folder, only):
 
 
 # --- run ------------------------------------------------------------------------------------------
-
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
-
 
 def clip_name(model, voice, line_id, seed):
     return f"{model}__v{voice}__{line_id}__s{seed}.wav"
