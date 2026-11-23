@@ -24,7 +24,6 @@ jobs/ttstest/run-or-release.sh then destroys the worker. Failures never stop the
 
 import argparse
 import contextlib
-import hashlib
 import json
 import os
 import platform
@@ -444,14 +443,6 @@ def keep_copy(out, keep, name):
     shutil.copytree(Path(out) / name, dst)
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
-
-
 # --- the job --------------------------------------------------------------------------------------------
 
 def plan(models, seed2):
@@ -611,7 +602,7 @@ def run_job(a):
     per_folder = len(json.loads((HERE / "lines.json").read_text()))
     lines = []
     for p in sorted(out.glob("*/*.wav")):
-        lines.append(f"{sha256(p)}  {p.parent.name}/{p.name}\n")
+        lines.append(f"{verify.sha256_file(p)}  {p.parent.name}/{p.name}\n")
     info["finished"] = stamp()
     info["timings_s"]["total"] = round(time.time() - t_start, 1)
     info["expected_wavs"] = per_folder * len(planned)
