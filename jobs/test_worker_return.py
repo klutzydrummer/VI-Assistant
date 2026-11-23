@@ -1287,6 +1287,38 @@ esac
         self.assertGreaterEqual(err.count("return path re-proved"), 2, err)
         self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
 
+    def test_reconnect_while_host_unreachable_keeps_lost_check_running(self):
+        # Round 21 (dbg2 rental 1): the tunnel reconnected with a new remote port while the host
+        # was unreachable, and hs_loop spent the whole lost-poll budget inside one return_prove
+        # call, so neither the endpoint refresh nor the lost-time check ran for 30 min. Each
+        # proof is now capped (VI_PROVE_CAP_SECONDS, 60 s in a real run, 2 s here), so the
+        # loop gets back to its lost-time check quickly, refreshes at lost_limit/3 and gives up
+        # at lost_limit (60 s here).
+        stage = "tunnel-reconnect-host-gone"
+        process = self.start(stage, 'sleep 300\n', VI_PROVE_CAP_SECONDS="2")
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        self.wait_tunnels(1)
+        self.fail_flag.write_text("")
+        os.kill(self.tunnel_lines()[0][0], 9)
+        t0 = time.time()
+        wait_for("the loop never got back to its lost-time check", 40,
+                 lambda: "poll failed; will retry" in self.stderr(stage))
+        first_check = time.time() - t0
+        rc = self.finish(process, 150)
+        took = time.time() - t0
+        err = self.stderr(stage)
+        lost = [int(m) for m in re.findall(r"poll failed; will retry \(lost for (\d+)s\)", err)]
+        self.assertLess(first_check, 20, err)
+        self.assertTrue(lost and lost[0] < 20, f"first lost-time check came late: {lost}\n{err}")
+        self.assertGreaterEqual(len(lost), 3, err)
+        gaps = [b - a for a, b in zip(lost, lost[1:])]
+        self.assertLess(max(gaps), 20, f"a proof blocked the loop: lost-time steps {lost}\n{err}")
+        self.assertIn("refreshing the worker endpoint", err)
+        self.assertLess(err.index("refreshing the worker endpoint"), err.index("giving up after"))
+        self.assertNotEqual(rc, 0)
+        self.assertLess(took, 60 + 2 + 30, err)
+
     def test_security_holds_after_reconnect_and_receiver_restart(self):
         stage = "security-after-reconnect"
         process = self.start(stage, 'sleep 20\necho done > "$VI_OUT/ok.txt"\n')

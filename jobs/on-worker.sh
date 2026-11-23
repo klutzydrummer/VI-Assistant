@@ -94,6 +94,10 @@ case $upload_limit in ''|*[!0-9]*) upload_limit=30 ;; esac
 
 poll_seconds=${VI_POLL_SECONDS:-30}
 lost_limit=$(( ${VI_LOST_MINUTES:-30} * 60 ))
+# hs_loop's cap on one return-path proof, so the lost-time check and the endpoint refresh keep
+# running while the host is unreachable. VI_PROVE_CAP_SECONDS overrides it (tests use 2).
+prove_cap=${VI_PROVE_CAP_SECONDS:-60}
+case $prove_cap in ''|*[!0-9]*|0) prove_cap=60 ;; esac
 stall_minutes=${VI_STALL_MINUTES:-30}
 stall_seconds=$((stall_minutes * 60))
 # The home loop's stall limit: while the stage runs and nothing is being pushed, no file in its
@@ -529,8 +533,8 @@ stop_tunnel_loop() {
 
 # Prove the return path with a fresh random token: write it on the worker,
 # push it through the receiver, and require the exact bytes home. BUDGET is the
-# whole attempt: 5 s on first start, the lost-poll budget on reconnect and
-# reattach. The push itself waits only a moment so a dead path retries here
+# whole attempt: 5 s on first start, the lost-poll budget on reattach, and at
+# most prove_cap (60 s) per hs_loop iteration on reconnect. The push itself waits only a moment so a dead path retries here
 # with backoff instead of blocking inside rsync.
 return_prove() {  # BUDGET
   local budget=$1 deadline delays=(0.25 0.5 1 2 4 5) i=0 token p ok=0
@@ -990,7 +994,7 @@ proven_port=
 rotations=0
 
 hs_loop() {
-  local offset now failed rp elapsed last_wd=0 last_refresh=0 lost_since=0
+  local offset now failed rp elapsed last_wd=0 last_refresh=0 lost_since=0 prove_budget prove_left
   local gate_paused=0 alerted_bad= rot_rc=0
   while :; do
     [ "$interrupted" = 0 ] || exit "$interrupted"
@@ -1020,7 +1024,16 @@ hs_loop() {
         rp=$(head -n1 "$return_state/remote-port" 2>/dev/null || true)
       fi
       if [ "$need_proof" = 1 ] || { [ -n "$rp" ] && [ "$rp" != "$proven_port" ]; }; then
-        if return_prove "$lost_limit"; then
+        # One proof may take at most prove_cap seconds (and never more than the lost budget
+        # left), so a dead path comes back to the lost-time check and the endpoint refresh
+        # below every iteration. dbg2 (round 20) spent its whole 30 min inside one proof.
+        prove_budget=$prove_cap
+        if [ "$lost_since" -gt 0 ]; then
+          prove_left=$(( lost_limit - ($(date +%s) - lost_since) ))
+          [ "$prove_left" -ge "$prove_budget" ] || prove_budget=$prove_left
+        fi
+        [ "$prove_budget" -ge 1 ] || prove_budget=1
+        if return_prove "$prove_budget"; then
           if [ "$VI_WORKER_HOST" = local ]; then
             proven_port=$return_port
           else
