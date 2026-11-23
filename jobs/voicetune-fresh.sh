@@ -429,6 +429,9 @@ ovft_python() {
 # free task slots prints a "worker-preflight: tasks ..." line, which retries on another machine.
 # shellcheck source=jobs/worker-limits.sh
 . "$jobs_dir/worker-limits.sh"
+# Open files: soft limit up to the hard limit (at most 65536) before any training process starts;
+# worker_limits does it too and logs soft and hard on its limits line.
+vi_raise_nofile
 worker_limits || exit 1
 PY=$(ovft_python)
 # accelerate's launcher as a python module (documented at

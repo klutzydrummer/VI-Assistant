@@ -9,7 +9,7 @@
 #   debug-pass:   | <log line>
 # and always exits 0, so a failed stage never hides the other one. Floors (all optional):
 #   DEBUG_MIN_VRAM_GB, DEBUG_MIN_CUDA, DEBUG_MIN_DISK_GB, DEBUG_MIN_RAM_GB, DEBUG_MIN_CORES,
-#   DEBUG_MIN_NOFILE (default 4096), DEBUG_MIN_SHM_GB (default 1), DEBUG_DISK_PATH (default $HOME).
+#   DEBUG_MIN_NOFILE (default 4096; judged after raising the soft limit to the hard one), DEBUG_MIN_SHM_GB (default 1), DEBUG_DISK_PATH (default $HOME).
 # Nothing here writes outside /tmp, installs anything, or reads a credential.
 
 excerpt() { sed -e 's/^/debug-pass:   | /'; }
@@ -68,9 +68,19 @@ s2_fail=()
 path=${DEBUG_DISK_PATH:-$HOME}
 disk_gb=$(df -Pk "$path" 2>/dev/null | awk 'NR == 2 { printf "%.0f", $4 / 1048576 }')
 echo "disk free at $path: ${disk_gb:-?} GB" >>"$s2_log"
-nofile=$(ulimit -n)
+# The worker job scripts raise the open-file soft limit to the hard limit (at most 65536) before
+# they start (jobs/worker-limits.sh vi_raise_nofile), so the gate judges the RAISED value, never
+# the login shell's soft one: round 18's box had soft 1024, hard 1048576, which is fine.
+nofile_soft0=$(ulimit -Sn)
 nofile_hard=$(ulimit -Hn)
-echo "open files (ulimit -n): soft $nofile, hard $nofile_hard" >>"$s2_log"
+nofile_target=$nofile_hard
+case $nofile_target in unlimited) nofile_target=65536 ;; ''|*[!0-9]*) nofile_target= ;; esac
+[ -z "$nofile_target" ] || [ "$nofile_target" -le 65536 ] || nofile_target=65536
+if [ -n "$nofile_target" ] && [ "$nofile_soft0" != unlimited ] && [ "$nofile_soft0" -lt "$nofile_target" ]; then
+  ulimit -Sn "$nofile_target" 2>/dev/null || true
+fi
+nofile=$(ulimit -Sn)
+echo "open files (ulimit -n): soft $nofile_soft0, hard $nofile_hard; raised soft $nofile" >>"$s2_log"
 echo "user processes (ulimit -u): $(ulimit -u)" >>"$s2_log"
 shm_kb=$(df -Pk /dev/shm 2>/dev/null | awk 'NR == 2 { print $2 }')
 shm_gb=$(awk -v k="${shm_kb:-0}" 'BEGIN { printf "%.1f", k / 1048576 }')
@@ -99,7 +109,8 @@ if [ -n "${DEBUG_MIN_CORES:-}" ] && [ "$cores" -lt "${DEBUG_MIN_CORES%.*}" ]; th
 fi
 case $nofile in
   unlimited) ;;
-  *) [ "$nofile" -ge "${DEBUG_MIN_NOFILE:-4096}" ] || s2_fail+=("open-file limit $nofile under ${DEBUG_MIN_NOFILE:-4096}") ;;
+  *) [ "$nofile" -ge "${DEBUG_MIN_NOFILE:-4096}" ] ||
+       s2_fail+=("open-file limit: hard limit $nofile_hard (soft raised to $nofile) is under ${DEBUG_MIN_NOFILE:-4096}; the jobs cannot raise it further") ;;
 esac
 if [ -z "$shm_kb" ] || awk -v x="$shm_gb" -v y="${DEBUG_MIN_SHM_GB:-1}" 'BEGIN { exit !(x < y) }'; then
   s2_fail+=("/dev/shm ${shm_gb} GiB (0 means missing), under ${DEBUG_MIN_SHM_GB:-1} GiB (DataLoader workers share memory there)")

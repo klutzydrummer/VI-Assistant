@@ -439,5 +439,53 @@ class Scripts(unittest.TestCase):
             self.assertRegex(r.stdout, rf"debug-pass: stage {n} {name}: (PASS|FAIL)")
 
 
+class Nofile(unittest.TestCase):
+    """Round 19 A4: stage 2 judges the open-file limit after raising soft to hard (at most 65536)."""
+
+    def probe(self, soft, hard):
+        # Lower the limits in a subshell (an unprivileged process may lower its hard limit), then
+        # run the real probe in it, the way a rented box with those limits would.
+        cmd = f"ulimit -Sn {soft} && ulimit -Hn {hard} && exec bash {JOBS / 'debug-probe.sh'}"
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = next(l for l in r.stdout.splitlines() if l.startswith("debug-pass: stage 2 "))
+        return line, r.stdout
+
+    def test_low_soft_with_a_high_hard_limit_passes_after_the_raise(self):
+        line, out = self.probe(1024, 8192)
+        self.assertNotIn("open-file limit", line)
+        self.assertIn("soft 1024, hard 8192; raised soft 8192", out)
+
+    def test_a_hard_limit_under_4096_is_a_clear_failure(self):
+        line, out = self.probe(1024, 2048)
+        self.assertIn("FAIL", line)
+        self.assertIn("open-file limit: hard limit 2048 (soft raised to 2048) is under 4096", line)
+
+    def test_the_raise_is_capped_at_65536(self):
+        hard = int(subprocess.run(["bash", "-c", "ulimit -Hn"], capture_output=True,
+                                  text=True).stdout.strip() or 0)
+        if hard <= 65536:
+            self.skipTest(f"this host's hard nofile limit is {hard}, not above 65536")
+        line, out = self.probe(1024, hard)
+        self.assertIn(f"hard {hard}; raised soft 65536", out)
+
+    def test_worker_limits_raises_and_logs_soft_and_hard(self):
+        cmd = (f"ulimit -Sn 1024 && ulimit -Hn 8192 && . {JOBS / 'worker-limits.sh'} && "
+               "vi_raise_nofile && echo \"now $(ulimit -Sn) $vi_lim_nofile_soft $vi_lim_nofile_hard\" && "
+               "worker_limits_measure && worker_limits_line")
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("now 8192 8192 8192", r.stdout)
+        self.assertRegex(r.stdout, r"nofile-soft=8192 nofile-hard=8192 -> threads=")
+
+    def test_job_scripts_raise_nofile_before_work(self):
+        fresh = (JOBS / "voicetune-fresh.sh").read_text()
+        self.assertLess(fresh.index("vi_raise_nofile"), fresh.index("worker_limits || exit 1"))
+        driver = (JOBS / "debug-pass.sh").read_text()
+        self.assertLess(driver.index("vi_raise_nofile\n"), driver.index('for n in "${order[@]}"'))
+        on_worker = (JOBS / "on-worker.sh").read_text()
+        self.assertLess(on_worker.index("ulimit -Sn"), on_worker.index("jobs_dir="))
+
+
 if __name__ == "__main__":
     unittest.main()

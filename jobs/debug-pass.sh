@@ -262,6 +262,9 @@ excerpt_lines=${VI_DEBUG_EXCERPT_LINES:-12}
 read -r -a order <<<"${VI_DEBUG_STAGES:-3 4 5 6 7 8 9 10 11}"
 declare -A result=() seconds=() rcs=() why=()
 load_worker_code
+# Open files: soft limit up to the hard limit (at most 65536), inherited by every stage below.
+vi_raise_nofile
+echo "debug-pass: open files: soft $vi_lim_nofile_soft, hard $vi_lim_nofile_hard (raised to the hard limit, at most 65536)"
 # Thread caps for every Python the stages start (the real stage does the same first). A box with
 # too few task slots is reported, not fatal: stage 2 at home logs the limits too.
 if ! worker_limits; then

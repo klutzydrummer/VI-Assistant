@@ -29,6 +29,29 @@ VI_FATAL_RE="BrokenProcessPool|pthread_create failed|can't start new thread|Trac
 # A large stand-in for "no limit", so the arithmetic below needs no special cases.
 vi_unlimited=1000000000
 
+# vi_raise_nofile: raise this shell's open-file soft limit to its hard limit, capped at 65536 when
+# the hard limit is larger or unlimited; a soft limit already at or above that target is left
+# alone. Children (the tokeniser pool, DataLoader workers, accelerate) inherit the raised limit.
+# Round 18's box had soft 1024, hard 1048576: the job ran with 1024 although it could have
+# asked for more. It sets vi_lim_nofile_soft/vi_lim_nofile_hard to what is in force afterwards.
+vi_raise_nofile() {
+  local hard soft target
+  hard=$(ulimit -Hn 2>/dev/null) || hard=
+  soft=$(ulimit -Sn 2>/dev/null) || soft=
+  target=$hard
+  case $target in unlimited) target=65536 ;; ''|*[!0-9]*) target= ;; esac
+  [ -z "$target" ] || [ "$target" -le 65536 ] || target=65536
+  if [ -n "$target" ]; then
+    case $soft in
+      unlimited) ;;
+      ''|*[!0-9]*) ulimit -Sn "$target" 2>/dev/null || true ;;
+      *) [ "$soft" -ge "$target" ] || ulimit -Sn "$target" 2>/dev/null || true ;;
+    esac
+  fi
+  vi_lim_nofile_soft=$(ulimit -Sn 2>/dev/null || echo '?')
+  vi_lim_nofile_hard=$(ulimit -Hn 2>/dev/null || echo '?')
+}
+
 # vi_cpuset_count LIST: number of CPUs in a cpuset list such as "0-3,8,10-11".
 vi_cpuset_count() {
   local list=$1 part n=0 a b
@@ -132,13 +155,14 @@ worker_limits_measure() {
 worker_limits_line() {
   local free=$vi_lim_tasks_free
   [ "$free" -lt "$vi_unlimited" ] || free=unlimited
-  echo "limits: nproc=$vi_lim_nproc cpus=$vi_lim_cpus quota=$vi_lim_quota cpuset=$vi_lim_cpuset pids.max=$vi_lim_pids_max current=$vi_lim_pids_current ulimit-u=$vi_lim_ulimit_u threads-max=$vi_lim_threads_max tasks_free=$free -> threads=$vi_lim_threads nj=$vi_lim_nj"
+  echo "limits: nproc=$vi_lim_nproc cpus=$vi_lim_cpus quota=$vi_lim_quota cpuset=$vi_lim_cpuset pids.max=$vi_lim_pids_max current=$vi_lim_pids_current ulimit-u=$vi_lim_ulimit_u threads-max=$vi_lim_threads_max tasks_free=$free nofile-soft=${vi_lim_nofile_soft:-$(ulimit -Sn)} nofile-hard=${vi_lim_nofile_hard:-$(ulimit -Hn)} -> threads=$vi_lim_threads nj=$vi_lim_nj"
 }
 
-# worker_limits: measure, print the limits line, export the thread caps and VI_LIMIT_NJ. Returns 1
+# worker_limits: raise the open-file soft limit (vi_raise_nofile), measure, print the limits line, export the thread caps and VI_LIMIT_NJ. Returns 1
 # after a "worker-preflight: tasks ..." line (which makes the run retry on another machine) when
 # the box has too few free task slots for even the capped job.
 worker_limits() {
+  vi_raise_nofile
   worker_limits_measure
   worker_limits_line
   if [ "$vi_lim_tasks_free" -lt "$vi_lim_need" ]; then
