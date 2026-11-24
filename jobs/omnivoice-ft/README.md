@@ -35,7 +35,7 @@ New here:
 | `style_drop_ratio` | `0.2` | independent prefix dropout for the text-only CFG branch |
 | `batch_tokens` | `2048` | per GPU micro-batch (r25; was 8192, which ran out of memory on 24 GB) |
 | `gradient_accumulation_steps` | `4` | so an optimizer step still sees 8192 tokens; `steps` counts optimizer steps. Both defaults live in `ft_guards.py` alone |
-| KL reference | bf16, frozen, no gradients | the KL itself is computed in fp32; the student stays fp32 under bf16 autocast |
+| KL reference | bf16, frozen, no gradients | the KL itself is computed in fp32; the student stays fp32 under bf16 autocast. Since r26 its forward runs only on the replay rows of each micro-batch (same KL value) |
 | `batch`/optim | bf16, TF32, weight decay 0.01, max grad norm 1.0, cosine schedule | primer's `train_config_finetune.json` |
 | collapse guard | ON | probe, fire rule, restart with `seed + attempt`, max 3 attempts |
 
@@ -150,7 +150,7 @@ Outputs in `--output-dir`:
 
 * `checkpoint-N/` every `--save-steps` and at the final step;
 * `style_metrics.jsonl` — one row per logged micro-step (`loss/ce`, `loss/aux`, `loss/kl`,
-  `style/z_spread`, `style/out_rms`, `attempt`, ...);
+  `kl/rows_used`, `kl/rows_total`, `style/z_spread`, `style/out_rms`, `attempt`, ...);
 * `collapse_guard.jsonl` — one row per probe (`sep_ratio` or `z_spread_min`, threshold, strikes);
 * `ft_config.json` — the full pipeline configuration of the run;
 * upstream's `train.log`, `initial_config.json` and TensorBoard events.
