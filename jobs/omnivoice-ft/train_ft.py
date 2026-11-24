@@ -300,6 +300,25 @@ def _print_vram_peak_after_first_step(optimizer: torch.optim.Optimizer) -> None:
     handle = optimizer.register_step_post_hook(hook)
 
 
+def _kl_rows_line(acc: Dict[str, Any], row: Dict[str, Any], logged: bool, micro_step: int,
+                  accum: int) -> None:
+    """r26: add up how many rows of each micro-batch the KL reference forward ran on (the replay
+    rows) and, at the end of an optimizer step that had a logged micro-step, print
+    "train_ft: kl-rows: used U of B rows (share S)" for that optimizer step. The counts are Python
+    ints the KL already computed, so this costs no extra device sync. Nothing without a KL term."""
+    if "kl/rows_total" not in row:
+        return
+    acc["used"] += int(row["kl/rows_used"])
+    acc["total"] += int(row["kl/rows_total"])
+    acc["logged"] = acc["logged"] or logged
+    if micro_step % max(accum, 1) != 0:
+        return
+    if acc["logged"] and acc["total"]:
+        print(f"train_ft: kl-rows: used {acc['used']} of {acc['total']} rows "
+              f"(share {acc['used'] / acc['total']:.3f})", flush=True)
+    acc.update(used=0, total=0, logged=False)
+
+
 def _report_sdpa_warnings_in_first_forward(model: torch.nn.Module) -> None:
     """r25 B4 diagnostic: record the warnings the first training forward raises (the student and
     the KL reference forward both run inside it) and print one "train_ft: sdpa-mask-warning:" line
@@ -556,6 +575,7 @@ def _run_training_once(
     metrics_path = os.path.join(cfg.output_dir, "style_metrics.jsonl")
     guard_path = os.path.join(cfg.output_dir, "collapse_guard.jsonl")
     counter = {"n": 0, "strikes": 0, "injected": False}
+    kl_rows = {"used": 0, "total": 0, "logged": False}
     baseline_z = None
     if cfg.guard and data.probe_kind == "unsupervised":
         baseline_z = ft_data.unsupervised_probe_stats(model, data.probe_crops)["z_spread_mean"]
@@ -565,10 +585,12 @@ def _run_training_once(
         _PROGRESS["micro_step"] = counter["n"]
         if counter["n"] == 50 and data.sample_counter is not None:
             FG.check_sample_counts(data.sample_counter, "first 50 micro-steps")
-        if counter["n"] % cfg.logging_steps == 0 or counter["n"] == 1:
+        logged = counter["n"] % cfg.logging_steps == 0 or counter["n"] == 1
+        if logged:
             with open(metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"micro_step": counter["n"], "attempt": attempt,
                                     **{k: float(v) for k, v in row.items()}}) + "\n")
+        _kl_rows_line(kl_rows, row, logged, counter["n"], cfg.gradient_accumulation_steps)
         if cfg.kill_at_step is not None and attempt == 0 and counter["n"] >= cfg.kill_at_step:
             raise SimulatedKill(f"simulated mid-run kill at micro-step {counter['n']}")
         if (cfg.inject_collapse_at is not None and attempt == 0 and not counter["injected"]
