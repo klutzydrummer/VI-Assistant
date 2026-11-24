@@ -420,7 +420,10 @@ sc_train() {
       pid=$(cat "$work/train.pid" 2>/dev/null || true)
       cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
       if [[ "$cmd" == *train_ft.py*"$R/"* ]]; then
-        kill -9 "$pid" && killed_tr=$step && echo "rehearsal: SIGKILLed trainer pid $pid at step $step"
+        # train.pid is the accelerate launcher, which runs train_ft.py as a child (r23: the stub
+        # launcher now does what the real one does); a SIGKILL is not passed on, so kill the
+        # trainer's whole process group (worker-job.sh starts it under setsid, pid = pgid).
+        kill -9 -- "-$pid" && killed_tr=$step && echo "rehearsal: SIGKILLed trainer process group $pid at step $step"
       fi
     fi
     if [ -z "$killed_home" ] && [ "$step" -ge 3600 ]; then

@@ -23,10 +23,15 @@
 # run with VI_NUM_WORKERS=0. Images without cgroup v2 memory.events retry
 # unchanged once.
 #
-# Exit 76 is a GPU out-of-memory (train_ft.py wrote $run/oom.json): the retry halves
-# --batch-tokens and doubles --gradient-accumulation-steps (the same tokens per optimizer
-# step) and resumes; below a batch of 2048 tokens it stops. A retry that fails with the
-# same last traceback line as the attempt before it is deterministic and is not repeated.
+# A GPU out-of-memory is exit 76 from train_ft.py, which also writes $run/oom.json. The
+# accelerate launcher turns any non-zero child exit into its own exit 1 (r23), so an attempt
+# also counts as an OOM when it failed and $run/oom.json was written during it (its
+# modification time changed since the attempt started); the trainer's own file, not
+# accelerate's message format, is the evidence. An OOM retry halves --batch-tokens and
+# doubles --gradient-accumulation-steps (the same tokens per optimizer step) and resumes;
+# below a batch of 2048 tokens it stops, and the job's rc is then 76 whatever the launcher
+# returned. A retry that fails with the same last traceback line as the attempt before it is
+# deterministic and is not repeated (an OOM is exempt: its batch changed).
 # Every retry decision is appended to $work/retries.jsonl.
 #
 # The rc file outlives a session that died. Relaunching a stopped job belongs
@@ -185,9 +190,12 @@ set_flag() {
   done
   base+=("$1" "$2")
 }
+# oom_stamp: $run/oom.json's modification time to the nanosecond, or "none".
+oom_stamp() { stat -c %y "$run/oom.json" 2>/dev/null || echo none; }
 prev_sig=
 while :; do
   log_off=$(stat -c %s "$work/job.log" 2>/dev/null || echo 0)
+  oom_before=$(oom_stamp)
   before=$(oom_kill)
   before=${before:-0}
   # The trainer gets its own session, so it survives this wrapper too; it
@@ -206,6 +214,11 @@ while :; do
     break
   fi
   [ $rc -eq 75 ] && break
+  # Through accelerate the trainer's 76 arrives as 1; oom.json written in this attempt says OOM.
+  if [ $rc -ne 76 ] && [ "$(oom_stamp)" != none ] && [ "$(oom_stamp)" != "$oom_before" ]; then
+    echo "worker-job.sh: exit $rc with $run/oom.json written in this attempt: GPU out of memory (exit 76)" >&2
+    rc=76
+  fi
   sig=$(last_frame "$log_off")
   if [ $rc -ne 76 ] && [ -n "$sig" ] && [ "$sig" = "$prev_sig" ]; then
     log_retry "$attempt" "$rc" "same-traceback-stop" "$sig"

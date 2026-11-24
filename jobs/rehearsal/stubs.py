@@ -320,7 +320,19 @@ def intercept():
 
 
 def accelerate_main():
-    """`accelerate launch [--opt VALUE]... SCRIPT ARGS`: run SCRIPT with this interpreter."""
+    """`accelerate launch [--opt VALUE]... SCRIPT ARGS`: run SCRIPT as a child of this interpreter,
+    the way the real accelerate 1.16.0 launcher does (r23; measured on the home CPU venv):
+      - the child's stdout passes through; its stderr is shown live and also kept;
+      - a non-zero child exit raises CalledProcessError chained from RuntimeError(<child stderr>),
+        so the child's stderr appears twice and the launcher exits 1 (a trainer's 76 becomes 1);
+      - SIGTERM or SIGINT to the launcher is passed to the child, then the launcher dies of it;
+        a SIGKILL of the launcher leaves the child running (it is not passed on).
+    The rehearsal used to os.execv the script, which let exit 76 through unchanged and hid that
+    worker-job.sh's OOM retry never fired behind the real launcher."""
+    import signal
+    import subprocess
+    import threading
+
     args = sys.argv[1:]
     if not args or args[0] != "launch":
         raise SystemExit("stub accelerate: only `launch` is supported")
@@ -329,7 +341,43 @@ def accelerate_main():
         args = args[2:] if "=" not in args[0] else args[1:]
     if not args:
         raise SystemExit("stub accelerate: no script")
-    os.execv(sys.executable, [sys.executable] + args)
+    cmd = [sys.executable] + args
+    child = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    got = []
+
+    def forward(signum, _frame):
+        got.append(signum)
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, forward)
+    kept = []
+
+    def pump():
+        for line in iter(child.stderr.readline, b""):
+            sys.stderr.buffer.write(line)
+            sys.stderr.buffer.flush()
+            kept.append(line)
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    rc = child.wait()
+    t.join()
+    if got:
+        signal.signal(got[0], signal.SIG_DFL)
+        os.kill(os.getpid(), got[0])
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd) from RuntimeError(
+            b"".join(kept).decode("utf-8", "replace"))
+
+
+# `python -m accelerate.commands.launch ...` in the stub accelerate wheel (and the tests' pylib).
+ACCELERATE_LAUNCH_PY = ("import sys\nfrom vi_rehearsal_stub import accelerate_main\n"
+                        "if __name__ == '__main__':\n    sys.argv[1:1] = ['launch']\n"
+                        "    accelerate_main()\n")
 
 
 def extract_audio_tokens_main():
@@ -488,9 +536,7 @@ def build_wheelhouse(out_dir: str):
         "accelerate/__init__.py": "STUB = True\n",
         "accelerate/commands/__init__.py": "",
         # voicetune-fresh.sh runs `python -m accelerate.commands.launch ...` (no console script).
-        "accelerate/commands/launch.py":
-            "import sys\nfrom vi_rehearsal_stub import accelerate_main\n"
-            "if __name__ == '__main__':\n    sys.argv[1:1] = ['launch']\n    accelerate_main()\n"}, stub,
+        "accelerate/commands/launch.py": ACCELERATE_LAUNCH_PY}, stub,
            {"accelerate": "vi_rehearsal_stub:accelerate_main"})
     _wheel(out_dir, "omnivoice", {
         "omnivoice/__init__.py": "STUB = True\n",
