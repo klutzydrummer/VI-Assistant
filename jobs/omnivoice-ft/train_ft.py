@@ -22,8 +22,13 @@ Shipped defaults (parent's decisions, do not change):
     from scratch with seed + attempt, up to ``guard_attempts`` attempts,
   * ``mask_ratio_range = [0.5, 1.0]`` (biased upward so the prefix is not ignored),
   * ``prompt_ratio = 0``: no real audio prompt, the learned prefix occupies the prompt slot,
-  * ``batch_tokens = 8192`` per GPU, bf16, TF32, weight decay 0.01, max grad norm 1.0,
-    drop_cond_ratio 0.1, steps 5000, save every 500, keep all checkpoints.
+  * ``batch_tokens = 2048`` per GPU x ``gradient_accumulation_steps = 4``: 8192 tokens per
+    optimizer step, as before r25, but a micro-step's activations fit a 24 GB card (round 24:
+    8192 x 1 ran out of memory in the first forward). bf16, TF32, weight decay 0.01, max grad
+    norm 1.0, drop_cond_ratio 0.1, steps 5000 (optimizer steps), save every 500, keep all
+    checkpoints.
+  * the frozen KL reference is held in bf16 (r25 B2; the student stays fp32 under bf16
+    autocast); the KL itself is computed in fp32 (``_kl_to_reference`` casts both logits).
 
 Real run (needs the tokenised shards first; see README):
     accelerate launch --num_processes 1 train_ft.py \
@@ -45,6 +50,7 @@ import math
 import os
 import shutil
 import sys
+import warnings
 import torch
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -116,8 +122,8 @@ class FTTrainConfig:
     encoder_learning_rate: float = 1e-3
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
-    batch_tokens: int = 8192
-    gradient_accumulation_steps: int = 1
+    batch_tokens: int = FG.DEFAULT_BATCH_TOKENS
+    gradient_accumulation_steps: int = FG.DEFAULT_GRAD_ACCUM
     lr_scheduler_type: str = "cosine"
     warmup_type: str = "ratio"
     warmup_ratio: float = 0.01
@@ -257,6 +263,75 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: FTTrainConfig):
     return get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup, num_training_steps=cfg.steps
     )
+
+
+# The KL reference's dtype (r25 B2). bf16 halves its 2.3 GB of weights. Under bf16 autocast its
+# matmuls already ran in bf16, so this changes mainly how its weights are stored;
+# _kl_to_reference casts both logits to fp32 before log_softmax, so the KL math stays fp32.
+KL_REFERENCE_DTYPE = torch.bfloat16
+
+
+def attach_kl_reference(model: StyleOmniVoice) -> StyleOmniVoice:
+    """Attach the frozen, grad-free Base snapshot for the KL term, its weights in
+    KL_REFERENCE_DTYPE. attach_reference's .to(dtype) also casts floating buffers, and a bf16
+    rotary inv_freq would shift every position's angle (about 0.4 % relative error); those buffers
+    go back to their own dtype, which is tiny next to the weights. Returns the reference."""
+    ref = StyleOmniVoice.reference_from(model)
+    buffer_dtypes = {name: b.dtype for name, b in ref.named_buffers()}
+    model.attach_reference(ref, dtype=KL_REFERENCE_DTYPE)
+    for module_name, module in ref.named_modules():
+        for name, b in list(module.named_buffers(recurse=False)):
+            full = f"{module_name}.{name}" if module_name else name
+            if b is not None and b.dtype != buffer_dtypes[full]:
+                module._buffers[name] = b.to(buffer_dtypes[full])
+    return ref
+
+
+def _print_vram_peak_after_first_step(optimizer: torch.optim.Optimizer) -> None:
+    """r25: print the CUDA peak once, right after the first optimizer step (when the gradients and
+    the Adam state first exist). A post-step hook on our own optimizer, which accelerate's wrapper
+    calls; nothing is printed without CUDA."""
+    def hook(opt, args, kwargs):
+        handle.remove()
+        line = FG.vram_peak_line(torch.cuda, "after the first optimizer step")
+        if line:
+            print(line, flush=True)
+
+    handle = optimizer.register_step_post_hook(hook)
+
+
+def _report_sdpa_warnings_in_first_forward(model: torch.nn.Module) -> None:
+    """r25 B4 diagnostic: record the warnings the first training forward raises (the student and
+    the KL reference forward both run inside it) and print one "train_ft: sdpa-mask-warning:" line
+    about attention kernels, or "none". The recorded warnings are shown again afterwards, so
+    nothing is hidden, and nothing changes which kernel runs. A forward that raises (an OOM)
+    restores the warning filters through the OOM path's normal exit; no line is printed then."""
+    state: Dict[str, Any] = {}
+
+    def pre(module, args, kwargs):
+        if not module.training:
+            return None
+        pre_handle.remove()
+        ctx = warnings.catch_warnings(record=True)
+        state["records"] = ctx.__enter__()
+        state["ctx"] = ctx
+        warnings.simplefilter("always")
+        return None
+
+    def post(module, args, kwargs, output):
+        if "ctx" not in state:
+            return None
+        post_handle.remove()
+        ctx, records = state.pop("ctx"), state.pop("records")
+        ctx.__exit__(None, None, None)
+        for line in FG.sdpa_mask_warning_lines(records):
+            print(line, flush=True)
+        for w in records:
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno)
+        return None
+
+    pre_handle = model.register_forward_pre_hook(pre, with_kwargs=True)
+    post_handle = model.register_forward_hook(post, with_kwargs=True)
 
 
 def _build_data(cfg: FTTrainConfig, seed: int, tokenizer) -> ft_data.DataBundle:
@@ -469,9 +544,11 @@ def _run_training_once(
 
     # Frozen Base snapshot for the KL term (not a submodule: never in state_dict/DDP/checkpoints).
     if cfg.kl_weight > 0:
-        model.attach_reference(StyleOmniVoice.reference_from(model))
+        attach_kl_reference(model)
 
     optimizer = build_optimizer(model, cfg)
+    _print_vram_peak_after_first_step(optimizer)
+    _report_sdpa_warnings_in_first_forward(model)
     scheduler = build_scheduler(optimizer, cfg)
     trainer_config = _build_trainer_config(cfg, attempt_seed)
 
@@ -611,8 +688,10 @@ def _add_common(ap: argparse.ArgumentParser):
     ap.add_argument("--encoder-lr", type=float, default=1e-3, help="style-encoder lr (higher by design; 5e-3 collapsed the tiny probe)")
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
-    ap.add_argument("--batch-tokens", type=int, default=8192)
-    ap.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    ap.add_argument("--batch-tokens", type=int, default=FG.DEFAULT_BATCH_TOKENS,
+                    help="tokens per micro-batch per GPU")
+    ap.add_argument("--gradient-accumulation-steps", type=int, default=FG.DEFAULT_GRAD_ACCUM,
+                    help="micro-batches per optimizer step (--steps counts optimizer steps)")
     ap.add_argument("--lr-scheduler", default="cosine", choices=["cosine", "constant"])
     ap.add_argument("--warmup-ratio", type=float, default=0.01)
     ap.add_argument("--mask-ratio-range", type=float, nargs=2, default=(0.5, 1.0))
@@ -707,6 +786,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # torch's own first line plus the device's free/reserved/allocated memory, on stderr and
         # in oom.json (r23: dbg3's OOM left no figures to tell why 24 GiB ran out); exit 76.
         return FG.report_oom(cfg.output_dir, _PROGRESS["micro_step"], cfg.batch_tokens, e, torch.cuda)
+    line = FG.vram_peak_line(torch.cuda, "end of training")
+    if line:
+        print(line)
     if torch.cuda.is_available():
         # The preflight gate reads this line (fail above 90 % of the device).
         total = torch.cuda.get_device_properties(0).total_memory

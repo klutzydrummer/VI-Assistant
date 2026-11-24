@@ -14,6 +14,7 @@ script's own wiring, and style-slot inference with the 3-branch CFG (tokens-only
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import shutil
@@ -67,7 +68,7 @@ def _state_equal(a, b) -> bool:
 def _tiny_cfg(out: str, **kw) -> TF.FTTrainConfig:
     base = dict(
         output_dir=out, synthetic=True, batch_size=8, logging_steps=10**9, seed=0,
-        kl_weight=0.0, guard=False, mixed_precision="no",
+        kl_weight=0.0, guard=False, mixed_precision="no", gradient_accumulation_steps=1,
     )
     base.update(kw)
     return TF.FTTrainConfig(**base)
@@ -217,7 +218,9 @@ def test_shipped_defaults_are_pinned():
     assert cfg.prompt_ratio == 0.0
     assert cfg.kl_weight == 1.0
     assert cfg.guard is True
-    assert cfg.batch_tokens == 8192
+    # r25 B1: 2048 tokens per micro-batch x 4 accumulation, the same 8192 per optimizer step
+    assert cfg.batch_tokens == 2048
+    assert cfg.gradient_accumulation_steps == 4
     assert TF._resolved_mixed_precision(cfg) in ("bf16", "no")
 
 
@@ -273,8 +276,10 @@ def test_kl_guard_uses_public_replay_rows(tmp_path):
     rows = _read_jsonl(os.path.join(out, "style_metrics.jsonl"))
     assert rows, "no metrics written"
     assert all("loss/kl" in r for r in rows)
-    assert rows[0]["loss/kl"] == 0.0, rows[0]  # reference snapshot == model before any update
-    assert rows[-1]["loss/kl"] > 0.0, rows[-1]  # after the update the frozen Base differs
+    # The reference snapshot equals the model before any update; r25 stores it in bf16, so the
+    # first KL is bf16 rounding only (measured 3.4e-7 on this tiny model; 4e-4 by step 3).
+    assert rows[0]["loss/kl"] < 1e-5, rows[0]
+    assert rows[-1]["loss/kl"] > 10 * rows[0]["loss/kl"], rows  # after the update the Base differs
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +290,10 @@ def test_kl_guard_uses_public_replay_rows(tmp_path):
 def test_kill_then_resume_restores_full_state(tmp_path):
     run_a = str(tmp_path / "a")
     run_c = str(tmp_path / "c")
+    # accum 1: kill_at_step counts micro-steps, and this test is about resume, not accumulation
     base = dict(synthetic=True, steps=6, save_steps=3, batch_size=8, logging_steps=10**9,
-                seed=0, kl_weight=0.0, guard=False, mixed_precision="no")
+                seed=0, kl_weight=0.0, guard=False, mixed_precision="no",
+                gradient_accumulation_steps=1)
 
     with pytest.raises(TF.SimulatedKill):
         TF.run_training(TF.FTTrainConfig(output_dir=run_a, kill_at_step=5, **base))
@@ -543,7 +550,7 @@ def test_train_ft_too_few_batches(tmp_path):
     cfgp = tmp_path / "data.json"
     cfgp.write_text(json.dumps({"train": [{"manifest_path": [str(lst)], "repeat": 1}]}))
     cfg = _tiny_cfg(str(tmp_path / "run"), synthetic=False, data_config=str(cfgp))
-    with pytest.raises(ValueError, match="expected 1 batch per epoch, need at least 50"):
+    with pytest.raises(ValueError, match=r"expected 1 batch per epoch at batch_tokens \d+, need at least 50"):
         TF._run_training_once(cfg, 0, 0, [])
 
 
@@ -573,6 +580,153 @@ def test_train_ft_oom_exit_76(tmp_path, monkeypatch, capsys):
     assert "train_ft: torch: CUDA out of memory (test)" in err
     assert "train_ft: cuda memory at the OOM:" in err
     assert info["error"] == "CUDA out of memory (test)" and "max_memory_reserved" in info
+
+
+def _with_replay(monkeypatch, fraction):
+    """main() with synthetic replay rows (the CLI has no flag for it), so the KL term runs."""
+    real = TF.config_from_args
+    monkeypatch.setattr(TF, "config_from_args",
+                        lambda a: replace(real(a), synthetic_replay_fraction=fraction))
+
+
+def _llm_class():
+    return type(S.build_model(seed=0).llm)
+
+
+def _oom_in_llm(monkeypatch, which):
+    """Make the backbone (the student's llm or the KL reference's) raise a CUDA OOM in its first
+    training-time forward. The reference is the bf16 copy; the student is the one with grads."""
+    cls = _llm_class()
+    real = cls.forward
+
+    def forward(self, *a, **k):
+        is_ref = next(self.parameters()).dtype == torch.bfloat16
+        if (which == "reference" and is_ref) or (which == "student" and torch.is_grad_enabled()
+                                                 and self.training):
+            raise torch.cuda.OutOfMemoryError(f"CUDA out of memory ({which} test)")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(cls, "forward", forward)
+
+
+@pytest.mark.parametrize("which,where", [("student", "student forward"),
+                                         ("reference", "kl reference forward")])
+def test_r25_oom_json_keeps_the_traceback(tmp_path, monkeypatch, capsys, which, where):
+    # base: oom.json had the message only, so the two cases looked the same
+    _oom_in_llm(monkeypatch, which)
+    _with_replay(monkeypatch, 1.0)
+    out = str(tmp_path / "run")
+    rc = TF.main(["--synthetic", "--output-dir", out, "--steps", "3", "--save-steps", "100",
+                  "--batch-size", "4", "--mixed-precision", "no", "--kl-weight", "1",
+                  "--no-collapse-guard"])
+    assert rc == 76
+    info = json.load(open(os.path.join(out, "oom.json")))
+    assert info["where"] == where, info
+    assert any(f.endswith(" in forward") and "style_omnivoice.py" in f for f in info["traceback"])
+    assert any(f.endswith(" in _kl_to_reference") for f in info["traceback"]) == (which == "reference")
+    err = capsys.readouterr().err
+    assert f"train_ft: oom in {where}: " in err
+
+
+def test_r25_kl_reference_is_bf16_grad_free_and_the_kl_is_fp32(tmp_path, monkeypatch):
+    # base: the reference was attached without a dtype, so it stayed fp32
+    import torch.nn.functional as F
+    seen = []
+    real = F.log_softmax
+
+    def log_softmax(x, *a, **k):
+        seen.append(x.dtype)
+        return real(x, *a, **k)
+
+    monkeypatch.setattr(F, "log_softmax", log_softmax)
+    cfg = _tiny_cfg(str(tmp_path / "run"), steps=2, save_steps=10**9, logging_steps=1,
+                    kl_weight=1.0, synthetic_replay_fraction=1.0)
+    _, model = TF.run_training(cfg)
+    ref = model._ref_holder[0]
+    assert {p.dtype for p in ref.parameters()} == {torch.bfloat16}
+    assert not any(p.requires_grad for p in ref.parameters()) and not ref.training
+    # floating buffers (the rotary inv_freq) stay fp32: a bf16 copy would shift positions
+    assert {b.dtype for b in ref.buffers() if b.is_floating_point()} == {torch.float32}
+    # the student is untouched: fp32, trainable
+    assert {p.dtype for p in model.parameters()} == {torch.float32}
+    assert any(p.requires_grad for p in model.parameters())
+    # every log_softmax (the KL's two and the CE's) saw fp32 logits
+    assert seen and set(seen) == {torch.float32}, set(seen)
+    rows = _read_jsonl(os.path.join(cfg.output_dir, "style_metrics.jsonl"))
+    assert all(math.isfinite(r["loss/kl"]) for r in rows), rows
+
+
+class _FakeCuda:
+    def is_available(self):
+        return True
+
+    def max_memory_allocated(self):
+        return int(15.25 * 2**30)
+
+    def max_memory_reserved(self):
+        return 16 * 2**30
+
+
+def test_r25_vram_peak_lines_and_sdpa_line_in_the_real_run(tmp_path, monkeypatch, capsys):
+    # base: no peak line after the first optimizer step or at the end, no sdpa line
+    import ft_guards as FG
+    real = FG.vram_peak_line
+    monkeypatch.setattr(FG, "vram_peak_line", lambda cuda, when: real(_FakeCuda(), when))
+    _with_replay(monkeypatch, 0.5)
+    out = str(tmp_path / "run")
+    rc = TF.main(["--synthetic", "--output-dir", out, "--steps", "3", "--save-steps", "100",
+                  "--batch-size", "4", "--mixed-precision", "no", "--kl-weight", "1",
+                  "--no-collapse-guard"])
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    peaks = [l for l in lines if l.startswith("train_ft: vram peak: ")]
+    assert peaks == [
+        "train_ft: vram peak: allocated 15.25 GiB reserved 16.00 GiB (after the first optimizer step)",
+        "train_ft: vram peak: allocated 15.25 GiB reserved 16.00 GiB (end of training)"], peaks
+    sdpa = [l for l in lines if l.startswith("train_ft: sdpa-mask-warning: ")]
+    assert len(sdpa) == 1, sdpa
+
+
+def test_r25_no_vram_peak_line_without_cuda(tmp_path, capsys):
+    out = str(tmp_path / "run")
+    assert TF.main(["--synthetic", "--output-dir", out, "--steps", "1", "--save-steps", "100",
+                    "--batch-size", "4", "--mixed-precision", "no", "--kl-weight", "0",
+                    "--no-collapse-guard"]) == 0
+    assert "vram peak" not in capsys.readouterr().out
+
+
+def test_r25_accumulation_counts_optimizer_steps(tmp_path, monkeypatch):
+    # --steps counts optimizer steps: 3 steps at accumulation 4 are 12 micro-batches, the
+    # optimizer and the scheduler move 3 times and checkpoint-3 is written, so the tokens per
+    # optimizer step (and the LR schedule over the run) are what they were at 8192 x 1.
+    made = {}
+    real_opt, real_sched = TF.build_optimizer, TF.build_scheduler
+
+    def build_optimizer(model, cfg):
+        opt = made["opt"] = real_opt(model, cfg)
+        made["opt_steps"] = 0
+
+        def count(*_):
+            made["opt_steps"] += 1
+
+        opt.register_step_post_hook(count)
+        return opt
+
+    def build_scheduler(opt, cfg):
+        made["sched"] = real_sched(opt, cfg)
+        return made["sched"]
+
+    monkeypatch.setattr(TF, "build_optimizer", build_optimizer)
+    monkeypatch.setattr(TF, "build_scheduler", build_scheduler)
+    out = str(tmp_path / "run")
+    cfg = _tiny_cfg(out, steps=3, save_steps=3, logging_steps=1, gradient_accumulation_steps=4)
+    TF.run_training(cfg)
+    rows = _read_jsonl(os.path.join(out, "style_metrics.jsonl"))
+    assert [r["micro_step"] for r in rows] == list(range(1, 13))
+    assert made["opt_steps"] == 3
+    assert made["sched"].last_epoch == 3
+    assert os.path.isdir(os.path.join(out, "checkpoint-3"))
+    assert not os.path.isdir(os.path.join(out, "checkpoint-12"))
 
 
 def test_train_ft_resume_allows_equal_product(tmp_path):

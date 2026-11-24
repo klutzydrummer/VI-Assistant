@@ -327,7 +327,7 @@ def run_check(args) -> dict:
     # (c) forward + backward, opt-in.
     if args.forward:
         batch = next((b for b in batches if bool(b["style_slot"].any())), batches[0])
-        model.attach_reference(TF.StyleOmniVoice.reference_from(model))
+        TF.attach_kl_reference(model)  # the worker's bf16 reference (r25 B2)
         model.train()
         out = model(**batch)
         loss = out.loss
