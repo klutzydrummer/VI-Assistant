@@ -740,3 +740,110 @@ def test_train_ft_resume_allows_equal_product(tmp_path):
     bad = replace(ok, gradient_accumulation_steps=1)
     with pytest.raises(SystemExit, match="product"):
         TF._check_resume_config(bad)
+
+
+# ---------------------------------------------------------------------------
+# r26: the KL reference forward runs only on the KL rows (the public replay rows)
+# ---------------------------------------------------------------------------
+
+
+def _full_batch_kl(model, logits, labels, input_ids, audio_mask, attention_mask, style_slot, kl_mask):
+    """The e05a3d4 _kl_to_reference: the reference forward over the WHOLE batch (test oracle)."""
+    import torch.nn.functional as F
+    ref = model._ref_holder[0]
+    B, C, S_, V = logits.shape
+    dev = logits.device
+    keep = ~style_slot if style_slot is not None else torch.ones(B, S_, dtype=torch.bool, device=dev)
+    base_mask = attention_mask if attention_mask is not None else torch.ones(B, 1, S_, S_, dtype=torch.bool, device=dev)
+    ref_mask = base_mask & keep[:, None, None, :]
+    ref_pos = (keep.long().cumsum(-1) - 1).clamp(min=0)
+    sel = labels != -100
+    if kl_mask is not None:
+        sel = sel & kl_mask.view(B, 1, 1)
+    pos_any = sel.any(1)
+    if not bool(pos_any.any()):
+        return logits.new_zeros(())
+    with torch.no_grad():
+        embeds = ref._prepare_embed_inputs(input_ids, audio_mask).to(next(ref.parameters()).dtype)
+        hidden = ref.llm(inputs_embeds=embeds, attention_mask=ref_mask, position_ids=ref_pos, return_dict=True)[0]
+        ref_lp = F.log_softmax(ref.audio_heads(hidden[pos_any]).view(-1, C, V).float(), dim=-1)
+    sel_m = sel.permute(0, 2, 1)[pos_any]
+    mdl_lp = F.log_softmax(logits.permute(0, 2, 1, 3)[pos_any].float(), dim=-1)
+    kl = (ref_lp.exp() * (ref_lp - mdl_lp)).sum(-1)
+    layer_means = (kl * sel_m).sum(0) / sel_m.sum(0).clamp(min=1).float()
+    return (layer_means * torch.tensor(model.normalized_audio_codebook_weights, device=dev)).sum()
+
+
+def _r26_model_and_batch(kl_rows):
+    """Tiny student + bf16 reference (as train_ft attaches it) and one 6-row batch whose kl_mask
+    is set by hand; rows outside kl_rows keep whatever style slot the processor gave them."""
+    random.seed(0)
+    torch.manual_seed(0)
+    model = S.build_model(seed=0)
+    TF.attach_kl_reference(model)
+    model.configure_training(kl_weight=1.0, style_aux_weight=1.0)
+    model.train()
+    _, _, loader = S.build_loader(batch_size=6, seed=0, replay_fraction=0.5)
+    batch = next(iter(loader))
+    batch["kl_mask"] = torch.tensor([i in kl_rows for i in range(6)])
+    ref_rows = []
+    model._ref_holder[0].llm.register_forward_pre_hook(
+        lambda m, a, k: ref_rows.append(k["inputs_embeds"].shape[0]), with_kwargs=True)
+    return model, batch, ref_rows
+
+
+@pytest.mark.parametrize("kl_rows", [(1, 4), (0, 1, 2, 3, 4, 5)], ids=["mixed", "all"])
+def test_r26_sliced_kl_equals_the_whole_batch_kl(kl_rows):
+    # base: the reference forward ran on all 6 rows (ref_rows == [6])
+    model, batch, ref_rows = _r26_model_and_batch(kl_rows)
+    out = model(**batch)
+    assert ref_rows == [len(kl_rows)], ref_rows
+    assert model._kl_rows == (len(kl_rows), 6)
+    want = _full_batch_kl(model, out.logits, batch["labels"], batch["input_ids"], batch["audio_mask"],
+                          batch["attention_mask"], batch.get("style_slot"), batch["kl_mask"])
+    assert float(want.detach()) > 0
+    torch.testing.assert_close(out.kl_loss.detach(), want.detach(), rtol=1e-4, atol=1e-6)
+
+
+def test_r26_no_kl_rows_returns_zero_without_touching_the_reference(monkeypatch):
+    # base: same zero and no forward, but nothing recorded the row counts (no _kl_rows)
+    model, batch, ref_rows = _r26_model_and_batch(())
+    ref = model._ref_holder[0]
+    touched = []
+    monkeypatch.setattr(ref, "to", lambda *a, **k: touched.append("to"))
+    monkeypatch.setattr(ref, "_prepare_embed_inputs", lambda *a, **k: touched.append("embed"))
+    out = model(**batch)
+    assert ref_rows == [] and touched == []
+    assert model._kl_rows == (0, 6)
+    kl = out.kl_loss
+    assert float(kl) == 0.0 and kl.shape == () and kl.dtype == out.logits.dtype
+    assert not kl.requires_grad
+
+
+def test_r26_kl_gradient_reaches_the_student_only():
+    # base: gradients were the same, but the reference forward still ran on all 6 rows
+    model, batch, ref_rows = _r26_model_and_batch((2, 5))
+    out = model(**batch)
+    assert ref_rows == [2]
+    out.kl_loss.backward()
+    grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+    assert grads and any(float(g.abs().sum()) > 0 for g in grads)
+    assert all(p.grad is None for p in model._ref_holder[0].parameters())
+
+
+def test_r26_kl_rows_line_per_optimizer_step(tmp_path, capsys):
+    # base: no "train_ft: kl-rows:" line at all
+    cfg = _tiny_cfg(str(tmp_path / "run"), steps=3, save_steps=10**9, logging_steps=1,
+                    kl_weight=1.0, synthetic_replay_fraction=0.5, batch_size=4,
+                    gradient_accumulation_steps=2)
+    TF.run_training(cfg)
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("train_ft: kl-rows: ")]
+    rows = _read_jsonl(os.path.join(cfg.output_dir, "style_metrics.jsonl"))
+    assert len(rows) == 6
+    want = []
+    for i in range(0, 6, 2):
+        used = int(rows[i]["kl/rows_used"] + rows[i + 1]["kl/rows_used"])
+        total = int(rows[i]["kl/rows_total"] + rows[i + 1]["kl/rows_total"])
+        want.append(f"train_ft: kl-rows: used {used} of {total} rows (share {used / total:.3f})")
+    assert lines == want, (lines, want)
+    assert all(int(r["kl/rows_total"]) == 4 for r in rows)
