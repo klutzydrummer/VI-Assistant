@@ -12,6 +12,10 @@ Two local rehearsals live here. Neither rents anything or touches Vast.
   `pip install -r` succeeds offline. The stub Base download writes sparse files at the pinned
   weight sizes, which use no real disk. The `preflight` scenario still stops at `gpu_gate`, because
   that step needs a real torch and CUDA and there is no torch stub.
+  The stub `accelerate` launcher behaves like accelerate 1.16.0 on CPU (round 23): it runs the
+  script as a child process, prints the child's stderr live and again in a `CalledProcessError`,
+  exits 1 whatever the child's exit code was, and passes SIGTERM and SIGINT on to the child. Like
+  the real launcher it does not pass SIGKILL on, so the rehearsal kills the trainer's process group.
 - `vast-limits.sh` is the Vast-conditions gate described below. It is opt-in and is not in
   `run.sh`'s default scenario list or in GitHub CI, because it needs real clips and the 2 GB home
   CPU venv.
