@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "omnivoice-ft"))
@@ -168,6 +169,114 @@ class GuardTests(unittest.TestCase):
             self.assertIn("train_ft: GPU out of memory at micro-step 3, batch_tokens 4096", buf.getvalue())
             self.assertEqual(info["batch_tokens"], 4096)
             self.assertIsNone(info["mem_free"])
+
+
+class _FakeCuda:
+    """torch.cuda with fixed peaks: 20 GiB allocated, 23 GiB reserved."""
+
+    def is_available(self):
+        return True
+
+    def max_memory_allocated(self):
+        return 20 * 2**30
+
+    def max_memory_reserved(self):
+        return 23 * 2**30
+
+    def mem_get_info(self):
+        return (512 * 2**20, 24 * 2**30)
+
+
+# Stand-ins named like the real call chain: our forward calls the KL reference, whose own
+# forward runs out of memory; or our forward itself runs out.
+def _kl_to_reference():
+    raise RuntimeError("CUDA out of memory. Tried to allocate 1.00 GiB")
+
+
+def forward(kl):  # noqa: A001 - named like nn.Module.forward on purpose
+    if kl:
+        _kl_to_reference()
+    raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+
+class R25DiagnosticsTest(unittest.TestCase):
+    def test_r25_defaults_keep_8192_tokens_per_optimizer_step(self):
+        # base: there were no shared defaults (train_ft.py said 8192 x 1 in two places)
+        self.assertEqual(FG.DEFAULT_BATCH_TOKENS, 2048)
+        self.assertEqual(FG.DEFAULT_GRAD_ACCUM, 4)
+        self.assertEqual(FG.DEFAULT_BATCH_TOKENS * FG.DEFAULT_GRAD_ACCUM, 8192)
+
+    def _oom(self, kl):
+        try:
+            forward(kl)
+        except RuntimeError as e:
+            return e
+
+    def test_r25_oom_json_keeps_the_traceback_and_says_where(self):
+        # base: oom.json had only the message, so student and reference forward looked the same
+        for kl, where in ((True, "kl reference forward"), (False, "student forward")):
+            buf = io.StringIO()
+            with tempfile.TemporaryDirectory() as d, \
+                    unittest.mock.patch.object(FG, "_OUR_FILES", FG._OUR_FILES + ("test_ft_guards.py",)):
+                FG.report_oom(d, 0, 2048, self._oom(kl), _FakeCuda(), out=buf)
+                info = json.loads(Path(d, "oom.json").read_text())
+            self.assertEqual(info["where"], where)
+            self.assertTrue(any(f.endswith(" in forward") for f in info["traceback"]), info)
+            self.assertEqual(any(f.endswith(" in _kl_to_reference") for f in info["traceback"]), kl)
+            line = [l for l in buf.getvalue().splitlines() if l.startswith("train_ft: oom in ")]
+            self.assertEqual(len(line), 1, buf.getvalue())
+            self.assertTrue(line[0].startswith(f"train_ft: oom in {where}: test_ft_guards.py:"), line)
+            self.assertLessEqual(len(line[0]), 300)
+
+    def test_r25_oom_without_a_traceback(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            FG.report_oom(d, 0, 2048, RuntimeError("x"), _FakeCuda(), out=buf)
+            info = json.loads(Path(d, "oom.json").read_text())
+        self.assertEqual(info["where"], "unknown")
+        self.assertEqual(info["traceback"], [])
+        self.assertIn("train_ft: oom in unknown: no traceback", buf.getvalue())
+
+    def test_r25_oom_where_classifies_backward_and_optimizer(self):
+        self.assertEqual(FG.oom_where(["/x/torch/_tensor.py:1 in backward"]), "backward")
+        self.assertEqual(FG.oom_where(["/x/torch/optim/adamw.py:1 in step"]), "optimizer step")
+        self.assertEqual(FG.oom_where(["/x/lib.py:1 in forward"]), "other")
+
+    def test_r25_vram_peak_line(self):
+        line = FG.vram_peak_line(_FakeCuda(), "after the first optimizer step")
+        self.assertEqual(line, "train_ft: vram peak: allocated 20.00 GiB reserved 23.00 GiB "
+                               "(after the first optimizer step)")
+
+    def test_r25_vram_peak_line_does_not_feed_the_vram_gate(self):
+        # voicetune-fresh.sh's gate reads only "train_ft: vram peak X of Y GiB" lines.
+        import re
+        gate = re.compile(r"train_ft: vram peak [0-9.]+ of [0-9.]+ GiB")
+        self.assertIsNone(gate.search(FG.vram_peak_line(_FakeCuda(), "end of training")))
+
+    def test_r25_vram_peak_line_without_cuda(self):
+        class NoCuda:
+            def is_available(self):
+                return False
+
+        class Broken(_FakeCuda):
+            def max_memory_reserved(self):
+                raise RuntimeError("driver gone")
+
+        self.assertIsNone(FG.vram_peak_line(NoCuda(), "end of training"))
+        self.assertIsNone(FG.vram_peak_line(Broken(), "end of training"))
+
+    def test_r25_sdpa_mask_warning_lines(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as recs:
+            warnings.simplefilter("always")
+            warnings.warn("Memory efficient kernel not used because: attn_mask is a dense bool")
+            warnings.warn("Memory efficient kernel not used because: attn_mask is a dense bool")
+            warnings.warn("something about tokenizers")
+        self.assertEqual(FG.sdpa_mask_warning_lines(recs), [
+            "train_ft: sdpa-mask-warning: Memory efficient kernel not used because: attn_mask "
+            "is a dense bool"])
+        self.assertEqual(FG.sdpa_mask_warning_lines(recs[2:]), [
+            "train_ft: sdpa-mask-warning: none (no attention-kernel warning in the first forward)"])
 
 
 if __name__ == "__main__":

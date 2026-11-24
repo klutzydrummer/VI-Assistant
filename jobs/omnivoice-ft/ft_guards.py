@@ -12,6 +12,7 @@ import math
 import multiprocessing
 import os
 import sys
+import traceback
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 MIN_BATCHES_PER_EPOCH = 50
@@ -19,6 +20,13 @@ FRAMES_PER_SECOND = 25  # the Higgs audio tokenizer's frame rate (unverified her
 MAX_FAILED_FRACTION = 0.01
 MAX_FAILED_SAMPLES = 5
 OOM_EXIT_CODE = 76
+# The trainer's default micro-batch and accumulation (r25 B1): 2048 tokens x 4 micro-steps keeps the
+# 8192 tokens per optimizer step the run always had, while a micro-step's saved activations
+# (about 2.3 MiB per token, round 24's CPU measurement) drop from about 18.4 GiB to about 4.6 GiB.
+# train_ft.py's config and CLI defaults, and worker-job.sh's OOM halving when the flags are absent,
+# all read these two names; nothing else repeats the numbers.
+DEFAULT_BATCH_TOKENS = 2048
+DEFAULT_GRAD_ACCUM = 4
 _ERR_SLOTS = 3
 _ERR_BYTES = 240
 
@@ -192,7 +200,10 @@ def report_oom(output_dir: str, step: int, batch_tokens: int, err: BaseException
     (passed in so this stays torch-free and testable). Prints torch's own first line (what was
     being allocated and how much the process held) and the device's free, total, peak-reserved and
     peak-allocated memory, writes the same figures into oom.json, and returns OOM_EXIT_CODE.
-    Every CUDA query is guarded: on CPU, or with a failing driver, the figures are 0 or None."""
+    r25: the traceback is kept too, every frame in oom.json and one "train_ft: oom in ..." line
+    that says whether the student forward or the KL reference forward ran out (round 24 could
+    not tell, because only the message was kept). Every CUDA query is guarded: on CPU, or with
+    a failing driver, the figures are 0 or None."""
     out = sys.stderr if out is None else out
     on_cuda = bool(_cuda_query(cuda.is_available))
     peak = reserved = 0
@@ -211,9 +222,92 @@ def report_oom(output_dir: str, step: int, batch_tokens: int, err: BaseException
            else "free/total unknown")
     print(f"train_ft: cuda memory at the OOM: {mem}; max reserved {reserved / gib:.2f} GiB; "
           f"max allocated {peak / gib:.2f} GiB" + ("" if on_cuda else " (no CUDA device)"), file=out)
+    frames = oom_frames(err)
+    where = oom_where(frames)
+    print(f"train_ft: oom in {where}: {oom_frames_summary(frames)}"[:300], file=out)
     path = write_oom_json(output_dir, step, batch_tokens, peak, max_memory_reserved=reserved,
-                          mem_free=free, mem_total=total, error=first)
+                          mem_free=free, mem_total=total, error=first, where=where,
+                          traceback=frames)
     print(f"train_ft: GPU out of memory at micro-step {step}, batch_tokens {batch_tokens}; "
           f"wrote {path}; exit {OOM_EXIT_CODE}", file=out)
     out.flush()
     return OOM_EXIT_CODE
+
+
+# ---------------------------------------------------------------------------
+# r25 diagnostics: where an OOM happened, the peak memory, SDPA's mask warning
+# ---------------------------------------------------------------------------
+
+_OUR_FILES = ("style_omnivoice.py", "train_ft.py", "ft_data.py", "style_data.py", "style_encoder.py")
+
+
+def oom_frames(err: BaseException) -> List[str]:
+    """Every frame of err's traceback, outermost first, as "path:line in function"."""
+    tb = getattr(err, "__traceback__", None)
+    if tb is None:
+        return []
+    return [f"{f.filename}:{f.lineno} in {f.name}" for f in traceback.extract_tb(tb)]
+
+
+def _is_ours(frame: str) -> bool:
+    return os.path.basename(frame.split(":", 1)[0]) in _OUR_FILES
+
+
+def oom_where(frames: List[str]) -> str:
+    """Which part of the step ran out: the KL reference forward, the student forward, backward,
+    the optimizer step, or "unknown" (no traceback)."""
+    names = [f.rsplit(" in ", 1)[-1] for f in frames]
+    if "_kl_to_reference" in names:
+        return "kl reference forward"
+    if any(n == "forward" and _is_ours(f) for f, n in zip(frames, names)):
+        return "student forward"
+    if any(n in ("backward", "_engine_run_backward") for n in names):
+        return "backward"
+    if any(n == "step" for n in names):
+        return "optimizer step"
+    return "unknown" if not frames else "other"
+
+
+def oom_frames_summary(frames: List[str]) -> str:
+    """The innermost frame of all (the library op that asked for the memory), then up to four of
+    our own frames, innermost first; file basenames only, so it fits a 300-character key line."""
+    def short(f: str) -> str:
+        path, _, rest = f.partition(":")
+        return f"{os.path.basename(path)}:{rest}"
+    ours = [short(f) for f in reversed(frames) if _is_ours(f)]
+    last = short(frames[-1]) if frames else "no traceback"
+    if not ours:
+        return last
+    return f"{last} | ours: " + " < ".join(ours[:4])
+
+
+def vram_peak_line(cuda: Any, when: str) -> Optional[str]:
+    """"train_ft: vram peak: allocated X GiB reserved Y GiB (WHEN)" from the CUDA peak counters,
+    or None without CUDA (or when the driver query fails). ``cuda`` is torch.cuda. This line is
+    the diagnostic of r25; it is not the "train_ft: vram peak X of Y GiB" line that
+    voicetune-fresh.sh's VRAM gate parses, and the gate's regex does not match it."""
+    if not _cuda_query(cuda.is_available):
+        return None
+    alloc = _cuda_query(cuda.max_memory_allocated)
+    reserved = _cuda_query(cuda.max_memory_reserved)
+    if alloc is None or reserved is None:
+        return None
+    gib = 2.0 ** 30
+    return f"train_ft: vram peak: allocated {alloc / gib:.2f} GiB reserved {reserved / gib:.2f} GiB ({when})"
+
+
+_SDPA_WORDS = ("attention", "sdpa", "flash", "efficient", "kernel", "mask")
+
+
+def sdpa_mask_warning_lines(records: List[Any]) -> List[str]:
+    """B4 diagnostic: "train_ft: sdpa-mask-warning: ..." for each distinct warning recorded during
+    the first forward that is about attention kernels or masks, or one "none" line. ``records``
+    are warnings.WarningMessage objects; nothing here changes which kernel runs."""
+    seen: List[str] = []
+    for w in records:
+        text = " ".join(str(getattr(w, "message", w)).split())
+        if any(k in text.lower() for k in _SDPA_WORDS) and text not in seen:
+            seen.append(text)
+    if not seen:
+        return ["train_ft: sdpa-mask-warning: none (no attention-kernel warning in the first forward)"]
+    return [f"train_ft: sdpa-mask-warning: {t}"[:300] for t in seen]
