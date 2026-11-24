@@ -662,14 +662,15 @@ class Plan(DebugBase):
         self.assertIn("cap $3.00 for both rentals together", self.out)
 
     def test_debug_plan_describes_two_rentals_of_their_own_hours(self):
-        # r21 F2: 2 x 1.25 h; GPU worst case 2 x 1.25 h x $0.31 (max_dph) = $0.78, inside $1
+        # r21 F2: 2 x 1.25 h; r27: the repo config's max_dph is 0.60 (was 0.31), so the GPU worst
+        # case is 2 x 1.25 h x $0.60 = $1.50, inside the dbg6 cap of $1.75
         self.scen()
-        self.assertEqual(self.run_debug(plan=True, cap=1, max_hours=1.25), 0, self.out)
+        self.assertEqual(self.run_debug(plan=True, cap=1.75, max_hours=1.25), 0, self.out)
         self.assertIn("max hours       : 1.25 h per rental (2 x 1.25 h at most)", self.out)
-        self.assertIn("GPU $0.78 (2 rentals x 1.25 h x $0.310/hr max_dph, inside the $1.00 cap)",
+        self.assertIn("GPU $1.50 (2 rentals x 1.25 h x $0.600/hr max_dph, inside the $1.75 cap)",
                       self.out)
-        self.assertRegex(self.out, r"worst case      : \$\d\.\d\d total = GPU \$0\.78 \(.*\) "
-                                   r"\+ disk \$0\.\d\d")
+        self.assertRegex(self.out, r"worst case      : \$1\.93 total = GPU \$1\.50 \(.*\) "
+                                   r"\+ disk \$0\.43")
         self.assertNotIn("max hours (all)", self.out)
         self.assertIn("--plan: nothing was called", self.out)
         self.assertFalse((self.tmp / "any-call.log").exists(), "--plan called vi")
