@@ -33,7 +33,9 @@ New here:
 | `prompt_ratio` | `0` | the learned prefix replaces the real audio prompt |
 | `drop_cond_ratio` | `0.1` | upstream's value |
 | `style_drop_ratio` | `0.2` | independent prefix dropout for the text-only CFG branch |
-| `batch_tokens` | `8192` | per GPU |
+| `batch_tokens` | `2048` | per GPU micro-batch (r25; was 8192, which ran out of memory on 24 GB) |
+| `gradient_accumulation_steps` | `4` | so an optimizer step still sees 8192 tokens; `steps` counts optimizer steps. Both defaults live in `ft_guards.py` alone |
+| KL reference | bf16, frozen, no gradients | the KL itself is computed in fp32; the student stays fp32 under bf16 autocast |
 | `batch`/optim | bf16, TF32, weight decay 0.01, max grad norm 1.0, cosine schedule | primer's `train_config_finetune.json` |
 | collapse guard | ON | probe, fire rule, restart with `seed + attempt`, max 3 attempts |
 
