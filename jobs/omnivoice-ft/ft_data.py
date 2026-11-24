@@ -188,7 +188,7 @@ def build_shard_bundle(
     data_config: str,
     tokenizer: Any,
     *,
-    batch_tokens: int = 8192,
+    batch_tokens: int = FG.DEFAULT_BATCH_TOKENS,
     min_sample_tokens: int = 50,
     max_sample_tokens: int = 2000,
     max_batch_size: int = 64,
