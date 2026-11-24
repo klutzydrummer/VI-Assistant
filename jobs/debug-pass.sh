@@ -16,8 +16,9 @@
 #    6 tokenise     the real tokenise() on the small train and dev slice
 #    7 cuda-load    gpu_gate, then replay_public.py loads Base on cuda and writes the replay set,
 #                   which is tokenised: this is what the KL reference reads
-#    8 train-steps  5 real steps through the accelerate launcher at the trainer's default
-#                   batch_tokens with the KL reference on, then the VRAM peak
+#    8 train-steps  5 real steps through the accelerate launcher at the trainer's default batch
+#                   (the real run's: 2048 tokens x 4 accumulation, from ft_guards.py) with the
+#                   KL reference on, then the VRAM peak, the r25 peak lines and SDPA's warning
 #    9 ckpt-push    publish checkpoint-5 and push it home through the receiver (home verifies it)
 #   10 listening    infer_listening.py writes a small labelled listening set into the stage
 #                   output, which comes home with it; for a person to listen to, never scored
@@ -143,7 +144,7 @@ PY
   echo "accelerate launcher (python -m accelerate.commands.launch): ok"
   "$PY" -m omnivoice.scripts.extract_audio_tokens --help >/dev/null
   echo "tokeniser entry point (python -m omnivoice.scripts.extract_audio_tokens --help): ok"
-  for f in train_ft.py ft_data.py infer_listening.py replay_public.py fetch_base_model.py; do
+  for f in train_ft.py ft_guards.py ft_data.py infer_listening.py replay_public.py fetch_base_model.py; do
     "$PY" -m py_compile "$jobs_dir/omnivoice-ft/$f"
   done
   echo "worker scripts compile: ok"
@@ -212,8 +213,10 @@ stage_8() {
   rm -rf "$probe_run"
   mkdir -p "$probe_run"
   local rc=0
-  # The trainer's default batch_tokens and KL weight (the real run's), 5 steps. The minimum
-  # batches-per-epoch guard is off only because the debug slice is deliberately small.
+  # The trainer's default batch and KL weight, 5 optimizer steps. No batch flags: the real run
+  # passes none either, so both use train_ft.py's defaults (ft_guards.DEFAULT_BATCH_TOKENS and
+  # DEFAULT_GRAD_ACCUM). The minimum batches-per-epoch guard is off only because the debug
+  # slice is deliberately small.
   # Teed live into the stage log, so a stage cut off by its limit still shows how far it got.
   PYTHONUNBUFFERED=1 "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
     --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \
@@ -223,6 +226,9 @@ stage_8() {
   [ "$rc" = 0 ] || train_failed 08 "$rc"
   [ -f "$probe_run/checkpoint-5/SHA256SUMS" ] || { echo "no checkpoint-5 with SHA256SUMS" >&2; exit 1; }
   grep -E 'kl|KL|replay' "$probe_run/train.log" | tail -n 3 || true
+  # r25 diagnostics: the CUDA peak after the first optimizer step and at the end, and whether
+  # SDPA warned about the dense attention mask in the first forward.
+  grep -aE 'train_ft: (vram peak: |sdpa-mask-warning: )' "$probe_run/train.log" | tail -n 4 || true
   vram_peak_gate "$probe_run/train.log"
 }
 

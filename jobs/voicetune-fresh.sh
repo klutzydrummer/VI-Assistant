@@ -762,11 +762,12 @@ preflight() {
   tokenise_smoke
   prepare_data
 
-  # Five real steps at the full batch (--steps 5 --save-steps 5 writes checkpoint-5), published
+  # Five real optimizer steps at the default batch (--steps 5 --save-steps 5 writes checkpoint-5), published
   # and pushed home as an end-to-end integrity proof, timed for the record. The Qwen3 loadbench
   # and push-rate gate are gone: they were voicetune.py internals with no OmniVoice counterpart.
-  # The probe uses the trainer's default batch, the same one train() runs, so it is the largest
-  # batch the real run will see; its log carries the VRAM peak line the gate reads.
+  # The probe uses the trainer's default batch (r25: 2048 tokens x 4 accumulation, from
+  # ft_guards.py), the same one train() runs, so its micro-batch is the largest the real run
+  # will see; its log carries the VRAM peak line the gate reads.
   mkdir -p "$probe_run"
   "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "$jobs_dir/omnivoice-ft/train_ft.py" \
     --init-from "$VI_BASE_MODEL" --data-config "$data_dir/data_config.json" \

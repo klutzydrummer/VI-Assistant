@@ -844,6 +844,63 @@ class DriverScript(unittest.TestCase):
         self.assertTrue((self.out / "debug" / "08-train.log").exists())
         self.assertFalse((self.out / "debug" / "08-oom.json").exists())
 
+    def _r25_trainer_body(self, args_log):
+        """A stage 8 trainer that records its arguments, writes checkpoint-5 and prints the r25
+        diagnostic lines and the VRAM gate line the way train_ft.py does."""
+        ck = self.probe_run / "checkpoint-5"
+        return (f"echo \"$*\" >'{args_log}'; mkdir -p '{ck}'; touch '{ck}/SHA256SUMS'; "
+                "echo 'train_ft: sdpa-mask-warning: none (no attention-kernel warning in the first forward)'; "
+                "echo 'train_ft: vram peak: allocated 15.10 GiB reserved 16.00 GiB (after the first optimizer step)'; "
+                "echo 'train_ft: vram peak: allocated 15.20 GiB reserved 16.00 GiB (end of training)'; "
+                "echo 'train_ft: vram peak 15.20 of 23.60 GiB'")
+
+    def test_r25_stage8_shows_the_peak_and_sdpa_lines_after_the_trainer(self):
+        # base: stage 8 grepped only the kl lines; the r25 lines were lost in the trainer's tee
+        args_log = self.tmp / "args"
+        self.fake_venv(self._r25_trainer_body(args_log))
+        res = self.run_driver("8", needs='NEEDS=([8]="")')
+        self.assertEqual(res[8]["result"], "PASS", self.output)
+        log = (self.out / "debug" / "08-train-steps.log").read_text()
+        gate = log.index("preflight: vram peak 15.20 of 23.60 GiB (limit 90 %)")
+        for line in ("train_ft: sdpa-mask-warning: none", "(after the first optimizer step)",
+                     "(end of training)"):
+            self.assertEqual(log.count(line), 2, log)  # the trainer's own, and the stage's summary
+            self.assertLess(log.rindex(line), gate, log)
+
+    def test_r25_stage8_uses_the_same_batch_as_the_real_run(self):
+        # Stage 8, the preflight probe and the real run pass no batch flags, so all three run
+        # train_ft.py's defaults, which come from ft_guards.py alone (base: literals 8192 and 1
+        # in train_ft.py's config and its CLI).
+        args_log = self.tmp / "args"
+        self.fake_venv(self._r25_trainer_body(args_log))
+        self.run_driver("8", needs='NEEDS=([8]="")')
+        stage8_args = args_log.read_text()
+        self.assertIn("train_ft.py", stage8_args)
+        vt = (JOBS / "voicetune-fresh.sh").read_text()
+        real = vt[vt.index('"$jobs_dir/worker-job.sh" --work'):]
+        real = real[:real.index("8>&- &")]
+        self.assertIn("train_ft.py", real)
+        for text in (stage8_args, real):
+            self.assertNotIn("--batch-tokens", text)
+            self.assertNotIn("--gradient-accumulation-steps", text)
+        import ast
+        tree = ast.parse((JOBS / "omnivoice-ft" / "train_ft.py").read_text())
+        defaults = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") in (
+                    "batch_tokens", "gradient_accumulation_steps"):
+                defaults["cfg." + node.target.id] = ast.unparse(node.value)
+            if (isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "add_argument"
+                    and node.args and getattr(node.args[0], "value", "") in (
+                        "--batch-tokens", "--gradient-accumulation-steps")):
+                kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
+                defaults[node.args[0].value] = kw.get("default")
+        self.assertEqual(defaults, {
+            "cfg.batch_tokens": "FG.DEFAULT_BATCH_TOKENS",
+            "cfg.gradient_accumulation_steps": "FG.DEFAULT_GRAD_ACCUM",
+            "--batch-tokens": "FG.DEFAULT_BATCH_TOKENS",
+            "--gradient-accumulation-steps": "FG.DEFAULT_GRAD_ACCUM"})
+
     def test_f2_no_time_left_is_skip_no_time_not_run(self):
         # 0.2 h left minus a 700 s margin leaves 20 s, under stage 3's minimum
         res = self.run_driver("3", VI_HOURS_LEFT="0.2", VI_DEBUG_MARGIN_SECONDS="700")
