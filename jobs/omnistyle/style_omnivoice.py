@@ -525,34 +525,41 @@ class StyleOmniVoice(OmniVoice):
         """KL(p_ref || p_model) at masked (label != -100) positions, codebook-weighted like the CE.
 
         The reference is the original model.  It never saw the style slot, so the slot positions are
-        removed from its view (key columns masked out, positions renumbered).  Only the masked
-        positions go through the output head and the softmax.
+        removed from its view (key columns masked out, positions renumbered).  The reference forward
+        runs only on the rows that take part in the KL (kl_mask rows with a masked position, i.e. the
+        public replay rows); every row attends only to itself, so this gives the same KL as a
+        whole-batch forward.  Only the masked positions go through the output head and the softmax.
+        Sets ``self._kl_rows = (rows used, rows in the batch)`` as Python ints for the log line.
         """
-        ref = self._ref_holder[0]
-        dev = logits.device
-        if next(ref.parameters()).device != dev:
-            ref.to(dev)
         B, C, S, V = logits.shape
-        keep = ~style_slot if style_slot is not None else torch.ones(B, S, dtype=torch.bool, device=dev)
-        base_mask = attention_mask if attention_mask is not None else torch.ones(B, 1, S, S, dtype=torch.bool, device=dev)
-        ref_mask = base_mask & keep[:, None, None, :]
-        ref_pos = (keep.long().cumsum(-1) - 1).clamp(min=0)
-
+        dev = logits.device
         sel = labels != -100  # [B,C,S]
         if kl_mask is not None:
             sel = sel & kl_mask.view(B, 1, 1)
-        pos_any = sel.any(1)  # [B,S]
-        if not bool(pos_any.any()):
+        rows = sel.flatten(1).any(1).nonzero().squeeze(1)  # [U] the one host sync, as before
+        self._kl_rows = (int(rows.numel()), int(B))
+        if rows.numel() == 0:
             return logits.new_zeros(())
+
+        ref = self._ref_holder[0]
+        if next(ref.parameters()).device != dev:
+            ref.to(dev)
+        U = rows.numel()
+        sel = sel[rows]
+        keep = ~style_slot[rows] if style_slot is not None else torch.ones(U, S, dtype=torch.bool, device=dev)
+        base_mask = attention_mask[rows] if attention_mask is not None else torch.ones(U, 1, S, S, dtype=torch.bool, device=dev)
+        ref_mask = base_mask & keep[:, None, None, :]
+        ref_pos = (keep.long().cumsum(-1) - 1).clamp(min=0)
+        pos_any = sel.any(1)  # [U,S]
 
         with torch.no_grad():
             ref_dtype = next(ref.parameters()).dtype
-            embeds = ref._prepare_embed_inputs(input_ids, audio_mask).to(ref_dtype)
+            embeds = ref._prepare_embed_inputs(input_ids[rows], audio_mask[rows]).to(ref_dtype)
             hidden = ref.llm(inputs_embeds=embeds, attention_mask=ref_mask, position_ids=ref_pos, return_dict=True)[0]
             ref_logits = ref.audio_heads(hidden[pos_any]).view(-1, C, V).float()  # [M,C,V]
             ref_lp = F.log_softmax(ref_logits, dim=-1)
         sel_m = sel.permute(0, 2, 1)[pos_any]  # [M,C]
-        mdl_logits = logits.permute(0, 2, 1, 3)[pos_any].float()  # [M,C,V]
+        mdl_logits = logits[rows].permute(0, 2, 1, 3)[pos_any].float()  # [M,C,V]
         mdl_lp = F.log_softmax(mdl_logits, dim=-1)
         kl = (ref_lp.exp() * (ref_lp - mdl_lp)).sum(-1)  # [M,C]
         layer_means = (kl * sel_m).sum(0) / sel_m.sum(0).clamp(min=1).float()
@@ -646,6 +653,8 @@ class StyleOmniVoice(OmniVoice):
                 row["loss/aux"] = float(aux.detach())
                 if kl is not None:
                     row["loss/kl"] = float(kl.detach())
+                    used, total = self._kl_rows
+                    row["kl/rows_used"], row["kl/rows_total"] = float(used), float(total)
                 self.metrics_sink(row)
         return StyleModelOutput(loss=loss, logits=logits, ce_loss=ce, kl_loss=kl, aux_loss=aux)
 
