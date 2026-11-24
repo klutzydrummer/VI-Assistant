@@ -867,6 +867,25 @@ class DriverScript(unittest.TestCase):
             self.assertEqual(log.count(line), 2, log)  # the trainer's own, and the stage's summary
             self.assertLess(log.rindex(line), gate, log)
 
+    def test_r26_stage8_shows_every_kl_rows_line(self):
+        # base: the excerpt grep had no kl-rows pattern, so only the generic kl grep's last 3
+        # lines survived and the first optimizer steps' replay share was lost
+        args_log = self.tmp / "args"
+        kl = "".join(f"echo 'train_ft: kl-rows: used {i} of 16 rows (share {i / 16:.3f})'; "
+                     for i in range(1, 6))
+        self.fake_venv(kl + self._r25_trainer_body(args_log))
+        res = self.run_driver("8", needs='NEEDS=([8]="")')
+        self.assertEqual(res[8]["result"], "PASS", self.output)
+        log = (self.out / "debug" / "08-train-steps.log").read_text()
+        gate = log.index("preflight: vram peak 15.20 of 23.60 GiB (limit 90 %)")
+        for i in range(1, 6):
+            line = f"train_ft: kl-rows: used {i} of 16 rows"
+            self.assertGreaterEqual(log.count(line), 2, log)  # the trainer's own, and the summary
+            self.assertLess(log.rindex(line), gate, log)
+        for line in ("(after the first optimizer step)", "(end of training)",
+                     "train_ft: sdpa-mask-warning: none"):
+            self.assertEqual(log.count(line), 2, log)
+
     def test_r25_stage8_uses_the_same_batch_as_the_real_run(self):
         # Stage 8, the preflight probe and the real run pass no batch flags, so all three run
         # train_ft.py's defaults, which come from ft_guards.py alone (base: literals 8192 and 1

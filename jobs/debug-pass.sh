@@ -227,8 +227,9 @@ stage_8() {
   [ -f "$probe_run/checkpoint-5/SHA256SUMS" ] || { echo "no checkpoint-5 with SHA256SUMS" >&2; exit 1; }
   grep -E 'kl|KL|replay' "$probe_run/train.log" | tail -n 3 || true
   # r25 diagnostics: the CUDA peak after the first optimizer step and at the end, and whether
-  # SDPA warned about the dense attention mask in the first forward.
-  grep -aE 'train_ft: (vram peak: |sdpa-mask-warning: )' "$probe_run/train.log" | tail -n 4 || true
+  # SDPA warned about the dense attention mask in the first forward. r26: one kl-rows line per
+  # optimizer step (5 here) with the share of rows the KL reference forward ran on.
+  grep -aE 'train_ft: (vram peak: |sdpa-mask-warning: |kl-rows: )' "$probe_run/train.log" | tail -n 9 || true
   vram_peak_gate "$probe_run/train.log"
 }
 
