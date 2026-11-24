@@ -30,7 +30,8 @@
 # accelerate's message format, is the evidence. An OOM retry halves --batch-tokens and
 # doubles --gradient-accumulation-steps (the same tokens per optimizer step) and resumes;
 # below a batch of 2048 tokens it stops, and the job's rc is then 76 whatever the launcher
-# returned. A retry that fails with the same last traceback line as the attempt before it is
+# returned. A command without the flags runs the trainer's defaults, read from
+# omnivoice-ft/ft_guards.py (r25: 2048 x 4, already the floor, so its first OOM stops). A retry that fails with the same last traceback line as the attempt before it is
 # deterministic and is not repeated (an OOM is exempt: its batch changed).
 # Every retry decision is appended to $work/retries.jsonl.
 #
@@ -155,6 +156,12 @@ base=("$@")
 cmd=("${base[@]}")
 attempt=0 rc=0
 min_batch_tokens=${VI_MIN_BATCH_TOKENS:-2048}
+# The trainer's default batch (r25: 2048 tokens x 4 accumulation), read from ft_guards.py, its
+# single source, for a command that does not pass the flag. Empty when it cannot be read.
+ft_default() {
+  python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import ft_guards as F; print(int(getattr(F, sys.argv[2])))' \
+    "$jobs_dir/omnivoice-ft" "$1" 2>/dev/null || true
+}
 retries_log=$work/retries.jsonl
 
 json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n\r'; }
@@ -231,8 +238,13 @@ while :; do
     break
   fi
   if [ $rc -eq 76 ]; then
-    bt=$(get_flag --batch-tokens 8192)
-    ga=$(get_flag --gradient-accumulation-steps 1)
+    bt=$(get_flag --batch-tokens "$(ft_default DEFAULT_BATCH_TOKENS)")
+    ga=$(get_flag --gradient-accumulation-steps "$(ft_default DEFAULT_GRAD_ACCUM)")
+    if ! [[ "$bt" =~ ^[0-9]+$ && "$ga" =~ ^[0-9]+$ ]]; then
+      log_retry "$attempt" "$rc" "oom-unknown-batch" "batch_tokens=$bt grad_accum=$ga"
+      echo "worker-job.sh: GPU out of memory, but the batch in use could not be read (ft_guards.py); stopping" >&2
+      break
+    fi
     if [ $((bt / 2)) -lt "$min_batch_tokens" ]; then
       log_retry "$attempt" "$rc" "oom-at-floor" "batch_tokens=$bt"
       echo "worker-job.sh: GPU out of memory at batch_tokens $bt; below the $min_batch_tokens floor, stopping" >&2

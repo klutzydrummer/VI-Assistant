@@ -210,15 +210,15 @@ class ResumeWiringTest(unittest.TestCase):
             self.assertIn("--resume-from-checkpoint", invocations[1])
             self.assertIn("--resume-from-checkpoint", invocations[2])
 
-    def _run_script(self, root, script, retries=2, extra=()):
+    def _run_script(self, root, script, retries=2, extra=(), env_extra=None, job=None):
         """Run worker-job.sh around a python -c script; returns (proc, arg lists per call)."""
         work, run = root / "work", root / "run"
         run.mkdir(exist_ok=True)
         events = root / "memory.events"
         events.write_text("oom_kill 0\n")
         log = root / "args.log"
-        env = dict(os.environ, LOG=str(log), VI_MEMORY_EVENTS=str(events))
-        args = ["bash", str(JOBS / "worker-job.sh"), "--work", str(work), "--run", str(run),
+        env = dict(os.environ, LOG=str(log), VI_MEMORY_EVENTS=str(events), **(env_extra or {}))
+        args = ["bash", str(job or JOBS / "worker-job.sh"), "--work", str(work), "--run", str(run),
                 "--retries", str(retries), "--", sys.executable, "-c", script, *extra]
         proc = subprocess.run(args, capture_output=True, text=True, timeout=120, env=env)
         calls = [l.split("\x1f") for l in log.read_text().splitlines()] if log.exists() else []
@@ -243,20 +243,48 @@ class ResumeWiringTest(unittest.TestCase):
             rows = [json.loads(l) for l in (root / "work" / "retries.jsonl").read_text().splitlines()]
             self.assertEqual(rows[0]["reason"], "oom-halve")
 
-    def test_worker_job_oom_uses_defaults_and_stops_at_the_floor(self):
-        # No flags given: the trainer defaults (8192, 1) are made explicit; 8192 -> 4096 -> 2048,
-        # and the next halving would go below the floor, so the job stops with 76.
-        script = ("import os, sys; "
+    ALWAYS_OOM = ("import os, sys; "
                   "open(os.environ['LOG'], 'a').write('\\x1f'.join(sys.argv[1:]) + '\\n'); sys.exit(76)")
+
+    def test_worker_job_oom_uses_defaults_and_stops_at_the_floor(self):
+        # r25: no flags given, so the trainer runs its defaults (2048 x 4), already the floor:
+        # the first OOM stops the job with 76 instead of retrying at a smaller batch.
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            proc, calls = self._run_script(root, script, retries=5)
+            proc, calls = self._run_script(root, self.ALWAYS_OOM, retries=5)
             self.assertEqual(proc.returncode, 76)
+            self.assertEqual(len(calls), 1)
             self.assertNotIn("--batch-tokens", calls[0])
+            rows = [json.loads(l) for l in (root / "work" / "retries.jsonl").read_text().splitlines()]
+            self.assertEqual([r["reason"] for r in rows], ["oom-at-floor"])
+            self.assertEqual(rows[0]["signature"], "batch_tokens=2048")
+            self.assertIn("at batch_tokens 2048; below the 2048 floor", (root / "work" / "job.log").read_text())
+
+    def test_worker_job_oom_default_batch_comes_from_ft_guards(self):
+        # With a lower floor the defaults are halved like explicit flags: 2048 x 4 -> 1024 x 8 ->
+        # 512 x 16, the same tokens per optimizer step. Both numbers come from ft_guards.py.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            proc, calls = self._run_script(root, self.ALWAYS_OOM, retries=5,
+                                           env_extra={"VI_MIN_BATCH_TOKENS": "512"})
+            self.assertEqual(proc.returncode, 76)
             self.assertEqual(len(calls), 3)
-            self.assertEqual([c[c.index("--batch-tokens") + 1] for c in calls[1:]], ["4096", "2048"])
-            self.assertEqual([c[c.index("--gradient-accumulation-steps") + 1] for c in calls[1:]], ["2", "4"])
-            self.assertIn("below the 2048 floor", (root / "work" / "job.log").read_text())
+            self.assertEqual([c[c.index("--batch-tokens") + 1] for c in calls[1:]], ["1024", "512"])
+            self.assertEqual([c[c.index("--gradient-accumulation-steps") + 1] for c in calls[1:]], ["8", "16"])
+            self.assertIn("below the 512 floor", (root / "work" / "job.log").read_text())
+
+    def test_worker_job_oom_with_unreadable_defaults_stops(self):
+        # Without ft_guards.py beside it, worker-job.sh does not guess the batch: it stops.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "jobs").mkdir()
+            job = root / "jobs" / "worker-job.sh"
+            shutil.copy(JOBS / "worker-job.sh", job)
+            proc, calls = self._run_script(root, self.ALWAYS_OOM, retries=5, job=job)
+            self.assertEqual(proc.returncode, 76)
+            self.assertEqual(len(calls), 1)
+            rows = [json.loads(l) for l in (root / "work" / "retries.jsonl").read_text().splitlines()]
+            self.assertEqual([r["reason"] for r in rows], ["oom-unknown-batch"])
 
     def test_worker_job_same_traceback_stops(self):
         # The same traceback line twice is deterministic: one retry, then stop (not a 3rd run).
@@ -285,7 +313,7 @@ argv = sys.argv[1:]
 def flag(name, default):
     return argv[argv.index(name) + 1] if name in argv else default
 open(os.environ["LOG"], "a").write("\x1f".join(argv) + "\n")
-bt = int(flag("--batch-tokens", "8192"))
+bt = int(flag("--batch-tokens", "2048"))
 if bt > int(os.environ.get("OOM_ABOVE", "0")):
     out = flag("--output-dir", ".")
     json.dump({"step": 0, "batch_tokens": bt, "max_memory_allocated": 0},
@@ -380,7 +408,8 @@ class OomThroughLauncherTest(unittest.TestCase):
             root = Path(d)
             proc, calls, rows, joblog = self._run(
                 root, [sys.executable, "-m", "accelerate.commands.launch"],
-                {"PYTHONPATH": str(stub_pylib(root))}, oom_above=0, retries=5)
+                {"PYTHONPATH": str(stub_pylib(root))}, oom_above=0, retries=5,
+                extra=["--batch-tokens", "8192", "--gradient-accumulation-steps", "1"])
             self.assertEqual(proc.returncode, 76, joblog)
             self.assertEqual(len(calls), 3, joblog)
             self.assertEqual([r["reason"] for r in rows], ["oom-halve", "oom-halve", "oom-at-floor"])
