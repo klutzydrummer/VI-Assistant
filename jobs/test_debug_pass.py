@@ -470,6 +470,49 @@ class HostDrop(DebugBase):
                 self.assertNotIn("HOST-DROP", self.results().values())
                 self.assertIn("not a confirmed host drop", self.details()[3])
 
+    # r27: the dbg5 transcript (2026-11-24): Vast no longer had instance 62400251, its logs said
+    # "No such container", and ssh stayed refused; r26 code called that "not a confirmed host drop".
+    def test_r27_instance_gone_with_ssh_refused_is_a_drop_and_rents_once_more(self):
+        self.scen2(dict(debug="drop", vast_gone=True))
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2, self.out)
+        self.assertEqual(len(self.show_calls(101)), 2, self.out)
+        r1 = self.summary()["rentals"][0]
+        self.assertTrue(r1["status"].startswith("HOST-DROP (status gone: Vast lists no such "
+                                                "instance (instances: null); its logs say No "
+                                                "such container)"), r1)
+        self.assertIn("ssh again: Connection refused", r1["status"])
+        ev = self.evidence(1)[0].read_text()
+        self.assertIn('"instances": null', ev)
+        self.assertIn("No such container: C.101", ev)
+
+    def test_r27_running_or_loading_with_ssh_refused_is_not_a_drop(self):
+        for seq in (["running"], ["loading"], ["loading", "loading"]):
+            with self.subTest(seq=seq):
+                self.setUp()
+                self.scen2(dict(debug="drop", vast_status_seq=seq))
+                self.assertEqual(self.run_debug(), 16, self.out)
+                self.assertEqual(len(self.ups()), 1, self.out)
+                self.assertNotIn("HOST-DROP", self.results().values())
+                self.assertIn("not a confirmed host drop", self.details()[3])
+
+    def test_r27_api_error_is_not_a_drop_even_with_no_such_container_in_the_logs(self):
+        for seq in (["FAIL"], ["NULL", "FAIL"], ["FAIL", "NULL"]):
+            with self.subTest(seq=seq):
+                self.setUp()
+                self.scen2(dict(debug="drop", vast_gone=True, vast_status_seq=seq))
+                self.assertEqual(self.run_debug(), 16, self.out)
+                self.assertEqual(len(self.ups()), 1, self.out)
+                self.assertNotIn("HOST-DROP", self.results().values())
+                self.assertIn("not a confirmed host drop", self.details()[3])
+
+    def test_r27_instance_gone_but_ssh_answers_again_is_not_a_drop(self):
+        self.scen2(dict(debug="drop", vast_gone=True, ssh_true_ok=True))
+        self.assertEqual(self.run_debug(), 16, self.out)
+        self.assertEqual(len(self.ups()), 1, self.out)
+        self.assertNotIn("HOST-DROP", self.results().values())
+        self.assertIn("Vast said gone, then gone, but ssh answers again", self.details()[3])
+
     def test_debug_pass_sets_lost_minutes_5_and_r9_keeps_the_default(self):
         self.scen()
         self.run_debug()
@@ -481,6 +524,40 @@ class HostDrop(DebugBase):
         lost = [c[2] for c in self.calls() if c[0] == "lost_minutes"]
         self.assertTrue(lost, self.out)
         self.assertEqual(set(lost), {None}, "r9 must keep on-worker.sh's 30 min default")
+
+
+# r27: the two Vast answers saved in ~/.local/state/vi/paid-run/omnivoice-ft-dbg5/
+# vast-attempt-1-host-drop-check.txt (2026-11-24), verbatim.
+DBG5_SHOW = '{\n "instances": null\n}\n'
+DBG5_LOGS = "Error response from daemon: No such container: C.62400251\n"
+
+
+class VastInstanceGone(unittest.TestCase):
+    """r27: vast_instance_gone() reads Vast's own "no such instance" answers, and nothing else."""
+
+    def setUp(self):
+        self.pr = tp.load_paid_run()
+
+    def test_dbg5_transcript_is_gone(self):
+        why = self.pr.vast_instance_gone(0, DBG5_SHOW, 0, DBG5_LOGS)
+        self.assertEqual(why, "Vast lists no such instance (instances: null); "
+                              "its logs say No such container")
+        self.assertTrue(self.pr.vast_instance_gone(0, '{"instances": []}', 1, ""))
+        self.assertTrue(self.pr.vast_instance_gone(0, "[]", 0, ""))
+        # a status-less answer plus the daemon's "No such container" also says gone
+        self.assertTrue(self.pr.vast_instance_gone(0, '{"instances": {"id": 1}}', 0, DBG5_LOGS))
+
+    def test_a_listed_instance_or_an_api_error_is_never_gone(self):
+        g = self.pr.vast_instance_gone
+        running = '{"instances": {"id": 1, "actual_status": "running"}}'
+        self.assertIsNone(g(0, running, 0, DBG5_LOGS))
+        self.assertIsNone(g(0, '{"id": 1, "actual_status": "loading"}', 0, DBG5_LOGS))
+        self.assertIsNone(g(1, DBG5_SHOW, 0, DBG5_LOGS))            # show failed
+        self.assertIsNone(g(1, "failed with error 500: server error", 0, DBG5_LOGS))
+        self.assertIsNone(g(0, "not json", 0, DBG5_LOGS))
+        self.assertIsNone(g(0, '{"success": false, "error": "invalid_args"}', 0, DBG5_LOGS))
+        self.assertIsNone(g(0, '{"instances": {"id": 1}}', 1, DBG5_LOGS))  # logs call failed
+        self.assertIsNone(g(0, '{"instances": {"id": 1}}', 0, "ok"))
 
 
 class AbandonDebugMarkers(DebugBase):

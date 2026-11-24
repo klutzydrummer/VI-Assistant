@@ -96,8 +96,10 @@ STUB = textwrap.dedent('''\
         print(f"credit ${st['credit']:.2f}")
     elif args[:2] == ["cloud", "ssh"]:
         log("ssh")
-        if st["worker"] and st.get("dropped") == st["worker"]["id"]:
+        if (st["worker"] and st.get("dropped") == st["worker"]["id"]
+                and not (att().get("ssh_true_ok") and args[2:] == ["true"])):
             # r18: once the host dropped, nothing listens on the ssh port any more
+            # (r27 "ssh_true_ok": `vi cloud ssh true` answers again after the drop)
             print("ssh: connect to host h port 1: Connection refused", file=sys.stderr); sys.exit(255)
         if "INPLACE_CHECK" in " ".join(args):
             seq = sc.get("inplace", [{}]); n = st.get("inplace_n", 0); st["inplace_n"] = n + 1; save()
@@ -248,12 +250,21 @@ VASTAI_STUB = textwrap.dedent('''\
     args = sys.argv[1:]
     ident = int(args[2] if args[:2] == ["show", "instance"] else args[1])
     dropped = st.get("dropped") == ident
+    # r27 "vast_gone": Vast no longer has the instance, as omnivoice-ft-dbg5 saw on 2026-11-24
+    # ("NULL" in vast_status_seq is the same answer for one show call)
+    gone = a.get("vast_gone") and dropped
     if args[:2] == ["show", "instance"]:
         status = a.get("vast_status", "exited" if dropped else "running")
-        print(json.dumps({"id": ident, "actual_status": status, "intended_status": "running",
-                          "status_msg": "container exited unexpectedly" if dropped else "success"}))
+        if status == "NULL" or (gone and "vast_status" not in a):
+            print(json.dumps({"instances": None}, indent=1))
+        else:
+            print(json.dumps({"id": ident, "actual_status": status, "intended_status": "running",
+                              "status_msg": "container exited unexpectedly" if dropped else "success"}))
     elif args[0] == "logs":
-        print("container log line 1\\nsshd: Received signal 15; terminating." if dropped else "ok")
+        if gone:
+            print(f"Error response from daemon: No such container: C.{ident}")
+        else:
+            print("container log line 1\\nsshd: Received signal 15; terminating." if dropped else "ok")
     else:
         print("vastai stub: unknown", args, file=sys.stderr); sys.exit(2)
 ''')
