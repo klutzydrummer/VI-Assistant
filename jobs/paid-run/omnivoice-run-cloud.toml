@@ -9,7 +9,14 @@ min_cuda = 12.8
 min_reliability = 0.99
 min_cpu_cores_effective = 4
 min_cpu_ram_gb = 30
-min_inet_up_mbps = 500
+# Advertised upload floor, a sanity floor only (round 27 survey, 2026-11-24). Advertised speed
+# does not predict the measured push: seven past rentals advertised 765-7622 Mbps and all
+# measured 2.9-6.0 MB/s through home's tunnel. Lowering it from 500 to 200 widens supply; it does
+# not make the push faster, and raising it would not either. The measured push is judged by
+# worker-preflight.sh on the rented worker, never by this number.
+min_inet_up_mbps = 200
 min_inet_down_mbps = 100
 min_disk_bw_mbps = 0
-max_dph = 0.31
+# $/hr ceiling on dph_total (round 27: at 0.31 only 2 verified 24 GB offers were
+# left and none in US/CA; 0.60 leaves about 36). No 48 GB tier.
+max_dph = 0.60
