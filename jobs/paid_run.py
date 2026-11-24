@@ -695,6 +695,16 @@ def parse_debug_output(text):
     return found
 
 
+def debug_excerpt_keep(lines, n=12):
+    """The excerpt kept for a debug stage: debug-pass.sh's "key: " lines (r23: the trainer's own
+    error and accelerate's "exit status N", printed on FAIL before the tail) always, then the last
+    n of the other lines."""
+    lines = list(lines)
+    key = [x for x in lines if x.startswith("key: ")]
+    rest = [x for x in lines if not x.startswith("key: ")]
+    return key + rest[-n:]
+
+
 def base_model_revision(script=GATE_SCRIPT):
     """The base-model revision pinned in the stage script (shown at --plan, not checked)."""
     try:
@@ -1943,6 +1953,9 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         starting with 'VANISHED' means the instance is gone."""
         if self.timed_out:
             return "the train stage ran out of its hours and was killed"
+        # worker-job.sh reads exit 76 for an OOM even through accelerate (which turns the
+        # trainer's 76 into 1) when oom.json was written in the attempt (r23); the string is
+        # the fallback for an rc lost on the way home.
         if rc == 76 or "GPU out of memory" in out:
             return "the GPU ran out of memory (exit 76); a restart on this card would do the same"
         if restarts >= INPLACE_MAX_RESTARTS:
@@ -1996,7 +2009,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 return
             if first_fail is None:
                 first_fail = clock()
-            if rc == 76 or "GPU out of memory" in out:
+            if rc == 76 or "GPU out of memory" in out:  # see train_blocker for the two signals
                 self.raise_vram_floor("train ran out of GPU memory")
             why = self.train_blocker(rc, out, restarts, first_fail)
             if why is None and self.last_facts.get("procs") not in ("0", ""):
@@ -2132,7 +2145,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
     # ----- the debug pass ------------------------------------------------------------------
     def debug_record(self, n, result, detail="", excerpt=()):
         self.debug[n] = dict(stage=n, name=DEBUG_NAMES[n], result=result, detail=detail,
-                             excerpt=list(excerpt)[-12:])
+                             excerpt=debug_excerpt_keep(excerpt))
         say(f"debug-pass: stage {n} {DEBUG_NAMES[n]}: {result}{' ' + detail if detail else ''}")
 
     def debug_gate(self, n):

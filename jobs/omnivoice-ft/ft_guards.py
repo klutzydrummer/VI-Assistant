@@ -11,6 +11,7 @@ import json
 import math
 import multiprocessing
 import os
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 MIN_BATCHES_PER_EPOCH = 50
@@ -165,10 +166,54 @@ def resume_product_mismatch(saved: Dict[str, Any], batch_tokens: int, grad_accum
     )
 
 
-def write_oom_json(output_dir: str, step: int, batch_tokens: int, max_memory_allocated: int) -> str:
+def write_oom_json(output_dir: str, step: int, batch_tokens: int, max_memory_allocated: int,
+                   **extra: Any) -> str:
+    """$output_dir/oom.json: the micro-step, batch_tokens and peak allocation of a GPU OOM, plus any
+    extra keys given (report_oom adds the reserved and free memory and torch's first line).
+    worker-job.sh only checks that the file was written during the attempt."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, "oom.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"step": step, "batch_tokens": batch_tokens,
-                   "max_memory_allocated": max_memory_allocated}, f)
+                   "max_memory_allocated": max_memory_allocated, **extra}, f)
     return path
+
+
+def _cuda_query(fn: Callable[[], Any]) -> Any:
+    try:
+        return fn()
+    except Exception:  # a dead or missing device must not hide the OOM report itself
+        return None
+
+
+def report_oom(output_dir: str, step: int, batch_tokens: int, err: BaseException, cuda: Any,
+               out: Any = None) -> int:
+    """train_ft.py's handler for torch.cuda.OutOfMemoryError (r23 A2). ``cuda`` is torch.cuda
+    (passed in so this stays torch-free and testable). Prints torch's own first line (what was
+    being allocated and how much the process held) and the device's free, total, peak-reserved and
+    peak-allocated memory, writes the same figures into oom.json, and returns OOM_EXIT_CODE.
+    Every CUDA query is guarded: on CPU, or with a failing driver, the figures are 0 or None."""
+    out = sys.stderr if out is None else out
+    on_cuda = bool(_cuda_query(cuda.is_available))
+    peak = reserved = 0
+    free = total = None
+    if on_cuda:
+        peak = int(_cuda_query(cuda.max_memory_allocated) or 0)
+        reserved = int(_cuda_query(cuda.max_memory_reserved) or 0)
+        info = _cuda_query(cuda.mem_get_info)
+        if info:
+            free, total = int(info[0]), int(info[1])
+    lines = str(err).strip().splitlines()
+    first = (lines[0] if lines else type(err).__name__)[:400]
+    gib = 2.0 ** 30
+    print(f"train_ft: torch: {first}", file=out)
+    mem = (f"free {free / gib:.2f} of {total / gib:.2f} GiB" if free is not None and total is not None
+           else "free/total unknown")
+    print(f"train_ft: cuda memory at the OOM: {mem}; max reserved {reserved / gib:.2f} GiB; "
+          f"max allocated {peak / gib:.2f} GiB" + ("" if on_cuda else " (no CUDA device)"), file=out)
+    path = write_oom_json(output_dir, step, batch_tokens, peak, max_memory_reserved=reserved,
+                          mem_free=free, mem_total=total, error=first)
+    print(f"train_ft: GPU out of memory at micro-step {step}, batch_tokens {batch_tokens}; "
+          f"wrote {path}; exit {OOM_EXIT_CODE}", file=out)
+    out.flush()
+    return OOM_EXIT_CODE

@@ -23,7 +23,9 @@
 #                   output, which comes home with it; for a person to listen to, never scored
 #   11 resume       2 more steps resumed from checkpoint-5, then --verify-checkpoint
 #
-# Status lines (read by paid_run.py), each followed by up to VI_DEBUG_EXCERPT_LINES log lines:
+# Status lines (read by paid_run.py), each followed by up to VI_DEBUG_EXCERPT_LINES log lines;
+# a FAIL first lists up to VI_DEBUG_KEY_LINES "key: " lines (the trainer's own error, exception
+# and out-of-memory lines, accelerate's "exit status N") and then "last N lines:":
 #   debug-pass: stage N NAME: PASS (S s)
 #   debug-pass: stage N NAME: FAIL (exit RC, S s)          RC 124 means it hit its time limit
 #   debug-pass: stage N NAME: SKIP-dependent (needs stage M NAME, which did not pass)
@@ -188,6 +190,22 @@ stage_7() {
   echo "replay set: $(wc -l <"$data_dir/replay/replay_public.jsonl") rows (Base loaded on $dev)"
 }
 
+# A failed trainer run in stage NN: copy its train.log, and its oom.json if it wrote one, into
+# $debug/NN-train.log and $debug/NN-oom.json (the debug directory comes home with the stage
+# output), then exit. accelerate turns the trainer's exit 76 into 1, so an oom.json written by
+# this run is what says "out of memory": exit 76, as worker-job.sh reads it (r23).
+train_failed() {
+  local nn=$1 rc=$2
+  cp -f "$probe_run/train.log" "$debug/$nn-train.log" 2>/dev/null || true
+  if [ -f "$probe_run/oom.json" ]; then
+    cp -f "$probe_run/oom.json" "$debug/$nn-oom.json" 2>/dev/null || true
+    echo "train_ft.py exited $rc (GPU out of memory: oom.json written; copied to $debug/$nn-oom.json); exit 76" >&2
+    exit 76
+  fi
+  echo "train_ft.py exited $rc" >&2
+  exit "$rc"
+}
+
 stage_8() {
   py_or_die; base_or_die
   cd "$data_dir"
@@ -202,7 +220,7 @@ stage_8() {
     --output-dir "$probe_run" --steps 5 --save-steps 5 --logging-steps 1 \
     --min-batches-per-epoch 0 --num-workers "${VI_NUM_WORKERS:-2}" 2>&1 \
     | tee "$probe_run/train.log" || rc=$?
-  [ "$rc" = 0 ] || { echo "train_ft.py exited $rc" >&2; exit "$rc"; }
+  [ "$rc" = 0 ] || train_failed 08 "$rc"
   [ -f "$probe_run/checkpoint-5/SHA256SUMS" ] || { echo "no checkpoint-5 with SHA256SUMS" >&2; exit 1; }
   grep -E 'kl|KL|replay' "$probe_run/train.log" | tail -n 3 || true
   vram_peak_gate "$probe_run/train.log"
@@ -267,6 +285,16 @@ if [ "${1:-}" = --stage ]; then
 fi
 
 # ----- the driver -------------------------------------------------------------------------
+# The lines of a failed stage's log that say why: train_ft's own lines (after any progress-bar
+# prefix), exception lines, out-of-memory text, and accelerate's CalledProcessError reduced to
+# "accelerate: child returned non-zero exit status N". Each once, at most VI_DEBUG_KEY_LINES (6).
+key_lines() {
+  grep -aE 'train_ft: |Error: |Exception: |out of memory|returned non-zero exit status [0-9]+' "$1" 2>/dev/null \
+    | grep -v '^Traceback' \
+    | sed -E -e 's/.*(returned non-zero exit status [0-9]+).*/accelerate: child \1/' -e 's/^.*(train_ft: )/\1/' \
+    | cut -c1-300 | awk '!seen[$0]++' | tail -n "${VI_DEBUG_KEY_LINES:-6}"
+}
+
 excerpt_lines=${VI_DEBUG_EXCERPT_LINES:-12}
 read -r -a order <<<"${VI_DEBUG_STAGES:-3 4 5 6 7 8 9 10 11}"
 declare -A result=() seconds=() rcs=() why=()
@@ -370,6 +398,13 @@ for n in "${order[@]}"; do
       why[$n]="exit $rc"
       echo "debug-pass: stage $n $name: FAIL (exit $rc, ${seconds[$n]} s)"
     fi
+  fi
+  if [ "$rc" != 0 ]; then
+    # Key lines first (r23): the trainer's own messages, exception lines, out-of-memory text and
+    # accelerate's "returned non-zero exit status N", wherever they are in the log, so the cause
+    # survives however long accelerate's traceback is. paid_run.py always keeps "key: " lines.
+    key_lines "$log" | sed -e 's/^/debug-pass:   | key: /'
+    echo "debug-pass:   | last $excerpt_lines lines:"
   fi
   tail -n "$excerpt_lines" "$log" 2>/dev/null | cut -c1-300 | sed -e 's/^/debug-pass:   | /'
 done

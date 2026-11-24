@@ -547,7 +547,7 @@ def test_train_ft_too_few_batches(tmp_path):
         TF._run_training_once(cfg, 0, 0, [])
 
 
-def test_train_ft_oom_exit_76(tmp_path, monkeypatch):
+def test_train_ft_oom_exit_76(tmp_path, monkeypatch, capsys):
     """The model forward raises a CUDA OOM at micro-step 3: exit 76 and oom.json, no crash."""
     from style_omnivoice import StyleOmniVoice
 
@@ -568,6 +568,11 @@ def test_train_ft_oom_exit_76(tmp_path, monkeypatch):
     assert rc == 76
     info = json.load(open(os.path.join(out, "oom.json")))
     assert info["batch_tokens"] == 8192 and info["step"] >= 1
+    # r23: torch's own first line and the memory figures are printed, and kept in oom.json
+    err = capsys.readouterr().err
+    assert "train_ft: torch: CUDA out of memory (test)" in err
+    assert "train_ft: cuda memory at the OOM:" in err
+    assert info["error"] == "CUDA out of memory (test)" and "max_memory_reserved" in info
 
 
 def test_train_ft_resume_allows_equal_product(tmp_path):

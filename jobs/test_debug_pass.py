@@ -635,6 +635,16 @@ class ParseOutput(unittest.TestCase):
         self.assertEqual(got[5][0], "SKIP-dependent")
         self.assertNotIn(6, got, "a heartbeat is not a result")
 
+    def test_r23_key_lines_survive_the_12_line_cap(self):
+        pr = tp.load_paid_run()
+        ex = ["key: train_ft: GPU out of memory", "key: accelerate: child returned non-zero exit status 76",
+              "last 12 lines:"] + [f"tail {i}" for i in range(12)]
+        kept = pr.debug_excerpt_keep(ex)
+        self.assertEqual(kept[:2], ex[:2])
+        self.assertEqual(kept[-12:], ex[-12:])
+        self.assertEqual(pr.debug_excerpt_keep([f"t{i}" for i in range(20)]),
+                         [f"t{i}" for i in range(8, 20)])
+
     def test_stage_table_matches_worker_script(self):
         pr = tp.load_paid_run()
         self.assertEqual([n for n, _, _ in pr.DEBUG_STAGES], list(range(1, 13)))
@@ -777,6 +787,62 @@ class DriverScript(unittest.TestCase):
         log = (self.out / "debug" / "08-train-steps.log").read_text()
         self.assertIn("boom", log)
         self.assertIn("train_ft.py exited 3", log)
+
+    def _accelerate_oom_body(self):
+        """A stage 8 trainer as the worker ran it in dbg3: train_ft's OOM line (behind a tqdm
+        bar), oom.json in the run dir, then accelerate's ~20-line wrapper traceback whose last
+        line is longer than 300 characters, and exit 1."""
+        long_cmd = "'" + "', '".join(["/root/venv/bin/python", "train_ft.py"] + ["--arg"] * 40) + "'"
+        return (f"mkdir -p '{self.probe_run}'; "
+                f"echo '{{\"step\": 0, \"batch_tokens\": 8192}}' >'{self.probe_run}/oom.json'; "
+                "echo 'Starting Training Loop...'; "
+                "printf 'Training:   0%%|  | 0/5 [00:00<?, ?it/s]train_ft: GPU out of memory at "
+                "micro-step 0, batch_tokens 8192; wrote oom.json; exit 76\\n' >&2; "
+                "echo 'RuntimeError: Training:   0%|  | 0/5train_ft: GPU out of memory at micro-step 0, "
+                "batch_tokens 8192; wrote oom.json; exit 76' >&2; "
+                "echo 'The above exception was the direct cause of the following exception:' >&2; "
+                "echo 'Traceback (most recent call last):' >&2; "
+                "for i in $(seq 1 14); do echo \"  File \\\"launch.py\\\", line $i, in f\" >&2; done; "
+                f"echo \"subprocess.CalledProcessError: Command '[{long_cmd}]' returned non-zero "
+                "exit status 76.\" >&2; exit 1")
+
+    def test_r23_fail_excerpt_shows_key_lines_before_the_tail(self):
+        # base: only the last 12 lines, cut at 300 characters: neither the train_ft line nor
+        # "exit status 76" made the excerpt
+        self.fake_venv(self._accelerate_oom_body())
+        res = self.run_driver("8", needs='NEEDS=([8]="")', VI_DEBUG_EXCERPT_LINES="12")
+        self.assertEqual(res[8]["result"], "FAIL", self.output)
+        self.assertIn("debug-pass:   | key: train_ft: GPU out of memory at micro-step 0", self.output)
+        self.assertIn("debug-pass:   | key: accelerate: child returned non-zero exit status 76",
+                      self.output)
+        # the child stderr accelerate shows twice is one key line, not two
+        self.assertEqual(self.output.count("| key: train_ft: GPU out of memory"), 1, self.output)
+        key = self.output.index("| key: ")
+        self.assertLess(key, self.output.index("| last 12 lines:"), self.output)
+        pr = tp.load_paid_run()
+        ex = pr.parse_debug_output(self.output)[8][2]
+        kept = pr.debug_excerpt_keep(ex)
+        self.assertIn("key: accelerate: child returned non-zero exit status 76", kept)
+        self.assertTrue(any(x.startswith("key: train_ft: GPU out of memory") for x in kept), kept)
+
+    def test_r23_stage8_oom_brings_oom_json_and_train_log_home_and_reads_76(self):
+        # base: oom.json and train.log stayed in $scratch/probe-run (beside VI_OUT), so they
+        # died with the instance; the stage read exit 1
+        self.fake_venv(self._accelerate_oom_body())
+        res = self.run_driver("8", needs='NEEDS=([8]="")')
+        self.assertEqual(res[8]["result"], "FAIL", self.output)
+        dbg = self.out / "debug"
+        self.assertEqual(json.loads((dbg / "08-oom.json").read_text())["batch_tokens"], 8192)
+        self.assertIn("train_ft: GPU out of memory", (dbg / "08-train.log").read_text())
+        self.assertEqual(res[8]["rc"], 76, self.output)
+        self.assertIn("GPU out of memory: oom.json written", (dbg / "08-train-steps.log").read_text())
+
+    def test_r23_stage8_plain_failure_copies_train_log_and_keeps_its_rc(self):
+        self.fake_venv("echo 'train_ft: step 1/5'; echo 'boom' >&2; exit 3")
+        res = self.run_driver("8", needs='NEEDS=([8]="")')
+        self.assertEqual(res[8]["rc"], 3, self.output)
+        self.assertTrue((self.out / "debug" / "08-train.log").exists())
+        self.assertFalse((self.out / "debug" / "08-oom.json").exists())
 
     def test_f2_no_time_left_is_skip_no_time_not_run(self):
         # 0.2 h left minus a 700 s margin leaves 20 s, under stage 3's minimum

@@ -1,6 +1,8 @@
 """Tests for omnivoice-ft/ft_guards.py (standard library only: no torch, no omnivoice)."""
 
+import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -100,6 +102,72 @@ class GuardTests(unittest.TestCase):
             path = FG.write_oom_json(d, 3, 8192, 123)
             self.assertEqual(json.load(open(path)),
                              {"step": 3, "batch_tokens": 8192, "max_memory_allocated": 123})
+
+
+    def test_r23_report_oom_prints_torch_text_and_memory(self):
+        # base: the handler dropped the exception and printed only its own summary
+        class FakeCuda:
+            def is_available(self):
+                return True
+
+            def max_memory_allocated(self):
+                return 20 * 2**30
+
+            def max_memory_reserved(self):
+                return 23 * 2**30
+
+            def mem_get_info(self):
+                return (512 * 2**20, 24 * 2**30)
+
+        err = RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total "
+                           "capacity of 23.69 GiB\nmore detail on a second line")
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            rc = FG.report_oom(d, 0, 8192, err, FakeCuda(), out=buf)
+            info = json.loads(Path(d, "oom.json").read_text())
+        self.assertEqual(rc, 76)
+        text = buf.getvalue()
+        self.assertIn("train_ft: torch: CUDA out of memory. Tried to allocate 2.00 GiB", text)
+        self.assertNotIn("second line", text)
+        self.assertIn("free 0.50 of 24.00 GiB", text)
+        self.assertIn("max reserved 23.00 GiB", text)
+        self.assertIn("max allocated 20.00 GiB", text)
+        self.assertIn("train_ft: GPU out of memory at micro-step 0, batch_tokens 8192", text)
+        self.assertEqual(info["step"], 0)
+        self.assertEqual(info["batch_tokens"], 8192)
+        self.assertEqual(info["max_memory_allocated"], 20 * 2**30)
+        self.assertEqual(info["max_memory_reserved"], 23 * 2**30)
+        self.assertEqual(info["mem_free"], 512 * 2**20)
+        self.assertEqual(info["mem_total"], 24 * 2**30)
+        self.assertTrue(info["error"].startswith("CUDA out of memory. Tried"))
+
+    def test_r23_report_oom_without_cuda_or_with_a_failing_query(self):
+        class NoCuda:
+            def is_available(self):
+                return False
+
+        class Broken(NoCuda):
+            def is_available(self):
+                return True
+
+            def max_memory_allocated(self):
+                return 7
+
+            def max_memory_reserved(self):
+                raise RuntimeError("driver gone")
+
+            def mem_get_info(self):
+                raise RuntimeError("driver gone")
+
+        for cuda in (NoCuda(), Broken()):
+            buf = io.StringIO()
+            with tempfile.TemporaryDirectory() as d:
+                rc = FG.report_oom(d, 3, 4096, RuntimeError(""), cuda, out=buf)
+                info = json.loads(Path(d, "oom.json").read_text())
+            self.assertEqual(rc, 76)
+            self.assertIn("train_ft: GPU out of memory at micro-step 3, batch_tokens 4096", buf.getvalue())
+            self.assertEqual(info["batch_tokens"], 4096)
+            self.assertIsNone(info["mem_free"])
 
 
 if __name__ == "__main__":

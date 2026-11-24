@@ -703,12 +703,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = config_from_args(a)
     try:
         trainer, model = run_training(cfg)
-    except torch.cuda.OutOfMemoryError:
-        peak = int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
-        path = FG.write_oom_json(cfg.output_dir, _PROGRESS["micro_step"], cfg.batch_tokens, peak)
-        print(f"train_ft: GPU out of memory at micro-step {_PROGRESS['micro_step']}, "
-              f"batch_tokens {cfg.batch_tokens}; wrote {path}; exit {FG.OOM_EXIT_CODE}", file=sys.stderr)
-        return FG.OOM_EXIT_CODE
+    except torch.cuda.OutOfMemoryError as e:
+        # torch's own first line plus the device's free/reserved/allocated memory, on stderr and
+        # in oom.json (r23: dbg3's OOM left no figures to tell why 24 GiB ran out); exit 76.
+        return FG.report_oom(cfg.output_dir, _PROGRESS["micro_step"], cfg.batch_tokens, e, torch.cuda)
     if torch.cuda.is_available():
         # The preflight gate reads this line (fail above 90 % of the device).
         total = torch.cuda.get_device_properties(0).total_memory
