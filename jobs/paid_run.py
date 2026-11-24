@@ -655,6 +655,42 @@ def parse_vast_instance(text):
     return {}
 
 
+# r27: what Vast prints for an instance it no longer has (omnivoice-ft-dbg5, 2026-11-24): `show
+# instance --raw` exits 0 with {"instances": null}, and `logs` exits 0 with the docker daemon's
+# "No such container: C.<id>". Either one, from a call that succeeded, means the instance is gone.
+NO_CONTAINER_RE = re.compile(r"No such container")
+VAST_GONE = "gone"
+# Statuses that mean the container is up or coming up: ssh refused then is not a confirmed drop.
+VAST_ALIVE = ("running", "loading")
+
+
+def vast_instance_gone(show_rc, show_text, logs_rc, logs_text):
+    """r27: a short reason when Vast's own answers say the instance no longer exists, else None.
+    Only calls that succeeded (exit 0) count. `show instance` must have answered with JSON that
+    has no instance record: {"instances": null}, an empty list, or null; anything that reports an
+    actual_status, or looks like an API error, is never "gone". The logs line "No such container"
+    counts only next to a successful show answer without a status, so a failing Vast API is never
+    read as a lost host."""
+    if show_rc != 0:
+        return None
+    try:
+        doc = json.loads(show_text or "")
+    except ValueError:
+        return None
+    if parse_vast_instance(show_text):
+        return None  # Vast still lists the instance with a status
+    if isinstance(doc, dict):
+        if any(k in doc for k in ("error", "msg", "success")):
+            return None  # an API error answer, not a statement about the instance
+        empty = "instances" in doc and doc["instances"] in (None, [], {})
+    else:
+        empty = doc in (None, [])
+    no_container = logs_rc == 0 and bool(NO_CONTAINER_RE.search(logs_text or ""))
+    reasons = (["Vast lists no such instance (instances: null)"] if empty else []) + (
+        ["its logs say No such container"] if no_container else [])
+    return "; ".join(reasons) or None
+
+
 def debug_worst_case(cap, disk_gb, hours, max_dph=None):
     """(total, gpu, disk) worst-case dollars of a debug pass of up to DEBUG_MAX_RENTALS rentals of
     `hours` each (r21: the hours are per rental). The GPU part is at most 2 x hours x max_dph (the
@@ -1539,7 +1575,8 @@ class PaidRun:
                 "host drop       : before release, `vastai show instance <id> --raw` and "
                 "`vastai logs <id>` are saved in the run folder; the stage reads HOST-DROP "
                 "(status X) only when ssh lost the host and two Vast reads at least "
-                f"{HOST_DROP_RECHECK_SECONDS} s apart both say not running; that worker is "
+                f"{HOST_DROP_RECHECK_SECONDS} s apart both say not running or loading (or both "
+                "say the instance is gone while ssh is still refused); that worker is "
                 f"released and one more offer is rented only if the cap left covers $/hr x "
                 f"{h:g} h (each rental has its own {h:g} h; the $ cap is shared)",
                 "flow            : offers -> cheapest qualifying offer -> up -> 1 host-cuda, "
@@ -1775,6 +1812,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 parts.append("(skipped: test clock in use and VI_VASTAI_BIN is unset)")
             else:
                 vastai = vastai or "vastai"
+                answers = {}
                 for cmd in (["show", "instance", str(ident), "--raw"],
                             ["logs", str(ident), "--tail", str(VAST_LOG_TAIL)]):
                     say(f"saving Vast's view of instance {ident} (at most {limit:.0f} s): "
@@ -1785,12 +1823,19 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                                            env={**os.environ, "PAGER": "cat"})
                         text = (r.stdout + r.stderr)[:DIAG_MAX_BYTES].decode(errors="replace")
                         parts.append(f"== vastai {' '.join(cmd)} (exit {r.returncode})\n{text}")
+                        answers[cmd[0]] = (r.returncode, r.stdout.decode(errors="replace"), text)
                         if cmd[0] == "show" and r.returncode == 0:
                             info.update(parse_vast_instance(r.stdout.decode(errors="replace")))
                     except subprocess.TimeoutExpired:
                         parts.append(f"== vastai {' '.join(cmd)}: cut off after {limit:.0f} s")
                     except OSError as e:
                         parts.append(f"== vastai {' '.join(cmd)}: could not run ({e})")
+                if info["status"] is None and "show" in answers:
+                    show_rc, show_out, _ = answers["show"]
+                    logs_rc, _, logs_text = answers.get("logs", (None, "", ""))
+                    gone = vast_instance_gone(show_rc, show_out, logs_rc, logs_text)
+                    if gone:
+                        info.update(status=VAST_GONE, msg=gone)
             head = (f"instance {ident}: actual_status {info['status'] or 'unknown'}; "
                     f"status_msg {info['msg'] or '-'}")
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -1808,10 +1853,13 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         """A2: (confirmed, text) when output that did not report its own result shows ssh losing
         the host; (False, None) when there is no sign of that. r21: a drop is confirmed only by
         TWO Vast status reads (`vastai show instance`, saved as A1 evidence) at least
-        HOST_DROP_RECHECK_SECONDS apart that both say not running. If home cannot read the status
-        from Vast (its own API call failed or hung), that is never a drop: our failure to ask is
-        not evidence about the host. `vi cloud ssh true` is tried once more for the record only.
-        Our own check failures print their own FAIL and never get here."""
+        HOST_DROP_RECHECK_SECONDS apart that both say not running (r27: nor loading). If home
+        cannot read the status from Vast (its own API call failed or hung), that is never a drop:
+        our failure to ask is not evidence about the host. r27: Vast saying the instance is gone
+        ({"instances": null}, or logs "No such container" next to a status-less answer; see
+        vast_instance_gone) is a drop only while `vi cloud ssh true`, tried once more, is still
+        refused or unreachable. Otherwise that ssh try is for the record only. Our own check
+        failures print their own FAIL and never get here."""
         sig = drop_signal(rc, out)
         if sig is None:
             return False, None
@@ -1824,7 +1872,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 nap(HOST_DROP_RECHECK_SECONDS)
             ev = self.vast_evidence(at, "host-drop-check" if i == 0 else "host-drop-recheck")
             reads.append((ev.get("status"), ev.get("msg"), ev.get("file")))
-            if reads[-1][0] is None or reads[-1][0].lower() == "running":
+            if reads[-1][0] is None or reads[-1][0].lower() in VAST_ALIVE:
                 break
         try:
             r3, o3 = self.run([self.vi, "cloud", "ssh", "true"], stream=False, timeout=60)
@@ -1833,7 +1881,11 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         again = drop_signal(r3, o3) if r3 != 0 else None
         again_text = "ssh again: ok" if r3 == 0 else f"ssh again: {again or f'exit {r3}'}"
         seen = ", then ".join(st or "unknown" for st, _, _ in reads)
-        if len(reads) == 2 and all(st is not None and st.lower() != "running" for st, _, _ in reads):
+        # r27: "gone" (Vast no longer lists the instance) counts only while ssh is still refused
+        # or unreachable; if ssh works again, the host is there whatever the listing said.
+        gone_ok = all(st != VAST_GONE for st, _, _ in reads) or (r3 != 0 and again is not None)
+        if (len(reads) == 2 and gone_ok
+                and all(st is not None and st.lower() not in VAST_ALIVE for st, _, _ in reads)):
             status, msg, f = reads[-1]
             text = (f"HOST-DROP (status {status}{f': {msg}' if msg else ''}); {sig}; Vast said "
                     f"{seen} {HOST_DROP_RECHECK_SECONDS} s apart; {again_text}"
@@ -1844,7 +1896,8 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 self.save()
             return True, text
         why = ("home could not read the instance status from Vast, so this is not a host drop"
-               if reads[-1][0] is None else f"Vast said {seen}")
+               if reads[-1][0] is None else
+               f"Vast said {seen}, but ssh answers again" if not gone_ok else f"Vast said {seen}")
         text = (f"ssh lost the connection ({sig}), but this is not a confirmed host drop "
                 f"({why}; {again_text})")
         say(text)
