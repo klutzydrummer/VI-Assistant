@@ -17,13 +17,43 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Python packages for the home stages
-        run: python3 -m pip install --user --break-system-packages -r jobs/requirements-home.txt
       - name: Format
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Python job tests
-        run: python3 -m unittest discover -s jobs
+
+  # The Python suite is split over four runners; .github/ci_shards.py lists which
+  # modules each one runs. Each shard runs its modules one after another.
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1", "2", "3", "4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: jobs/requirements-home.txt
+      - name: Python packages for the home stages
+        run: python -m pip install -r jobs/requirements-home.txt
+      - name: Python job tests, shard ${{ matrix.shard }}
+        run: python .github/ci_shards.py run ${{ matrix.shard }}
+
+  # Proves the shards cover every jobs/test_*.py module and add up to the expected count.
+  python-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: jobs/requirements-home.txt
+      - run: python -m pip install -r jobs/requirements-home.txt
+      - name: Every test module is in exactly one shard
+        run: python .github/ci_shards.py check
