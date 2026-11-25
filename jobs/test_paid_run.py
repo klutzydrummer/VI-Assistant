@@ -1287,9 +1287,9 @@ class ViBinResolution(unittest.TestCase):
         self.pr = paid_run
         self.tmp = Path(tempfile.mkdtemp(prefix="vi-bin-test."))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)]))
-        self.old_repo = paid_run.REPO
-        paid_run.REPO = self.tmp
-        self.addCleanup(lambda: setattr(paid_run, "REPO", self.old_repo))
+        self.old_repo = paid_run.common.REPO
+        paid_run.common.REPO = self.tmp
+        self.addCleanup(lambda: setattr(paid_run.common, "REPO", self.old_repo))
         self.saved = os.environ.pop("VI_BIN", None)
         self.addCleanup(self.restore_env)
 
