@@ -1851,8 +1851,8 @@ class Resilience(Base):
         self.assertTrue(ok, line)
         def broken(*_):
             raise ModuleNotFoundError("No module named 'huggingface_hub'")
-        self.addCleanup(setattr, pr, "load_size_table", pr.load_size_table)
-        pr.load_size_table = broken  # stands in for any import or parse failure in the check
+        self.addCleanup(setattr, pr.hf, "load_size_table", pr.hf.load_size_table)
+        pr.hf.load_size_table = broken  # stands in for any import or parse failure in the check
         ok, line = pr.hf_offline_check()
         self.assertFalse(ok)
         self.assertIn("BROKEN offline", line)
@@ -1894,7 +1894,7 @@ class Resilience(Base):
             spec = importlib.util.spec_from_file_location("pr", {str(SCRIPT)!r})
             pr = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(pr)
-            pr.HF_API = sys.argv[1]
+            pr.hf.HF_API = sys.argv[1]
             ok, lines = pr.hf_revision_gate({str(home)!r}, {rev!r}, sleep=lambda s: None)
             print(lines[0])
             sys.exit(0 if ok else pr.EXIT["hf"])
