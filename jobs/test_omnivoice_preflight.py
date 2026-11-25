@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -591,6 +592,17 @@ class FetchBaseModelGuardTest(unittest.TestCase):
             with open(folder / rel, "wb") as f:
                 f.truncate(size)
 
+    def calls(self):
+        """local_dir of every snapshot_download call; each try runs in a forked child, so the fake
+        records its calls in a file the parent reads."""
+        log = self.root / "calls.log"
+        return log.read_text().splitlines() if log.is_file() else []
+
+    def record(self, local_dir):
+        with open(self.root / "calls.log", "a") as f:
+            f.write(f"{local_dir}\n")
+        return len(self.calls())
+
     def run_main(self):
         import contextlib, io
         out, err = io.StringIO(), io.StringIO()
@@ -599,25 +611,23 @@ class FetchBaseModelGuardTest(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_fetch_base_model_retry_and_size(self):
-        calls = []
-
         def snap(repo, revision=None, local_dir=None):
-            calls.append(local_dir)
-            if len(calls) <= 2:
+            if self.record(local_dir) <= 2:
                 raise TimeoutError("read timed out")
             self.write_files(local_dir)
         self.hub.snapshot_download = snap
         rc, out, err = self.run_main()
         dest = self.root / "cache" / "k2-fsa--OmniVoice-c5fdb5ccb189"
         self.assertEqual(rc, 0, err)
-        self.assertEqual(len(calls), 3)
-        self.assertTrue(all(c.endswith(".part") for c in calls))
+        self.assertEqual(len(self.calls()), 3)
+        self.assertIn("TimeoutError: read timed out", err)
+        self.assertTrue(all(c.endswith(".part") for c in self.calls()))
         self.assertEqual(out.strip(), str(dest))
         self.assertFalse(dest.with_name(dest.name + ".part").exists())  # renamed atomically
         # A passing dest is reused without a download.
-        calls.clear()
+        (self.root / "calls.log").unlink()
         self.assertEqual(self.run_main()[0], 0)
-        self.assertEqual(calls, [])
+        self.assertEqual(self.calls(), [])
 
     def test_truncated_safetensors_is_refused(self):
         def snap(repo, revision=None, local_dir=None):
@@ -632,16 +642,79 @@ class FetchBaseModelGuardTest(unittest.TestCase):
     def test_a_truncated_existing_dest_is_not_reused(self):
         dest = self.root / "cache" / "k2-fsa--OmniVoice-c5fdb5ccb189"
         self.write_files(dest, truncate=True)
-        calls = []
 
         def snap(repo, revision=None, local_dir=None):
-            calls.append(local_dir)
+            self.record(local_dir)
             self.write_files(local_dir)
         self.hub.snapshot_download = snap
         rc, out, err = self.run_main()
         self.assertEqual(rc, 0, err)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.fb.size_problems(dest, self.REV), [])
+
+    # r31 F2: dbg6's host trickled at about 0.01 MB/s and the fetch hung with no error. A fake
+    # downloader grows the .part folder (sparse files, no disk used) at a chosen rate; the window
+    # and floor are shrunk so the test takes seconds.
+    def trickle(self, bytes_per_tick, ticks, tick=0.05):
+        def snap(repo, revision=None, local_dir=None):
+            self.record(local_dir)
+            f = Path(local_dir) / ".cache" / "huggingface" / "download" / "model.safetensors.incomplete"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            size = f.stat().st_size if f.is_file() else 0
+            for _ in range(ticks):
+                size += bytes_per_tick
+                with open(f, "ab") as h:
+                    h.truncate(size)
+                time.sleep(tick)
+            self.write_files(local_dir)
+        return snap
+
+    def stall_env(self, window="0.6", mbps="1"):
+        for k, v in (("VI_FETCH_STALL_WINDOW", window), ("VI_FETCH_MIN_MBPS", mbps)):
+            os.environ[k] = v
+            self.addCleanup(os.environ.pop, k, None)
+
+    def test_r31_slow_inbound_stops_each_try_and_fails_clearly(self):
+        self.stall_env()
+        self.hub.snapshot_download = self.trickle(1000, 10_000)  # 0.02 MB/s, would take ~8 min
+        t0 = time.monotonic()
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 1, err)
+        self.assertLess(time.monotonic() - t0, 30, "the watchdog did not stop the slow tries")
+        self.assertEqual(len(self.calls()), 4, err)  # the existing 4 tries, then a clear failure
+        self.assertEqual(err.count("inbound too slow"), 5, err)  # 4 tries + the final line
+        self.assertIn("worker-preflight: base model download failed: inbound too slow", err)
+        self.assertEqual(out, "")
+        self.assertFalse((self.root / "cache" / "k2-fsa--OmniVoice-c5fdb5ccb189").exists())
+
+    def test_r31_one_slow_try_then_a_fast_one_succeeds(self):
+        self.stall_env()
+
+        def snap(repo, revision=None, local_dir=None):
+            if self.record(local_dir) == 1:
+                time.sleep(60)  # nothing arrives at all; the watchdog ends this try
+            self.write_files(local_dir)
+        self.hub.snapshot_download = snap
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.calls()), 2, err)
+        self.assertIn("try 1/4 failed: inbound too slow: 0.000 MB/s", err)
+
+    def test_r31_a_download_above_the_floor_is_never_stopped(self):
+        self.stall_env()
+        # 1 MB per 0.05 s = 20 MB/s for about 2 s, three windows long
+        self.hub.snapshot_download = self.trickle(1_000_000, 40)
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.calls()), 1, err)
+        self.assertNotIn("inbound too slow", err)
+
+    def test_r31_an_import_error_in_the_child_is_a_failed_try_not_a_hang(self):
+        import sys
+        sys.modules["huggingface_hub"] = None  # import raises ImportError in the child
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 1, err)
+        self.assertRegex(err, r"worker-preflight: base model download failed: (ModuleNotFound|Import)Error")
 
 
 WORKER_JOB_STUB = r'''

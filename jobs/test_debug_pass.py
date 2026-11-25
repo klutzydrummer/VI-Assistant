@@ -38,8 +38,32 @@ DEBUG_BRANCH = '''\
             print("rsync: connection unexpectedly closed (0 bytes received so far) [sender]", file=sys.stderr)
             print("on-worker.sh: exiting with 255", file=sys.stderr)
             print("error: stage omnivoice_debug failed: exit status: 255", file=sys.stderr); sys.exit(1)
+        if r == "drop_dbg6":
+            # r31: omnivoice-ft-dbg6 (2026-11-25, run.log 146-216): stages 3 and 4 passed, stage 5
+            # never reported, the host vanished; ssh printed no "remote host" and no exit 255 of
+            # its own, on-worker.sh exited 1 and so did the vi CLI
+            print("debug-pass: stage 3 upload: PASS (5 s)", flush=True)
+            print("debug-pass: stage 4 venv: PASS (670 s)", flush=True)
+            print("debug-pass: stage 5 base-model: still running (720 s)", flush=True)
+            st["dropped"] = st["worker"]["id"]; save()
+            for ln in ("worker-preflight: return path: worker could not push through the reverse SSH return tunnel",
+                       "Connection closed by 192.0.2.7 port 53880",
+                       "2026-11-25T12:02:58Z tunnel down (ssh exit 255); reconnecting in 10s",
+                       "on-worker.sh: ALERT: could not re-prove the return path",
+                       "on-worker.sh: poll failed; will retry (lost for 308s)",
+                       "on-worker.sh: giving up after 5 min without a successful poll; keeping /root/vi-jobs/w on the worker for a reattach",
+                       "on-worker.sh: omnivoice_debug did not complete successfully; keeping the worker copy",
+                       "on-worker.sh: exiting with 1",
+                       "error: stage omnivoice_debug failed: exit status: 1"):
+                print(ln, file=sys.stderr)
+            sys.exit(1)
         if r == "silent":
             print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
+        # r31 F4: the vi runner's key line and debug-pass.sh's log path name this run's key
+        key = a.get("stage_key", sc.get("stage_key", "ab12" * 16))
+        print(f"omnivoice_debug: running ({key[:12]})", file=sys.stderr)
+        print(f"debug-pass: stage 3 upload: running (limit 60 s; log /root/vi-jobs/omnivoice_debug."
+              f"{key}.20261125T113310Z/out/debug/03-upload.log)", flush=True)
         if sc.get("push_probe"):  # r30: on-worker.sh's probe line, before debug-pass.sh starts
             print("push-probe: start (random bytes only)", file=sys.stderr)
             print(sc["push_probe"], file=sys.stderr, flush=True)
@@ -68,7 +92,8 @@ DEBUG_BRANCH = '''\
                 res[n] = "PASS"
                 print(f"debug-pass: stage {n} {names[n]}: PASS (2 s)", flush=True)
         if res.get(9) == "PASS" and not sc.get("no_home_ckpt"):
-            ck = Path(os.environ["VI_CHECKPOINT_ROOT"]) / "omnivoice_debug" / "run1" / "checkpoint-5"
+            ck = (Path(os.environ["VI_CHECKPOINT_ROOT"]) / "omnivoice_debug"
+                  / f"{key}-20261125T113310Z" / "checkpoint-5")
             ck.mkdir(parents=True, exist_ok=True)
             sums = []
             for f in ("config.json", "model.safetensors", "optimizer.bin", "scheduler.bin",
@@ -77,7 +102,7 @@ DEBUG_BRANCH = '''\
                 import hashlib
                 sums.append(hashlib.sha256((ck / f).read_bytes()).hexdigest() + "  " + f)
             (ck / "SHA256SUMS").write_text("\\n".join(sums) + "\\n")
-        out = Path(sc["corpus"]) / "stages" / "omnivoice_debug" / ".tmp-k1" / "out" / "debug"
+        out = Path(sc["corpus"]) / "stages" / "omnivoice_debug" / f".tmp-{key}" / "out" / "debug"
         out.mkdir(parents=True, exist_ok=True)
         (out / "summary.json").write_text(json.dumps({str(k): v for k, v in res.items()}))
         if res.get(10) == "PASS" and not sc.get("no_home_wav"):
@@ -317,6 +342,58 @@ class KeepGoing(DebugBase):
         self.assertIn("no listening wav", self.details()[10])
 
 
+class ThisRunsHomeDirs(DebugBase):
+    """r31 F4: stage 9 and 10 read THIS run's stage-key dirs at home, never another run's newer
+    ones (dbg6 copied an older run's summary.json because it took the newest dir by mtime)."""
+
+    OTHER = "cd34" * 16
+
+    def other_run(self):
+        ck = Path(self.env["VI_CHECKPOINT_ROOT"]) / "omnivoice_debug" / f"{self.OTHER}-20261124T193837Z"
+        (ck / "checkpoint-5").mkdir(parents=True)
+        (ck / "checkpoint-5" / "model.safetensors").write_bytes(b"old")  # no SHA256SUMS
+        out = self.tmp / "corpus" / "stages" / "omnivoice_debug" / self.OTHER / "out" / "debug"
+        (out / "listening").mkdir(parents=True)
+        (out / "listening" / "old.wav").write_bytes(b"RIFF")
+        (out / "summary.json").write_text('{"5": "OLD RUN"}')
+        future = 4102444800  # 2100-01-01: the other run's dirs are the newest by mtime
+        for d in (ck, out, out.parent.parent):
+            os.utime(d, (future, future))
+        return ck
+
+    def test_picks_this_runs_key_not_the_newest_dir(self):
+        self.other_run()
+        self.scen()
+        self.assertEqual(self.run_debug(), 0, self.out)
+        det = self.details()
+        self.assertEqual(self.results()[9], "PASS", self.out)
+        self.assertIn("ab12ab12", det[9])
+        self.assertNotIn(self.OTHER, det[9])
+        self.assertIn(f".tmp-{'ab12' * 16}", det[10])
+        got = (self.tmp / "paid" / "t1" / "debug-worker-summary.json").read_text()
+        self.assertNotIn("OLD RUN", got)
+
+    def test_another_runs_dirs_never_stand_in_for_this_runs_missing_ones(self):
+        self.other_run()
+        self.scen(no_home_ckpt=True, no_home_wav=True)
+        self.assertEqual(self.run_debug(), 16, self.out)
+        res, det = self.results(), self.details()
+        self.assertEqual((res[9], res[10]), ("FAIL", "FAIL"), self.out)
+        self.assertIn(f"stage key {'ab12' * 16}", det[9])
+        self.assertIn("no listening wav", det[10])
+
+    def test_run_key_parsing(self):
+        pr = tp.load_paid_run()
+        k = "43c8eb65a5f29300ade7f0cb97193c59ba98e58ba02690b88243c679ea5eef0c"
+        self.assertEqual(pr.debug_run_key(
+            "omnivoice_debug: running (43c8eb65a5f2)\n"
+            f"debug-pass: stage 3 upload: running (limit 60 s; log /root/vi-jobs/omnivoice_debug."
+            f"{k}.20261125T113310Z/out/debug/03-upload.log)"), (k, "20261125T113310Z"))
+        self.assertEqual(pr.debug_run_key("omnivoice_debug: running (43c8eb65a5f2)"),
+                         ("43c8eb65a5f2", None))
+        self.assertEqual(pr.debug_run_key("nothing here"), (None, None))
+
+
 class SkipDependent(DebugBase):
     def test_rental_failure_skips_1_to_11_and_names_it(self):
         self.scenario([dict(up="fail")], corpus=str(self.tmp / "corpus"))
@@ -429,6 +506,27 @@ class HostDrop(DebugBase):
         self.assertIn("rental 2      : offer 2, instance 102, released", text)
         self.assertIn("spent $0.72 of $5.00 cap in 2 rental(s)", text)
         self.assertIn("HOST-DROP (status exited", self.out)
+
+    def test_r31_dbg6_drop_with_exit_1_is_confirmed_and_rents_once_more(self):
+        # r31 F1: dbg6's lines and exit 1 used to give no drop signal, so Vast was never asked
+        self.scen2(dict(debug="drop_dbg6", vast_gone=True))
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2, self.out)
+        self.assertEqual(len(self.show_calls(101)), 2, self.out)
+        r1 = self.summary()["rentals"][0]
+        self.assertTrue(r1["status"].startswith("HOST-DROP (status gone"), r1)
+        st1 = {r["stage"]: r for r in r1["stages"]}
+        self.assertEqual((st1[3]["result"], st1[4]["result"]), ("PASS", "PASS"))
+        self.assertEqual(st1[5]["result"], "HOST-DROP", st1[5])
+        self.assertIn("ssh may have lost the host", self.out)
+
+    def test_r31_ordinary_exit_1_without_a_drop_line_is_not_a_drop(self):
+        # stage 3 never reports and the stage ends with exit 1 and no ssh or tunnel line
+        self.scen2(dict(debug="silent"))
+        self.assertEqual(self.run_debug(), 16, self.out)
+        self.assertEqual(len(self.ups()), 1, self.out)
+        self.assertNotIn("HOST-DROP", self.results().values())
+        self.assertNotIn("ssh may have lost the host", self.out)
 
     def test_two_drops_never_rent_a_third(self):
         self.scenario([dict(spent=0.3, debug="drop"), dict(spent=0.3, debug="drop"), dict(spent=0.3)],
@@ -607,34 +705,47 @@ class VastInstanceGone(unittest.TestCase):
 
 class AbandonDebugMarkers(DebugBase):
     """r21 F4: after the release, an `omnivoice_debug-*` unverified marker whose checkpoint dir is
-    empty or missing is abandoned (jobs/checkpoints.py abandon); a non-empty debug dir and any
-    other stage's marker are never touched. Fake marker dirs only (VI_STATE_DIR is the test's)."""
+    empty or missing is abandoned (jobs/checkpoints.py abandon); r31 F3: so is one whose checkpoint
+    has no SHA256SUMS (dbg5's partial push), files kept. A debug dir with a manifest and any other
+    stage's marker are never touched. Fake marker dirs only (VI_STATE_DIR is the test's)."""
 
     def make_markers(self):
         mdir = Path(self.env["VI_STATE_DIR"]) / "unverified"
         mdir.mkdir(parents=True, exist_ok=True)
         ck = self.tmp / "ck"
         dirs = dict(missing=ck / "omnivoice_debug" / "gone", empty=ck / "omnivoice_debug" / "empty",
-                    full=ck / "omnivoice_debug" / "full", other=ck / "omnivoice_train" / "empty")
+                    full=ck / "omnivoice_debug" / "full", other=ck / "omnivoice_train" / "empty",
+                    partial=ck / "omnivoice_debug" / "partial",
+                    other_partial=ck / "omnivoice_train" / "partial")
         dirs["empty"].mkdir(parents=True)
         dirs["full"].mkdir(parents=True)
         (dirs["full"] / "checkpoint-5").mkdir()
+        (dirs["full"] / "checkpoint-5" / "SHA256SUMS").write_text("")
         dirs["other"].mkdir(parents=True)
+        for k in ("partial", "other_partial"):  # dbg5's shape: weights, an rsync partial, no manifest
+            (dirs[k] / "checkpoint-5" / ".rsync-partial").mkdir(parents=True)
+            (dirs[k] / "checkpoint-5" / "model.safetensors").write_bytes(b"w")
+            (dirs[k] / "checkpoint-5" / ".rsync-partial" / "optimizer.bin").write_bytes(b"o")
         names = dict(missing="omnivoice_debug-gone", empty="omnivoice_debug-empty",
-                     full="omnivoice_debug-full", other="omnivoice_train-empty")
+                     full="omnivoice_debug-full", other="omnivoice_train-empty",
+                     partial="omnivoice_debug-partial", other_partial="omnivoice_train-partial")
         for k, d in dirs.items():
             (mdir / names[k]).write_text(f"{d}\n")
         return mdir, dirs, names
 
     def check(self, mdir, dirs, names):
         left = sorted(x.name for x in mdir.iterdir())
-        self.assertEqual(left, ["omnivoice_debug-full", "omnivoice_train-empty"], self.out)
+        self.assertEqual(left, ["omnivoice_debug-full", "omnivoice_train-empty",
+                                "omnivoice_train-partial"], self.out)
         self.assertTrue((dirs["empty"] / "ABANDONED").is_file(), self.out)
+        self.assertTrue((dirs["partial"] / "ABANDONED").is_file(), self.out)
+        self.assertTrue((dirs["partial"] / "checkpoint-5" / "model.safetensors").is_file())
+        self.assertFalse((dirs["other_partial"] / "ABANDONED").exists())
         self.assertFalse((dirs["full"] / "ABANDONED").exists())
         self.assertTrue((dirs["full"] / "checkpoint-5").is_dir())
         self.assertFalse((dirs["other"] / "ABANDONED").exists())
         self.assertFalse(dirs["missing"].exists())
-        self.assertIn("abandoned 2 empty debug marker(s)", self.out)
+        self.assertIn("abandoned 3 empty or incomplete debug marker(s)", self.out)
 
     def test_release_abandons_only_empty_or_missing_debug_markers(self):
         mdir, dirs, names = self.make_markers()

@@ -8,9 +8,16 @@ retried (the hub client reuses completed files), is checked against a pinned siz
 only then renamed to DEST. An existing DEST is reused only if it passes the same size check, so
 a truncated file never reaches training. The Base is a public hub model, not game data.
 
-Environment (tests override these): VI_FETCH_BACKOFF="10 30 90" (seconds between the 4 tries).
+Each try runs in a forked child process. r31: HF_HUB_DOWNLOAD_TIMEOUT is a per-read timeout, so
+a host whose inbound trickles at a few KB/s (omnivoice-ft-dbg6, 2026-11-25) never trips it. The
+parent watches DEST.part and ends the try with "inbound too slow" when it grew by less than
+VI_FETCH_MIN_MBPS MB/s over the last VI_FETCH_STALL_WINDOW seconds; the try then counts as failed.
+
+Environment (tests override these): VI_FETCH_BACKOFF="10 30 90" (seconds between the 4 tries),
+VI_FETCH_MIN_MBPS=1 (decimal MB/s), VI_FETCH_STALL_WINDOW=120 (seconds).
 """
 
+import multiprocessing
 import os
 import shutil
 import sys
@@ -56,6 +63,76 @@ def _backoff():
     return [float(x) for x in raw]
 
 
+def _stall_settings():
+    window = float(os.environ.get("VI_FETCH_STALL_WINDOW", "120"))
+    min_rate = float(os.environ.get("VI_FETCH_MIN_MBPS", "1")) * 1_000_000
+    return window, min_rate
+
+
+def tree_bytes(folder):
+    """Bytes of every file under folder, the hub's hidden .incomplete files included."""
+    total = 0
+    for f in Path(folder).rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _one_try(repo, revision, part, conn):
+    """The child: one snapshot_download; sends None or the error text to the parent."""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(repo, revision=revision, local_dir=str(part))
+        conn.send(None)
+    except BaseException as e:  # noqa: BLE001 - any hub/network error is reported, then retried
+        conn.send(f"{type(e).__name__}: {e}")
+
+
+def download_once(repo, revision, part):
+    """One try in a child process: None when snapshot_download returned, else the problem. The
+    child is stopped when DEST.part grows slower than the floor over the whole window."""
+    window, min_rate = _stall_settings()
+    poll = max(0.05, min(5.0, window / 4))
+    ctx = multiprocessing.get_context("fork")
+    recv, send = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=_one_try, args=(repo, revision, part, send), daemon=True)
+    child.start()
+    send.close()
+    samples = [(time.monotonic(), tree_bytes(part))]
+    try:
+        while True:
+            child.join(poll)
+            if not child.is_alive():
+                break
+            now, have = time.monotonic(), tree_bytes(part)
+            samples.append((now, have))
+            old = [i for i, (t, _) in enumerate(samples) if now - t >= window]
+            if old:
+                samples = samples[old[-1]:]
+                t0, b0 = samples[0]
+                rate = (have - b0) / (now - t0)
+                if rate < min_rate:
+                    return (f"inbound too slow: {rate / 1_000_000:.3f} MB/s over the last "
+                            f"{now - t0:.0f} s (floor {min_rate / 1_000_000:g} MB/s, "
+                            f"{have} bytes in {part.name} so far); stopped this try")
+        if recv.poll():
+            return recv.recv()
+        return f"the download process exited {child.exitcode} without a result"
+    except (EOFError, OSError) as e:
+        return f"the download process gave no result: {type(e).__name__}: {e}"
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(10)
+            if child.is_alive():
+                child.kill()
+                child.join(10)
+        recv.close()
+
+
 def main(argv):
     if len(argv) != 3:
         print(__doc__, file=sys.stderr)
@@ -72,22 +149,19 @@ def main(argv):
               "downloading again", file=sys.stderr)
         shutil.rmtree(dest)
     part = dest.with_name(dest.name + ".part")
-    from huggingface_hub import snapshot_download
     print(f"fetch_base_model: downloading {repo}@{revision} to {part}", file=sys.stderr)
     delays = _backoff()
     last = "no attempt"
     for attempt in range(TRIES):
         part.mkdir(parents=True, exist_ok=True)
-        try:
-            snapshot_download(repo, revision=revision, local_dir=str(part))
+        last = download_once(repo, revision, part)
+        if last is None:
             problems = size_problems(part, revision)
             if not problems:
                 os.replace(part, dest)
                 print(dest)
                 return 0
             last = "; ".join(problems)
-        except Exception as e:  # noqa: BLE001 - any hub/network error is retried
-            last = f"{type(e).__name__}: {e}"
         print(f"fetch_base_model: try {attempt + 1}/{TRIES} failed: {last}", file=sys.stderr)
         if attempt < TRIES - 1:
             time.sleep(delays[min(attempt, len(delays) - 1)])

@@ -128,9 +128,14 @@ def failure_rc_text(rc, out):
 
 # A host drop (r18): the worker's ssh ended from its side or nothing listens any more. ssh's own
 # exit 255 or one of these lines is only a suspicion; host_drop() confirms it with a status check.
+# r31: dbg6's host vanished with only `Connection closed by <ip> port <n>`, the return tunnel's
+# `tunnel down (ssh exit 255)`, and on-worker.sh's own give-up lines, and the vi CLI exited 1.
 HOST_DROP_RE = re.compile(r"closed by remote host|Connection refused|Connection reset by peer|"
                           r"Connection timed out|No route to host|kex_exchange_identification|"
-                          r"Broken pipe|connection unexpectedly closed")
+                          r"Broken pipe|connection unexpectedly closed|"
+                          r"Connection closed by \S+ port \d+|tunnel down \(ssh exit 255\)|"
+                          r"giving up after \d+ min without a successful poll|"
+                          r"could not re-prove the return path")
 DROP_EXIT_RE = re.compile(r"(?:exited with|exiting with|exit status:) 255\b")
 
 
@@ -144,6 +149,24 @@ def drop_signal(rc, out):
     if rc == 255 or DROP_EXIT_RE.search(out):
         return "ssh exit 255"
     return None
+
+
+# r31 F4: this run's stage key. debug-pass.sh names the worker dir
+# `omnivoice_debug.<key>.<attempt>` in its stage log paths; the vi runner's own
+# `omnivoice_debug: running (<first 12 of key>)` line is the fallback.
+DEBUG_WORK_RE = re.compile(r"omnivoice_debug\.([0-9a-f]{12,})\.(\d{8}T\d{6}Z)")
+DEBUG_RUNNING_RE = re.compile(r"omnivoice_debug: running \(([0-9a-f]{12,})\)")
+
+
+def debug_run_key(out):
+    """(stage key or its 12-character prefix, attempt or None) named in this run's output, or
+    (None, None)."""
+    out = out or ""
+    m = DEBUG_WORK_RE.findall(out)
+    if m:
+        return m[-1]
+    m = DEBUG_RUNNING_RE.findall(out)
+    return (m[-1], None) if m else (None, None)
 
 
 def retryable_gate(out):
@@ -1246,33 +1269,65 @@ def realpath_check(stages, repo, forward=False, home=None, mem_mb=None, runner=r
     return False, [f"{label}{head} (exit {rc}); last lines of the check:"] + [f"                  | {ln}" for ln in tail]
 
 
-def stale_markers(state_dir=None, home=None):
-    """Unverified markers whose checkpoint dir is missing or empty: [(marker, dir)]. Read-only."""
+def marker_state(d):
+    """What an unverified marker's checkpoint dir holds, read-only: "missing", "empty",
+    "incomplete" (files but no SHA256SUMS in the dir or any checkpoint below it, e.g. dbg5's
+    partial push) or "complete-unverified" (a manifest exists, `verify` has not passed yet)."""
+    if not d.is_dir():
+        return "missing"
+    try:
+        kids = list(d.iterdir())
+    except OSError:
+        return "missing"
+    if not kids:
+        return "empty"
+    if (d / "SHA256SUMS").is_file() or any(
+            k.is_dir() and not k.name.startswith(".") and (k / "SHA256SUMS").is_file() for k in kids):
+        return "complete-unverified"
+    return "incomplete"
+
+
+def unverified_markers(state_dir=None):
+    """Every unverified marker with its checkpoint dir and marker_state(): [(marker, dir, state)].
+    Read-only."""
     root = Path(state_dir) if state_dir else vi_state_dir()
     out = []
     mdir = root / "unverified"
     if not mdir.is_dir():
         return out
     for m in sorted(mdir.iterdir()):
+        if not m.is_file():
+            continue
         try:
             d = Path(m.read_text().strip())
         except OSError:
             continue
-        if m.is_file() and str(d) and (not d.is_dir() or not any(d.iterdir())):
-            out.append((m, d))
+        if str(d):
+            out.append((m, d, marker_state(d)))
     return out
 
 
+def stale_markers(state_dir=None, home=None):
+    """Unverified markers whose checkpoint dir is missing or empty: [(marker, dir)]. Read-only."""
+    return [(m, d) for m, d, st in unverified_markers(state_dir) if st in ("missing", "empty")]
+
+
 def stale_marker_lines():
-    found = stale_markers()
+    """r31 F3: the plan lists EVERY unverified marker with its state (dbg6's plan said `none`
+    while dbg5's incomplete marker existed). Read-only; abandon commands only for dead dirs."""
+    found = unverified_markers()
     if not found:
         return ["stale markers   : none"]
-    lines = [f"stale markers   : {len(found)} unverified marker(s) name an empty or missing "
-             "checkpoint dir; a plain `vi cloud down` refuses while any marker exists. Nothing is "
-             "deleted here. If you agree they are dead, run for each:"]
-    for m, d in found:
-        lines.append(f"                  python3 jobs/checkpoints.py abandon {d} "
-                     "--reason 'empty failed-attempt dir'")
+    lines = [f"stale markers   : {len(found)} unverified marker(s); a plain `vi cloud down` refuses "
+             "while any marker exists. Nothing is deleted here."]
+    for m, d, st in found:
+        lines.append(f"                  {st}: {m.name} -> {d}")
+    dead = [d for _m, d, st in found if st in ("missing", "empty")]
+    if dead:
+        lines.append("                  If you agree the empty or missing ones are dead, run for each:")
+        for d in dead:
+            lines.append(f"                  python3 jobs/checkpoints.py abandon {d} "
+                         "--reason 'empty failed-attempt dir'")
     return lines
 
 
@@ -1792,16 +1847,20 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         """r21 F4: after a debug worker is released, its `omnivoice_debug-*` unverified marker
         names a checkpoint dir that is empty or missing (the debug pass keeps nothing), and that
         marker would make the next plain `vi cloud down` refuse. Abandon exactly those with
-        `jobs/checkpoints.py abandon` (stale_markers() decides empty/missing). A non-empty debug
-        dir and every other stage's marker are left alone. Best effort, never raises."""
+        `jobs/checkpoints.py abandon` (marker_state() decides). r31 F3: also a debug dir whose
+        checkpoint has no SHA256SUMS (dbg5's partial push): it can never verify, and a debug pass
+        is never resumed. Files are kept. A debug dir with a manifest and every other stage's
+        marker are left alone. Best effort, never raises."""
         done = 0
-        for m, d in stale_markers():
-            if not m.name.startswith(f"{DEBUG_STAGE}-"):
+        for m, d, st in unverified_markers():
+            if not m.name.startswith(f"{DEBUG_STAGE}-") or st == "complete-unverified":
                 continue
+            why = ("empty debug checkpoint dir" if st in ("missing", "empty") else
+                   "debug checkpoint has no SHA256SUMS (partial push)")
             try:
                 r = subprocess.run([sys.executable, str(REPO / "jobs" / "checkpoints.py"),
                                     "abandon", str(d), "--reason",
-                                    f"debug pass {self.a.run_id}: empty debug checkpoint dir "
+                                    f"debug pass {self.a.run_id}: {why} "
                                     "after release"], env=self.env(), capture_output=True,
                                    text=True, timeout=60)
             except (OSError, subprocess.SubprocessError) as e:
@@ -1813,7 +1872,8 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 say(f"could not abandon the debug marker {m.name}: "
                     f"{(r.stdout + r.stderr).strip()[-300:]}")
         if done:
-            say(f"abandoned {done} empty debug marker(s) (jobs/checkpoints.py abandon; files kept)")
+            say(f"abandoned {done} empty or incomplete debug marker(s) (jobs/checkpoints.py "
+                "abandon; files kept)")
 
     def fetch_diagnostics(self, at, outcome):
         """Best effort, never raises: pull a bounded diagnostics file from the worker into the run
@@ -2339,12 +2399,20 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                        f"never reported; the stage ended ({failure_rc_text(rc, out)}) first"
                        + (f"; {drop[1]}" if drop and drop[1] else ""))
                 self.debug_record(n, "FAIL", f"({why})", tail)
-        self.debug_home_checks()
+        self.debug_home_checks(out)
 
-    def debug_home_dirs(self):
-        """(newest checkpoint run dir, newest stage output debug dir) at home, or None each."""
+    def debug_home_dirs(self, out=""):
+        """(checkpoint run dir, stage output debug dir) at home for THIS run's stage key, or None
+        each. r31 F4: the key (and attempt) come from this run's output; dbg6 took the newest dir
+        of any run by mtime and read an older run's summary. No key in the output: None, None."""
+        key, attempt = debug_run_key(out)
+        if key is None:
+            return None, None
         root = Path(self.a.checkpoint_root) / DEBUG_STAGE
-        runs = [d for d in root.glob("*") if d.is_dir()] if root.is_dir() else []
+        runs = [d for d in root.glob("*") if d.is_dir() and d.name.startswith(key)] \
+            if root.is_dir() else []
+        exact = [d for d in runs if attempt and d.name.endswith(f"-{attempt}")]
+        runs = exact or runs
         ck = max(runs, key=lambda d: d.stat().st_mtime) if runs else None
         corpus_dir = None
         try:
@@ -2358,17 +2426,20 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         if corpus_dir is not None:
             base = corpus_dir / "stages" / DEBUG_STAGE
             outs = [d for d in list(base.glob("*/out/debug")) + list(base.glob(".tmp-*/out/debug"))
-                    if d.is_dir()]
+                    if d.is_dir() and d.parent.parent.name.removeprefix(".tmp-").startswith(key)]
         out = max(outs, key=lambda d: d.stat().st_mtime) if outs else None
         return ck, out
 
-    def debug_home_checks(self):
+    def debug_home_checks(self, run_out=""):
         """Stage 9 and 10 pass only if their results are really at home."""
-        ck, out = self.debug_home_dirs()
+        ck, out = self.debug_home_dirs(run_out)
         if self.debug.get(9, {}).get("result") == "PASS":
             if ck is None:
+                key = debug_run_key(run_out)[0]
                 self.debug_record(9, "FAIL", "(the worker pushed, but no checkpoint run folder "
-                                  f"is under {self.a.checkpoint_root}/{DEBUG_STAGE})")
+                                  f"is under {self.a.checkpoint_root}/{DEBUG_STAGE} for this run's "
+                                  + (f"stage key {key})" if key else "stage key: the output "
+                                     "named none)"))
             else:
                 r = subprocess.run([sys.executable, str(REPO / "jobs" / "checkpoints.py"),
                                     "--format", "omnivoice", "verify-epoch", str(ck), "5"],

@@ -736,6 +736,23 @@ class Flow(Base):
         self.assertIn("vastai", [c[0] for c in self.calls()])
         self.assertTrue(list((self.tmp / "paid" / "t1").glob("vast-attempt-1-preflight-failed.txt")))
 
+    def test_r31_dbg6_lines_are_a_drop_signal_with_exit_1(self):
+        # omnivoice-ft-dbg6 run.log (2026-11-25): the vi CLI exited 1 and ssh never said
+        # "remote host"; each of these lines alone must raise the suspicion host_drop() checks
+        pr = load_paid_run()
+        for ln in ("Connection closed by 192.0.2.7 port 53880",
+                   "2026-11-25T12:02:58Z tunnel down (ssh exit 255); reconnecting in 10s",
+                   "on-worker.sh: giving up after 5 min without a successful poll; keeping /w",
+                   "on-worker.sh: ALERT: could not re-prove the return path"):
+            with self.subTest(ln=ln):
+                self.assertIsNotNone(pr.drop_signal(1, "on-worker.sh: exiting with 1\n" + ln))
+        for ordinary in ("on-worker.sh: input upload failed\non-worker.sh: exiting with 1",
+                         "error: stage omnivoice_debug failed: exit status: 1",
+                         "2026-11-25T12:02:58Z tunnel down (ssh exit 1); reconnecting in 10s",
+                         "worker-return: giving up after rsync exit 23 (waited 30s)", ""):
+            with self.subTest(ordinary=ordinary):
+                self.assertIsNone(pr.drop_signal(1, ordinary))
+
     def test_failure_rc_text_round19_passthrough(self):
         # r18: ssh lost the host, on-worker.sh exited 255 under set -e, and the summary said 1
         pr = load_paid_run()
@@ -1412,14 +1429,25 @@ class IdsAndMarkers(Base):
         (mdir / "a").write_text(str(empty))
         (mdir / "b").write_text(str(full))
         (mdir / "c").write_text(str(self.tmp / "ck-gone"))
+        # r31 F3: every marker is listed with its state, not only the empty or missing ones
+        done = self.tmp / "ck-done"
+        (done / "checkpoint-5").mkdir(parents=True)
+        (done / "checkpoint-5" / "SHA256SUMS").write_text("")
+        (mdir / "d").write_text(str(done))
         st = HomeChecks.stages_file(self, 1, 0)
         self.assertEqual(self.run_orch(stages=st, plan=True), 0, self.out)
-        self.assertIn("stale markers   : 2 unverified marker(s)", self.out)
+        self.assertIn("stale markers   : 4 unverified marker(s)", self.out)
+        self.assertIn(f"empty: a -> {empty}", self.out)
+        self.assertIn(f"incomplete: b -> {full}", self.out)
+        self.assertIn(f"missing: c -> {self.tmp / 'ck-gone'}", self.out)
+        self.assertIn(f"complete-unverified: d -> {done}", self.out)
         self.assertIn(f"checkpoints.py abandon {empty} ", self.out)
-        self.assertIn("ck-gone", self.out)
+        self.assertIn(f"checkpoints.py abandon {self.tmp / 'ck-gone'} ", self.out)
         self.assertNotIn(f"abandon {full} ", self.out)
-        self.assertEqual(sorted(p.name for p in mdir.iterdir()), ["a", "b", "c"])
+        self.assertNotIn(f"abandon {done} ", self.out)
+        self.assertEqual(sorted(p.name for p in mdir.iterdir()), ["a", "b", "c", "d"])
         self.assertTrue(empty.is_dir())
+        self.assertEqual(sorted(p.name for p in full.iterdir()), ["model.safetensors"])
 
 
 class RealPathCheck(Base):
