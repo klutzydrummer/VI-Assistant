@@ -102,6 +102,16 @@ from paidrun.common import (
     Interrupted, StopRequested, proc_start, proc_is_run, say, state_root, vi_state_dir, clock,
     rfc3339, state_path, stop_path, resolve_vi_bin,
 )
+from paidrun import limits
+from paidrun.limits import (
+    PROGRESS_SECONDS, STOP_WAIT_SECONDS, OUTER_RETRY_SECONDS, RELEASE_BACKOFF,
+    QUERY_TIMEOUT_SECONDS, DOWN_TIMEOUT_SECONDS, DOWN_VERIFY_TIMEOUT_SECONDS,
+    VERIFY_EPOCH_TIMEOUT_SECONDS, PREFLIGHT_TIMEOUT_SECONDS, FATAL_QUIET_SECONDS, UP_EXTRA_SECONDS,
+    DEFAULT_BOOT_MINUTES, INPLACE_MAX_RESTARTS, INPLACE_MAX_SECONDS, REATTACH_MAX,
+    REATTACH_WAIT_SECONDS, HF_TRIES, HF_TIMEOUT_SECONDS, HF_BACKOFF, VAST_EVIDENCE_SECONDS,
+    HOST_DROP_RECHECK_SECONDS, DIAG_TIMEOUT_SECONDS, DEBUG_PROBE_SECONDS,
+    DEBUG_RELEASE_MARGIN_SECONDS, DEBUG_LOST_MINUTES, PUSH_PROBE_MAX_MINUTES, REALPATH_TIMEOUT,
+)
 # ---- end of paidrun re-exports
 
 # Every failed cheap gate of jobs/worker-preflight.sh prints `worker-preflight: <what failed>`
@@ -227,40 +237,20 @@ STEP_RE = re.compile(r"\b[Ss]teps?\s*[:=]?\s*(\d+)\s*(?:/|of)\s*(\d+)")
 # on-worker.sh prints this on home once a checkpoint is verified at home and acked to the worker.
 ACK_RE = re.compile(r"on-worker\.sh: checkpoint (\d+) verified home and acked")
 CKPT_EVERY = 500
-PROGRESS_SECONDS = 30.0
-STOP_WAIT_SECONDS = 600.0
 MIN_SAMPLES = 3
 
 
-# ---- retries, timeouts and recovery bounds (every wait goes through nap(), so tests never wait) ----
-OUTER_RETRY_SECONDS = 20          # F-NET-1: one more try of `offers` / `status` after this long
-RELEASE_BACKOFF = (10, 20, 40, 80)  # F-REL-1: waits between `down --force` tries before exit 9
-QUERY_TIMEOUT_SECONDS = 180       # F-CLK-1: offers / status
-DOWN_TIMEOUT_SECONDS = 300        # a hung `down` would bill forever
-DOWN_VERIFY_TIMEOUT_SECONDS = 600  # r32: `down --verify` = DELETE retries + up to 120 s of listing
-VERIFY_EPOCH_TIMEOUT_SECONDS = 300  # r32 WP7: the debug pass's home verify-epoch
-PREFLIGHT_TIMEOUT_SECONDS = 90 * 60
 # r7: the tokeniser's pool died (pthread_create failed -> BrokenProcessPool) and the stage then
 # printed nothing for hours. A fatal line followed by this long with no new output ends the
 # preflight as a non-retryable failure (fork F2: a crash is a code or limits bug, not a bad
 # offer). The same words as VI_FATAL_RE in jobs/worker-limits.sh. PAID_RUN_FATAL_QUIET_SECONDS
 # overrides the wait for tests.
 FATAL_RE = re.compile(r"BrokenProcessPool|pthread_create failed|can't start new thread|Traceback")
-FATAL_QUIET_SECONDS = 180
-UP_EXTRA_SECONDS = 5 * 60         # `up` may take boot_minutes plus this
-DEFAULT_BOOT_MINUTES = 15
-INPLACE_MAX_RESTARTS = 2          # F-RES-1 / F-TRN-2: in-place train restarts on the same worker
-INPLACE_MAX_SECONDS = 45 * 60     # ... and the window, from the first failure, they must fit in
-REATTACH_MAX = 3                  # F-PUSH-5: stage died but the trainer lives; reattach this often
-REATTACH_WAIT_SECONDS = 15
 BOOT_FAIL_RE = re.compile(r"no ssh after|disappeared while booting|failed to start|boot (?:timeout|failure)",
                           re.I)
 INPLACE_MIN_DISK_GB = 5.0         # a worker with less free disk than this is treated as ENOSPC
 HF_REPO = "k2-fsa/OmniVoice"
 HF_API = "https://huggingface.co/api/models"  # the tests point it at a local stub server
-HF_TRIES = 3
-HF_TIMEOUT_SECONDS = 60
-HF_BACKOFF = (5, 15)
 VRAM_FLOOR_STEP_GB = 4.0          # F-OOM-1: how much a memory failure raises the next offer's VRAM floor
 CUDA_GATE_RE = re.compile(r"worker-preflight: .*\b(CUDA|driver)\b", re.I)
 MEMORY_GATE_RE = re.compile(r"worker-preflight: (?:vram peak \S+ of \S+ GiB|.*\b(?:VRAM|RAM)\b)", re.I)
@@ -293,16 +283,9 @@ CONFIG_DEFAULT_DISK_GB = 60.0
 
 
 DIAG_MAX_BYTES = 256 * 1024
-# A1: host-side evidence from the Vast CLI before a failed worker is destroyed. Each call is cut
-# off after this long; VI_VASTAI_BIN overrides the binary (tests use a stub). The CLI reads its
-# own key; this script never reads or prints the key or the CLI's config/state files.
-VAST_EVIDENCE_SECONDS = 30.0
-# r21: a host drop needs two Vast status reads this far apart that both say not running.
-HOST_DROP_RECHECK_SECONDS = 60
 VAST_LOG_TAIL = 200
 # C: a debug pass rents at most this many workers; the second only after a confirmed host drop.
 DEBUG_MAX_RENTALS = 2
-DIAG_TIMEOUT_SECONDS = 25.0
 # Run on the worker through `vi cloud ssh`; every part is bounded by head/tail and `timeout`.
 DIAG_SCRIPT = r"""
 exec 2>&1
@@ -528,11 +511,6 @@ DEBUG_STAGES = (
     (10, "listening", (8,)), (11, "resume", (8,)), (12, "down", ()))
 DEBUG_NAMES = {n: name for n, name, _ in DEBUG_STAGES} | {0: "rental"}
 DEBUG_PROBE_SCRIPT = REPO / "jobs" / "debug-probe.sh"
-DEBUG_PROBE_SECONDS = 180
-# The worker stage is cut off this long before the run's hours end, so `down` still fits.
-DEBUG_RELEASE_MARGIN_SECONDS = 10 * 60
-# r21: on-worker.sh gives up on an unreachable worker after this many minutes in the debug pass.
-DEBUG_LOST_MINUTES = 5
 # r21: SKIP-no-time = debug-pass.sh did not start the stage because the rental's hours ran out;
 # it is shown apart from FAIL (the stage itself was never tried).
 DEBUG_LINE_RE = re.compile(
@@ -643,7 +621,6 @@ def parse_debug_output(text):
 
 
 PUSH_PROBE_JSON_RE = re.compile(r"push-probe: json (\{.*\})\s*$")
-PUSH_PROBE_MAX_MINUTES = 5  # VI_PUSH_PROBE_SECONDS' default in jobs/push-probe.sh, 300 s
 
 
 def parse_push_probe(text):
@@ -838,7 +815,6 @@ REALPATH_REQ = REPO / "jobs" / "requirements-omnivoice-home-cpu.txt"
 REALPATH_SCRIPT = REPO / "jobs" / "omnivoice-ft" / "home_realpath_check.py"
 REALPATH_MIN_RAM_MB = 4096
 REALPATH_FORWARD_RAM_MB = 12288  # model + KL reference + gradients, measured ~9 GB peak by estimate
-REALPATH_TIMEOUT = {False: 900, True: 1800}
 
 
 def mem_available_mb(meminfo="/proc/meminfo"):
