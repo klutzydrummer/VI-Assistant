@@ -149,14 +149,31 @@ class PushProbeTest(unittest.TestCase):
 
     def test_a_broken_helper_is_fail_soft(self):
         # No python3 at all: the JSON cannot be built, but the probe still returns 0.
-        env_path = ":".join(p for p in self.env["PATH"].split(":")
-                            if not (Path(p) / "python3").exists())
+        # Hermetic PATH: one dir holding a symlink to every tool on PATH except python. Dropping
+        # whole PATH dirs instead would also drop bash and coreutils wherever they share a dir
+        # with python3 (/usr/bin on the CI runner). bash is resolved here in the parent.
+        bash = shutil.which("bash", path=self.env["PATH"])
+        nopy = Path(self.tmp.name) / "nopy-bin"
+        nopy.mkdir()
+        for d in self.env["PATH"].split(":"):
+            if not d or not Path(d).is_dir():
+                continue
+            for tool in Path(d).iterdir():
+                if (re.fullmatch(r"python[0-9.]*(-config)?", tool.name) or (nopy / tool.name).exists()
+                        or not os.access(tool, os.X_OK) or tool.is_dir()):
+                    continue
+                (nopy / tool.name).symlink_to(tool.resolve())
+        env = {**self.env, "PATH": str(nopy), "VI_PUSH_PROBE_LEG_SECONDS": "15"}
+        check = subprocess.run([bash, "-c", "command -v python3 || command -v python || echo none"],
+                               env=env, capture_output=True, text=True)
+        self.assertEqual(check.stdout.strip(), "none")
         result = subprocess.run(
-            ["bash", "-c", RUN, "probe", self.work, self.out, self.port, PROBE],
-            env={**self.env, "PATH": env_path, "VI_PUSH_PROBE_LEG_SECONDS": "15"},
-            capture_output=True, text=True, timeout=120)
+            [bash, "-c", RUN, "probe", self.work, self.out, self.port, PROBE],
+            env=env, capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("after-probe rc=0", result.stdout)
+        # The probe itself ran (legs reached), rather than bash failing before it.
+        self.assertIn("push-probe: leg a", result.stderr)
 
     def test_the_time_cap_is_respected(self):
         # curl ignores its own --max-time and hangs; the leg is killed at the cap left and the
