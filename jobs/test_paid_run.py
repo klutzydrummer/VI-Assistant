@@ -1851,6 +1851,7 @@ class Resilience(Base):
         self.assertTrue(ok, line)
         def broken(*_):
             raise ModuleNotFoundError("No module named 'huggingface_hub'")
+        self.addCleanup(setattr, pr, "load_size_table", pr.load_size_table)
         pr.load_size_table = broken  # stands in for any import or parse failure in the check
         ok, line = pr.hf_offline_check()
         self.assertFalse(ok)

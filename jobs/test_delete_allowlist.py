@@ -102,6 +102,7 @@ def production_files():
     for p in sorted(JOBS.glob("*.py")):
         if not p.name.startswith("test_"):
             yield p
+    yield from sorted((JOBS / "paidrun").glob("*.py"))
     yield from sorted(JOBS.glob("*.sh"))
     yield from sorted(CRATES.glob("*/src/**/*.rs"))
 

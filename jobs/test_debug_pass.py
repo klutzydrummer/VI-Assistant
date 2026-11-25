@@ -692,6 +692,9 @@ class HungVerifyEpoch(unittest.TestCase):
             run.debug_record(9, "PASS", "(pushed)")
             run.debug_home_dirs = lambda out="": (ck, None)
             run.dir = Path(tmp) / "paid"
+            self.addCleanup(setattr, pr, "VERIFY_EPOCH_TIMEOUT_SECONDS",
+                            pr.VERIFY_EPOCH_TIMEOUT_SECONDS)
+            self.addCleanup(setattr, pr, "verify_epoch_argv", pr.verify_epoch_argv)
             pr.VERIFY_EPOCH_TIMEOUT_SECONDS = 1
             pr.verify_epoch_argv = lambda d: [sys.executable, "-c",
                                               "import time; print('hashing', flush=True); "
