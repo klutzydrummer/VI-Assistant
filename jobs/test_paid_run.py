@@ -284,14 +284,6 @@ def machine_offers(*specs):
     return [dict(id=i, dph=d, loc="US", up=800, machine=m, host=h) for i, d, m, h in specs]
 
 
-def load_paid_run():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("paid_run_under_test", SCRIPT)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def install_fake_realpath(home, rc=0, text="real-path check: OK (3 batches, forward skipped)"):
     """A fake home CPU venv + base snapshot under `home`: its python prints `text` and exits `rc`,
     appending its argv to home/realpath-calls.log. The real subprocess path in paid_run runs it."""
@@ -758,6 +750,27 @@ class Flow(Base):
         self.assertNotIn("status", between, between)
         self.assertEqual(self.state()["attempts"][0]["instance"], "101")
 
+    def test_r32_wp3_invalid_mid_run_deletes_before_any_diagnostics(self):
+        # r32 WP3 fault injection: training hangs while the (fake) clock runs past the 8 h wall
+        # cap, so the validity machine turns INVALID(cap) mid-stage. The orchestrator stops the
+        # stage, DELETEs first (no ssh diagnostics at all), saves Vast's view afterwards, and
+        # records the reason in the attempt and in the run's validity snapshot.
+        self.scenario([dict(train_seq=["hang"], train_tick=9)])
+        self.assertEqual(self.run_orch(), 10, self.out)
+        calls = self.calls()
+        names = [c[0] for c in calls]
+        stage = max(i for i, c in enumerate(calls) if c[0] == "stage")
+        down = names.index("down")
+        self.assertLess(stage, down)
+        self.assertNotIn("ssh", names[stage:down], names[stage:down])
+        self.assertLess(down, names.index("vastai"), "DELETE must come first")
+        self.assertEqual(self.downs()[0][1], ["--force", "--verify", "101"])
+        s = self.state()
+        self.assertEqual(s["attempts"][0]["invalid"]["reason"], "cap")
+        self.assertEqual(s["validity"]["reason"], "cap")
+        self.assertEqual(s["validity"]["state"], "INVALID")
+        self.assertIn("INVALID (cap)", self.out)
+
     def test_r31_dbg6_lines_are_a_drop_signal_with_exit_1(self):
         # omnivoice-ft-dbg6 run.log (2026-11-25): the vi CLI exited 1 and ssh never said
         # "remote host"; each of these lines alone must raise the suspicion host_drop() checks
@@ -1111,7 +1124,8 @@ class StatusAndStop(Base):
         self.assertEqual(set(st), {
             "run_id", "status", "exit_code", "message", "phase", "attempt", "offer",
             "price_per_hour", "spend", "hours_used", "max_hours", "hours_left", "cap",
-            "cap_left", "train", "process_alive", "stop_requested", "stage_log_tail", "credit"})
+            "cap_left", "train", "process_alive", "stop_requested", "stage_log_tail", "credit",
+            "validity"})
         self.assertEqual(set(st["spend"]), {"closed_attempts", "open_attempt_estimate", "total",
                                             "total_is_estimate"})
         self.assertEqual(set(st["train"]), {"step", "total", "updated_at", "eta_seconds",

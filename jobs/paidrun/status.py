@@ -52,7 +52,9 @@ def build_status(s, now):
         train=dict(step=step, total=total, updated_at=pr.get("updated_at"),
                    eta_seconds=eta, eta_is_estimate=True),
         process_alive=alive, stop_requested=stop_path(s["run_id"]).exists(),
-        stage_log_tail=stage_tail(s["run_id"]))
+        stage_log_tail=stage_tail(s["run_id"]),
+        # r32 WP3: the last rental's validity (state, INVALID reason class), or None
+        validity=s.get("validity"))
 
 
 def fmt_secs(x):
@@ -95,6 +97,10 @@ def cmd_status(args):
         print(f"  training : step {t['step']}/{t['total']}; {eta}")
     else:
         print("  training : no step read yet")
+    v = st["validity"]
+    if v:
+        print(f"  validity : {v['state']}" + (f" ({v['reason']}): {v['detail']}" if v["reason"]
+                                              else "") + f"; attempt {v['attempt']}")
     if st["stop_requested"]:
         print("  a stop has been requested")
     if "credit" in st:

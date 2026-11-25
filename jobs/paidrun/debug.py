@@ -16,6 +16,7 @@ from paidrun.signals import (
     debug_excerpt_keep, debug_run_key, failure_rc_text, parse_debug_output, parse_push_probe,
     push_probe_lines,
 )
+from paidrun.validity import INVALID, REASON_HOST_DROP, rental2_allowed
 from paidrun.config import DEBUG_MAX_RENTALS, DEBUG_STAGE, config_boot_minutes, stage_settings
 
 
@@ -196,6 +197,14 @@ class DebugMixin:
             self.dir.mkdir(parents=True, exist_ok=True)
             (self.dir / "debug-worker-summary.json").write_bytes((out / "summary.json").read_bytes())
 
+    def rental_reason(self):
+        """The open rental's INVALID reason class. A confirmed host drop (debug_rent_and_run
+        returned its text) always set INVALID(host-drop) through host_drop()."""
+        v = getattr(self, "validity", None)
+        if v is not None and v.state == INVALID:
+            return v.reason
+        return REASON_HOST_DROP if self.dropped else None
+
     def debug_write_summary(self):
         rows = [self.debug.get(n) or dict(stage=n, name=DEBUG_NAMES[n], result="FAIL",
                                           detail="(never ran: the debug pass stopped early)",
@@ -210,7 +219,7 @@ class DebugMixin:
                                 dph=at.get("dph"), status=status, spent=at.get("spent"),
                                 spent_estimated=at.get("spent_estimated", False),
                                 vast_status=at.get("vast_status"), vast_file=at.get("vast_file"),
-                                stages=at.get("debug_stages")))
+                                invalid=at.get("invalid"), stages=at.get("debug_stages")))
         doc = dict(run_id=self.a.run_id, rental=self.debug.get(0), rentals=rentals,
                    note=self.debug_note, stages=rows,
                    spent_total=self.s["spent_total"], hours_total=self.s["hours_total"],
@@ -229,7 +238,8 @@ class DebugMixin:
             spent = "?" if r["spent"] is None else f"${r['spent']:.2f}" + (
                 " (estimated)" if r["spent_estimated"] else "")
             lines.append(f"  rental {r['n']}      : offer {r['offer']}, instance "
-                         f"{r['instance'] or '?'}, {r['status']}, spent {spent}")
+                         f"{r['instance'] or '?'}, {r['status']}, spent {spent}"
+                         + (f", INVALID ({r['invalid']['reason']})" if r["invalid"] else ""))
         if self.debug_note:
             lines.append(f"  note          : {self.debug_note}")
         if len(rentals) > 1:
@@ -318,8 +328,10 @@ class DebugMixin:
                 self.save()
             if self.stop_file.exists():
                 raise StopRequested("stop requested; nothing was rented")
-            if self.debug_rent_and_run(1):
-                # C: a confirmed host drop on rental 1 -> evidence, release, then at most one more
+            if self.debug_rent_and_run(1) and rental2_allowed(self.rental_reason()):
+                # C/C.6: a confirmed host drop on rental 1 -> evidence, release, then at most one
+                # more. rental2_allowed is True for host-drop only (stalled, our-failure and cap
+                # never; host-unqualified waits for WP5)
                 at = self.open_attempt()
                 at["debug_stages"] = [self.debug[k] for k in sorted(self.debug)]
                 self.s["failed_offers"].append(at["offer"])
@@ -346,6 +358,7 @@ class DebugMixin:
                     say(self.debug_note)
         except (Stop, Interrupted, Exception) as e:  # noqa: BLE001: stage 12 still runs
             failure = e
+            self.user_stopped = isinstance(e, Interrupted)
             say(f"debug pass stopped early: {getattr(e, 'message', None) or e!r}")
         finally:
             if self.worker_maybe_up:

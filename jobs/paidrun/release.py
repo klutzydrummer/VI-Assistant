@@ -16,6 +16,7 @@ from paidrun.signals import (
 )
 from paidrun.config import DEBUG_STAGE, EXPECTED_STEPS, LISTENING_STEPS
 from paidrun.gates import unverified_markers
+from paidrun.validity import INVALID, REASON_HOST_DROP, SELF_REASONS, reason_for_outcome
 
 
 DIAG_MAX_BYTES = 256 * 1024
@@ -61,9 +62,15 @@ class ReleaseMixin:
         shows it gone; exit 9 means the destroy was never verified. Only that blocks: it raises
         Stop(9). Markers and unverified checkpoints never delay or prevent the DELETE. The
         ssh diagnostics (bounded, DIAG_TIMEOUT_SECONDS) need the live worker and so come first;
-        Vast's view, the spend and the debug-marker cleanup come after the destroy."""
+        Vast's view, the spend and the debug-marker cleanup come after the destroy.
+        r32 WP3: a rental that became INVALID by itself (cap, stalled) skips the ssh diagnostics
+        before the DELETE; its reason class is recorded in the attempt and the run's status."""
         self.in_teardown = True
-        if outcome not in ("done", "up-failed", "train-vanished"):
+        v = getattr(self, "validity", None)
+        if v is not None and v.attempt is not None and v.attempt != (at or {}).get("n"):
+            v = None  # another rental's (cannot happen today; never mix them up)
+        self_invalid = v is not None and v.state == INVALID and v.reason in SELF_REASONS
+        if outcome not in ("done", "up-failed", "train-vanished") and not self_invalid:
             self.fetch_diagnostics(at, outcome)
         ident = (at or {}).get("instance")
         down = ("cloud", "down", "--force", "--verify", *([str(ident)] if ident else []))
@@ -86,6 +93,7 @@ class ReleaseMixin:
                        f"{f' (instance {ident})' if ident else ''}. Run `vi cloud status`, then "
                        "`vi cloud down --force` now.")
         self.worker_maybe_up = False
+        self.record_release_reason(at, outcome, v)
         gone = re.search(r"^destroyed instance (\d+)", out, re.M)
         if at is not None and not at.get("instance") and gone:
             at["instance"] = gone.group(1)
@@ -108,6 +116,29 @@ class ReleaseMixin:
             self.abandon_empty_debug_markers()
         self.in_teardown = False
         return spent
+
+    def record_release_reason(self, at, outcome, v):
+        """After a verified destroy: the rental's reason class (C.1) into the attempt record, the
+        run state (`status` shows it) and the log. The validity's own INVALID reason wins; else
+        the outcome's class (reason_for_outcome); a user stop or signal has none."""
+        reason = detail = None
+        if v is not None and v.state == INVALID:
+            reason, detail = v.reason, v.detail
+        elif not (outcome in ("aborted", "debug-failed") and getattr(self, "user_stopped", False)):
+            reason, detail = reason_for_outcome(outcome), outcome
+            if reason and v is not None:
+                v.invalidate(reason, detail)
+        if v is not None:
+            self.s["validity"] = v.snapshot()
+        self.validity = None
+        if reason is None or at is None:
+            if at is not None:
+                self.save()
+            return
+        at["invalid"] = dict(reason=reason, detail=detail)
+        self.save()
+        say(f"rental INVALID ({reason}): {detail}; instance {at.get('instance') or '?'} "
+            "destroyed and verified gone")
 
     def abandon_empty_debug_markers(self):
         """r21 F4: after a debug worker is released, its `omnivoice_debug-*` unverified marker
@@ -264,6 +295,8 @@ class ReleaseMixin:
         except Exception as e:  # noqa: BLE001
             r3, o3 = None, repr(e)
         again = drop_signal(r3, o3) if r3 != 0 else None
+        if r3 == 0:
+            self.validity_evidence("ssh_ok")
         again_text = "ssh again: ok" if r3 == 0 else f"ssh again: {again or f'exit {r3}'}"
         seen = ", then ".join(st or "unknown" for st, _, _ in reads)
         # r27: "gone" (Vast no longer lists the instance) counts only while ssh is still refused
@@ -279,6 +312,9 @@ class ReleaseMixin:
             if at is not None:
                 at["host_drop"] = text
                 self.save()
+            v = getattr(self, "validity", None)
+            if v is not None:
+                v.invalidate(REASON_HOST_DROP, text)
             return True, text
         why = ("home could not read the instance status from Vast, so this is not a host drop"
                if reads[-1][0] is None else

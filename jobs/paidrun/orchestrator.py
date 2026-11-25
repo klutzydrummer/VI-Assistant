@@ -32,6 +32,9 @@ from paidrun.gates import (
     REHEARSAL_CMD, home_check, ids_check, realpath_check, rehearsal_gate, stale_marker_lines,
 )
 from paidrun.release import ReleaseMixin
+from paidrun.validity import (
+    EV_RETURN_PUSH_OK, EV_SSH_OK, EV_VAST_RUNNING, INVALID, SELF_REASONS, Validity,
+)
 from paidrun.rental import RentalMixin
 from paidrun.debug import DebugMixin
 
@@ -48,6 +51,8 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         self.last_facts = {}
         self.worker_maybe_up = False
         self.in_teardown = False
+        self.validity = None  # r32 WP3: the open rental's Validity (armed by current_validity)
+        self.user_stopped = False  # a stop request or signal ended the run (no reason class)
         self.config_path = None  # the per-attempt config currently in force
         self.s = None
         self.stop_file = stop_path(args.run_id)
@@ -148,6 +153,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
                         self.note_line(line)
                 if watch:
                     self.check_stop()
+                self.poll_validity()
                 if fatal_quiet and self.fatal_line \
                         and time.monotonic() - last_line_at >= fatal_quiet:
                     self.fatal_stopped = self.fatal_line
@@ -200,6 +206,55 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
                 self.write_progress(force=True)  # also leaves stage-tail.log for `status`
         return p.returncode, "".join(buf)
 
+    # ----- validity (r32 WP3) ---------------------------------------------------------------
+    def current_validity(self):
+        """The open rental's Validity, armed on first use for each attempt: started at the
+        attempt's start, effective cap = min(hours left, the $ cap left / $/hr). A full run's
+        hours are the run's hours left; a debug rental has its own --max-hours (r21). None while
+        no worker may be up (nothing to judge) or during teardown."""
+        if self.s is None or not self.worker_maybe_up:
+            return None
+        at = self.open_attempt()
+        if at is None:
+            return None
+        v = self.validity
+        if v is None or v.attempt != at["n"]:
+            if getattr(self.a, "debug_pass", False):
+                wall_h = self.a.max_hours
+            else:
+                wall_h = self.s["max_hours"] - self.s["hours_total"]
+            v = self.validity = Validity(started=at["started"], wall_cap_s=wall_h * 3600,
+                                         dollar_cap=at.get("cap"), dph=at.get("dph"),
+                                         attempt=at["n"])
+            v.enter(at.get("phase"))
+        return v
+
+    def poll_validity(self):
+        """Called while a stage runs. A rental that became INVALID by itself (cap, stalled) ends
+        the stage at once: Invalidated is raised, run() kills the stage, and the usual teardown
+        releases the worker, destroy first. Other reasons are recorded by whoever saw them."""
+        if self.in_teardown:
+            return
+        v = self.current_validity()
+        if v is None:
+            return
+        before = v.state
+        if v.poll() != before:
+            self.record_validity(v)
+        if v.state == INVALID and v.reason in SELF_REASONS:
+            say(f"rental INVALID ({v.reason}): {v.detail}; stopping the stage and destroying "
+                "the worker")
+            raise v.stop()
+
+    def validity_evidence(self, kind):
+        v = None if self.in_teardown else self.current_validity()
+        if v is not None:
+            v.evidence(kind)
+
+    def record_validity(self, v):
+        self.s["validity"] = v.snapshot()
+        self.save()
+
     # ----- progress and stop requests ------------------------------------------------------
     def note_line(self, line):
         self.tail.append(line.rstrip("\n"))
@@ -211,10 +266,15 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         m = ACK_RE.search(line)
         if m:
             self.last_ack = max(self.last_ack, int(m.group(1)))
+            self.validity_evidence(EV_RETURN_PUSH_OK)  # a checkpoint push landed home
         self.write_progress()
 
     def set_phase(self, at, phase):
         at["phase"] = phase
+        v = self.current_validity()
+        if v is not None:
+            # no deadline here: each stage keeps its existing run() timeout (see the WP3 notes)
+            v.enter(phase)
         self.write_progress(force=True)  # also saves the state
 
     def write_progress(self, force=False):
@@ -294,6 +354,10 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         if m and at is not None:
             at["instance"] = m.group(1) or m.group(2)
             self.save()
+        if re.search(r"^worker \d+ ready", out, re.M):
+            # `up` reports ready only once Vast says running and ssh answered
+            self.validity_evidence(EV_VAST_RUNNING)
+            self.validity_evidence(EV_SSH_OK)
         return at.get("instance") if at is not None else None
 
     def credit(self):
@@ -590,6 +654,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
             except Stop as e:
                 code, message = e.code, e.message
             except Interrupted as e:
+                self.user_stopped = True
                 code, message = EXIT["interrupted"], e.reason
             except Exception as e:  # noqa: BLE001: always fall through to the release below
                 code, message = EXIT["other"], f"unexpected error: {type(e).__name__}: {e}"
