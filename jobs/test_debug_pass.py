@@ -40,6 +40,9 @@ DEBUG_BRANCH = '''\
             print("error: stage omnivoice_debug failed: exit status: 255", file=sys.stderr); sys.exit(1)
         if r == "silent":
             print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
+        if sc.get("push_probe"):  # r30: on-worker.sh's probe line, before debug-pass.sh starts
+            print("push-probe: start (random bytes only)", file=sys.stderr)
+            print(sc["push_probe"], file=sys.stderr, flush=True)
         names = %r
         needs = %r
         fail = set(sc.get("debug_fail", []))
@@ -194,6 +197,48 @@ class Ordering(DebugBase):
         self.assertTrue((d / "debug-summary.txt").is_file())
         self.assertTrue((d / "debug-worker-summary.json").is_file())
         self.assertIn("never scored", self.summary()["listening_set_note"])
+
+    def test_r30_push_probe_goes_into_the_summary(self):
+        probe = {"ran": True, "cap_seconds": 300, "seconds": 212, "note": "random",
+                 "legs": {"a": {"name": "tunnel-rsync", "status": "ok", "bytes": 209715200,
+                                "planned": 209715200, "mb_s": 3.1, "seconds": 67.6},
+                          "b": {"name": "4-streams", "status": "timeout", "bytes": 150000000,
+                                "planned": 209715200, "mb_s": 1.67, "streams": 4,
+                                "per_stream_mb_s": [0.4, 0.42, 0.41, 0.44]},
+                          "c": {"name": "public-curl", "status": "ok", "down_status": "ok",
+                                "down_mb_s": 95.5, "down_url": "https://x.invalid/100MB.bin",
+                                "up_status": "ok", "up_mb_s": 40.2,
+                                "up_url": "https://y.invalid/up"}}}
+        self.scen(push_probe="push-probe: json " + json.dumps(probe))
+        self.assertEqual(self.run_debug(), 0, self.out)
+        got = self.summary()["push_probe"]
+        self.assertEqual(got, probe)
+        self.assertIn("null when it did not run", self.summary()["push_probe_note"])
+        text = (self.tmp / "paid" / "t1" / "debug-summary.txt").read_text()
+        self.assertIn("a tunnel-rsync : 3.1 MB/s, ok", text)
+        self.assertIn("b 4-streams    : 1.67 MB/s in all, timeout (per stream 0.4, 0.42, 0.41, 0.44)", text)
+        self.assertIn("c public-curl  : download 95.5 MB/s, ok (https://x.invalid/100MB.bin); "
+                      "upload 40.2 MB/s, ok (https://y.invalid/up)", text)
+        # the run log (stdout) has the legs too, and the stages are unchanged
+        self.assertIn("a tunnel-rsync : 3.1 MB/s", self.out)
+        self.assertEqual({r["result"] for r in self.summary()["stages"]}, {"PASS"})
+
+    def test_r30_no_probe_line_is_null_and_said(self):
+        self.scen()
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertIsNone(self.summary()["push_probe"])
+        self.assertIn("push probe    : no result", self.out)
+
+    def test_r30_a_broken_probe_line_never_breaks_the_pass(self):
+        self.scen(push_probe="push-probe: json {not json")
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertIsNone(self.summary()["push_probe"])
+
+    def test_r30_plan_names_the_probe_cost_and_time(self):
+        self.scen()
+        self.assertEqual(self.run_debug(plan=True), 0, self.out)
+        self.assertIn("push probe      : after the worker preflight passes, at most 5 min", self.out)
+        self.assertIn("worst case does not grow", self.out)
 
     def test_debug_rows_reaches_worker(self):
         self.scen()
@@ -735,7 +780,8 @@ class ParseOutput(unittest.TestCase):
 
 class Scripts(unittest.TestCase):
     def test_shell_syntax(self):
-        for s in ("debug-pass.sh", "debug-probe.sh", "on-worker.sh", "rehearsal/debug-pass.sh"):
+        for s in ("debug-pass.sh", "debug-probe.sh", "on-worker.sh", "push-probe.sh",
+                  "rehearsal/debug-pass.sh"):
             p = JOBS / s
             if p.exists():
                 r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)

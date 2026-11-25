@@ -62,7 +62,10 @@ the real tunnel, receiver and token push) for 3 upload, 4 venv and launchers, 5 
 (verified at home here), 10 listening set (checked at home here), 11 resume, and 12 down, which
 always runs. A stage whose prerequisite failed prints SKIP-dependent. The results go to
 <state dir>/<run-id>/debug-summary.{txt,json}; exit 0 only if every stage passed, else 16. The
-same pre-rent gates as a real run apply, and --plan prints the worst-case dollars.
+same pre-rent gates as a real run apply, and --plan prints the worst-case dollars. After the
+worker preflight passes, on-worker.sh runs a transfer-speed probe (jobs/push-probe.sh, at most
+5 minutes, random bytes only, fail-soft): MB/s through the tunnel, over 4 parallel ssh streams, and
+with curl on the worker against public speed-test URLs; it goes into the summary as push_probe.
 
 Heavy work happens inside `vi dataset run` (stages `omnivoice_preflight`, `omnivoice_train`,
 and `omnivoice_debug` for --debug-pass). No Vast credential file is read here; only the `vi`
@@ -729,6 +732,54 @@ def parse_debug_output(text):
         if "debug-pass: stage" in line:  # a "running" or "still running" line ends an excerpt
             cur = None
     return found
+
+
+PUSH_PROBE_JSON_RE = re.compile(r"push-probe: json (\{.*\})\s*$")
+PUSH_PROBE_MAX_MINUTES = 5  # VI_PUSH_PROBE_SECONDS' default in jobs/push-probe.sh, 300 s
+
+
+def parse_push_probe(text):
+    """The transfer-speed probe's result (jobs/push-probe.sh's last `push-probe: json` line), or
+    None when the output has none or it does not parse."""
+    found = None
+    for line in (text or "").splitlines():
+        m = PUSH_PROBE_JSON_RE.search(line)
+        if m:
+            try:
+                found = json.loads(m.group(1))
+            except ValueError:
+                pass
+    return found if isinstance(found, dict) else None
+
+
+def push_probe_lines(probe):
+    """Summary lines for the probe, one per leg, with MB/s (decimal) first."""
+    if not probe:
+        return ["  push probe    : no result (it runs only after a passed worker preflight; see "
+                "the run log for `push-probe:` lines)"]
+    legs = probe.get("legs") or {}
+
+    def rate(v):
+        return "?" if v is None else f"{v:g}"
+
+    lines = [f"  push probe    : {probe.get('seconds', '?')} s of a {probe.get('cap_seconds', '?')} "
+             "s cap; random bytes only; MB/s is decimal"]
+    a = legs.get("a") or {}
+    lines.append(f"    a tunnel-rsync : {rate(a.get('mb_s'))} MB/s, {a.get('status', '?')} "
+                 f"({a.get('bytes', 0)} of {a.get('planned', '?')} bytes)")
+    b = legs.get("b") or {}
+    per = ", ".join(rate(x) for x in b.get("per_stream_mb_s") or [])
+    lines.append(f"    b 4-streams    : {rate(b.get('mb_s'))} MB/s in all, {b.get('status', '?')}"
+                 + (f" (per stream {per})" if per else ""))
+    c = legs.get("c") or {}
+    if c.get("status") == "skip":
+        lines.append("    c public-curl  : skip (no time left)")
+    else:
+        up = ("not measured (no sink set)" if c.get("up_status") in (None, "none") else
+              f"{rate(c.get('up_mb_s'))} MB/s, {c.get('up_status')} ({c.get('up_url')})")
+        lines.append(f"    c public-curl  : download {rate(c.get('down_mb_s'))} MB/s, "
+                     f"{c.get('down_status', '?')} ({c.get('down_url', '?')}); upload {up}")
+    return lines
 
 
 def debug_excerpt_keep(lines, n=12):
@@ -1593,6 +1644,14 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 "                  formula: worst case = min(cap, 2 x max_hours x max_dph) + "
                 "disk_gb x 1.00 / 730 x 2 x max_hours; a typical pass should take under 30 min, "
                 "so it costs about $/hr x 0.5",
+                "push probe      : after the worker preflight passes, at most "
+                f"{PUSH_PROBE_MAX_MINUTES} min of transfer-speed probe (jobs/push-probe.sh: "
+                "200 MiB random through the tunnel, 4 x 50 MiB parallel ssh streams, curl to "
+                "public speed-test URLs; fail-soft) = at most "
+                + (f"${PUSH_PROBE_MAX_MINUTES / 60 * max_dph:.2f} at the ${max_dph:.3f}/hr "
+                   "max_dph" if max_dph is not None else "$/hr x 0.08")
+                + ", about $0.02 at $0.20/hr; it is inside the hours and the cap above, so the "
+                "worst case does not grow",
                 "time per rental : each stage's limit is cut to the rental's time left minus a "
                 "15 min margin; a stage with too little time left reads SKIP-no-time (not "
                 "started, shown apart from FAIL); stage 9's limit is 1.5 x checkpoint bytes / "
@@ -2254,6 +2313,9 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         rc, out = self.run([self.vi, "dataset", "run", self.a.stages, DEBUG_STAGE, "--force"],
                            watch=True, timeout=limit)
         timed_out = self.timed_out
+        self.push_probe = at["push_probe"] = parse_push_probe(out)
+        for ln in push_probe_lines(self.push_probe):
+            say(ln.strip())
         found = parse_debug_output(out)
         tail = [ln for ln in out.strip().splitlines() if "debug-pass:" not in ln][-10:]
         drop = None
@@ -2347,7 +2409,11 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                    note=self.debug_note, stages=rows,
                    spent_total=self.s["spent_total"], hours_total=self.s["hours_total"],
                    cap=self.s["cap"], max_hours=self.s["max_hours"],
-                   listening_set_note="for human listening only; never scored")
+                   listening_set_note="for human listening only; never scored",
+                   push_probe=getattr(self, "push_probe", None),
+                   push_probe_note=("jobs/push-probe.sh, the last rental's; MB/s is decimal; "
+                                    "null when it did not run (it needs a passed worker "
+                                    "preflight)"))
         (self.dir / "debug-summary.json").write_text(json.dumps(doc, indent=1) + "\n")
         lines = [f"debug pass {self.a.run_id}: spent ${self.s['spent_total']:.2f} of "
                  f"${self.s['cap']:.2f} cap in {len(rentals)} rental(s) (at most "
@@ -2366,6 +2432,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         if self.debug.get(0):
             r = self.debug[0]
             lines.append(f"  rental        : {r['result']} {r['detail']}".rstrip())
+        lines += push_probe_lines(getattr(self, "push_probe", None))
         for r in rows:
             lines.append(f"  {r['stage']:>2} {r['name']:<12}: {r['result']} {r['detail']}".rstrip())
             lines += [f"       | {x}" for x in r["excerpt"]]
@@ -2434,6 +2501,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         self.debug = {}
         self.dropped = None
         self.debug_note = None
+        self.push_probe = None
         failure = None
         a_h = self.a.max_hours
         try:

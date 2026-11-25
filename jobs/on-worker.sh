@@ -686,6 +686,23 @@ if [ "$reattach" = 0 ] && [ "$pre_rc" != 0 ]; then
   fi
 fi
 
+# Transfer-speed probe (jobs/push-probe.sh): once, after a passed preflight, in a debug pass
+# (VI_PUSH_PROBE=1 asks for it in any run, VI_PUSH_PROBE=0 turns it off). Random bytes only,
+# capped at VI_PUSH_PROBE_SECONDS (300 s), and fail-soft: it never stops the run.
+if [ "$reattach" = 0 ] && [ "${pre_rc:-0}" = 0 ] && [ "${VI_PUSH_PROBE:-}" != 0 ] &&
+  { [ "$debug_pass" = 1 ] || [ "${VI_PUSH_PROBE:-}" = 1 ]; }; then
+  if [ "$VI_WORKER_HOST" = local ]; then
+    probe_ssh=(bash -c)
+  else
+    # A new connection per call (no shared master), so the parallel leg is really parallel.
+    probe_ssh=(ssh "${ssh_opts[@]}" -o ControlMaster=no -o ControlPath=none "$target")
+  fi
+  # shellcheck source=jobs/push-probe.sh
+  . "$jobs_dir/push-probe.sh" && push_probe ||
+    echo "on-worker.sh: the push probe could not run; carrying on" >&2
+  rm -rf "$VI_OUT/.push-probe"
+fi
+
 if [ "$reattach" = 0 ]; then
   if [ -n "$checkpoint" ]; then
     # A copy taken mid-write can end in half a line; drop it before resuming.
