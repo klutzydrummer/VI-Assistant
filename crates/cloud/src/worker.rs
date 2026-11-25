@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::state::{Marker, StateDir, Tracked};
 use crate::vast::{Endpoint, Instance, Offer, Vast};
-use crate::{onstart, Config, Error, Result};
+use crate::{deadman, onstart, Config, Error, Result};
 
 const POLL_SECS: u64 = 10;
 
@@ -37,6 +37,28 @@ pub trait Host {
     fn key_fingerprints(&self, _lines: &[String]) -> Vec<String> {
         Vec::new()
     }
+    /// The dead-man timer (see `deadman.rs`): does the systemd user manager
+    /// answer? A host without timers says no, so renting refuses loudly.
+    fn timer_ready(&self) -> Result<()> {
+        Err(no_timers())
+    }
+    /// Is `<unit>.timer` loaded?
+    fn timer_loaded(&self, _unit: &str) -> Result<bool> {
+        Err(no_timers())
+    }
+    /// Starts the transient timer `r` describes.
+    fn timer_arm(&self, _r: &deadman::Record) -> Result<()> {
+        Err(no_timers())
+    }
+    /// Stops `<unit>.timer` (and `<unit>.service` if `service`); a unit that
+    /// is not loaded counts as stopped.
+    fn timer_stop(&self, _unit: &str, _service: bool) -> Result<()> {
+        Err(no_timers())
+    }
+}
+
+fn no_timers() -> Error {
+    Error::Worker("this host has no systemd user timers".into())
 }
 
 pub struct SystemHost;
@@ -117,6 +139,22 @@ impl Host for SystemHost {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    fn timer_ready(&self) -> Result<()> {
+        deadman::systemd_ready()
+    }
+
+    fn timer_loaded(&self, unit: &str) -> Result<bool> {
+        deadman::systemd_loaded(unit)
+    }
+
+    fn timer_arm(&self, r: &deadman::Record) -> Result<()> {
+        deadman::systemd_arm(r, self.now())
+    }
+
+    fn timer_stop(&self, unit: &str, service: bool) -> Result<()> {
+        deadman::systemd_stop(unit, service)
     }
 }
 
@@ -358,6 +396,10 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         if let Some(t) = self.state.load()? {
             match self.vast.instance(t.id)? {
                 Some(inst) if !stopped(&inst) => {
+                    // Never run a rental without the dead-man timer: re-arm it
+                    // if it is gone (idempotent when it is still armed).
+                    let cap_at = deadman::cap_at(t.created, until, self.cfg.max_hours, cap, t.dph);
+                    self.arm_deadman(t.id, t.created, cap_at)?;
                     if t.endpoint.is_some() && inst.status() == "running" {
                         return self.touch_tracked(t);
                     }
@@ -420,6 +462,8 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             }
         }
         let credit = self.check_budget(first, cap)?;
+        // Refuse before renting if the dead-man timer could not be armed.
+        deadman::preflight(&self.host)?;
         if !confirm(first, Some(credit)) {
             return Err(Error::Worker("nothing rented".into()));
         }
@@ -439,6 +483,25 @@ impl<V: Vast, H: Host> Cloud<V, H> {
         // Saved before waiting, so `vi cloud down` can release it even if
         // this process is interrupted.
         self.state.save(&t)?;
+        // The dead-man timer (L2) is armed before anything else can go wrong,
+        // so a crash, kill or hang from here on still destroys the instance.
+        let cap_at = deadman::cap_at(now, until, self.cfg.max_hours, cap, t.dph);
+        if let Err(e) = self.arm_deadman(id, now, cap_at) {
+            self.host.log(&format!(
+                "ALERT: could not arm the dead-man timer for instance {id} ({e}); destroying it"
+            ));
+            let gone = self.vast.destroy(id).and_then(|()| self.state.clear(id));
+            return Err(Error::Worker(match gone {
+                Ok(()) => format!(
+                    "could not arm the dead-man timer ({e}); instance {id} was destroyed \
+                     (run `vi cloud down --force --verify {id}` to confirm)"
+                ),
+                Err(d) => format!(
+                    "could not arm the dead-man timer ({e}) and destroying instance {id} \
+                     failed ({d}); run `vi cloud down --force --verify {id}` now"
+                ),
+            }));
+        }
         self.host
             .log(&format!("rented instance {id}; waiting for it to boot"));
         match self.wait(t) {
@@ -454,6 +517,49 @@ impl<V: Vast, H: Host> Cloud<V, H> {
                 Err(e)
             }
         }
+    }
+
+    /// Arms (or confirms) the dead-man timer for `id`; it runs this same `vi`
+    /// as `vi cloud deadman fire <id>`.
+    fn arm_deadman(&self, id: u64, start: u64, cap_at: u64) -> Result<deadman::Record> {
+        let exe = std::env::current_exe()
+            .map_err(|e| Error::Worker(format!("cannot find the vi executable: {e}")))?;
+        let r = deadman::arm(
+            &self.host,
+            &self.state,
+            deadman::fire_argv(&exe, id)?,
+            id,
+            start,
+            cap_at,
+        )?;
+        let now = self.host.now();
+        self.host.log(&format!(
+            "dead-man timer {}.timer fires at {} (in {} min; hard cap in {} min) unless \
+             instance {id} is verified destroyed first",
+            r.unit,
+            r.fire_at,
+            r.fire_at.saturating_sub(now) / 60,
+            r.cap_at.saturating_sub(now) / 60
+        ));
+        Ok(r)
+    }
+
+    /// The heartbeat (`vi cloud deadman extend`): see [`deadman::extend`].
+    pub fn deadman_extend(&self, id: u64, grace: u64) -> Result<deadman::Record> {
+        deadman::extend(&self.host, &self.state, id, grace)
+    }
+
+    /// What the dead-man timer runs (`vi cloud deadman fire <id>`): destroy
+    /// `id`, then verify. When `id` is the tracked worker this is exactly
+    /// `down_verified(Some(id))`, labelled sweep included. When home tracks a
+    /// different (newer) instance, or none, only `id` is destroyed, so a stale
+    /// timer can never take down a later rental. On a verified destroy the
+    /// timer is cancelled except for its running service, which is this
+    /// process; a nonzero exit leaves it to be retried by systemd.
+    pub fn deadman_fire(&self, id: u64) -> Result<Down> {
+        let tracked = self.state.load().unwrap_or(None);
+        let sweep = tracked.as_ref().is_some_and(|t| t.id == id);
+        self.destroy_verified(Some(id), sweep, Some(id))
     }
 
     /// The money guards that need the chosen offer: the worst case (`max_hours`
@@ -817,25 +923,40 @@ impl<V: Vast, H: Host> Cloud<V, H> {
     /// counts as proof, so if the API stays unreachable the result has
     /// `verified == false`. Failures along the way are collected in `errors`
     /// rather than returned, so one bad call never skips the rest.
+    /// Once the destroy is verified, the dead-man timer of every destroyed id
+    /// is cancelled; an unverified destroy leaves the timers armed.
     pub fn down_verified(&self, id: Option<u64>) -> Result<Down> {
+        self.destroy_verified(id, true, None)
+    }
+
+    /// `down_verified`, optionally limited to `id` alone (`sweep == false`:
+    /// no tracked worker, no labelled instances). `firing` is the id whose
+    /// dead-man service is running this destroy; its service is not stopped.
+    fn destroy_verified(&self, id: Option<u64>, sweep: bool, firing: Option<u64>) -> Result<Down> {
         let mut errors = Vec::new();
         let overridden = self.state.markers().unwrap_or_else(|e| {
             errors.push(format!("could not read the unverified markers: {e}"));
             Vec::new()
         });
-        let tracked = self.state.load().unwrap_or_else(|e| {
-            errors.push(format!("could not read the tracked worker: {e}"));
+        let tracked = if sweep {
+            self.state.load().unwrap_or_else(|e| {
+                errors.push(format!("could not read the tracked worker: {e}"));
+                None
+            })
+        } else {
             None
-        });
+        };
         let mut ids: Vec<u64> = tracked.iter().map(|t| t.id).collect();
         if let Some(id) = id {
             if !ids.contains(&id) {
                 ids.push(id);
             }
         }
-        match self.vast.instances() {
-            Ok(list) => self.add_ours(&mut ids, &list),
-            Err(e) => errors.push(format!("listing instances before the destroy: {e}")),
+        if sweep {
+            match self.vast.instances() {
+                Ok(list) => self.add_ours(&mut ids, &list),
+                Err(e) => errors.push(format!("listing instances before the destroy: {e}")),
+            }
         }
         for &i in &ids {
             self.delete_noting(i, &mut errors);
@@ -848,7 +969,9 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             match self.vast.instances() {
                 Ok(list) => {
                     let before = ids.len();
-                    self.add_ours(&mut ids, &list);
+                    if sweep {
+                        self.add_ours(&mut ids, &list);
+                    }
                     for &i in &ids[before..] {
                         // Appeared since the first listing (a rent that raced us).
                         self.delete_noting(i, &mut errors);
@@ -886,6 +1009,12 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             if let Some(t) = &tracked {
                 if let Err(e) = self.state.clear(t.id) {
                     errors.push(format!("could not clear the tracked worker: {e}"));
+                }
+            }
+            // Only now, with Vast's list as proof, may the timers go.
+            for &i in &ids {
+                if let Err(e) = deadman::cancel(&self.host, &self.state, i, firing != Some(i)) {
+                    errors.push(format!("could not cancel the dead-man timer for {i}: {e}"));
                 }
             }
         }
@@ -1191,8 +1320,17 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct FakeHost {
         now: Cell<u64>,
+        /// Loaded timers: unit -> fire time.
+        timers: RefCell<std::collections::BTreeMap<String, u64>>,
+        /// Every timer call, in order, e.g. "arm vi-deadman-100 @5000".
+        timer_calls: RefCell<Vec<String>>,
+        /// When set, the user manager "does not answer" / systemd-run fails.
+        timer_down: Cell<bool>,
+        /// The next this many `systemd-run` calls fail.
+        arm_failures: Cell<u32>,
     }
 
     impl Host for &FakeHost {
@@ -1206,6 +1344,39 @@ mod tests {
             true
         }
         fn log(&self, _: &str) {}
+        fn timer_ready(&self) -> Result<()> {
+            if self.timer_down.get() {
+                return Err(Error::Worker("user manager down".into()));
+            }
+            Ok(())
+        }
+        fn timer_loaded(&self, unit: &str) -> Result<bool> {
+            self.timer_ready()?;
+            Ok(self.timers.borrow().contains_key(unit))
+        }
+        fn timer_arm(&self, r: &deadman::Record) -> Result<()> {
+            self.timer_ready()?;
+            // Exercise the real argument builder and its refusals.
+            deadman::systemd_run_args(r, self.now.get())?;
+            if self.arm_failures.get() > 0 || self.timers.borrow().contains_key(&r.unit) {
+                self.arm_failures
+                    .set(self.arm_failures.get().saturating_sub(1));
+                return Err(Error::Worker("systemd-run failed".into()));
+            }
+            self.timer_calls
+                .borrow_mut()
+                .push(format!("arm {} @{}", r.unit, r.fire_at));
+            self.timers.borrow_mut().insert(r.unit.clone(), r.fire_at);
+            Ok(())
+        }
+        fn timer_stop(&self, unit: &str, service: bool) -> Result<()> {
+            self.timer_ready()?;
+            self.timer_calls
+                .borrow_mut()
+                .push(format!("stop {unit} service={service}"));
+            self.timers.borrow_mut().remove(unit);
+            Ok(())
+        }
     }
 
     /// The fixed answer the reap tests inject instead of the real ssh probe.
@@ -1283,6 +1454,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
 
@@ -1327,6 +1499,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         let err = c.up(None, CAP, UNTIL, |_, _| true).unwrap_err();
@@ -1347,6 +1520,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         assert!(c.up(None, CAP, UNTIL, |_, _| false).is_err());
@@ -1363,6 +1537,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1391,6 +1566,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1411,6 +1587,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1434,6 +1611,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1452,7 +1630,10 @@ mod tests {
             boots: RefCell::new(vec!["running"]),
             ..FakeVast::default()
         };
-        let host = FakeHost { now: Cell::new(0) };
+        let host = FakeHost {
+            now: Cell::new(0),
+            ..FakeHost::default()
+        };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
         for _ in 0..24 {
@@ -1474,7 +1655,10 @@ mod tests {
             boots: RefCell::new(vec!["running"]),
             ..FakeVast::default()
         };
-        let host = FakeHost { now: Cell::new(0) };
+        let host = FakeHost {
+            now: Cell::new(0),
+            ..FakeHost::default()
+        };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
 
@@ -1503,6 +1687,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1544,6 +1729,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1568,6 +1754,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1605,6 +1792,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         let err = c
@@ -1625,6 +1813,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         // max_hours (4) at $0.15/hr is $0.60, so a $0.50 cap is too small.
@@ -1647,6 +1836,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         let err = c
@@ -1670,6 +1860,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         let err = c
@@ -1703,6 +1894,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1724,6 +1916,7 @@ mod tests {
         };
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = cloud(&vast, &host, dir.path());
         c.up(None, CAP, UNTIL, |_, _| true).unwrap();
@@ -1861,6 +2054,7 @@ mod tests {
         *api.delete_failures.borrow_mut() = vec![500, 500, 500];
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = api_cloud(&api, &host, dir.path());
 
@@ -1893,6 +2087,7 @@ mod tests {
         api.sticky_deletes.set(2);
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = api_cloud(&api, &host, dir.path());
 
@@ -1913,6 +2108,7 @@ mod tests {
         api.live.borrow_mut().push((5, None));
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = api_cloud(&api, &host, dir.path());
 
@@ -1930,6 +2126,7 @@ mod tests {
         api.down.set(true);
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = api_cloud(&api, &host, dir.path());
 
@@ -1949,11 +2146,229 @@ mod tests {
         let api = FakeApi::default();
         let host = FakeHost {
             now: Cell::new(1000),
+            ..FakeHost::default()
         };
         let c = api_cloud(&api, &host, dir.path());
         let down = c.down_verified(None).unwrap();
         assert!(down.verified);
         assert!(down.ids.is_empty());
         assert_eq!(api.deletes(), 0);
+    }
+
+    // ----- the dead-man timer (L2) ------------------------------------------
+
+    fn one_offer_running() -> FakeVast {
+        FakeVast {
+            offers: vec![offer(1, 10, 0.15)],
+            boots: RefCell::new(vec!["running"]),
+            ..FakeVast::default()
+        }
+    }
+
+    #[test]
+    fn up_arms_the_dead_man_timer_at_the_hard_cap_and_rearming_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = one_offer_running();
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        let c = cloud(&vast, &host, dir.path());
+        let t = c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+        assert_eq!(t.id, 100);
+        let cap_at = deadman::cap_at(1000, UNTIL, c.cfg.max_hours, CAP, 0.15);
+        assert_eq!(cap_at, 1000 + (c.cfg.max_hours * 3600.0) as u64);
+        assert_eq!(
+            *host.timer_calls.borrow(),
+            vec![format!("arm vi-deadman-100 @{cap_at}")]
+        );
+        let r = deadman::load(&c.state, 100).unwrap().unwrap();
+        assert_eq!((r.start, r.cap_at, r.fire_at), (1000, cap_at, cap_at));
+        assert_eq!(r.argv[1..], ["cloud", "deadman", "fire", "100"]);
+        assert!(
+            r.env.iter().all(|(k, _)| k != "VAST_API_KEY"),
+            "{:?}",
+            r.env
+        );
+        assert_eq!(r.log, dir.path().join("deadman-100.log"));
+
+        // A second `up` reuses the worker and leaves the armed timer alone.
+        c.up(None, CAP, UNTIL, |_, _| panic!("asked to rent again"))
+            .unwrap();
+        assert_eq!(host.timer_calls.borrow().len(), 1);
+
+        // If the timer is gone (it was never meant to survive a reboot), the
+        // next `up` re-arms it at the recorded time, not a later one.
+        host.timers.borrow_mut().clear();
+        host.now.set(5000);
+        c.up(None, CAP, UNTIL, |_, _| panic!("asked to rent again"))
+            .unwrap();
+        assert_eq!(
+            host.timer_calls.borrow().last().unwrap(),
+            &format!("arm vi-deadman-100 @{cap_at}")
+        );
+        // A shorter approval lowers the cap; nothing raises it.
+        c.up(None, CAP, 6000, |_, _| panic!("asked to rent again"))
+            .unwrap();
+        let r = deadman::load(&c.state, 100).unwrap().unwrap();
+        assert_eq!((r.cap_at, r.fire_at), (6000, 6000));
+        c.up(None, CAP, UNTIL, |_, _| panic!("asked to rent again"))
+            .unwrap();
+        assert_eq!(deadman::load(&c.state, 100).unwrap().unwrap().cap_at, 6000);
+    }
+
+    #[test]
+    fn a_failed_arm_aborts_up_and_destroys_the_new_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = one_offer_running();
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        host.arm_failures.set(1);
+        let c = cloud(&vast, &host, dir.path());
+        let err = c.up(None, CAP, UNTIL, |_, _| true).unwrap_err();
+        assert!(err.to_string().contains("dead-man timer"), "{err}");
+        assert_eq!(*vast.destroyed.borrow(), vec![100]);
+        assert!(c.state.load().unwrap().is_none());
+        assert!(deadman::load(&c.state, 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn no_user_manager_refuses_before_renting() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = one_offer_running();
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        host.timer_down.set(true);
+        let c = cloud(&vast, &host, dir.path());
+        let err = c.up(None, CAP, UNTIL, |_, _| true).unwrap_err();
+        assert!(err.to_string().contains("refusing to rent"), "{err}");
+        assert!(vast.created.borrow().is_empty());
+    }
+
+    #[test]
+    fn heartbeats_extend_the_timer_but_never_past_the_hard_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = one_offer_running();
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+        let cap_at = deadman::load(&c.state, 100).unwrap().unwrap().cap_at;
+
+        // The first heartbeat brings the fire time in to now + grace.
+        host.now.set(2000);
+        assert_eq!(c.deadman_extend(100, 1800).unwrap().fire_at, 3800);
+        assert_eq!(host.timers.borrow()["vi-deadman-100"], 3800);
+        // Near the cap, now + grace is clamped to the cap.
+        host.now.set(cap_at - 100);
+        assert_eq!(c.deadman_extend(100, 1800).unwrap().fire_at, cap_at);
+        assert_eq!(host.timers.borrow()["vi-deadman-100"], cap_at);
+        // At the cap nothing can extend it, and the timer stays armed.
+        host.now.set(cap_at);
+        let err = c.deadman_extend(100, 1800).unwrap_err();
+        assert!(err.to_string().contains("hard cap"), "{err}");
+        assert_eq!(host.timers.borrow()["vi-deadman-100"], cap_at);
+        // An unknown instance has nothing to extend.
+        assert!(c.deadman_extend(7, 1800).is_err());
+    }
+
+    #[test]
+    fn a_failed_extend_puts_the_old_fire_time_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let vast = one_offer_running();
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        let c = cloud(&vast, &host, dir.path());
+        c.up(None, CAP, UNTIL, |_, _| true).unwrap();
+        host.now.set(2000);
+        c.deadman_extend(100, 1800).unwrap();
+        host.now.set(2500);
+        host.arm_failures.set(1);
+        let err = c.deadman_extend(100, 1800).unwrap_err();
+        assert!(err.to_string().contains("still fires at 3800"), "{err}");
+        assert_eq!(host.timers.borrow()["vi-deadman-100"], 3800);
+        assert_eq!(deadman::load(&c.state, 100).unwrap().unwrap().fire_at, 3800);
+        // Both failing is reported as an alert.
+        host.arm_failures.set(2);
+        let err = c.deadman_extend(100, 1800).unwrap_err();
+        assert!(err.to_string().contains("NOT armed"), "{err}");
+    }
+
+    #[test]
+    fn the_timer_is_cancelled_only_after_a_verified_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        rented_with_marker(dir.path(), &api);
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        let c = api_cloud(&api, &host, dir.path());
+        c.arm_deadman(100, 1000, 9000).unwrap();
+
+        // An unverified destroy leaves the timer and its record.
+        api.down.set(true);
+        assert!(!c.down_verified(Some(100)).unwrap().verified);
+        assert!(host.timers.borrow().contains_key("vi-deadman-100"));
+        assert!(deadman::load(&c.state, 100).unwrap().is_some());
+
+        // A verified one cancels both units and forgets the record.
+        api.down.set(false);
+        let down = c.down_verified(Some(100)).unwrap();
+        assert!(down.verified, "{down:?}");
+        assert!(down.errors.is_empty(), "{down:?}");
+        assert!(host.timers.borrow().is_empty());
+        assert!(deadman::load(&c.state, 100).unwrap().is_none());
+        assert!(host
+            .timer_calls
+            .borrow()
+            .contains(&"stop vi-deadman-100 service=true".to_string()));
+        // Cancelling again, or a timer that never existed, is a no-op.
+        deadman::cancel(&c.host, &c.state, 100, true).unwrap();
+        deadman::cancel(&c.host, &c.state, 12345, true).unwrap();
+    }
+
+    #[test]
+    fn a_fire_for_a_stale_id_never_touches_the_tracked_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        let label = Config::default().label;
+        rented_with_marker(dir.path(), &api);
+        api.live.borrow_mut().push((7, Some(label.clone())));
+        let host = FakeHost {
+            now: Cell::new(1000),
+            ..FakeHost::default()
+        };
+        let c = api_cloud(&api, &host, dir.path());
+        c.arm_deadman(7, 1000, 9000).unwrap();
+
+        // Home tracks 100, so the timer for 7 destroys 7 alone.
+        let down = c.deadman_fire(7).unwrap();
+        assert!(down.verified, "{down:?}");
+        assert_eq!(down.ids, vec![7]);
+        assert_eq!(*api.live.borrow(), vec![(100, Some(label.clone()))]);
+        assert_eq!(c.state.load().unwrap().map(|t| t.id), Some(100));
+        // Its own service (this process) is left to finish.
+        assert!(host
+            .timer_calls
+            .borrow()
+            .contains(&"stop vi-deadman-7 service=false".to_string()));
+        assert!(deadman::load(&c.state, 7).unwrap().is_none());
+
+        // The timer for the tracked worker is the full verified down.
+        api.live.borrow_mut().push((8, Some(label)));
+        let down = c.deadman_fire(100).unwrap();
+        assert!(down.verified, "{down:?}");
+        assert_eq!(down.ids, vec![100, 8]);
+        assert!(api.live.borrow().is_empty());
+        assert!(c.state.load().unwrap().is_none());
     }
 }

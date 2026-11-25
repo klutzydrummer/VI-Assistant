@@ -14,7 +14,7 @@ Heavy jobs run on a GPU rented from Vast.ai. The worker keeps nothing that matte
 - `python3 jobs/progress.py corpus/tali [--watch 60]`: how far a running stage has got, as a percentage per pass, read from its log at home; `--watch` adds the time left in the current pass. It reads only logs, so it works for GPU and home stages alike and changes no stage's key.
 
 ## Keeping the budget safe
-Two guards, so a forgotten worker can't drain the credit:
+Three guards, so a forgotten worker can't drain the credit:
 1. **On the worker.** `jobs/worker-onstart.sh` runs at boot and starts a watchdog. It destroys the instance after `idle_minutes` with no running job and no ssh session, or `max_hours` after boot whatever it's doing. This works while the home machine is asleep. It calls the Vast API with the instance's own `CONTAINER_API_KEY`; if destroying fails it stops the instance instead, which ends the GPU charge but still bills disk until `vi cloud down` or the next `vi cloud up` cleans it up. Ssh sessions do not see the container's environment, so the boot script saves the `CONTAINER_*` variables to `/root/.vi-env` (mode 600). A watchdog that `on-worker.sh` restarts over ssh reads that file and defaults its job root to `/root/vi-jobs`.
 2. **At home.** `vi cloud reap` applies the same limits from home's own clock. Its idle release first checks the worker over ssh for an interactive session (`who`) or another established ssh connection (`ss`); only a worker it can see is idle is released, and `max_hours` still releases regardless. Run it from a timer:
 
@@ -25,6 +25,8 @@ Two guards, so a forgotten worker can't drain the credit:
      timerConfig.OnCalendar = "*:0/5";
    };
    ```
+
+3. **The dead-man timer at home.** Every `vi cloud up` that rents arms a transient systemd user timer, `vi-deadman-<id>`, at the rental's hard cap: the earliest of `--until`, `max_hours` after the start, and the point where `--cap` would be spent at this price. So `--until` now also ends the rental at that time. When it fires it runs `vi cloud deadman fire <id>`, which destroys that instance and checks it is gone. It is cancelled only by a verified destroy (`vi cloud down --verify`, or the timer itself); a plain `vi cloud down` leaves it armed, and when it later fires it finds the instance gone and cancels itself. If the user manager isn't reachable `up` refuses before renting, and if arming fails after the create, `up` destroys the new instance. `jobs/paid_run.py` keeps moving the timer to 30 minutes from now while the run is healthy (`vi cloud deadman extend <id> --grace SECS`, never past the cap), so a crashed or hung run is cleaned up within about half an hour. `vi cloud deadman show <id>` prints the stored fire time and cap. The timer is transient and does not survive a home reboot; the worker watchdog covers that case.
 
 The worker-side watchdog hasn't run on a real instance yet. The first `vi cloud up` should be followed by `vi cloud ssh cat /var/log/vi-watchdog.log` after the idle timeout on a short `idle_minutes`, to confirm it really releases itself.
 

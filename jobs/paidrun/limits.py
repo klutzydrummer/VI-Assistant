@@ -30,6 +30,15 @@ HF_TIMEOUT_SECONDS = 60
 HF_BACKOFF = (5, 15)
 
 
+# r32 WP2: the home dead-man timer (L2) that `vi cloud up` arms at the hard cap. While this run
+# is alive and still judging the rental (VALID or SUSPECT), it moves the timer to now + the grace,
+# at most once per heartbeat; `vi cloud` never moves it past the hard cap. A crashed or frozen run
+# stops moving it, so the instance is destroyed (and verified) at most this long after.
+DEADMAN_HEARTBEAT_SECONDS = 60
+DEADMAN_STALL_GRACE_SECONDS = 30 * 60
+DEADMAN_EXTEND_TIMEOUT_SECONDS = 30
+
+
 # A1: host-side evidence from the Vast CLI before a failed worker is destroyed. Each call is cut
 # off after this long; VI_VASTAI_BIN overrides the binary (tests use a stub). The CLI reads its
 # own key; this script never reads or prints the key or the CLI's config/state files.

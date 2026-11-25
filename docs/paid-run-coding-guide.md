@@ -12,7 +12,7 @@ The design behind it is the round 32 audit (rental-wait table, validity design C
 | WP7: verify-epoch bounded at 300 s, `verify_final` after release, instance id cached from `up` | **Built** (PR #185) |
 | WP3: `jobs/paidrun/validity.py` state machine and the cap | Planned |
 | WP4: worker progress counters (`VI-PROGRESS stage counter value`) | Planned |
-| WP2: home dead-man timer (L2) | Planned |
+| WP2: home dead-man timer (L2), `vi cloud deadman` | **Built** (branch feat/wp2-deadman-timer) |
 | WP6: worker watchdog fixes (L3) | Planned |
 | WP5: host qualification gate in every mode, rental-2 rules, host exclusion | Planned |
 
@@ -28,11 +28,12 @@ Three layers each decide on their own whether to destroy a rental. Each one only
   - **VALID** again only on *new* positive evidence. "No error" does not count.
   - **INVALID** when recovery is used up, the cap is reached or a host drop is confirmed. It records one reason: `host-drop`, `host-unqualified`, `stalled`, `our-failure` or `cap`.
   - From INVALID it goes to **DESTROY**, then **VERIFY**, then **DIAG**, then **BOOKKEEPING**.
-- **L2, the home dead-man timer** (planned in WP2). This is a transient `systemd-run --user` timer, armed by `vi cloud up` with the instance id right after the create call.
-  - It fires at `min(until, start + wall cap, start + $ cap ÷ hourly price)`.
-  - L1's heartbeats push it forward, but never past that hard cap.
-  - When it fires it runs `vi cloud down --force --verify <id>`.
-  - It is cancelled only after a destroy has been verified.
+- **L2, the home dead-man timer** (`crates/cloud/src/deadman.rs`, built in WP2). This is a transient `systemd-run --user` timer named `vi-deadman-<id>`, armed by `vi cloud up` with the instance id right after the create call. If arming fails, `up` destroys the new instance and exits nonzero, so no rental runs without a timer.
+  - Its hard cap is `min(until, start + max_hours, start + $ cap ÷ hourly price)`, stored with the fire time in `~/.local/state/vi/deadman-<id>.json`. It is armed at that cap.
+  - While L1 judges the rental VALID or SUSPECT, `paid_run.py` calls `vi cloud deadman extend <id> --grace 1800` at most once a minute. That moves the fire time to now + 30 min, never past the cap, so a dead or frozen paid run is cleaned up within about 30 minutes.
+  - When it fires it runs `vi cloud deadman fire <id>`: a forced, verified destroy (the same one as `down --force --verify`) that is scoped to that id, so a stale timer cannot destroy a newer rental. The output is appended to `deadman-<id>.log` in the run folder (or the state dir), and a failed fire is retried every 60 s.
+  - It is cancelled only after a destroy has been verified, and cancelling twice is harmless.
+  - `paid_run.py` passes `--until` = now + the hours left in the approval, so `--until` also ends the rental at that time.
   - It survives a crash, OOM kill, SIGKILL or hang of `paid_run.py`. It does not survive a home reboot. That is deliberate (decision D1): there is no boot-time settle unit, and L3 covers a reboot.
 - **L3, the worker watchdog** (`jobs/worker-onstart.sh`, rendered by `crates/cloud/src/onstart.rs`; fixes planned in WP6).
   - It self-destroys at the hard cap + 10 min with the instance's own key.

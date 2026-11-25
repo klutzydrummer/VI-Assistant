@@ -221,7 +221,9 @@ class RentalMixin:
                 self.s["attempts"].append(at)
                 self.save()
                 self.worker_maybe_up = True
-                until = rfc3339(clock() + 3600)
+                # r32 WP2: --until also bounds the dead-man timer `up` arms, so it is the end
+                # of the hours left, not a start-by hour (that killed a full run after 1 h).
+                until = rfc3339(clock() + hours_left * 3600)
                 boot_s = config_boot_minutes(self.base_config_text()) * 60 + UP_EXTRA_SECONDS
                 rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
                                     f"{cap_left:.2f}", "--until", until, "--yes"], watch=True,

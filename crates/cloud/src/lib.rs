@@ -7,6 +7,7 @@
 //! `max_hours` regardless), and `vi cloud reap` does the same from home.
 
 pub mod config;
+pub mod deadman;
 pub mod onstart;
 pub mod state;
 pub mod vast;

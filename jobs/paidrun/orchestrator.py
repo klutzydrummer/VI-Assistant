@@ -17,6 +17,7 @@ from paidrun.common import (
     say, state_root, stop_path, timeout_scale,
 )
 from paidrun.limits import (
+    DEADMAN_EXTEND_TIMEOUT_SECONDS, DEADMAN_HEARTBEAT_SECONDS, DEADMAN_STALL_GRACE_SECONDS,
     DOWN_TIMEOUT_SECONDS, DOWN_VERIFY_TIMEOUT_SECONDS, HOST_DROP_RECHECK_SECONDS,
     OUTER_RETRY_SECONDS, PROGRESS_SECONDS, PUSH_PROBE_MAX_MINUTES, QUERY_TIMEOUT_SECONDS,
     STOP_WAIT_SECONDS,
@@ -54,6 +55,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         self.in_teardown = False
         self.validity = None  # r32 WP3: the open rental's Validity (armed by current_validity)
         self.progress_stage = None  # r32 WP4: the worker stage now reporting VI-PROGRESS
+        self.deadman_beat_at = None  # r32 WP2: monotonic time of the last dead-man heartbeat
         self.user_stopped = False  # a stop request or signal ended the run (no reason class)
         self.config_path = None  # the per-attempt config currently in force
         self.s = None
@@ -109,6 +111,8 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         env = dict(os.environ)
         if self.config_path:
             env["VI_CLOUD_CONFIG"] = str(self.config_path)
+        # r32 WP2: the dead-man timer `vi cloud up` arms logs its fire into this run's folder.
+        env["VI_DEADMAN_LOG_DIR"] = str(self.dir)
         env.update(getattr(self, "extra_env", {}))
         return env
 
@@ -248,6 +252,40 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
             say(f"rental INVALID ({v.reason}): {v.detail}; stopping the stage and destroying "
                 "the worker")
             raise v.stop()
+        self.deadman_heartbeat(v)
+
+    def deadman_heartbeat(self, v):
+        """r32 WP2: move the home dead-man timer (L2, armed by `vi cloud up` at the hard cap) to
+        now + DEADMAN_STALL_GRACE_SECONDS while this run is alive and still judging the rental
+        (VALID or SUSPECT: Validity itself turns a stall INVALID). At most once per
+        DEADMAN_HEARTBEAT_SECONDS. `vi cloud deadman extend` never moves it past the hard cap and
+        refuses once the cap is reached. The call is a plain subprocess, not run(), because it
+        happens inside run()'s loop. A failure is an ALERT; the timer stays armed at its last
+        fire time and the next beat tries again. A home reboot loses the timer: the worker's own
+        watchdog (L3) covers that."""
+        if self.in_teardown or v is None or v.state == INVALID:
+            return
+        at = self.open_attempt()
+        inst = str(at.get("instance") or "") if at else ""
+        if not inst.isdigit():
+            return  # `up` has not printed the instance yet; the timer sits at the hard cap
+        now = time.monotonic()
+        last = getattr(self, "deadman_beat_at", None)
+        if last is not None and now - last < DEADMAN_HEARTBEAT_SECONDS:
+            return
+        self.deadman_beat_at = now
+        argv = [self.vi, "cloud", "deadman", "extend", inst, "--grace",
+                str(DEADMAN_STALL_GRACE_SECONDS)]
+        try:
+            p = subprocess.run(argv, cwd=self.a.repo, env=self.env(), stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True,
+                               timeout=DEADMAN_EXTEND_TIMEOUT_SECONDS)
+            rc, out = p.returncode, (p.stdout + p.stderr).strip()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            rc, out = None, str(e)
+        if rc != 0:
+            say(f"ALERT: could not move the dead-man timer for instance {inst} (exit {rc}): "
+                f"{' '.join(out.split())[-300:]}; it stays armed at its last fire time")
 
     def validity_evidence(self, kind, value=None, counter=None, min_rate=None):
         v = None if self.in_teardown else self.current_validity()

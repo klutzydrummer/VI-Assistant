@@ -79,6 +79,7 @@ ALLOWLIST = [
     ("jobs/worker-preflight.sh", r'rm -f "\$disk_probe"', "the worker job dir's disk-probe file"),
     ("jobs/worker-preflight.sh", r'rm -f "\$speed_file"', "the worker job dir's speed-test dummy"),
     ("crates/cloud/src/state.rs", r"std::fs::remove_file\(path\)", "the vi state dir (markers and known_hosts)"),
+    ("crates/cloud/src/deadman.rs", r"std::fs::remove_file\(&path\)", "the vi state dir's deadman-<id>.json record, only after that instance's destroy is verified"),
     ("crates/review/src/hub.rs", r"fs::remove_file\(&path\)", "a task's TASK_DONE file under the hub dir"),
     ("crates/harvest/src/extract.rs", r"fs::remove_dir_all\(&tmp\)", "the extraction temp dir this run created"),
     ("crates/dataset/src/runner.rs", r"fs::remove_dir_all\(&tmp\)", "a stage's .tmp- partial dir under corpus/stages"),

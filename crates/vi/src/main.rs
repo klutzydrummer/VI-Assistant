@@ -40,6 +40,8 @@ pub(crate) const USAGE: &str = "usage:
   vi cloud hostkey
   vi cloud down [--force]
   vi cloud down --force --verify [ID]   (exit 9: destroy not verified)
+  vi cloud deadman fire ID | extend ID --grace SECS | show ID   (the home dead-man timer that `up` arms;
+      it fires `deadman fire ID` at the earliest of --until, max_hours and --cap; a heartbeat moves it to now + SECS, never past that cap)
   vi cloud status
   vi cloud reap
   vi cloud ssh [command]

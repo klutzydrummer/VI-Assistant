@@ -91,6 +91,9 @@ STUB = textwrap.dedent('''\
         st["credit"] = round(st["credit"] - spent, 4); st["worker"] = None; st["downs"] = st.get("downs", 0) + 1; save()
         print(f"destroyed instance {w['id']}")
         print(f"credit ${w['credit']:.2f} before, ${st['credit']:.2f} now (${spent:.2f} spent)")
+    elif args[:3] == ["cloud", "deadman", "extend"]:
+        log("deadman", args[2:])
+        print(f"dead-man timer vi-deadman-{args[3]} fires later")
     elif args[:2] == ["cloud", "status"]:
         log("status")
         if sc.get("status_hang"): time.sleep(600)
@@ -564,6 +567,20 @@ class Flow(Base):
             if sys.version_info >= (3, 11):
                 import tomllib
                 self.assertEqual(len(tomllib.loads(toml)["clip"]), 2)
+
+    def test_dead_man_until_is_the_hours_left_and_heartbeats_extend_it(self):
+        # r32 WP2: `up --until` bounds the dead-man timer, so it must be the end of the hours
+        # left (8 h here), not one hour; and the run moves the timer while it judges the rental.
+        from datetime import datetime
+        self.scenario([dict(spent=0.80, hours=2.0)])
+        t0 = time.time()
+        self.assertEqual(self.run_orch(), 0, self.out)
+        until = datetime.fromisoformat(self.ups()[0]["until"].replace("Z", "+00:00"))
+        self.assertAlmostEqual(until.timestamp() - t0, 8 * 3600, delta=120)
+        beats = [c[1] for c in self.calls() if c[0] == "deadman"]
+        self.assertTrue(beats, self.calls())
+        self.assertEqual(beats[0], ["extend", "101", "--grace", "1800"])
+        self.assertNotIn("ALERT", self.out)
 
     def test_2_slow_push_only_warns_and_never_retries(self):
         # round 19: the push rate is no gate; one rental, the train stage runs, exit 0

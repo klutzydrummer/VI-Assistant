@@ -33,6 +33,7 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
         ["hostkey"] => hostkey(&c),
         ["down"] => down(&c, force),
         ["down", "--verify", rest @ ..] => down_verified(&c, force, rest),
+        ["deadman", rest @ ..] => deadman(&c, rest),
         ["status"] => status(&c),
         ["reap"] => match c.reap(&SshActivity) {
             Ok(Some(why)) => {
@@ -373,7 +374,12 @@ fn down_verified(c: &Cloud<HttpVast, SystemHost>, force: bool, args: &[&str]) ->
             return ExitCode::from(2);
         }
     };
-    let down = match c.down_verified(id) {
+    report_verified(c.down_verified(id))
+}
+
+/// Prints what a verified destroy did. Exit 9 when it is not verified.
+fn report_verified(result: Result<cloud::Down, cloud::Error>) -> ExitCode {
+    let down = match result {
         Ok(down) => down,
         Err(e) => {
             eprintln!("error: {e}");
@@ -418,6 +424,74 @@ fn down_verified(c: &Cloud<HttpVast, SystemHost>, force: bool, args: &[&str]) ->
     }
     print_spend(&down);
     ExitCode::SUCCESS
+}
+
+/// `vi cloud deadman ...`: the home dead-man timer (L2). `vi cloud up` arms it;
+/// these are what the timer and the paid-run heartbeat call.
+fn deadman(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
+    let now = cloud::Host::now(&c.host);
+    match args {
+        ["fire", id] => {
+            let id = match cloud::deadman::parse_id(id) {
+                Ok(id) => id,
+                Err(e) => return fail(e),
+            };
+            // stdout and stderr are appended to the run's dead-man log.
+            println!("dead-man timer fired for instance {id} at unix {now}: destroying it");
+            let code = report_verified(c.deadman_fire(id));
+            println!(
+                "dead-man fire for instance {id} finished at unix {}",
+                cloud::Host::now(&c.host)
+            );
+            code
+        }
+        ["extend", id, "--grace", secs] => {
+            let id = match cloud::deadman::parse_id(id) {
+                Ok(id) => id,
+                Err(e) => return fail(e),
+            };
+            let Ok(grace) = secs.parse::<u64>() else {
+                return fail(format!("--grace takes whole seconds, not {secs:?}"));
+            };
+            match c.deadman_extend(id, grace) {
+                Ok(r) => {
+                    println!(
+                        "dead-man timer {} fires at unix {} (in {} s; hard cap unix {})",
+                        r.unit,
+                        r.fire_at,
+                        r.fire_at.saturating_sub(now),
+                        r.cap_at
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e),
+            }
+        }
+        ["show", id] => {
+            let id = match cloud::deadman::parse_id(id) {
+                Ok(id) => id,
+                Err(e) => return fail(e),
+            };
+            match cloud::deadman::load(&c.state, id) {
+                Ok(Some(r)) => {
+                    println!(
+                        "{} fires at unix {} (hard cap unix {}); log {}",
+                        r.unit,
+                        r.fire_at,
+                        r.cap_at,
+                        r.log.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => fail(format!("no dead-man timer recorded for instance {id}")),
+                Err(e) => fail(e),
+            }
+        }
+        _ => {
+            eprintln!("{}", crate::USAGE);
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// The spend report: credit when the worker was rented, credit now, and the
