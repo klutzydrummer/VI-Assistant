@@ -353,6 +353,54 @@ fn pause(pid: u32) -> Paused {
     Paused(pid)
 }
 
+/// The parent pid from `/proc/<pid>/stat` (the field after the `(comm)`).
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// SIGSTOP the main home supervisor (not one of its same-named subshells)
+/// while it sits in the `sleep` between two polls, so that on SIGCONT it
+/// starts a fresh loop iteration (receiver check first) instead of finishing
+/// one it was stopped in the middle of. The sleep child is checked again after
+/// the stop: a stopped shell cannot move past a child it has not reaped.
+fn pause_between_polls(token: &str) -> Paused {
+    let pattern = format!("on-worker\\.sh.*{token}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let in_sleep = |pid: u32| {
+        Command::new("pgrep")
+            .args(["-P", &pid.to_string(), "-x", "sleep"])
+            .output()
+            .is_ok_and(|o| !o.stdout.is_empty())
+    };
+    loop {
+        let pids = pgrep_f(&pattern);
+        let main = pids
+            .iter()
+            .copied()
+            .find(|&p| parent_pid(p).is_some_and(|pp| !pids.contains(&pp)));
+        if let Some(pid) = main {
+            if in_sleep(pid) {
+                let paused = pause(pid);
+                if in_sleep(pid) {
+                    return paused;
+                }
+                drop(paused);
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "on-worker.sh carrying {token} was never caught between polls"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Live children a test started and must reap.
 struct Kids(Vec<Child>);
 
@@ -1709,9 +1757,17 @@ jobs/worker-job.sh --work "$w/wj" --run "$w/run" -- sh -c 'i=0; while [ $i -lt 2
 
 /// Row 6: a home supervisor stopped long enough to miss the whole run resumes
 /// and reattaches: the return receiver is restarted and re-proved, the stage
-/// is not relaunched, and the output still comes home. The pause is 10
-/// seconds of wall clock rather than 10 minutes; the code keys on state, not
+/// is not relaunched, and the output still comes home. The pause lasts as
+/// long as the job does rather than 10 minutes; the code keys on state, not
 /// on how long the process was stopped.
+///
+/// Every step waits on state, not on a sleep (round 34: CI twice paused the
+/// supervisor while its first return-path proof was still in flight, so the
+/// receiver kill failed that first proof and only one proof line was printed).
+/// The supervisor is stopped only after its first proof is logged and only
+/// while it sleeps between polls (stopped mid-iteration, it can see the
+/// finished job before it rechecks the receiver), and the job finishes only
+/// when the test releases it, while the supervisor is stopped.
 #[test]
 fn sigstop_home_supervisor_10min_then_sigcont_reattaches() {
     if !have_rsync() {
@@ -1724,7 +1780,7 @@ fn sigstop_home_supervisor_10min_then_sigcont_reattaches() {
 echo "$VI_RETURN_PORT" > "$VI_OUT/port"
 echo "$BASHPID" > "$VI_OUT/jobpid"
 echo run >> "$VI_OUT/runs"
-sleep 8
+for _ in $(seq 1 1200); do [ -f "$VI_OUT/../release" ] && break; sleep 0.1; done
 echo done > "$VI_OUT/done.txt""#
     );
     let (mut child, err_path) = start_stage(
@@ -1738,26 +1794,32 @@ echo done > "$VI_OUT/done.txt""#
     wait_until("the job never wrote jobpid", 30, || {
         work.join("out/jobpid").is_file()
     });
-    let supervisor = supervisor_pid(&token);
-    let paused = pause(supervisor);
-    std::thread::sleep(Duration::from_secs(1));
+    wait_until("the first return-path proof was never logged", 60, || {
+        err_text(&err_path).contains("return path re-proved")
+    });
+    let paused = pause_between_polls(&token);
     let receiver = receiver_pid(dir.path()).expect("the receiver never wrote its pid");
     assert!(
         send_signal(receiver, "-TERM"),
         "could not stop the receiver"
     );
     wait_until("the receiver did not die", 10, || !pid_alive(receiver));
-    std::thread::sleep(Duration::from_secs(4));
+    // The whole run happens while the supervisor is stopped.
+    fs::write(work.join("release"), "").unwrap();
+    wait_until(
+        "the job did not finish while the supervisor was stopped",
+        60,
+        || work.join("out/done.txt").is_file(),
+    );
     drop(paused);
     let status = wait_stage_or_dump(&mut child, 120, &err_path);
     let err = err_text(&err_path);
     assert!(status.success(), "{err}");
+    let restarted = err
+        .find("the return receiver is down; restarting it")
+        .unwrap_or_else(|| panic!("the receiver was not restarted: {err}"));
     assert!(
-        err.contains("the return receiver is down; restarting it"),
-        "{err}"
-    );
-    assert!(
-        err.matches("return path re-proved").count() >= 2,
+        err[restarted..].contains("return path re-proved"),
         "the restarted return path was not proved again: {err}"
     );
     let got = dataset::runner::current_out(&dir.path().join("corpus"), "on-gpu").unwrap();
