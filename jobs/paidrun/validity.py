@@ -54,24 +54,32 @@ class StageSpec:
     counter: str | None
     tries: int = 1
     recover_s: float | None = None
+    # units per second: an advance slower than this, measured since the last counted reading,
+    # is not progress (C.2: upload "60 s at < 0.5 MB/s", base-model fetch "120 s at < 1 MB/s")
+    min_rate: float | None = None
 
 
-# C.2 (w33 report), about 3x the worst good past run and at least 120 s. Not enforced yet: the
-# stages that would report these counters land in WP4, so today's stages are entered with the
-# existing ad-hoc limits (see PaidRun.run) and these rows are the target values.
+# C.2 (w33 report), about 3x the worst good past run and at least 120 s. WP4: the worker now
+# reports these counters (`VI-PROGRESS <stage> <counter> <value>`), and PaidRun.note_progress
+# enters each reported stage with its stall_s and min_rate, so a stalled or trickling stage turns
+# SUSPECT. The deadlines, tries and recover_s are still not enforced: the existing ad-hoc limits
+# (see PaidRun.run and on-worker.sh) keep deciding when a stage is stopped.
 STAGE_TABLE = {
     "create-running": StageSpec(600, None, None),
     "boot-ssh": StageSpec(900, None, None),
     "host-qual": StageSpec(240, 60, "probe-bytes"),
-    "upload": StageSpec(300, 60, "bytes-acked"),
-    "venv": StageSpec(300, 120, "packages"),
-    "base-model-fetch": StageSpec(300, 120, "bytes-on-disk"),
-    "tokenise": StageSpec(450, 120, "items"),
+    "upload": StageSpec(300, 60, "bytes-acked", min_rate=0.5e6),
+    # pip reports no package count it can be asked for; the worker reports bytes of wheels
+    # and installed files instead (VI-PROGRESS venv install-bytes)
+    "venv": StageSpec(300, 120, "install-bytes"),
+    "base-model-fetch": StageSpec(300, 120, "bytes-on-disk", min_rate=1e6),
+    # upstream's token extractor reports no item count; the worker reports shard bytes written
+    "tokenise": StageSpec(450, 120, "shard-bytes"),
     "cuda-load": StageSpec(300, None, "loaded"),
     # first step within 300 s; after that the whole-run cap, stall max(600, 5x median step)
     "train": StageSpec(None, 600, "step"),
     # deadline max(600, 1.5x bytes/rate) is computed per push
-    "checkpoint-push": StageSpec(600, 120, "bytes-acked"),
+    "checkpoint-push": StageSpec(600, 120, "files-pushed"),
 }
 TRAIN_FIRST_STEP_SECONDS = 300
 TRAIN_STALL_MIN_SECONDS = 600
@@ -167,6 +175,7 @@ class Validity:
         self.invalid_at = None
         self.stage = None
         self.counters = {}
+        self.rate_base = {}
         self.seen = {}
         self._enter_stage(None, self.started, None, None, 1, None, None)
 
@@ -197,9 +206,11 @@ class Validity:
         return self.state
 
     # ----- evidence -------------------------------------------------------------------------
-    def evidence(self, kind, value=None, counter=None, now=None):
+    def evidence(self, kind, value=None, counter=None, now=None, min_rate=None):
         """Record positive evidence. Liveness kinds only refresh their timestamp. `progress`
-        counts only when its counter strictly increases; that alone moves SUSPECT to VALID."""
+        counts only when its counter strictly increases; that alone moves SUSPECT to VALID.
+        min_rate (units/s): the increase must also average at least this since the last counted
+        reading, so a trickle never counts however long it keeps creeping up."""
         if kind not in EVIDENCE_KINDS:
             raise ValueError(f"unknown evidence kind {kind!r}")
         now = self.clock() if now is None else now
@@ -217,7 +228,13 @@ class Validity:
         self.counters[name] = value
         if prev is None:
             # the first reading of a counter is a baseline, not an advance
+            self.rate_base[name] = (value, now)
             return self.state
+        if min_rate:
+            base_value, base_at = self.rate_base.get(name, (prev, now))
+            if now <= base_at or (value - base_value) / (now - base_at) < min_rate:
+                return self.state
+        self.rate_base[name] = (value, now)
         self.last_progress_at = now
         if self.state == SUSPECT:
             self.recover_used += now - self.suspect_since

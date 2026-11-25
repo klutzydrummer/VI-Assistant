@@ -13,6 +13,11 @@ a host whose inbound trickles at a few KB/s (omnivoice-ft-dbg6, 2026-11-25) neve
 parent watches DEST.part and ends the try with "inbound too slow" when it grew by less than
 VI_FETCH_MIN_MBPS MB/s over the last VI_FETCH_STALL_WINDOW seconds; the try then counts as failed.
 
+r32 WP4: every poll also prints `VI-PROGRESS base-model-fetch bytes-on-disk <N>` on stderr (N is
+the most bytes seen in DEST.part so far, so it never goes down; a stalled download repeats it),
+and `VI-PROGRESS-END base-model-fetch` when the download is over. on-worker.sh forwards these
+home, where only a strictly increasing value counts as progress.
+
 Environment (tests override these): VI_FETCH_BACKOFF="10 30 90" (seconds between the 4 tries),
 VI_FETCH_MIN_MBPS=1 (decimal MB/s), VI_FETCH_STALL_WINDOW=120 (seconds).
 """
@@ -81,6 +86,23 @@ def tree_bytes(folder):
     return total
 
 
+PROGRESS_STAGE = "base-model-fetch"
+PROGRESS_COUNTER = "bytes-on-disk"
+_progress_high = 0
+
+
+def report_progress(have):
+    """Print the WP4 progress line for `have` bytes on disk (the high mark, never lower)."""
+    global _progress_high
+    _progress_high = max(_progress_high, int(have))
+    print(f"VI-PROGRESS {PROGRESS_STAGE} {PROGRESS_COUNTER} {_progress_high}", file=sys.stderr,
+          flush=True)
+
+
+def report_progress_end():
+    print(f"VI-PROGRESS-END {PROGRESS_STAGE}", file=sys.stderr, flush=True)
+
+
 def _one_try(repo, revision, part, conn):
     """The child: one snapshot_download; sends None or the error text to the parent."""
     try:
@@ -102,6 +124,7 @@ def download_once(repo, revision, part):
     child.start()
     send.close()
     samples = [(time.monotonic(), tree_bytes(part))]
+    report_progress(samples[0][1])
     try:
         while True:
             child.join(poll)
@@ -109,6 +132,7 @@ def download_once(repo, revision, part):
                 break
             now, have = time.monotonic(), tree_bytes(part)
             samples.append((now, have))
+            report_progress(have)
             old = [i for i, (t, _) in enumerate(samples) if now - t >= window]
             if old:
                 samples = samples[old[-1]:]
@@ -150,6 +174,13 @@ def main(argv):
         shutil.rmtree(dest)
     part = dest.with_name(dest.name + ".part")
     print(f"fetch_base_model: downloading {repo}@{revision} to {part}", file=sys.stderr)
+    try:
+        return _download(repo, revision, dest, part)
+    finally:
+        report_progress_end()
+
+
+def _download(repo, revision, dest, part):
     delays = _backoff()
     last = "no attempt"
     for attempt in range(TRIES):

@@ -72,6 +72,27 @@ LIMITS=([3]=60 [4]=1200 [5]=900 [6]=600 [7]=600 [8]=900 [9]=600 [10]=600 [11]=60
 MIN_LIMITS=([3]=30 [4]=300 [5]=120 [6]=60 [7]=120 [8]=120 [9]=120 [10]=120 [11]=120)
 
 # ----- the real worker functions ----------------------------------------------------------
+# relay_progress LOG: copy the stage's new VI-PROGRESS / VI-PROGRESS-END lines (r32 WP4) from its
+# log to this script's output (job.log), which on-worker.sh forwards home. Only whole lines are
+# read, and RELAYED counts the ones already copied, so each line goes out once.
+RELAYED=0
+relay_progress() {
+  local whole lines n
+  whole=$(wc -l <"$1" 2>/dev/null || echo 0)
+  lines=$(head -n "$whole" "$1" 2>/dev/null | grep -aE '^VI-PROGRESS(-END)? ' || true)
+  [ -n "$lines" ] || return 0
+  n=$(printf '%s\n' "$lines" | wc -l)
+  [ "$n" -gt "$RELAYED" ] || return 0
+  printf '%s\n' "$lines" | tail -n "+$((RELAYED + 1))"
+  RELAYED=$n
+}
+# end_progress LOG: a stage that hit its limit was killed before its VI-PROGRESS-END; close every
+# counter stage its log opened, so on-worker.sh and home do not wait on a counter that is gone.
+end_progress() {
+  local whole
+  whole=$(wc -l <"$1" 2>/dev/null || echo 0)
+  head -n "$whole" "$1" 2>/dev/null | awk '$1 == "VI-PROGRESS" && NF == 4 && !seen[$2]++ { print "VI-PROGRESS-END " $2 }'
+}
 cut_functions() {
   local src="$jobs_dir/voicetune-fresh.sh" fn
   for fn in "$@"; do
@@ -80,7 +101,8 @@ cut_functions() {
 }
 load_worker_code() {
   local code
-  code=$(cut_functions publish_sync acked_checkpoints mark_pushed mark_bad push_repairs \
+  code=$(cut_functions vi_progress vi_progress_end vi_tree_bytes vi_progress_watch \
+    vi_progress_stop publish_sync acked_checkpoints mark_pushed mark_bad push_repairs \
     push_publish weights_first push_two_part ovft_python audio_tokenizer_dir tokenise \
     tokenise_count_guard gpu_gate vram_peak_gate)
   FULL_ONLY_RE='  (optimizer\.bin|scheduler\.bin|random_states_0\.pkl)$'
@@ -380,10 +402,13 @@ for n in "${order[@]}"; do
   timeout -k 15 "$limit" bash "$self" --stage "$n" "$limit" >"$log" 2>&1 </dev/null &
   pid=$!
   last=$t0
+  RELAYED=0
   while kill -0 "$pid" 2>/dev/null; do
     sleep "${VI_DEBUG_POLL_SECONDS:-5}"
+    relay_progress "$log"
     now=$(date +%s)
-    # A line now and then keeps on-worker.sh's stall watch (job.log must change) quiet.
+    # A line now and then keeps on-worker.sh's liveness watch (job.log must change) quiet while
+    # no counter stage is open; it is never counted as progress.
     if [ $((now - last)) -ge "${VI_DEBUG_HEARTBEAT_SECONDS:-60}" ]; then
       echo "debug-pass: stage $n $name: still running ($((now - t0)) s; $(tail -n 1 "$log" 2>/dev/null | cut -c1-160))"
       last=$now
@@ -391,6 +416,8 @@ for n in "${order[@]}"; do
   done
   rc=0
   wait "$pid" || rc=$?
+  relay_progress "$log"
+  end_progress "$log"
   seconds[$n]=$(( $(date +%s) - t0 ))
   rcs[$n]=$rc
   if [ "$rc" = 0 ]; then

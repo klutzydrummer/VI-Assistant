@@ -82,6 +82,53 @@ probe_publish="$scratch/probe-publish"
 mkdir -p "$scratch"
 work="$(cd "$(dirname "$VI_OUT")" && pwd)"
 
+# r32 WP4 progress counters. A stage reports `VI-PROGRESS <stage> <counter> <integer>` on stderr
+# (job.log, which on-worker.sh forwards home) and `VI-PROGRESS-END <stage>` when it is over. A
+# counter never goes down: a stalled stage repeats its last value, and home counts only a strictly
+# increasing value as progress. Log lines and file mtimes are never progress.
+# (Each helper is written over several lines: jobs/debug-pass.sh cuts them out by name and stops
+# at the first line that is a lone closing brace.)
+vi_progress() {
+  printf 'VI-PROGRESS %s %s %s\n' "$1" "$2" "$3" >&2
+}
+vi_progress_end() {
+  printf 'VI-PROGRESS-END %s\n' "$1" >&2
+}
+
+# vi_tree_bytes PATH...: apparent bytes under the paths that exist (log files left out: writing a
+# log is not progress).
+vi_tree_bytes() {
+  local p n total=0
+  for p in "$@"; do
+    [ -e "$p" ] || continue
+    n=$(du -sb --exclude='*.log' "$p" 2>/dev/null | awk '{print $1; exit}')
+    case $n in ''|*[!0-9]*) n=0 ;; esac
+    total=$((total + n))
+  done
+  printf '%s\n' "$total"
+}
+
+# vi_progress_watch STAGE COUNTER PATH...: run in the background (stdout to /dev/null, so it never
+# holds a $(...) open). Every VI_PROGRESS_SECONDS (default 10) it reports the most bytes seen so far
+# under the paths: a folder that is cleared and rebuilt repeats the old high mark until it passes it.
+vi_progress_watch() {
+  local stage=$1 counter=$2 best=0 n
+  shift 2
+  while :; do
+    n=$(vi_tree_bytes "$@")
+    [ "$n" -le "$best" ] || best=$n
+    vi_progress "$stage" "$counter" "$best"
+    sleep "${VI_PROGRESS_SECONDS:-10}"
+  done
+}
+
+# vi_progress_stop PID: end a vi_progress_watch started with `&`.
+vi_progress_stop() {
+  [ -n "${1:-}" ] || return 0
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
 # publish_sync SRC DST: mirror every finished checkpoint from SRC into DST as hard links (so the
 # copy costs no disk), and drop published checkpoints the trainer removed again. Only a
 # checkpoint with its SHA256SUMS counts; a replaced same-name checkpoint (collapse guard
@@ -147,6 +194,13 @@ mark_pushed() {
     case $n in ''|*[!0-9]*) continue ;; esac
     : >"$work/pushed/checkpoint-$n"
   done
+  # files-pushed: checkpoints home in full plus those home as weights only; repeats when a pass
+  # sent nothing new
+  local count=0 f
+  for f in "$work/pushed"/* "$work/wpushed"/*; do
+    [ -e "$f" ] && count=$((count + 1))
+  done
+  vi_progress checkpoint-push files-pushed "$count"
 }
 
 mark_bad() {  # NAME (checkpoint-<step> or epoch-<k>)
@@ -402,8 +456,12 @@ ovft_python() {
     flock 7
     if [ ! -f "$venv/.vi-complete" ]; then
       # 3 tries, sleeping 30 s then 90 s (VI_PIP_BACKOFF="30 90" overrides, for tests).
-      local try delays rc=1
+      local try delays rc=1 watch
       read -r -a delays <<<"${VI_PIP_BACKOFF:-30 90}"
+      # install-bytes: the venv plus pip's cache and unpack dirs; a stuck download repeats
+      vi_progress_watch venv install-bytes "$venv" "${PIP_CACHE_DIR:-$HOME/.cache/pip}" \
+        "${TMPDIR:-/tmp}"/pip-* >/dev/null &
+      watch=$!
       for try in 0 1 2; do
         rm -rf "$venv"
         if python3 -m venv --system-site-packages "$venv" &&
@@ -413,6 +471,8 @@ ovft_python() {
         fi
         [ "$try" -lt 2 ] && sleep "${delays[$try]:-30}"
       done
+      vi_progress_stop "$watch"
+      vi_progress_end venv
       if [ "$rc" != 0 ]; then
         rm -rf "$venv"
         echo "worker-preflight: pip install failed (3 tries) for $req" >&2
@@ -528,7 +588,12 @@ tokenise() {
   tok=$(audio_tokenizer_dir) || return 1
   [ -s "$manifest" ] || { echo "tokenise: $manifest missing or empty" >&2; return 1; }
   mkdir -p "$data_dir/shards/$name"
-  local log="$data_dir/shards/$name/extract.log" rc=0
+  local log="$data_dir/shards/$name/extract.log" rc=0 watch
+  # shard-bytes: upstream prints no per-item count, so the bytes of shards written stand in for
+  # items done (extract.log is left out).
+  vi_progress_watch tokenise shard-bytes "$data_dir/shards/$name/audios" \
+    "$data_dir/shards/$name/txts" >/dev/null &
+  watch=$!
   # Watched, in its own process group, with the worker count from jobs/worker-limits.sh: a fatal
   # pool crash stops it within VI_FATAL_QUIET_SECONDS instead of hanging, and no orphan is left.
   vi_run_watched "$log" "$PY" -m omnivoice.scripts.extract_audio_tokens \
@@ -537,6 +602,9 @@ tokenise() {
     --jsonl_output_pattern "$data_dir/shards/$name/txts/shard-%06d.jsonl" \
     --tokenizer_path "$tok" --samples_per_shard 1000 --skip_errors \
     --nj_per_gpu "${VI_LIMIT_NJ:-1}" || rc=$?
+  vi_progress_stop "$watch"
+  vi_progress tokenise shard-bytes "$(vi_tree_bytes "$data_dir/shards/$name/audios" "$data_dir/shards/$name/txts")"
+  vi_progress_end tokenise
   [ "$rc" = 0 ] || { echo "tokenise: extract_audio_tokens exited $rc for $name" >&2; return 1; }
   [ -s "$lst" ] || { echo "tokenise: $lst was not written for $name" >&2; return 1; }
   tokenise_count_guard "$name" "$manifest" "$log" || { rm -f "$lst"; return 1; }
@@ -700,7 +768,21 @@ rehearse_kill_resume() {
   setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' _ "$pidfile" \
     "${ACCELERATE_LAUNCH[@]}" --num_processes 1 "${trainer[@]}" "${args[@]}" &
   bg=$!
-  while [ ! -s "$pidfile" ]; do sleep 0.2; done
+  # Bounded: a launcher that never writes its process group id (setsid failed, a full disk) must
+  # not hold the preflight forever. VI_REHEARSE_PIDFILE_SECONDS (default 60) is the limit.
+  local pid_limit=${VI_REHEARSE_PIDFILE_SECONDS:-60} pid_waited=0
+  while [ ! -s "$pidfile" ]; do
+    if ! kill -0 "$bg" 2>/dev/null && [ ! -s "$pidfile" ]; then
+      echo "rehearsal: the trainer launcher exited without writing its process group id" >&2
+      return 1
+    fi
+    if [ "$pid_waited" -ge "$((pid_limit * 5))" ]; then
+      kill "$bg" 2>/dev/null || true
+      echo "rehearsal: the trainer launcher wrote no process group id in ${pid_limit}s; stopping the rehearsal" >&2
+      return 1
+    fi
+    sleep 0.2; pid_waited=$((pid_waited + 1))
+  done
   pgid=$(cat "$pidfile")
   last_micro() {
     python3 -c '
@@ -875,6 +957,7 @@ for line in open(sys.argv[1], errors="replace"):
         pass
 print(last)' "$run/style_metrics.jsonl" 2>/dev/null || echo 0)
       eta_check "$step" "$(( $(date +%s) - start ))"
+      vi_progress train step "$step"
     fi
     if [ -n "$reason" ]; then
       echo "train abort: $reason" >&2
@@ -886,6 +969,7 @@ print(last)' "$run/style_metrics.jsonl" 2>/dev/null || echo 0)
     fi
     sleep "${VI_WATCH_SECONDS:-15}"
   done
+  vi_progress_end train
   set +e
   wait "$wj_pid"
   rc=$?

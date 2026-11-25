@@ -21,7 +21,7 @@ from paidrun.limits import (
     OUTER_RETRY_SECONDS, PROGRESS_SECONDS, PUSH_PROBE_MAX_MINUTES, QUERY_TIMEOUT_SECONDS,
     STOP_WAIT_SECONDS,
 )
-from paidrun.signals import ACK_RE, FATAL_RE, parse_step
+from paidrun.signals import ACK_RE, FATAL_RE, parse_progress, parse_progress_end, parse_step
 from paidrun.config import (
     CKPT_EVERY, DEBUG_MAX_RENTALS, DISK_CEILING_PER_GB_MONTH, DISK_OVERHEAD_GB, EU_COUNTRIES,
     EXPECTED_STEPS, HOURS_PER_MONTH, LISTENING_STEPS, config_max_dph, debug_worst_case, disk_check,
@@ -33,7 +33,8 @@ from paidrun.gates import (
 )
 from paidrun.release import ReleaseMixin
 from paidrun.validity import (
-    EV_RETURN_PUSH_OK, EV_SSH_OK, EV_VAST_RUNNING, INVALID, SELF_REASONS, Validity,
+    EV_PROGRESS, EV_RETURN_PUSH_OK, EV_SSH_OK, EV_VAST_RUNNING, INVALID, SELF_REASONS,
+    STAGE_TABLE, Validity,
 )
 from paidrun.rental import RentalMixin
 from paidrun.debug import DebugMixin
@@ -52,6 +53,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         self.worker_maybe_up = False
         self.in_teardown = False
         self.validity = None  # r32 WP3: the open rental's Validity (armed by current_validity)
+        self.progress_stage = None  # r32 WP4: the worker stage now reporting VI-PROGRESS
         self.user_stopped = False  # a stop request or signal ended the run (no reason class)
         self.config_path = None  # the per-attempt config currently in force
         self.s = None
@@ -227,6 +229,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
                                          dollar_cap=at.get("cap"), dph=at.get("dph"),
                                          attempt=at["n"])
             v.enter(at.get("phase"))
+            self.progress_stage = None
         return v
 
     def poll_validity(self):
@@ -246,10 +249,50 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
                 "the worker")
             raise v.stop()
 
-    def validity_evidence(self, kind):
+    def validity_evidence(self, kind, value=None, counter=None, min_rate=None):
         v = None if self.in_teardown else self.current_validity()
         if v is not None:
-            v.evidence(kind)
+            before = v.state
+            v.evidence(kind, value, counter=counter, min_rate=min_rate)
+            if v.state != before:
+                self.record_validity(v)
+
+    # Worker stages that report a counter while the outer phase waits on them. Entering one
+    # arms its C.2 stall window (and min rate) so a stalled or trickling stage turns SUSPECT;
+    # its deadline is not armed: the existing run() timeouts and on-worker.sh limits still
+    # decide when a stage is stopped. checkpoint-push runs beside training, so it only adds
+    # evidence and never takes over the stage.
+    FOREGROUND_PROGRESS_STAGES = ("host-qual", "upload", "venv", "base-model-fetch", "tokenise",
+                                  "train")
+
+    def note_progress(self, stage, counter, value):
+        """One `VI-PROGRESS <stage> <counter> <value>` line from the worker (r32 WP4). Only a
+        strictly increasing counter is progress (Validity.evidence); log lines, file touches and
+        return pushes never are."""
+        v = None if self.in_teardown else self.current_validity()
+        if v is None:
+            return
+        spec = STAGE_TABLE.get(stage)
+        if stage in self.FOREGROUND_PROGRESS_STAGES \
+                and getattr(self, "progress_stage", None) != stage:
+            self.progress_stage = stage
+            before = v.state
+            v.enter(stage, stall_s=spec.stall_s if spec else None)
+            if v.state != before:
+                self.record_validity(v)
+        self.validity_evidence(EV_PROGRESS, value, counter=f"{stage}/{counter}",
+                               min_rate=spec.min_rate if spec else None)
+
+    def note_progress_end(self, stage):
+        """`VI-PROGRESS-END <stage>`: the worker stage is over, so the outer phase takes back
+        the validity stage (with no limits, as set_phase does)."""
+        if getattr(self, "progress_stage", None) != stage:
+            return
+        self.progress_stage = None
+        v = None if self.in_teardown else self.current_validity()
+        at = self.open_attempt()
+        if v is not None:
+            v.enter(at.get("phase") if at else None)
 
     def record_validity(self, v):
         self.s["validity"] = v.snapshot()
@@ -267,10 +310,18 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         if m:
             self.last_ack = max(self.last_ack, int(m.group(1)))
             self.validity_evidence(EV_RETURN_PUSH_OK)  # a checkpoint push landed home
+        got = parse_progress(line)
+        if got:
+            self.note_progress(*got)
+        else:
+            ended = parse_progress_end(line)
+            if ended:
+                self.note_progress_end(ended)
         self.write_progress()
 
     def set_phase(self, at, phase):
         at["phase"] = phase
+        self.progress_stage = None
         v = self.current_validity()
         if v is not None:
             # no deadline here: each stage keeps its existing run() timeout (see the WP3 notes)

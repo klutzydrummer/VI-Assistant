@@ -113,6 +113,24 @@ STEP_RE = re.compile(r"\b[Ss]teps?\s*[:=]?\s*(\d+)\s*(?:/|of)\s*(\d+)")
 # on-worker.sh prints this on home once a checkpoint is verified at home and acked to the worker.
 ACK_RE = re.compile(r"on-worker\.sh: checkpoint (\d+) verified home and acked")
 
+# WP4: worker stages report a monotonic counter as `VI-PROGRESS <stage> <counter> <integer>`
+# and `VI-PROGRESS-END <stage>` once the stage is over. Only these exact shapes count; anything
+# else (a partial line, a float, extra words) is ignored, never guessed at.
+PROGRESS_RE = re.compile(r"^VI-PROGRESS ([a-z0-9][a-z0-9-]*) ([a-z0-9][a-z0-9-]*) (\d{1,19})\s*$")
+PROGRESS_END_RE = re.compile(r"^VI-PROGRESS-END ([a-z0-9][a-z0-9-]*)\s*$")
+
+
+def parse_progress(line):
+    """(stage, counter, value) from one `VI-PROGRESS` line, or None for anything malformed."""
+    m = PROGRESS_RE.match(line.strip("\r\n") if isinstance(line, str) else "")
+    return (m.group(1), m.group(2), int(m.group(3))) if m else None
+
+
+def parse_progress_end(line):
+    """The stage named by one `VI-PROGRESS-END` line, or None."""
+    m = PROGRESS_END_RE.match(line.strip("\r\n") if isinstance(line, str) else "")
+    return m.group(1) if m else None
+
 
 MIN_SAMPLES = 3
 

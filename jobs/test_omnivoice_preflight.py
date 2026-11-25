@@ -461,6 +461,24 @@ class RehearsalTest(PreflightHarness):
         self.assertNotEqual(r.returncode, 0)
         self.assertTrue("no checkpoint-10" in r.stderr or "exited before checkpoint-10" in r.stderr, r.stderr)
 
+    def test_the_wait_for_the_trainer_process_group_id_is_bounded(self):
+        # r32 WP4: a launcher that stays alive but never writes its process group id must not
+        # hold the rehearsal forever. Only the rehearsal's setsid (the one writing `$$`) hangs;
+        # worker-limits' setsid still runs for real.
+        real = shutil.which("setsid")
+        self._exe(self.root / "bin" / "setsid", f"""case "$*" in
+  *'echo $$'*) exec sleep 600 ;;
+esac
+exec {real} "$@"
+""".rstrip("\n"))
+        t0 = time.monotonic()
+        r = self.preflight(VI_REHEARSE_PIDFILE_SECONDS="1")
+        took = time.monotonic() - t0
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("wrote no process group id in 1s", r.stderr)
+        self.assertNotIn("preflight: ok", r.stdout)
+        self.assertLess(took, 120)
+
 
 if __name__ == "__main__":
     unittest.main()

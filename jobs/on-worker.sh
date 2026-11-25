@@ -862,7 +862,7 @@ echo VI-PENDING \"\$(ls pending 2>/dev/null | tr '\n' ' ')\"
 echo VI-REPUSH \"\$(ls repush 2>/dev/null | tr '\n' ' ')\"
 echo VI-BAD \"\$(ls bad 2>/dev/null | tr '\n' ' ')\"
 echo VI-WATCHDOG \$(pgrep -f vi-watchdog.sh >/dev/null 2>&1 && echo 1 || echo 0)
-echo VI-PROGRESS \$(find . -mindepth 1 -newermt \"@\$(( \$(date +%s) - $progress_seconds ))\" -print -quit 2>/dev/null | grep -q . && echo 1 || echo 0)
+echo VI-TOUCHED \$(find . -mindepth 1 -newermt \"@\$(( \$(date +%s) - $progress_seconds ))\" -print -quit 2>/dev/null | grep -q . && echo 1 || echo 0)
 vi_size=\$(stat -c %s job.log 2>/dev/null || echo 0)
 echo VI-SIZE \$vi_size
 echo VI-LOG"
@@ -901,6 +901,68 @@ render_log() {
   new=$((have + $(stat -c %s "$chunk" 2>/dev/null || echo 0)))
   [ "$new" -le "$size" ] || new=$size
   printf '%s\n' "$new" >"$cursor"
+}
+
+# note_progress OFFSET FRESH: read this poll's job.log chunk for r32 WP4 progress lines
+# (`VI-PROGRESS <stage> <counter> <integer>`, `VI-PROGRESS-END <stage>`, from voicetune-fresh.sh,
+# debug-pass.sh and fetch_base_model.py; render_log has already forwarded them home). State
+# lives in $return_state/progress.json: the highest value per counter, the counter stages still
+# open, and when a counter last advanced (home's clock). Only a new counter or a strictly higher
+# value is an advance; a log line or a touched file never is. A line cut off at the chunk's end
+# waits for the next poll. FRESH=1 (the first poll of this home process, as after a reattach)
+# restarts the clock, so time home was away is not counted as a stall. Prints one word:
+#   stalled  a counter stage is open and no counter advanced for progress_seconds
+#   open     a counter stage is open and a counter advanced within progress_seconds
+#   none     no counter stage is open (the VI-TOUCHED file-mtime rule applies)
+# checkpoint-push runs beside training and never ends, so it adds advances but never opens.
+note_progress() {
+  python3 - "$return_state/chunk" "$return_state/progress.json" "$1" "$2" "$progress_seconds" <<'PY' 2>/dev/null || echo none
+import json, re, sys, time
+chunk, path, offset, fresh, limit = sys.argv[1:6]
+now = time.time()
+try:
+    st = json.load(open(path))
+except (OSError, ValueError):
+    st = {}
+counters = st.get("counters", {})
+opened = st.get("open", [])
+advanced_at = st.get("advanced_at", now)
+partial = "" if offset == "0" else st.get("partial", "")
+if fresh == "1":
+    advanced_at = now
+try:
+    text = partial + open(chunk, "rb").read().decode("utf-8", "replace")
+except OSError:
+    text = partial
+lines = text.split("\n")
+partial = lines.pop()[-4096:]
+prog = re.compile(r"^VI-PROGRESS ([a-z0-9][a-z0-9-]*) ([a-z0-9][a-z0-9-]*) (\d{1,19})\s*$")
+end = re.compile(r"^VI-PROGRESS-END ([a-z0-9][a-z0-9-]*)\s*$")
+for line in lines:
+    m = prog.match(line)
+    if m:
+        stage, key, value = m.group(1), f"{m.group(1)}/{m.group(2)}", int(m.group(3))
+        if key not in counters or value > counters[key]:
+            counters[key] = value
+            advanced_at = now
+        if stage != "checkpoint-push" and stage not in opened:
+            opened.append(stage)
+            advanced_at = now
+        continue
+    m = end.match(line)
+    if m and m.group(1) in opened:
+        opened.remove(m.group(1))
+json.dump(dict(counters=counters, open=opened, advanced_at=advanced_at, partial=partial),
+          open(path + ".tmp", "w"))
+import os
+os.replace(path + ".tmp", path)
+if not opened:
+    print("none")
+elif now - advanced_at >= float(limit):
+    print("stalled")
+else:
+    print("open")
+PY
 }
 
 # The published-checkpoint name prefix for this stage's layout: epoch-<k> (legacy)
@@ -1019,7 +1081,7 @@ rotations=0
 
 hs_loop() {
   local offset now failed rp elapsed last_wd=0 last_refresh=0 lost_since=0 prove_budget prove_left
-  local gate_paused=0 alerted_bad= rot_rc=0
+  local gate_paused=0 alerted_bad= rot_rc=0 progress=none progress_fresh=1 stall_why=
   while :; do
     [ "$interrupted" = 0 ] || exit "$interrupted"
     now=$(date +%s)
@@ -1085,6 +1147,8 @@ hs_loop() {
       if poll_worker "$offset"; then
         lost_since=0
         render_log
+        progress=$(note_progress "$offset" "$progress_fresh")
+        progress_fresh=0
 
         if [ "$VI_WORKER_HOST" != local ] && [ "$(sv VI-WATCHDOG)" = 0 ] && [ $((now - last_wd)) -ge 60 ]; then
           remote "nohup bash $(q "$watchdog_script") >>$(q "$watchdog_log") 2>&1 </dev/null &" >/dev/null 2>&1 || true
@@ -1122,6 +1186,14 @@ hs_loop() {
         lock=$(sv VI-LOCK)
         pending=$(sv VI-PENDING)
         acked=$(sv VI-ACKED)
+        # r32 WP4: while a counter stage is open, only a counter advance is progress; file and
+        # log activity is liveness only. With no counter stage open, the old rule stays: some
+        # file in the work folder must change within the stall limit.
+        stall_why=
+        case $progress in
+          stalled) stall_why="advanced no progress counter for ${progress_seconds}s (log and file activity do not count as progress)" ;;
+          none) [ "$(sv VI-TOUCHED)" != 0 ] || stall_why="wrote nothing for ${progress_seconds}s" ;;
+        esac
 
         if [ "$stage_alive" = 0 ] && [ -n "$stage_rc" ]; then
           if [ "$stage_rc" -eq 0 ]; then
@@ -1142,11 +1214,12 @@ hs_loop() {
             stage_finished "$stage_rc"
             return
           fi
-        elif [ "$stage_alive" = 1 ] && [ "$(sv VI-PROGRESS)" = 0 ] && [ "$(sv VI-PUSH)" != 1 ]; then
-          # Nothing in the work folder changed within the stall limit: the job is hung (r7: a
-          # dead tokeniser pool behind an orphaned Manager). Stop its whole session on the worker
-          # so home does not wait out the stage timeout, and fail the stage.
-          echo "on-worker.sh: ALERT: $VI_STAGE ($stage_mode) wrote nothing for ${progress_seconds}s, over its stall limit; stopping it on the worker" >&2
+        elif [ "$stage_alive" = 1 ] && [ -n "$stall_why" ] && [ "$(sv VI-PUSH)" != 1 ]; then
+          # No progress within the stall limit: the job is hung (r7: a dead tokeniser pool
+          # behind an orphaned Manager). Stop its whole session on the worker so home does not
+          # wait out the stage timeout, and fail the stage. The limit is unchanged by WP4; only
+          # the evidence is (a counter while one is open, else file mtimes).
+          echo "on-worker.sh: ALERT: $VI_STAGE ($stage_mode) $stall_why, over its stall limit; stopping it on the worker" >&2
           remote "p=\$(cat $(q "$work/stage.pid") 2>/dev/null) && [ -n \"\$p\" ] && { kill -TERM -- -\"\$p\" 2>/dev/null; sleep 2; kill -KILL -- -\"\$p\" 2>/dev/null; }; true" >/dev/null 2>&1 || true
           [ -z "$pending" ] && stage_failed=1
           stage_finished 1
@@ -1204,15 +1277,27 @@ hs_loop() {
 hs_loop
 [ "$interrupted" = 0 ] || exit "$interrupted"
 
+# final_sync SRC MODULE [ARGS]: worker_sync for the pushes after hs_loop. hs_loop restarts a
+# dead receiver at the top of every pass, but nothing does after it returns, and a push into a
+# dead receiver would wait out rsync's timeouts. So the receiver is checked first: gone means a
+# clear ALERT and the same failure return as a failed push (the caller's failure branch runs).
+final_sync() {
+  if ! receiver_alive; then
+    echo "on-worker.sh: ALERT: the return receiver is gone; cannot push $2 home" >&2
+    return 1
+  fi
+  worker_sync "$@"
+}
+
 # Final checkpoint copy, then (only on success) the output push and whole-run
 # verification. Any failure keeps the worker's copy for a reattach/re-push.
 if [ -n "$checkpoint" ]; then
-  worker_sync "$work/checkpoint/" vi-checkpoint --append --exclude='epoch-*/' ||
+  final_sync "$work/checkpoint/" vi-checkpoint --append --exclude='epoch-*/' ||
     echo "on-worker.sh: could not copy the final checkpoint home; the last periodic copy is kept" >&2
 fi
 
 if [ "$final_ok" = 1 ]; then
-  if ! worker_sync "$work/out/" vi-out; then
+  if ! final_sync "$work/out/" vi-out; then
     echo "on-worker.sh: could not bring the job output home; keeping the worker copy" >&2
     exit 1
   fi
