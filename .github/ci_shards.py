@@ -25,17 +25,17 @@ JOBS = REPO / "jobs"
 EXPECTED_TESTS = 715
 
 SHARDS = {
-    # about 360 s
+    # 283 s on a CI runner
     "1": ["test_worker_return", "test_eq_check", "test_vast_limits", "test_steer"],
-    # about 235 s
-    "2": ["test_omnivoice_preflight", "test_ttstest", "test_fx_detect", "test_confounds",
+    # about 155 s
+    "2": ["test_omnivoice_preflight", "test_fx_detect", "test_confounds",
           "test_venv_build", "test_filter_probe", "test_prep", "test_eq_match",
           "test_textscore", "test_rehearsal_push", "test_refscreen"],
-    # about 240 s
-    "3": ["test_paid_run", "test_suit_fit", "test_classes", "test_worker_preflight_cuda",
+    # about 175 s
+    "3": ["test_paid_run", "test_ttstest", "test_suit_fit", "test_classes", "test_worker_preflight_cuda",
           "test_checkpoints", "test_codectrip", "test_embed", "test_voicesteer",
           "test_decide", "test_remap_purity", "test_omnivoice_data", "test_replay_public"],
-    # about 235 s
+    # 130 s
     "4": ["test_debug_pass", "test_voicearms", "test_cluster", "test_worker_limits",
           "test_omnivoice_supervision", "test_calibrate", "test_delete_allowlist",
           "test_fusion", "test_progress", "test_ft_guards", "test_voicetune",
@@ -43,8 +43,9 @@ SHARDS = {
           "test_clean", "test_label"],
 }
 
-# Skips each shard is expected to report (21 in total).
-SKIPPED = {"1": None, "2": None, "3": None, "4": None}
+# Skips each shard reports on a GitHub ubuntu-latest runner (23 in total; the 21 seen on a
+# developer machine differ by two environment-dependent skips).
+SKIPPED = {"1": 0, "2": 0, "3": 0, "4": 23}
 
 
 def on_disk():
