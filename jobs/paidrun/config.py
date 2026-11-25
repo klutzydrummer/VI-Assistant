@@ -220,3 +220,6 @@ def push_hours_line(settings, bytes_full=CHECKPOINT_BYTES_CALCULATED,
             f"({bytes_full / 1e9:.2f} GB), {weights:.2f} h per weights-only one "
             f"({bytes_weights / 1e9:.2f} GB); sizes calculated, not measured (jobs/checkpoints.py "
             f"floors {'2.0 GB weights + 4.0 GB optimizer'})")
+
+
+DEBUG_STAGE = "omnivoice_debug"
