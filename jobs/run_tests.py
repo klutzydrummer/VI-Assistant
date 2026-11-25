@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -288,9 +289,7 @@ def main(argv=None):
         print(f"FAILED ({len(failed)}); logs kept in {logdir}")
         return 1
     print("OK")
-    for f in logdir.iterdir():
-        f.unlink()
-    logdir.rmdir()
+    shutil.rmtree(logdir)  # this run's own mkdtemp log dir, only when every test passed
     return 0
 
 

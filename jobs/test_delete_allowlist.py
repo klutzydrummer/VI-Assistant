@@ -58,6 +58,7 @@ ALLOWLIST = [
     ("jobs/voicetune-fresh.sh", r'rm -f "\$rp" "\$f"', "the worker job dir's repush marker and fail counter"),
     ("jobs/voicetune-fresh.sh", r'rm -f "\$work/push\.pid"', "the worker job dir's push-loop pid file"),
     ("jobs/debug_slice.py", r"shutil\.rmtree\(dst\)", "the debug slice folder under home's cache, only when it holds the .debug-slice marker this script writes"),
+    ("jobs/run_tests.py", r"shutil\.rmtree\(logdir\)", "the mkdtemp log dir this test run created, only when every test passed"),
     ("jobs/debug-pass.sh", r'rm -rf "\$probe_run"', "the debug pass's probe trainer run dir (<job dir>/voicetune-fresh/probe-run, beside VI_OUT)"),
     ("jobs/debug-pass.sh", r'rm -rf "\$out"', "the debug pass's listening folder ($VI_OUT/debug/listening), rebuilt by stage 10"),
     ("jobs/debug-pass.sh", r'rm -rf "\$resume_run"', "the debug pass's resume run dir (<job dir>/voicetune-fresh/resume-run, beside VI_OUT)"),
