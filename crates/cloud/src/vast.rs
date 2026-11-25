@@ -546,6 +546,27 @@ mod tests {
     }
 
     #[test]
+    fn vast_destroy_retries_three_500s_then_succeeds_and_404_counts_as_gone() {
+        let t = Scripted::new(vec![
+            Err(status(500)),
+            Err(status(500)),
+            Err(status(500)),
+            Ok(json!({"success": true})),
+        ]);
+        no_sleep(&t).destroy(7).unwrap();
+        assert_eq!(t.calls.lock().unwrap().len(), 4);
+        assert!(t
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c == "DELETE /instances/7/"));
+
+        let t = Scripted::new(vec![Err(status(404))]);
+        no_sleep(&t).destroy(7).unwrap();
+    }
+
+    #[test]
     fn vast_call_retries_connect_errors_timeouts_and_429() {
         let t = Scripted::new(vec![
             Err(CallFailure::NotSent("refused".into())),

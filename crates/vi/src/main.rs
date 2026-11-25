@@ -39,6 +39,7 @@ pub(crate) const USAGE: &str = "usage:
   vi cloud refresh
   vi cloud hostkey
   vi cloud down [--force]
+  vi cloud down --force --verify [ID]   (exit 9: destroy not verified)
   vi cloud status
   vi cloud reap
   vi cloud ssh [command]

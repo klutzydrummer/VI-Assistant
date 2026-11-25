@@ -71,6 +71,7 @@ STUB = textwrap.dedent('''\
         if a.get("up") == "fail":
             print("error: boot failure: machine given back", file=sys.stderr); save(); sys.exit(1)
         st["worker"] = {"id": 100 + st["ups"], "offer": opt.get("--offer"), "credit": st["credit"]}
+        print(f"rented instance {st['worker']['id']}; waiting for it to boot", file=sys.stderr, flush=True)
         tick(a.get("hours", 0))
         save(); print(f"worker {st['worker']['id']} ready: ssh -p 1 root@h  ($0.2/hr)")
     elif args[:2] == ["cloud", "down"]:
@@ -80,6 +81,10 @@ STUB = textwrap.dedent('''\
             print("error: vast api timeout", file=sys.stderr); sys.exit(1)
         if sc.get("down_fail") == "always" or (sc.get("down_fail") == "plain" and "--force" not in args):
             print("error: refused", file=sys.stderr); sys.exit(1)
+        if sc.get("down_fail") == "unverified" and "--verify" in args:
+            # r32: DELETE sent, but Vast still lists the instance after 120 s
+            print(f"DESTROY NOT VERIFIED: Vast still lists instance(s) {(st['worker'] or {}).get('id')}",
+                  file=sys.stderr); sys.exit(9)
         if not st["worker"]:
             print("no worker to release"); sys.exit(0)
         w = st["worker"]; spent = att().get("spent", 0.0)
@@ -736,6 +741,23 @@ class Flow(Base):
         self.assertIn("vastai", [c[0] for c in self.calls()])
         self.assertTrue(list((self.tmp / "paid" / "t1").glob("vast-attempt-1-preflight-failed.txt")))
 
+    def test_r32_delete_comes_before_vast_evidence_and_uses_the_cached_id(self):
+        # r32 WP1/C.7: on an ordinary failure release() DELETEs first (the ssh diag, bounded,
+        # needs the live worker so it stays before); Vast's view is saved after the destroy.
+        # The instance id comes from `vi cloud up` ("rented instance 101"), so no `vi cloud
+        # status` lookup sits between the failure and the DELETE.
+        self.scenario([dict(preflight="other")])
+        self.assertEqual(self.run_orch(), 4, self.out)
+        calls = self.calls()
+        names = [c[0] for c in calls]
+        self.assertLess(names.index("ssh"), names.index("down"))
+        self.assertLess(names.index("down"), names.index("vastai"), "DELETE must come first")
+        self.assertEqual(self.downs()[0][1], ["--force", "--verify", "101"])
+        stage = max(i for i, c in enumerate(calls) if c[0] == "stage")
+        between = names[stage:names.index("down")]
+        self.assertNotIn("status", between, between)
+        self.assertEqual(self.state()["attempts"][0]["instance"], "101")
+
     def test_r31_dbg6_lines_are_a_drop_signal_with_exit_1(self):
         # omnivoice-ft-dbg6 run.log (2026-11-25): the vi CLI exited 1 and ssh never said
         # "remote host"; each of these lines alone must raise the suspicion host_drop() checks
@@ -787,11 +809,22 @@ class Flow(Base):
                 self.assertEqual(pr.failure_rc_text(1, r.stderr),
                                  f"exit {code} on the worker; the vi CLI exited 1")
 
-    def test_release_failure_is_loud_and_forced_first(self):
+    def test_release_is_forced_and_verified_first_time(self):
+        # r32 WP1: a plain `down` that would refuse is never tried; one --force --verify does it
         self.scenario([dict(train="fail", spent=0.1)], down_fail="plain")
-        self.assertEqual(self.run_orch(), 6, self.out)  # --force worked
-        self.assertEqual([c[1] for c in self.downs()], [[], ["--force"]])
+        self.assertEqual(self.run_orch(), 6, self.out)
+        self.assertEqual([c[1] for c in self.downs()], [["--force", "--verify", "101"]])
         self.assertIsNone(self.worker())
+
+    def test_release_unverified_destroy_is_exit_9(self):
+        # r32 WP1: `down --verify` exit 9 (Vast still lists it) is retried, then blocks with 9
+        self.scenario([dict(train="fail", spent=0.1)], down_fail="unverified")
+        self.assertEqual(self.run_orch(), 9, self.out)
+        self.assertIn("COULD NOT RELEASE", self.out)
+        self.assertIn("instance 101", self.out)
+        # 1 + 4 backed-off tries, then the run's final safety-net release tries all 5 again
+        self.assertEqual([c[1] for c in self.downs()], [["--force", "--verify", "101"]] * 10)
+        self.assertIsNotNone(self.worker())
 
     def test_release_total_failure_exit_9(self):
         self.scenario([dict(train="fail", spent=0.1)], down_fail="always")
@@ -1980,9 +2013,9 @@ class Resilience(Base):
     def test_paid_run_release_retries(self):
         self.scenario([dict(train="fail", spent=0.1)], down_fail_times=3)
         self.assertEqual(self.run_orch(), 6, self.out)
-        self.assertEqual([c[1] for c in self.downs()],
-                         [[], ["--force"], ["--force"], ["--force"]])
-        self.assertEqual([x for x in self.sleeps() if x in (10.0, 20.0, 40.0, 80.0)], [10.0, 20.0])
+        self.assertEqual([c[1] for c in self.downs()], [["--force", "--verify", "101"]] * 4)
+        self.assertEqual([x for x in self.sleeps() if x in (10.0, 20.0, 40.0, 80.0)],
+                         [10.0, 20.0, 40.0])
         self.assertIsNone(self.worker())
 
     def test_paid_run_release_total_failure_backs_off_10_20_40_80(self):
@@ -1992,10 +2025,23 @@ class Resilience(Base):
                          [10.0, 20.0, 40.0, 80.0])
 
     def test_paid_run_release_with_stale_marker(self):
-        # the r1 state: an unverified marker names the run dir, plain `down` refuses, --force works
+        # the r1 state: an unverified marker names the run dir and plain `down` would refuse.
+        # r32 WP1: the marker never delays the DELETE: one down, forced and verified, no sleep
         self.scenario([dict(train="marker", spent=0.1)], down_fail="plain")
         self.assertEqual(self.run_orch(), 7, self.out)
-        self.assertEqual([c[1] for c in self.downs()], [[], ["--force"]])
+        self.assertEqual([c[1] for c in self.downs()], [["--force", "--verify", "101"]])
+        self.assertEqual([x for x in self.sleeps() if x in (10.0, 20.0, 40.0, 80.0)], [])
+        self.assertIsNone(self.worker())
+
+    def test_r32_verify_final_runs_after_the_destroy(self):
+        # r32 WP7: the home-side verify needs no worker, so it runs after the verified destroy;
+        # its failure still gives exit 7 and marks the attempt verify-failed
+        self.scenario([dict(train="noverify", spent=0.1)])
+        self.assertEqual(self.run_orch(), 7, self.out)
+        self.assertLess(self.out.index("releasing the worker"),
+                        self.out.index("results at home do not check out"))
+        self.assertEqual(self.state()["attempts"][0]["outcome"], "verify-failed")
+        self.assertEqual(len(self.downs()), 1)
         self.assertIsNone(self.worker())
 
     def test_paid_run_train_inplace_recovery(self):

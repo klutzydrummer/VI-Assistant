@@ -12,6 +12,14 @@ use crate::{onstart, Config, Error, Result};
 
 const POLL_SECS: u64 = 10;
 
+/// How long `down_verified` keeps listing instances, waiting for the
+/// destroyed ones to disappear, before it reports the destroy unverified.
+pub const VERIFY_SECS: u64 = 120;
+
+/// While an instance is still listed, `down_verified` sends its DELETE again
+/// at most this often.
+const REDELETE_SECS: u64 = 30;
+
 /// The outside world, so tests can fake time and ssh.
 pub trait Host {
     /// Unix seconds.
@@ -240,6 +248,15 @@ pub struct Down {
     pub credit_before: Option<f64>,
     /// Account credit after the worker was released.
     pub credit_after: Option<f64>,
+    /// `down_verified` only: true once Vast's instance list showed every id in
+    /// `ids` absent (or `destroyed`). Always false for `down`/`down_force`,
+    /// which trust the DELETE answer and never look.
+    pub verified: bool,
+    /// `down_verified` only: ids Vast still listed when the check gave up.
+    pub still_listed: Vec<u64>,
+    /// `down_verified` only: failures it carried on past (a DELETE or a listing
+    /// that failed, unreadable state), so the caller can report them.
+    pub errors: Vec<String>,
 }
 
 /// A host key the worker presents now, as a known_hosts line and the
@@ -784,7 +801,127 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             overridden,
             credit_before,
             credit_after,
+            verified: false,
+            still_listed: Vec::new(),
+            errors: Vec::new(),
         })
+    }
+
+    /// The automated release: destroy first, then prove it. Unverified
+    /// markers never stop it; they are returned in `overridden` so the caller
+    /// can record them. Destroys the tracked worker, `id` if given (the id the
+    /// caller cached when it rented) and every instance carrying our label,
+    /// then lists the account's instances until none of them is listed (or
+    /// each shows `destroyed`), for up to `VERIFY_SECS`. An instance still
+    /// listed gets its DELETE again every `REDELETE_SECS`. Only a listing
+    /// counts as proof, so if the API stays unreachable the result has
+    /// `verified == false`. Failures along the way are collected in `errors`
+    /// rather than returned, so one bad call never skips the rest.
+    pub fn down_verified(&self, id: Option<u64>) -> Result<Down> {
+        let mut errors = Vec::new();
+        let overridden = self.state.markers().unwrap_or_else(|e| {
+            errors.push(format!("could not read the unverified markers: {e}"));
+            Vec::new()
+        });
+        let tracked = self.state.load().unwrap_or_else(|e| {
+            errors.push(format!("could not read the tracked worker: {e}"));
+            None
+        });
+        let mut ids: Vec<u64> = tracked.iter().map(|t| t.id).collect();
+        if let Some(id) = id {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        match self.vast.instances() {
+            Ok(list) => self.add_ours(&mut ids, &list),
+            Err(e) => errors.push(format!("listing instances before the destroy: {e}")),
+        }
+        for &i in &ids {
+            self.delete_noting(i, &mut errors);
+        }
+        let mut last_delete = self.host.now();
+        let deadline = last_delete + VERIFY_SECS;
+        let mut still_listed = ids.clone();
+        let mut verified = false;
+        loop {
+            match self.vast.instances() {
+                Ok(list) => {
+                    let before = ids.len();
+                    self.add_ours(&mut ids, &list);
+                    for &i in &ids[before..] {
+                        // Appeared since the first listing (a rent that raced us).
+                        self.delete_noting(i, &mut errors);
+                    }
+                    still_listed = ids
+                        .iter()
+                        .copied()
+                        .filter(|i| {
+                            list.iter()
+                                .any(|inst| inst.id == *i && inst.status() != "destroyed")
+                        })
+                        .collect();
+                    if still_listed.is_empty() {
+                        verified = true;
+                        break;
+                    }
+                }
+                Err(e) => errors.push(format!("listing instances to verify the destroy: {e}")),
+            }
+            if self.host.now() >= deadline {
+                break;
+            }
+            self.host.sleep(POLL_SECS);
+            if self.host.now().saturating_sub(last_delete) >= REDELETE_SECS {
+                for &i in &still_listed {
+                    self.host.log(&format!(
+                        "instance {i} is still listed; sending DELETE again"
+                    ));
+                    self.delete_noting(i, &mut errors);
+                }
+                last_delete = self.host.now();
+            }
+        }
+        if verified {
+            if let Some(t) = &tracked {
+                if let Err(e) = self.state.clear(t.id) {
+                    errors.push(format!("could not clear the tracked worker: {e}"));
+                }
+            }
+        }
+        let credit_after = if ids.is_empty() {
+            None
+        } else {
+            self.vast.credit().ok()
+        };
+        Ok(Down {
+            ids,
+            overridden,
+            credit_before: tracked.map(|t| t.credit),
+            credit_after,
+            verified,
+            still_listed: if verified { Vec::new() } else { still_listed },
+            errors,
+        })
+    }
+
+    /// Appends to `ids` every instance in `list` that carries our label.
+    fn add_ours(&self, ids: &mut Vec<u64>, list: &[Instance]) {
+        for inst in list {
+            if self.is_ours(inst) && !ids.contains(&inst.id) {
+                ids.push(inst.id);
+            }
+        }
+    }
+
+    /// One DELETE (with the API client's own retries); a failure is logged
+    /// and noted, never returned, so the verify still runs.
+    fn delete_noting(&self, id: u64, errors: &mut Vec<String>) {
+        if let Err(e) = self.vast.destroy(id) {
+            self.host
+                .log(&format!("DELETE for instance {id} failed: {e}"));
+            errors.push(format!("DELETE instance {id}: {e}"));
+        }
     }
 
     /// The actual destruction, without consulting markers. `reap` uses this so
@@ -1605,5 +1742,218 @@ mod tests {
         assert!(err.to_string().contains("nothing rented"), "{err}");
         assert!(asked.get());
         assert_eq!(vast.created.borrow().len(), 1);
+    }
+
+    // ----- down_verified against a fake Vast HTTP API -------------------------
+    //
+    // These run the real `HttpVast` client (its retries included) over a fake
+    // transport that answers like the Vast API, so nothing reaches the network.
+
+    use crate::vast::{CallFailure, HttpVast, Transport};
+
+    /// A stateful fake of the Vast API endpoints `down_verified` uses.
+    #[derive(Default)]
+    struct FakeApi {
+        /// Instances the account holds, as (id, label).
+        live: RefCell<Vec<(u64, Option<String>)>>,
+        /// Status codes the next DELETEs fail with, in order.
+        delete_failures: RefCell<Vec<u16>>,
+        /// DELETEs (by count) that answer OK but leave the instance listed.
+        sticky_deletes: Cell<u32>,
+        /// When set, every call fails as if the API were unreachable.
+        down: Cell<bool>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl Transport for &FakeApi {
+        fn send(
+            &self,
+            method: &str,
+            path: &str,
+            _body: Option<&Value>,
+        ) -> std::result::Result<Value, CallFailure> {
+            self.calls.borrow_mut().push(format!("{method} {path}"));
+            if self.down.get() {
+                return Err(CallFailure::NotSent("connection refused".into()));
+            }
+            match (method, path) {
+                ("GET", "/instances/") => Ok(json!({"instances": self
+                    .live
+                    .borrow()
+                    .iter()
+                    .map(|(id, label)| json!({"id": id, "label": label, "actual_status": "running"}))
+                    .collect::<Vec<_>>()})),
+                ("GET", "/users/current/") => Ok(json!({"credit": 11.5})),
+                ("DELETE", p) => {
+                    if !self.delete_failures.borrow().is_empty() {
+                        let code = self.delete_failures.borrow_mut().remove(0);
+                        return Err(CallFailure::Status(code, "server error".into()));
+                    }
+                    let id: u64 = p
+                        .trim_start_matches("/instances/")
+                        .trim_end_matches('/')
+                        .parse()
+                        .unwrap();
+                    if self.sticky_deletes.get() > 0 {
+                        self.sticky_deletes.set(self.sticky_deletes.get() - 1);
+                    } else {
+                        self.live.borrow_mut().retain(|(i, _)| *i != id);
+                    }
+                    Ok(json!({"success": true}))
+                }
+                _ => Err(CallFailure::Status(404, "not found".into())),
+            }
+        }
+    }
+
+    impl FakeApi {
+        fn deletes(&self) -> usize {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("DELETE"))
+                .count()
+        }
+    }
+
+    fn api_cloud<'a>(
+        api: &'a FakeApi,
+        host: &'a FakeHost,
+        dir: &Path,
+    ) -> Cloud<HttpVast<&'a FakeApi>, &'a FakeHost> {
+        Cloud {
+            cfg: Config::default(),
+            vast: HttpVast::with_transport(api).with_backoff(vec![std::time::Duration::ZERO; 4]),
+            state: StateDir::new(dir),
+            host,
+        }
+    }
+
+    /// A tracked worker 100 (our label) plus a stale unverified marker.
+    fn rented_with_marker(dir: &Path, api: &FakeApi) -> std::path::PathBuf {
+        let state = StateDir::new(dir);
+        state
+            .save(&Tracked {
+                id: 100,
+                machine_id: 10,
+                gpu_name: "RTX 3090".into(),
+                dph: 0.2,
+                credit: 12.0,
+                created: 1000,
+                last_used: 1000,
+                endpoint: None,
+            })
+            .unwrap();
+        api.live
+            .borrow_mut()
+            .push((100, Some(Config::default().label)));
+        let marker = dir.join("unverified").join("omnivoice_train");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "/home/x/stages/omnivoice_train/.checkpoint-y\n").unwrap();
+        marker
+    }
+
+    #[test]
+    fn down_verified_survives_three_delete_500s_and_ignores_a_stale_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        let marker = rented_with_marker(dir.path(), &api);
+        *api.delete_failures.borrow_mut() = vec![500, 500, 500];
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = api_cloud(&api, &host, dir.path());
+
+        // Plain `down` still refuses for a human while the marker is there.
+        assert!(c.down().is_err());
+        assert_eq!(api.deletes(), 0);
+
+        let down = c.down_verified(None).unwrap();
+        assert!(down.verified, "{down:?}");
+        assert_eq!(down.ids, vec![100]);
+        assert!(down.still_listed.is_empty());
+        // Three 500s then the OK, all inside the client's own retries.
+        assert_eq!(api.deletes(), 4);
+        assert!(api.live.borrow().is_empty());
+        // The marker is recorded and left in place, and the state is cleared.
+        assert_eq!(down.overridden.len(), 1);
+        assert_eq!(down.overridden[0].stage, "omnivoice_train");
+        assert!(marker.exists());
+        assert!(c.state.load().unwrap().is_none());
+        assert_eq!(down.credit_before, Some(12.0));
+        assert_eq!(down.credit_after, Some(11.5));
+    }
+
+    #[test]
+    fn down_verified_reissues_delete_while_the_instance_is_still_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        rented_with_marker(dir.path(), &api);
+        // The first two DELETEs answer OK but Vast keeps listing the instance.
+        api.sticky_deletes.set(2);
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = api_cloud(&api, &host, dir.path());
+
+        let down = c.down_verified(Some(100)).unwrap();
+        assert!(down.verified, "{down:?}");
+        assert_eq!(api.deletes(), 3);
+        assert!(api.live.borrow().is_empty());
+        // Verified within the window, not at its end.
+        assert!(host.now.get() - 1000 < VERIFY_SECS, "{}", host.now.get());
+    }
+
+    #[test]
+    fn down_verified_destroys_a_cached_id_and_an_unlabelled_one_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        // Nothing tracked at home: the caller passes the id it cached at create.
+        api.live.borrow_mut().push((7, None));
+        api.live.borrow_mut().push((5, None));
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = api_cloud(&api, &host, dir.path());
+
+        let down = c.down_verified(Some(7)).unwrap();
+        assert!(down.verified, "{down:?}");
+        assert_eq!(down.ids, vec![7]);
+        assert_eq!(*api.live.borrow(), vec![(5, None)]);
+    }
+
+    #[test]
+    fn down_verified_is_unverified_when_the_api_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        rented_with_marker(dir.path(), &api);
+        api.down.set(true);
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = api_cloud(&api, &host, dir.path());
+
+        let down = c.down_verified(None).unwrap();
+        assert!(!down.verified);
+        assert_eq!(down.still_listed, vec![100]);
+        assert!(!down.errors.is_empty());
+        // It kept trying for the whole window, then gave up.
+        assert!(host.now.get() - 1000 >= VERIFY_SECS);
+        // The tracked worker is kept, so a later `down` can still find it.
+        assert_eq!(c.state.load().unwrap().map(|t| t.id), Some(100));
+    }
+
+    #[test]
+    fn down_verified_with_nothing_rented_is_verified_by_an_empty_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = FakeApi::default();
+        let host = FakeHost {
+            now: Cell::new(1000),
+        };
+        let c = api_cloud(&api, &host, dir.path());
+        let down = c.down_verified(None).unwrap();
+        assert!(down.verified);
+        assert!(down.ids.is_empty());
+        assert_eq!(api.deletes(), 0);
     }
 }

@@ -186,6 +186,12 @@ def nap(seconds):
     time.sleep(seconds * float(os.environ.get("PAID_RUN_SLEEP_SCALE", "1")))
 
 
+def verify_epoch_argv(ck):
+    """The home check that checkpoint-5 of a debug pass came home whole (patchable in tests)."""
+    return [sys.executable, str(REPO / "jobs" / "checkpoints.py"), "--format", "omnivoice",
+            "verify-epoch", str(ck), "5"]
+
+
 def timeout_scale(seconds):
     """A per-call timeout; PAID_RUN_TIMEOUT_SCALE shrinks it for tests (never below 2 s)."""
     return min(seconds, max(seconds * float(os.environ.get("PAID_RUN_TIMEOUT_SCALE", "1")), 2.0))
@@ -237,6 +243,8 @@ OUTER_RETRY_SECONDS = 20          # F-NET-1: one more try of `offers` / `status`
 RELEASE_BACKOFF = (10, 20, 40, 80)  # F-REL-1: waits between `down --force` tries before exit 9
 QUERY_TIMEOUT_SECONDS = 180       # F-CLK-1: offers / status
 DOWN_TIMEOUT_SECONDS = 300        # a hung `down` would bill forever
+DOWN_VERIFY_TIMEOUT_SECONDS = 600  # r32: `down --verify` = DELETE retries + up to 120 s of listing
+VERIFY_EPOCH_TIMEOUT_SECONDS = 300  # r32 WP7: the debug pass's home verify-epoch
 PREFLIGHT_TIMEOUT_SECONDS = 90 * 60
 # r7: the tokeniser's pool died (pthread_create failed -> BrokenProcessPool) and the stage then
 # printed nothing for hours. A fatal line followed by this long with no new output ends the
@@ -1618,13 +1626,24 @@ class PaidRun:
         timeout; nothing else is retried here."""
         kind = args[1] if len(args) > 1 and args[0] == "cloud" else None
         timeout = QUERY_TIMEOUT_SECONDS if kind in ("offers", "status") else (
-            DOWN_TIMEOUT_SECONDS if kind == "down" else None)
+            (DOWN_VERIFY_TIMEOUT_SECONDS if "--verify" in args else DOWN_TIMEOUT_SECONDS)
+            if kind == "down" else None)
         rc, out = self.run([self.vi, *args], stream=stream, timeout=timeout)
         if rc != 0 and kind in ("offers", "status"):
             say(f"`vi cloud {kind}` failed (exit {rc}); trying once more in {OUTER_RETRY_SECONDS} s")
             nap(OUTER_RETRY_SECONDS)
             rc, out = self.run([self.vi, *args], stream=stream, timeout=timeout)
         return rc, out
+
+    def cache_instance(self, at, out):
+        """r32 WP7: remember the instance id `vi cloud up` printed ("rented instance N" right
+        after the create, "worker N ready" once booted), even when `up` failed, so release()
+        needs no 180 s `vi cloud status` lookup. Returns the id or None."""
+        m = re.search(r"^(?:rented instance (\d+);|worker (\d+) ready)", out, re.M)
+        if m and at is not None:
+            at["instance"] = m.group(1) or m.group(2)
+            self.save()
+        return at.get("instance") if at is not None else None
 
     def credit(self):
         rc, out = self.vi_cmd("cloud", "status")
@@ -1798,34 +1817,43 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         self.save()
 
     def release(self, at, outcome):
-        """`vi cloud down`, then close the attempt with its spend. Raises Stop(9) if the worker
-        cannot be released."""
+        """r32 WP1/C.7: destroy first, then everything else. `vi cloud down --force --verify`
+        DELETEs the worker (the cached instance id from create, else whatever is tracked or
+        labelled), ignores unverified markers (it records them), and lists instances until Vast
+        shows it gone; exit 9 means the destroy was never verified. Only that blocks: it raises
+        Stop(9). Markers and unverified checkpoints never delay or prevent the DELETE. The
+        ssh diagnostics (bounded, DIAG_TIMEOUT_SECONDS) need the live worker and so come first;
+        Vast's view, the spend and the debug-marker cleanup come after the destroy."""
         self.in_teardown = True
         if outcome not in ("done", "up-failed", "train-vanished"):
             self.fetch_diagnostics(at, outcome)
-        if outcome not in ("done", "debug-done", "orphan") and not (at or {}).get("vast_file"):
-            self.vast_evidence(at, outcome)
-        say("releasing the worker (vi cloud down)")
-        rc, out = self.vi_cmd("cloud", "down", stream=True)
-        if rc != 0:
-            say("plain `down` refused; trying `down --force` so nothing keeps billing")
-            rc, out = self.vi_cmd("cloud", "down", "--force", stream=True)
-            for wait in RELEASE_BACKOFF:
-                if rc == 0:
-                    break
-                say(f"`down --force` failed (exit {rc}); trying again in {wait} s")
-                nap(wait)
-                rc, out = self.vi_cmd("cloud", "down", "--force", stream=True)
+        ident = (at or {}).get("instance")
+        down = ("cloud", "down", "--force", "--verify", *([str(ident)] if ident else []))
+        say(f"releasing the worker (vi {' '.join(down)})")
+        rc, out = self.vi_cmd(*down, stream=True)
+        for wait in RELEASE_BACKOFF:
+            if rc == 0:
+                break
+            say(f"`down --force --verify` failed (exit {rc}); trying again in {wait} s")
+            nap(wait)
+            rc, out = self.vi_cmd(*down, stream=True)
         if rc != 0:
             self.worker_maybe_up = True
             if at is not None:
                 at["outcome"] = outcome + "+release-failed"
                 self.save()
-            ident = self.instance_id()
-            raise Stop(EXIT["release"], "COULD NOT RELEASE THE WORKER. It may still be billing"
+            ident = ident or self.instance_id()
+            raise Stop(EXIT["release"], "COULD NOT RELEASE THE WORKER: the destroy was not "
+                       "verified, so it may still be billing"
                        f"{f' (instance {ident})' if ident else ''}. Run `vi cloud status`, then "
                        "`vi cloud down --force` now.")
         self.worker_maybe_up = False
+        gone = re.search(r"^destroyed instance (\d+)", out, re.M)
+        if at is not None and not at.get("instance") and gone:
+            at["instance"] = gone.group(1)
+            self.save()
+        if outcome not in ("done", "debug-done", "orphan") and not (at or {}).get("vast_file"):
+            self.vast_evidence(at, outcome)
         spent, est = None, False
         m = re.search(r"\(\$([\d.]+) spent\)", out)
         if m:
@@ -2251,6 +2279,7 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                 rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
                                     f"{cap_left:.2f}", "--until", until, "--yes"], watch=True,
                                    timeout=boot_s)
+                self.cache_instance(at, out)
                 if rc != 0:
                     # F-RENT-1/2: the offer is gone, or the box did not boot. Release whatever
                     # exists (a no-op when nothing was created), skip this offer, try the next.
@@ -2307,9 +2336,12 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
             say("preflight passed; starting the train stage")
             self.run_train(at)
             self.set_phase(at, "verify")
+            # r32 WP7: destroy first; the home-side verify needs no worker and can take minutes
+            spent = self.release(at, "done")
             problems = self.verify_final()
-            spent = self.release(at, "verify-failed" if problems else "done")
             if problems:
+                at["outcome"] = "verify-failed"
+                self.save()
                 raise Stop(EXIT["verify"], "the train stage finished but the results at home do "
                            "not check out:\n  " + "\n  ".join(problems))
             return spent
@@ -2441,14 +2473,22 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                                   + (f"stage key {key})" if key else "stage key: the output "
                                      "named none)"))
             else:
-                r = subprocess.run([sys.executable, str(REPO / "jobs" / "checkpoints.py"),
-                                    "--format", "omnivoice", "verify-epoch", str(ck), "5"],
-                                   capture_output=True, text=True)
-                if r.returncode != 0:
-                    self.debug_record(9, "FAIL", f"(checkpoint-5 in {ck} did not verify at home)",
-                                      (r.stdout + r.stderr).strip().splitlines()[-6:])
+                limit = VERIFY_EPOCH_TIMEOUT_SECONDS
+                try:
+                    r = subprocess.run(verify_epoch_argv(ck), capture_output=True, text=True,
+                                       timeout=limit)
+                except subprocess.TimeoutExpired as e:  # r32 WP7: never hang home
+                    part = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) \
+                        else (e.stdout or "")
+                    self.debug_record(9, "FAIL", f"(checkpoint-5 in {ck}: the home verify-epoch "
+                                      f"did not finish in {limit} s and was stopped)",
+                                      part.strip().splitlines()[-6:])
                 else:
-                    self.debug_record(9, "PASS", f"(checkpoint-5 verified at home in {ck})")
+                    if r.returncode != 0:
+                        self.debug_record(9, "FAIL", f"(checkpoint-5 in {ck} did not verify at "
+                                          "home)", (r.stdout + r.stderr).strip().splitlines()[-6:])
+                    else:
+                        self.debug_record(9, "PASS", f"(checkpoint-5 verified at home in {ck})")
         if self.debug.get(10, {}).get("result") == "PASS":
             wavs = sorted((out / "listening").rglob("*.wav")) if out is not None else []
             if not wavs:
@@ -2545,10 +2585,8 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
         rc, out = self.run([self.vi, "cloud", "up", "--offer", str(offer["id"]), "--cap",
                             f"{cap_left:.2f}", "--until", rfc3339(clock() + hours_left * 3600),
                             "--yes"], watch=True, timeout=boot_s)
+        self.cache_instance(at, out)
         m = re.search(r"^worker (\d+) ready", out, re.M)
-        if m:
-            at["instance"] = m.group(1)
-            self.save()
         if rc != 0:
             self.debug_record(0, "FAIL", f"(`vi cloud up` exited {rc}"
                               f"{', boot timed out' if self.timed_out else ''})",

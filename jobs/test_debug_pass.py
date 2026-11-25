@@ -675,6 +675,34 @@ DBG5_SHOW = '{\n "instances": null\n}\n'
 DBG5_LOGS = "Error response from daemon: No such container: C.62400251\n"
 
 
+class HungVerifyEpoch(unittest.TestCase):
+    """r32 WP7: the home verify-epoch of stage 9 is bounded (VERIFY_EPOCH_TIMEOUT_SECONDS = 300 s),
+    so a hung check can never hold home while the rental bills. A fake verify that sleeps stands
+    in; the limit is patched to 1 s so the test never waits 300 s."""
+
+    def test_a_hung_verify_epoch_is_stopped_and_fails_stage_9(self):
+        import time
+        pr = tp.load_paid_run()
+        self.assertEqual(pr.VERIFY_EPOCH_TIMEOUT_SECONDS, 300)
+        with tempfile.TemporaryDirectory() as tmp:
+            ck = Path(tmp) / "run"
+            ck.mkdir()
+            run = pr.PaidRun.__new__(pr.PaidRun)
+            run.debug = {}
+            run.debug_record(9, "PASS", "(pushed)")
+            run.debug_home_dirs = lambda out="": (ck, None)
+            run.dir = Path(tmp) / "paid"
+            pr.VERIFY_EPOCH_TIMEOUT_SECONDS = 1
+            pr.verify_epoch_argv = lambda d: [sys.executable, "-c",
+                                              "import time; print('hashing', flush=True); "
+                                              "time.sleep(600)"]
+            t0 = time.monotonic()
+            run.debug_home_checks("")
+            self.assertLess(time.monotonic() - t0, 30)
+        self.assertEqual(run.debug[9]["result"], "FAIL")
+        self.assertIn("did not finish in 1 s and was stopped", run.debug[9]["detail"])
+
+
 class VastInstanceGone(unittest.TestCase):
     """r27: vast_instance_gone() reads Vast's own "no such instance" answers, and nothing else."""
 

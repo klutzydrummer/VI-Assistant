@@ -32,6 +32,7 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
         ["refresh"] => refresh(&c),
         ["hostkey"] => hostkey(&c),
         ["down"] => down(&c, force),
+        ["down", "--verify", rest @ ..] => down_verified(&c, force, rest),
         ["status"] => status(&c),
         ["reap"] => match c.reap(&SshActivity) {
             Ok(Some(why)) => {
@@ -340,6 +341,83 @@ fn down(c: &Cloud<HttpVast, SystemHost>, force: bool) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+/// `vi cloud down --force --verify [ID]`: the automated release. Destroys the
+/// tracked worker, `ID` (the id the caller cached when it rented) and every
+/// instance with our label, ignoring unverified markers but printing them, then
+/// lists instances until they are gone. Exit 9 means the destroy could not be
+/// verified and the worker may still be billing; it is the only failure exit.
+fn down_verified(c: &Cloud<HttpVast, SystemHost>, force: bool, args: &[&str]) -> ExitCode {
+    if !force {
+        eprintln!(
+            "--verify ignores unverified markers, so it needs --force as well\n{}",
+            crate::USAGE
+        );
+        return ExitCode::from(2);
+    }
+    let id = match args {
+        [] => None,
+        [id] => match id.parse() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                eprintln!(
+                    "--verify takes an instance id, not {id:?}\n{}",
+                    crate::USAGE
+                );
+                return ExitCode::from(2);
+            }
+        },
+        _ => {
+            eprintln!("{}", crate::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    let down = match c.down_verified(id) {
+        Ok(down) => down,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!("DESTROY NOT VERIFIED: the worker may still be billing");
+            return ExitCode::from(9);
+        }
+    };
+    for id in &down.ids {
+        println!("destroyed instance {id}");
+    }
+    for m in &down.overridden {
+        println!(
+            "overrode unverified marker for stage {} ({}): run \
+             `python3 jobs/checkpoints.py verify {} --expect N` to clear it",
+            m.stage,
+            m.path.display(),
+            m.path.display()
+        );
+    }
+    for e in &down.errors {
+        eprintln!("note: {e}");
+    }
+    if !down.verified {
+        let listed: Vec<String> = down.still_listed.iter().map(u64::to_string).collect();
+        eprintln!(
+            "DESTROY NOT VERIFIED: Vast still lists instance(s) {} after {} s, or could not \
+             be asked; the worker may still be billing. Run `vi cloud status`, then \
+             `vi cloud down --force --verify` again",
+            if listed.is_empty() {
+                "?".into()
+            } else {
+                listed.join(", ")
+            },
+            cloud::worker::VERIFY_SECS
+        );
+        return ExitCode::from(9);
+    }
+    if down.ids.is_empty() {
+        println!("no worker to release (verified: Vast lists none of ours)");
+    } else {
+        println!("verified: Vast no longer lists the destroyed instance(s)");
+    }
+    print_spend(&down);
+    ExitCode::SUCCESS
 }
 
 /// The spend report: credit when the worker was rented, credit now, and the
