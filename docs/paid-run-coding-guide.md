@@ -1,6 +1,6 @@
 # Paid-run coding guide
 
-Written 2026-11-25 for round 33. Covers the code that rents, watches and releases a Vast.ai worker: `jobs/paid_run.py`, `jobs/on-worker.sh`, `jobs/worker-onstart.sh`, `jobs/debug-pass.sh`, `jobs/push-probe.sh`, `jobs/voicetune-fresh.sh`, `jobs/worker-job.sh`, `jobs/worker-return.sh` and `crates/cloud`. It is for anyone changing that code and anyone writing or reviewing a brief for it. The user-facing commands are in `cloud-worker.md`; why the work is split between home and worker is in `design/local-cloud-split.md`.
+Written 2026-11-25 for round 33. Covers the code that rents, watches and releases a Vast.ai worker: `jobs/paid_run.py` (the entry point) and the `jobs/paidrun/` package it loads, `jobs/on-worker.sh`, `jobs/worker-onstart.sh`, `jobs/debug-pass.sh`, `jobs/push-probe.sh`, `jobs/voicetune-fresh.sh`, `jobs/worker-job.sh`, `jobs/worker-return.sh` and `crates/cloud`. It is for anyone changing that code and anyone writing or reviewing a brief for it. The user-facing commands are in `cloud-worker.md`; why the work is split between home and worker is in `design/local-cloud-split.md`.
 
 The design behind it is the round 32 audit (rental-wait table, validity design C.1-C.7, work packages WP1-WP7). Every rule below applies to new work now, including the parts not yet built, so the later work packages fit together.
 
@@ -10,7 +10,7 @@ The design behind it is the round 32 audit (rental-wait table, validity design C
 |---|---|
 | WP1: destroy-first release, `vi cloud down --force --verify`, exit 9 = destroy not verified | **Built** (PR #185) |
 | WP7: verify-epoch bounded at 300 s, `verify_final` after release, instance id cached from `up` | **Built** (PR #185) |
-| WP3: `jobs/validity.py` state machine and the cap | Planned |
+| WP3: `jobs/paidrun/validity.py` state machine and the cap | Planned |
 | WP4: worker progress counters (`VI-PROGRESS stage counter value`) | Planned |
 | WP2: home dead-man timer (L2) | Planned |
 | WP6: worker watchdog fixes (L3) | Planned |
@@ -22,7 +22,7 @@ Until WP3 and WP4 land, progress is still judged by "some file changed" (`on-wor
 
 Three layers each decide on their own whether to destroy a rental. Each one only adds protection, so a later layer never relies on an earlier one having worked.
 
-- **L1, the validity state machine** (`jobs/validity.py`, owned by `paid_run.py`; planned in WP3). This is the normal path. Every stage registers its deadline and the evidence it will produce. The machine moves through these states:
+- **L1, the validity state machine** (`jobs/paidrun/validity.py`, owned by the paid run; planned in WP3). This is the normal path. Every stage registers its deadline and the evidence it will produce. The machine moves through these states:
   - **VALID** while fresh positive evidence keeps arriving.
   - **SUSPECT** when an item goes stale. It then runs bounded recovery using only the actions that stage registered.
   - **VALID** again only on *new* positive evidence. "No error" does not count.
@@ -46,7 +46,7 @@ Three layers each decide on their own whether to destroy a rental. Each one only
 |---|---|---|
 | Which instance is ours | `crates/cloud/src/state.rs` (`~/.local/state/vi/cloud.json`) | create, track or forget an instance |
 | Talking to the Vast API with the account key | `crates/cloud` (`vast.rs`, `worker.rs`) through `vi cloud ...` | call the API from Python or bash at home |
-| Whether to keep paying | L1 `validity.py` (until then, `paid_run.py`) | decide to continue; a bash script may only *report* |
+| Whether to keep paying | L1 `validity.py` (until then, `jobs/paidrun/`) | decide to continue; a bash script may only *report* |
 | Run progress, attempts, outcome, spend | `paid_run.py` run state (`<state root>/<run_id>.json`) | write it |
 | Moving bytes, the tunnel, the receiver, stage execution | `jobs/on-worker.sh` | open its own tunnel or receiver |
 | The worker's own deadline | L3 watchdog | — |
@@ -91,7 +91,7 @@ Every new stage, wait or check must state all five of the following, both in the
 4. **Fault-injection test.** A local test that makes the failure happen and checks the outcome: SUSPECT, then recovery, then VALID, or INVALID with the right reason, followed by DESTROY.
 5. **Where it registers.**
    - After WP3: one `validity.enter(stage, deadline_s, evidence_fn)` call, plus the stage's row in the stage table in `validity.py`.
-   - Until then: one named constant in `paid_run.py`, passed to the worker script as a `VI_*` environment variable, not repeated as a separate default in bash.
+   - Until then: one named constant in `jobs/paidrun/limits.py`, passed to the worker script as a `VI_*` environment variable, not repeated as a separate default in bash.
    - The table in round 32's design C.2 holds the current proposed values.
 
 A check that can fail a rental must also say which reason class it reports, because that decides whether rental 2 is allowed.
@@ -101,14 +101,14 @@ A check that can fail a rental must also say which reason class it reports, beca
 | Goes in | What | Why |
 |---|---|---|
 | **Rust (`crates/cloud`, `vi cloud`)** | Every Vast API call with the account key, offer search, create, boot wait, host key, `cloud.json`, markers, destroy and verify, reap, rendering the onstart script, and the L2 timer arm and cancel | One typed, tested owner for money and identity. The key never reaches Python or bash. |
-| **Python (`jobs/paid_run.py`, `jobs/validity.py`)** | Orchestration: stage order, the validity state machine, the cap, reason classes, rental-2 rules, run state, reports | It holds the whole run and is easy to test with a fake clock |
+| **Python (`jobs/paid_run.py`, `jobs/paidrun/`, including the planned `validity.py`)** | Orchestration: stage order, the validity state machine, the cap, reason classes, rental-2 rules, run state, reports | It holds the whole run and is easy to test with a fake clock |
 | **Bash on home (`jobs/on-worker.sh`)** | The tunnel, the restricted receiver, rsync, running a stage over ssh, and forwarding `VI-*` lines | It is a thin layer over ssh and rsync |
 | **Bash on the worker (`worker-onstart.sh`, `debug-pass.sh`, `push-probe.sh`, `voicetune-fresh.sh`, `worker-job.sh`, `worker-return.sh`)** | Doing the work and *emitting* evidence | The worker image only promises bash, coreutils and curl |
 
 Rules:
 
 - Bash scripts report evidence. They do not decide to keep paying, and they do not destroy, with one exception: the L3 watchdog's self-destroy at the hard cap.
-- Python never parses Rust's TOML or state files itself. Ask `vi cloud` for the value. (`paid_run.py:584-591 config_boot_minutes` is an existing exception, flagged in the refactor assessment.)
+- Python never parses Rust's TOML or state files itself. Ask `vi cloud` for the value. (`config_boot_minutes` in `jobs/paidrun/config.py` is an existing exception, flagged in the refactor assessment.)
 - **The onstart limit.** Vast's onstart field holds 4048 characters. `crates/cloud/src/onstart.rs` tests keep the rendered script under 3000 bytes and its live logic under 2700. Any change to `worker-onstart.sh` must keep those tests green. Anything that will not fit goes into a script pushed over ssh after boot, not into onstart.
 
 ## Testing
@@ -165,6 +165,6 @@ For a brief or a review that touches this area:
 Limits and rental state are currently spread across Python, bash and Rust, and some values are copied between languages. The measured list (file sizes, every place that owns a limit or rental state, and the values copied between languages) is in the round 33 planning notes, which are kept outside the repo. In short:
 
 - Make targeted fixes, folded into WP3 and WP4.
-- Do not split `paid_run.py` now.
+- Round 35 split `paid_run.py` into the `jobs/paidrun/` package as a behavior-preserving move (no logic changed). `jobs/paid_run.py` is now the entry point and re-exports every old name. Line references into `paid_run.py` in older round notes (w33, w35) point at the pre-split file and are stale.
 - The fixes: WP3's stage table becomes the one home for stage deadlines, and `paid_run.py` passes them to bash as `VI_*` variables. WP4's `VI-PROGRESS` lines replace mtime checks. Values copied between languages are removed as each work package touches them.
 - Prose regexes are moved to machine lines only when their code is touched anyway.
