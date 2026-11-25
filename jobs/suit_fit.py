@@ -41,11 +41,13 @@ corpus/tali/analysis/suit_fit). Changes no stage outputs.
 """
 
 import argparse
+import hashlib
 import html
 import json
 import os
 import sys
 import warnings
+from collections import OrderedDict
 from math import gcd
 from pathlib import Path
 
@@ -90,6 +92,29 @@ def pitch_shift(x, ratio, n=2048, hop=512):
     return signal.resample(y, len(x))
 
 
+_SHIFTED = OrderedDict()  # (clip digest, ratio) -> its pitch_shift, read-only
+SHIFT_CACHE_BYTES = 256 << 20
+
+
+def shifted(x, ratio):
+    """pitch_shift(x, ratio), cached: a fit scores every level, drive and
+    noise setting with the same few layer shifts of the same clips. The
+    cache is keyed on the clip's bytes and bounded to SHIFT_CACHE_BYTES."""
+    x = np.ascontiguousarray(x)
+    key = (hashlib.blake2b(x.tobytes(), digest_size=16).digest(), x.dtype.str, x.shape, float(ratio))
+    y = _SHIFTED.get(key)
+    if y is None:
+        y = pitch_shift(x, ratio)
+        y.flags.writeable = False
+        _SHIFTED[key] = y
+        size = sum(v.nbytes for v in _SHIFTED.values())
+        while size > SHIFT_CACHE_BYTES and len(_SHIFTED) > 1:
+            size -= _SHIFTED.popitem(last=False)[1].nbytes
+    else:
+        _SHIFTED.move_to_end(key)
+    return y
+
+
 def drive(x, amount):
     """tanh soft clipping; the peak stays where it was."""
     if amount <= 0:
@@ -107,7 +132,7 @@ def pre_eq(x, p, rng):
     """The chain before its EQ: the doubled layer, the drive, the noise."""
     y = x
     if p.get("layer_ratio"):
-        y = y + 10 ** (p["layer_db"] / 20) * pitch_shift(x, p["layer_ratio"])
+        y = y + 10 ** (p["layer_db"] / 20) * shifted(x, p["layer_ratio"])
     y = drive(y, p.get("drive", 0.0))
     if p.get("snr_db") is not None:
         y = y + rng.standard_normal(len(y)) * active_rms(y) * 10 ** (-p["snr_db"] / 20)
@@ -149,10 +174,9 @@ def stats(xs):
         fr = fp.active_frames(x, SR)
         if len(fr) < 2:
             continue
-        h = fp.harmonic_profile(fr, SR)
+        h, q = fp.harmonics_and_periodicity(fr, SR)
         if h is not None:
             harm.append(h)
-        q = fp.periodicity(fr, SR)
         if q is not None:
             per.append(q)
     return {"harm": np.mean(harm, axis=0), "per": float(np.median(per))}

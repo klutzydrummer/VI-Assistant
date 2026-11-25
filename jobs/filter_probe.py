@@ -103,19 +103,28 @@ def clip_envelope(x, sr):
     return q / (q.sum() + 1e-20)
 
 
+def _loud(frames):
+    """The frames periodicity and harmonic_profile look at: about 40, evenly spread."""
+    return frames[:: max(1, len(frames) // 40)]
+
+
+def _autocorr(frames):
+    """Each frame's autocorrelation (mean removed), lags 0..len-1, all at once."""
+    n = frames.shape[1]
+    spec = np.fft.rfft(frames - frames.mean(axis=1, keepdims=True), 2 * n, axis=1)
+    return np.fft.irfft(np.abs(spec) ** 2, axis=1)[:, :n]
+
+
+def _periodicity(acs, sr):
+    lo, hi = int(sr * 0.0025), int(sr * 0.0125)
+    vals = [float(ac[lo:hi].max() / ac[0]) for ac in acs if ac[0] > 0]
+    return float(np.median(vals)) if vals else None
+
+
 def periodicity(frames, sr):
     """Median peak of the normalised autocorrelation at 2.5-12.5 ms lag
     (pitch 80-400 Hz) over the loudest frames."""
-    lo, hi = int(sr * 0.0025), int(sr * 0.0125)
-    vals = []
-    for fr in frames[:: max(1, len(frames) // 40)]:
-        fr = fr - fr.mean()
-        spec = np.fft.rfft(fr, 2 * len(fr))
-        ac = np.fft.irfft(np.abs(spec) ** 2)[: len(fr)]
-        if ac[0] <= 0:
-            continue
-        vals.append(float(ac[lo:hi].max() / ac[0]))
-    return float(np.median(vals)) if vals else None
+    return _periodicity(_autocorr(_loud(frames)), sr)
 
 
 RATIOS = np.round(np.arange(0.9, 1.3001, 0.005), 3)
@@ -124,10 +133,11 @@ RATIOS = np.round(np.arange(0.9, 1.3001, 0.005), 3)
 def f0_of(fr, sr):
     """Pitch of a frame by autocorrelation (80-400 Hz), or None if the frame
     isn't clearly voiced."""
+    return _f0_from(_autocorr(fr[None, :])[0], sr)
+
+
+def _f0_from(ac, sr):
     lo, hi = int(sr * 0.0025), int(sr * 0.0125)
-    fr = fr - fr.mean()
-    spec = np.fft.rfft(fr, 2 * len(fr))
-    ac = np.fft.irfft(np.abs(spec) ** 2)[: len(fr)]
     if ac[0] <= 0:
         return None
     lag = lo + int(np.argmax(ac[lo:hi]))
@@ -139,21 +149,36 @@ def f0_of(fr, sr):
     return sr / (lag + shift)
 
 
+def _harmonic_profile(frames, acs, sr, nfft):
+    freqs = np.fft.rfftfreq(nfft, 1 / sr)
+    band = (freqs >= 100) & (freqs <= 3000)
+    f0s = [_f0_from(ac, sr) for ac in acs]
+    keep = [i for i, f0 in enumerate(f0s) if f0 is not None]
+    if not keep:
+        return None
+    voiced = frames[keep]
+    win = np.hanning(frames.shape[1])
+    spec = np.fft.rfft((voiced - voiced.mean(axis=1, keepdims=True)) * win, nfft, axis=1)
+    rows = []
+    for i, db in zip(keep, 20 * np.log10(np.abs(spec) + 1e-12)):
+        db -= np.median(db[band])
+        rows.append(np.mean([np.interp(k * f0s[i] * RATIOS, freqs, db) for k in (1, 2, 3)], axis=0))
+    return np.mean(rows, axis=0)
+
+
 def harmonic_profile(frames, sr, nfft=8192):
     """Mean spectrum level (dB re the frame's median, 100-3000 Hz) at
     k * f0 * r for k = 1..3, per ratio r in RATIOS, over voiced frames."""
-    freqs = np.fft.rfftfreq(nfft, 1 / sr)
-    band = (freqs >= 100) & (freqs <= 3000)
-    win = np.hanning(frames.shape[1])
-    rows = []
-    for fr in frames[:: max(1, len(frames) // 40)]:
-        f0 = f0_of(fr, sr)
-        if f0 is None:
-            continue
-        db = 20 * np.log10(np.abs(np.fft.rfft((fr - fr.mean()) * win, nfft)) + 1e-12)
-        db -= np.median(db[band])
-        rows.append(np.mean([np.interp(k * f0 * RATIOS, freqs, db) for k in (1, 2, 3)], axis=0))
-    return np.mean(rows, axis=0) if rows else None
+    sel = _loud(frames)
+    return _harmonic_profile(sel, _autocorr(sel), sr, nfft)
+
+
+def harmonics_and_periodicity(frames, sr, nfft=8192):
+    """(harmonic_profile, periodicity) of the same frames, sharing their
+    autocorrelations: the same numbers as calling both, in less time."""
+    sel = _loud(frames)
+    acs = _autocorr(sel)
+    return _harmonic_profile(sel, acs, sr, nfft), _periodicity(acs, sr)
 
 
 def comb_track(x, sr, nperseg=1024, block=8, lo_ms=0.45, hi_ms=1.3):

@@ -181,6 +181,8 @@ worker_limits() {
 #   - VI_RUN_TIMEOUT_SECONDS (3 h) in total: timeout kills the group, then SIGKILL 30 s later;
 #   - after COMMAND exits, any process still in its group (an orphaned Manager) is killed, so
 #     nothing is left holding the log or the stage's output open.
+# VI_WATCH_POLL_SECONDS (2) is the watch loop's poll; VI_WATCH_TAIL_SECONDS (1) is how often the
+# live `tail` checks that COMMAND is still running. Tests shorten both.
 # The output goes to a file rather than through `| tee`, so an orphan can never keep a pipe open.
 vi_run_watched() {
   local log=$1; shift
@@ -192,7 +194,7 @@ vi_run_watched() {
   # VI_WATCH_SHOW=0 keeps the output in LOG only (the tasks smoke, whose crash lines must not
   # reach the job log).
   if [ "${VI_WATCH_SHOW:-1}" = 1 ]; then
-    tail -n +1 -f --pid="$pid" "$log" 2>/dev/null &
+    tail -n +1 -f -s "${VI_WATCH_TAIL_SECONDS:-1}" --pid="$pid" "$log" 2>/dev/null &
     tail_pid=$!
   fi
   while kill -0 "$pid" 2>/dev/null; do

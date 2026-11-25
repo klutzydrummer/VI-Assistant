@@ -202,7 +202,10 @@ class PreflightHarness(unittest.TestCase):
                    VI_RETURN_PORT="1", VI_INPUT_OMNIVOICE_DATA=str(self.data),
                    HOME=str(self.root / "home"),
                    VI_BASE_MODEL=str(self.base), VI_MIN_DISK_GB="0", VI_PUSH_SECONDS="0",
-                   VI_REHEARSE_TIMEOUT="30")
+                   VI_REHEARSE_TIMEOUT="30",
+                   # vi_run_watched polls every 2 s and its tail every 1 s by default; a stub
+                   # finishes in milliseconds, so poll fast (about 8 s saved per preflight).
+                   VI_WATCH_POLL_SECONDS="0.1", VI_WATCH_TAIL_SECONDS="0.1")
         env.pop("VI_INPUT_VOICETUNE_DATA", None)
         env.update(extra)
         env = {k: v for k, v in env.items() if v is not None}
@@ -712,8 +715,10 @@ class PublishSideTest(PreflightHarness):
         run.mkdir(parents=True)
         (run / "ft_config.json").write_text("{}")
         (run / "collapse_guard.jsonl").write_text("")
-        r = self.mode("train", VI_TRAIN_STEPS="200", VI_SAVE_STEPS="100", VI_WATCH_SECONDS="0.2",
-                      VI_HOURS_LEFT="0.01", STUB_FAST="")
+        # 20 slow stub steps (0.15 s each) with the ETA check from step 10: the same path as a
+        # real run's check from step 100, in 3 s instead of 30 s
+        r = self.mode("train", VI_TRAIN_STEPS="20", VI_SAVE_STEPS="10", VI_ETA_MIN_STEP="10",
+                      VI_WATCH_SECONDS="0.2", VI_HOURS_LEFT="0.01", STUB_FAST="")
         self.assertRegex(r.stderr, r"voicetune-fresh: projected [0-9.]+ h > [0-9.]+ h left")
         self.assertEqual(r.stderr.count("projected"), 1, r.stderr)
         # a roomy budget prints nothing and the step count is untouched
@@ -723,10 +728,10 @@ class PublishSideTest(PreflightHarness):
         (run / "ft_config.json").write_text("{}")
         (run / "collapse_guard.jsonl").write_text("")
         (self.work / "rc").unlink(missing_ok=True)
-        r = self.mode("train", VI_TRAIN_STEPS="200", VI_SAVE_STEPS="100", VI_WATCH_SECONDS="0.2",
-                      VI_HOURS_LEFT="8")
+        r = self.mode("train", VI_TRAIN_STEPS="20", VI_SAVE_STEPS="10", VI_ETA_MIN_STEP="10",
+                      VI_WATCH_SECONDS="0.2", VI_HOURS_LEFT="8")
         self.assertNotIn("projected", r.stderr)
-        self.assertIn("--steps 200", "\n".join(self.log()))
+        self.assertIn("--steps 20 ", "\n".join(self.log()))
 
     def push_calls(self):
         return [l for l in self.log() if l.startswith("push ")]
@@ -906,7 +911,8 @@ class PublishSideTest(PreflightHarness):
             Path(str(self.calls) + ".n").unlink(missing_ok=True)
             r = self.mode("train", VI_TRAIN_STEPS="200", VI_SAVE_STEPS="100", VI_WATCH_SECONDS="0.2",
                           VI_HOURS_LEFT="8", VI_RC=str(self.work / "rc"), VI_FAILS=str(fails),
-                          VI_FINAL_PUSH_SLEEP="0", VI_WEIGHTS_FIRST="0")
+                          VI_FINAL_PUSH_SLEEP="0", VI_WEIGHTS_FIRST="0",
+                          STUB_FAST="1")  # only the final push matters, not the training pace
             if want_rc == 0:
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn("final push failed (try 1 of 3)", r.stderr)

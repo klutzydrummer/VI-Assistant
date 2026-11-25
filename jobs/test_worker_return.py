@@ -1028,6 +1028,7 @@ class HomeSupervisorTest(unittest.TestCase):
         self.tunnel_log = self.root / "tunnels.log"
         self.fail_flag = self.root / "link-down"
         self.hostkey_flag = self.root / "hostkey-changed"
+        self.release_flag = self.root / "release-stage"
         self.rotations_log = None
         self.logs = []
         self.procs = []
@@ -1109,6 +1110,17 @@ class HomeSupervisorTest(unittest.TestCase):
         )
         self.procs.append(process)
         return process
+
+    def hold(self, seconds):
+        """Job text that keeps the stage running until release() or, at the
+        latest, `seconds` (the old fixed sleep), so a test that has seen what it
+        needs does not wait out the rest of the sleep."""
+        flag = shlex.quote(str(self.release_flag))
+        return (f"_held=0; while [ ! -e {flag} ] && [ $_held -lt {seconds * 10} ]; "
+                "do sleep 0.1; _held=$((_held + 1)); done\n")
+
+    def release(self):
+        self.release_flag.write_text("")
 
     def stderr(self, stage):
         return (self.root / f"{stage}.err").read_text()
@@ -1209,7 +1221,7 @@ esac
     # -- row 3: tunnel reconnect and token re-proof ------------------------
     def test_tunnel_reconnects_after_kill(self):
         stage = "tunnel-reconnect"
-        process = self.start(stage, 'sleep 16\necho done > "$VI_OUT/ok.txt"\n')
+        process = self.start(stage, self.hold(16) + 'echo done > "$VI_OUT/ok.txt"\n')
         first = self.wait_tunnels(1)
         # The first start proves the path on a 5 s budget; let it finish so the
         # kill exercises the reconnect path and not a failed first start.
@@ -1238,13 +1250,14 @@ esac
             time.sleep(0.05)
         self.assertIn(settled, log, log or self.stderr(stage))
 
+        self.release()
         self.assertEqual(self.finish(process), 0, self.stderr(stage))
         self.assertIn("tunnel down", log)
         self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
 
     def test_reconnect_uses_new_remote_port_when_old_listener_lingers(self):
         stage = "tunnel-lingering-port"
-        process = self.start(stage, 'sleep 16\necho done > "$VI_OUT/ok.txt"\n')
+        process = self.start(stage, self.hold(16) + 'echo done > "$VI_OUT/ok.txt"\n')
         first = self.wait_tunnels(1)
         wait_for("the first tunnel never proved the path", 20,
                  lambda: "return path re-proved" in self.stderr(stage))
@@ -1263,6 +1276,7 @@ esac
             second = self.wait_tunnels(2)
             self.assertNotEqual(second[1], first[1])
             self.assertEqual(second[2], first[2], "the local receiver port must stay fixed")
+            self.release()
             self.assertEqual(self.finish(process), 0, self.stderr(stage))
             self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
             self.assertIsNone(linger.poll(), "the old port's listener was disturbed")
@@ -1272,7 +1286,7 @@ esac
 
     def test_reconnect_token_proof_survives_short_flap(self):
         stage = "tunnel-short-flap"
-        process = self.start(stage, 'sleep 20\necho done > "$VI_OUT/ok.txt"\n')
+        process = self.start(stage, self.hold(20) + 'echo done > "$VI_OUT/ok.txt"\n')
         wait_for("the first tunnel never proved the path", 20,
                  lambda: "return path re-proved" in self.stderr(stage))
         self.wait_tunnels(1)
@@ -1281,6 +1295,9 @@ esac
         time.sleep(3)
         self.fail_flag.unlink()
         self.wait_tunnels(2)
+        wait_for("the path was not re-proved after the flap", 30,
+                 lambda: self.stderr(stage).count("return path re-proved") >= 2)
+        self.release()
         self.assertEqual(self.finish(process, 90), 0, self.stderr(stage))
         err = self.stderr(stage)
         self.assertIn("poll failed; will retry", err)
@@ -1321,7 +1338,7 @@ esac
 
     def test_security_holds_after_reconnect_and_receiver_restart(self):
         stage = "security-after-reconnect"
-        process = self.start(stage, 'sleep 20\necho done > "$VI_OUT/ok.txt"\n')
+        process = self.start(stage, self.hold(20) + 'echo done > "$VI_OUT/ok.txt"\n')
         first = self.wait_tunnels(1)
         wait_for("the first tunnel never proved the path", 20,
                  lambda: "return path re-proved" in self.stderr(stage))
@@ -1377,6 +1394,7 @@ esac
         with self.assertRaises(OSError):
             link.read_text()
 
+        self.release()
         self.assertEqual(self.finish(process), 0, self.stderr(stage))
         self.assertEqual((self.out / "ok.txt").read_text(), "done\n")
 
@@ -1450,7 +1468,7 @@ esac
         )
         fake_pgrep.chmod(0o755)
         process = self.start(
-            stage, 'sleep 12\necho done > "$VI_OUT/ok.txt"\n',
+            stage, self.hold(12) + 'echo done > "$VI_OUT/ok.txt"\n',
             VI_WATCHDOG_SCRIPT=str(script),
             VI_WATCHDOG_LOG=str(self.root / "watchdog.log"),
         )
@@ -1458,6 +1476,7 @@ esac
             wait_for("the missing watchdog was never restarted", 10, alive.exists)
             wait_for("the restart was not reported", 10,
                      lambda: "the worker watchdog was missing; restarted" in self.stderr(stage))
+            self.release()
             self.assertEqual(self.finish(process), 0, self.stderr(stage))
         finally:
             subprocess.run(["pkill", "-f", str(script)], capture_output=True)
@@ -1566,7 +1585,7 @@ esac
         process = self.start(
             stage,
             'echo started >> "$VI_OUT/runs.txt"\n'
-            'sleep 20\necho done > "$VI_OUT/ok.txt"\n',
+            + self.hold(20) + 'echo done > "$VI_OUT/ok.txt"\n',
             VI_BIN=str(vi),
         )
         wait_for("the first tunnel never proved the path", 20,
@@ -1588,6 +1607,7 @@ esac
 
         self.assertEqual((work / "stage.pid").read_text().strip(), stage_pid,
                          "the rotation relaunched the stage")
+        self.release()
         self.assertEqual(self.finish(process, 90), 0, self.stderr(stage))
         err = self.stderr(stage)
         self.assertIn("ALERT: the worker's ssh host key changed", err)
@@ -1604,7 +1624,7 @@ esac
         stage = "hostkey-many"
         vi = self.write_vi_stub()
         process = self.start(
-            stage, 'sleep 30\necho done > "$VI_OUT/ok.txt"\n', VI_BIN=str(vi))
+            stage, self.hold(30) + 'echo done > "$VI_OUT/ok.txt"\n', VI_BIN=str(vi))
         wait_for("the first tunnel never proved the path", 20,
                  lambda: "return path re-proved" in self.stderr(stage))
         work = self.wait_worker_work(stage)
@@ -1622,6 +1642,7 @@ esac
 
         self.assertEqual((work / "stage.pid").read_text().strip(), stage_pid,
                          "a rotation relaunched the stage")
+        self.release()
         self.assertEqual(self.finish(process, 120), 0, self.stderr(stage))
         err = self.stderr(stage)
         for n in (1, 2, 3):
