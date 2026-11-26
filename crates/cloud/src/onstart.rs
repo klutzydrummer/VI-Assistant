@@ -4,6 +4,18 @@ use crate::Config;
 
 const TEMPLATE: &str = include_str!("../../../jobs/worker-onstart.sh");
 
+/// Vast's onstart field holds at most this many characters
+/// (docs.vast.ai/api-reference/creating-instances-with-api).
+const VAST_ONSTART_MAX_CHARS: usize = 4048;
+
+/// The rendered script must stay this far under the limit, so a small fix does
+/// not need a size hunt. The placeholders only ever shrink when filled.
+const ONSTART_BUDGET_CHARS: usize = 3500;
+
+// Fails the build, not a rental, when the template outgrows the budget.
+const _: () = assert!(TEMPLATE.len() < ONSTART_BUDGET_CHARS);
+const _: () = assert!(ONSTART_BUDGET_CHARS < VAST_ONSTART_MAX_CHARS);
+
 pub fn render(cfg: &Config) -> String {
     TEMPLATE
         .replace("@IDLE_MINUTES@", &cfg.idle_minutes.to_string())
@@ -25,7 +37,11 @@ mod tests {
         assert!(!script.contains("_MINUTES@"), "{script}");
         assert!(script.contains("IDLE=$((7 * 60)) MAX=$((90 * 60))"));
         // It travels in an API field; keep it small.
-        assert!(script.len() < 3000, "{} bytes", script.len());
+        assert!(
+            script.len() < ONSTART_BUDGET_CHARS,
+            "{} bytes",
+            script.len()
+        );
     }
 
     #[test]
@@ -51,9 +67,49 @@ mod tests {
             script.contains("R=${R:-/root/vi-jobs};. /root/.vi-env"),
             "{script}"
         );
-        // The LIVE logic stays well under Vast's 4048-character onstart field
-        // (docs.vast.ai/api-reference/creating-instances-with-api).
-        assert!(script.len() < 2700, "{} bytes", script.len());
+        // The LIVE logic stays well under Vast's 4048-character onstart field.
+        assert!(
+            script.len() < ONSTART_BUDGET_CHARS,
+            "{} bytes",
+            script.len()
+        );
+    }
+
+    #[test]
+    fn onstart_fits_vast_field_with_headroom() {
+        // The largest limits make the longest numbers; the script is ASCII, so
+        // bytes equal characters.
+        let cfg = Config {
+            idle_minutes: 99_999,
+            max_hours: 9_999.0,
+            ..Config::default()
+        };
+        let script = render(&cfg);
+        assert!(script.is_ascii());
+        let n = script.chars().count();
+        assert!(
+            n + 500 < VAST_ONSTART_MAX_CHARS,
+            "{n} chars leaves under 500 of {VAST_ONSTART_MAX_CHARS}"
+        );
+        println!("rendered onstart: {n} chars");
+    }
+
+    #[test]
+    fn watchdog_has_hard_cap_stop_fallback_and_hold_cap() {
+        let script = render(&Config::default());
+        // L3 hard self-destroy at the cap + 10 min, whatever else is going on.
+        assert!(
+            script.contains("-ge $((MAX+600)) ]&&release hard"),
+            "{script}"
+        );
+        // D4: the stop fallback after DELETE is refused.
+        assert!(script.contains("DELETE refused; fallback stop"), "{script}");
+        assert!(
+            script.contains("vastai stop instance $CONTAINER_ID"),
+            "{script}"
+        );
+        // The pending hold is capped at 30 minutes.
+        assert!(script.contains("[ $PH -gt 1800 ]&&PH=1800"), "{script}");
     }
 
     #[test]

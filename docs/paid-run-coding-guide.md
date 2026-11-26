@@ -13,7 +13,7 @@ The design behind it is the round 32 audit (rental-wait table, validity design C
 | WP3: `jobs/paidrun/validity.py` state machine and the cap | Planned |
 | WP4: worker progress counters (`VI-PROGRESS stage counter value`) | Planned |
 | WP2: home dead-man timer (L2), `vi cloud deadman` | **Built** (branch feat/wp2-deadman-timer) |
-| WP6: worker watchdog fixes (L3) | Planned |
+| WP6: worker watchdog fixes (L3) | **Built** (branch feat/wp6-watchdog-fixes; DELETE with the instance key still unproven on a real worker) |
 | WP5: host qualification gate in every mode, rental-2 rules, host exclusion | Planned |
 
 Until WP3 and WP4 land, progress is still judged by "some file changed" (`on-worker.sh`), and stage limits are still spread across the files listed in "Where limits live today" below.
@@ -35,10 +35,12 @@ Three layers each decide on their own whether to destroy a rental. Each one only
   - It is cancelled only after a destroy has been verified, and cancelling twice is harmless.
   - `paid_run.py` passes `--until` = now + the hours left in the approval, so `--until` also ends the rental at that time.
   - It survives a crash, OOM kill, SIGKILL or hang of `paid_run.py`. It does not survive a home reboot. That is deliberate (decision D1): there is no boot-time settle unit, and L3 covers a reboot.
-- **L3, the worker watchdog** (`jobs/worker-onstart.sh`, rendered by `crates/cloud/src/onstart.rs`; fixes planned in WP6).
-  - It self-destroys at the hard cap + 10 min with the instance's own key.
-  - It ignores home's tunnel ssh session when deciding whether the worker is idle.
-  - If DELETE is refused it falls back to the documented `vastai stop instance $CONTAINER_ID` (decision D4). That ends compute billing but not storage billing, so L1 or L2 still has to destroy.
+- **L3, the worker watchdog** (`jobs/worker-onstart.sh`, rendered by `crates/cloud/src/onstart.rs`; fixes built in WP6).
+  - It self-destroys at the hard cap (MAX) + 10 min with the instance's own key, even with ssh sessions open or checkpoints pending.
+  - It ignores home's tunnel ssh session (`ssh -N`, an sshd session with no child process) when deciding whether the worker is idle.
+  - If DELETE is refused or fails (three tries), it falls back to a PUT of `{"state":"stopped"}`, the REST form of the documented `vastai stop instance $CONTAINER_ID` (decision D4). That ends compute billing but not storage billing, so L1 or L2 still has to destroy. The log line `DELETE refused; fallback stop` shows the fallback ran.
+  - Its pending (checkpoint push) hold defers release by at most min(`PENDING_HOLD`, 30 min).
+  - Open item: whether the instance key may DELETE is undocumented and unproven; it rides the next approved debug pass.
   - It is the only layer that works when home is gone for good.
 
 **Who owns what**
@@ -110,7 +112,7 @@ Rules:
 
 - Bash scripts report evidence. They do not decide to keep paying, and they do not destroy, with one exception: the L3 watchdog's self-destroy at the hard cap.
 - Python never parses Rust's TOML or state files itself. Ask `vi cloud` for the value. (`config_boot_minutes` in `jobs/paidrun/config.py` is an existing exception, flagged in the refactor assessment.)
-- **The onstart limit.** Vast's onstart field holds 4048 characters. `crates/cloud/src/onstart.rs` tests keep the rendered script under 3000 bytes and its live logic under 2700. Any change to `worker-onstart.sh` must keep those tests green. Anything that will not fit goes into a script pushed over ssh after boot, not into onstart.
+- **The onstart limit.** Vast's onstart field holds 4048 characters. `crates/cloud/src/onstart.rs` fails the build if the template reaches its 3500-character budget, and its tests keep the rendered script (with the longest possible limits filled in) at least 500 characters under 4048. After WP6 it is about 3100. Any change to `worker-onstart.sh` must keep those tests green. Anything that will not fit goes into a script pushed over ssh after boot, not into onstart.
 
 ## Testing
 

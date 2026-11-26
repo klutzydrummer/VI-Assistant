@@ -19,6 +19,9 @@ struct Rig {
     log: PathBuf,
     calls: PathBuf,
     put_fails: PathBuf,
+    del_fails: PathBuf,
+    sshd: PathBuf,
+    kids: PathBuf,
     config: Config,
 }
 
@@ -36,15 +39,21 @@ impl Rig {
         );
         write_exe(
             &bin.join("pgrep"),
-            "#!/bin/sh\nexit 1\n", // no ssh session unless a test says so
+            // `-f` lists the sshd session pids in $SSHD (none unless a test
+            // writes some); `-P PID` succeeds when PID is a line of $KIDS,
+            // that is, when the session runs a command.
+            "#!/bin/sh\ncase \"$1\" in\n  -f) [ -s \"$SSHD\" ] && exec cat \"$SSHD\" ;;\n  -P) grep -qx \"$2\" \"$KIDS\" 2>/dev/null && exit 0 ;;\nesac\nexit 1\n",
         );
         write_exe(
             &bin.join("curl"),
-            "#!/bin/sh\necho \"$*\" >>\"$CALLS\"\ncase \"$*\" in\n  *\"-X PUT\"*) [ -e \"$PUT_FAILS\" ] && exit 22 ;;\nesac\nexit 0\n",
+            "#!/bin/sh\necho \"$*\" >>\"$CALLS\"\ncase \"$*\" in\n  *\"-X PUT\"*) [ -e \"$PUT_FAILS\" ] && exit 22 ;;\n  *\"-X DELETE\"*) [ -e \"$DEL_FAILS\" ] && { echo 'curl: (22) The requested URL returned error: 403' >&2; exit 22; } ;;\nesac\nexit 0\n",
         );
         let rig = Rig {
             calls: dir.path().join("calls"),
             put_fails: dir.path().join("put-fails"),
+            del_fails: dir.path().join("del-fails"),
+            sshd: dir.path().join("sshd-pids"),
+            kids: dir.path().join("sshd-kids"),
             log: dir.path().join("watchdog.log"),
             root,
             config,
@@ -59,21 +68,26 @@ impl Rig {
     /// Run the watchdog until it exits or `ms` passes, then return the fake
     /// curl calls it made, one per line.
     fn run(&self, ms: u64) -> String {
-        self.run_as(ms, false)
+        self.run_as(ms, false, &[])
+    }
+
+    /// Like `run`, with extra environment variables for the watchdog.
+    fn run_env(&self, ms: u64, env: &[(&str, &str)]) -> String {
+        self.run_as(ms, false, env)
     }
 
     /// Like `run`, but the way on-worker.sh restarts a missing watchdog over
     /// ssh: no `R` and no Vast `CONTAINER_*` vars in the environment. The
     /// production paths point at this rig's root and env file.
     fn run_over_ssh(&self, ms: u64) -> String {
-        self.run_as(ms, true)
+        self.run_as(ms, true, &[])
     }
 
     fn env_file(&self) -> PathBuf {
         self.root.parent().unwrap().join("vi-env")
     }
 
-    fn run_as(&self, ms: u64, over_ssh: bool) -> String {
+    fn run_as(&self, ms: u64, over_ssh: bool, env: &[(&str, &str)]) -> String {
         let rendered = onstart::render(&self.config);
         let body = rendered
             .split_once("cat >/root/vi-watchdog.sh <<'EOF'\n")
@@ -102,9 +116,17 @@ impl Rig {
         } else {
             cmd.env("R", &self.root);
         }
+        cmd.env_remove("PENDING_HOLD")
+            .env_remove("RECOVERY_MINUTES");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let mut child = cmd
             .env("CALLS", &self.calls)
             .env("PUT_FAILS", &self.put_fails)
+            .env("DEL_FAILS", &self.del_fails)
+            .env("SSHD", &self.sshd)
+            .env("KIDS", &self.kids)
             .env("PATH", path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -126,6 +148,28 @@ impl Rig {
 
     fn backdate_active(&self, seconds: u64) {
         self.backdate(&self.root.join(".active"), seconds);
+    }
+
+    fn read_log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// An sshd session; `runs_command` is false for home's tunnel (`ssh -N`).
+    fn ssh_session(&self, runs_command: bool) {
+        fs::write(&self.sshd, "4100\n").unwrap();
+        if runs_command {
+            fs::write(&self.kids, "4100\n").unwrap();
+        }
+    }
+
+    /// A job dir with one un-acked pending epoch, all of it backdated.
+    fn pending_job(&self) -> PathBuf {
+        let job = self.job();
+        fs::create_dir(job.join("pending")).unwrap();
+        fs::write(job.join("pending/0"), "").unwrap();
+        self.backdate(&job.join("pending"), 3600);
+        self.backdate(&job.join("pending/0"), 3600);
+        job
     }
 
     /// The watchdog reads `.boot` and `.this-boot` as timestamps, not mtimes.
@@ -263,9 +307,23 @@ fn lock_held_without_change_releases() {
 
 #[test]
 fn pending_only_holds_until_pending_hold() {
-    // Before PENDING_HOLD (120 min by default) the pending epochs hold the
-    // worker even with no lock, trainer or recent change. The job ended 31
-    // minutes ago: past the idle window, inside PENDING_HOLD.
+    // Before the hold ends the pending epochs keep the worker even with no
+    // lock, trainer or recent change. PENDING_HOLD defaults to 120 min but
+    // is capped at 30, so a job that ended 29 minutes ago is still held.
+    let rig = Rig::new(liveness_config());
+    let job = rig.job();
+    fs::create_dir(job.join("pending")).unwrap();
+    fs::write(job.join("pending/0"), "").unwrap();
+    let rc = job.join("rc");
+    fs::write(&rc, "0").unwrap();
+    set_mtime(&rc, now() - 29 * 60);
+    rig.backdate(&job.join("pending"), 3600);
+    rig.backdate(&job.join("pending/0"), 3600);
+    rig.backdate_active(3600);
+    assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
+
+    // After it (31 min, still inside the old 120), release stops (never
+    // destroys) with work still pending.
     let rig = Rig::new(liveness_config());
     let job = rig.job();
     fs::create_dir(job.join("pending")).unwrap();
@@ -273,19 +331,6 @@ fn pending_only_holds_until_pending_hold() {
     let rc = job.join("rc");
     fs::write(&rc, "0").unwrap();
     set_mtime(&rc, now() - 31 * 60);
-    rig.backdate(&job.join("pending"), 3600);
-    rig.backdate(&job.join("pending/0"), 3600);
-    rig.backdate_active(3600);
-    assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
-
-    // After it, release stops (never destroys) with work still pending.
-    let rig = Rig::new(liveness_config());
-    let job = rig.job();
-    fs::create_dir(job.join("pending")).unwrap();
-    fs::write(job.join("pending/0"), "").unwrap();
-    let rc = job.join("rc");
-    fs::write(&rc, "0").unwrap();
-    set_mtime(&rc, now() - 121 * 60);
     rig.backdate(&job.join("pending"), 3600);
     rig.backdate(&job.join("pending/0"), 3600);
     rig.backdate_active(3600);
@@ -307,9 +352,144 @@ fn idle_with_pending_stops() {
 
 #[test]
 fn nothing_releases() {
+    // DELETE succeeds, so the stop fallback never runs.
     let rig = Rig::new(liveness_config());
     rig.backdate_active(3600);
     assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+    let log = rig.read_log();
+    assert!(log.contains("release: idle"), "{log}");
+    assert!(log.contains("destroyed"), "{log}");
+    assert!(!log.contains("fallback"), "{log}");
+    assert!(!rig.root.join(".stopped-at").exists());
+}
+
+#[test]
+fn pending_hold_shorter_than_cap_is_kept() {
+    // PENDING_HOLD below the 30-minute cap still applies as set. The idle
+    // window is shorter than rc's age, so rc is not a recent change.
+    let rig = Rig::new(Config {
+        idle_minutes: 5,
+        max_hours: 0.0,
+        ..Config::default()
+    });
+    let job = rig.pending_job();
+    let rc = job.join("rc");
+    fs::write(&rc, "0").unwrap();
+    set_mtime(&rc, now() - 11 * 60);
+    rig.backdate_active(3600);
+    assert_eq!(
+        methods(&rig.run_env(400, &[("PENDING_HOLD", "10")])),
+        vec!["PUT"]
+    );
+    assert!(rig.read_log().contains("release: pending"));
+}
+
+#[test]
+fn pending_hold_cap_reached_proceeds_to_destroy_when_stop_fails() {
+    // Even a huge PENDING_HOLD ends at 30 minutes; with stop refused the
+    // watchdog goes on to DELETE.
+    let rig = Rig::new(liveness_config());
+    let job = rig.pending_job();
+    let rc = job.join("rc");
+    fs::write(&rc, "0").unwrap();
+    set_mtime(&rc, now() - 31 * 60);
+    rig.backdate_active(3600);
+    fs::write(&rig.put_fails, "").unwrap();
+    assert_eq!(
+        methods(&rig.run_env(1000, &[("PENDING_HOLD", "100000")])),
+        vec!["PUT", "PUT", "PUT", "DELETE"]
+    );
+    let log = rig.read_log();
+    assert!(log.contains("stop refused; fallback DELETE"), "{log}");
+    assert!(log.contains("destroyed"), "{log}");
+}
+
+#[test]
+fn tunnel_only_ssh_still_releases_idle() {
+    // Home's reverse tunnel is an sshd session with no command under it.
+    let rig = Rig::new(liveness_config());
+    rig.ssh_session(false);
+    rig.backdate_active(3600);
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+    assert!(rig.read_log().contains("release: idle"));
+}
+
+#[test]
+fn ssh_session_running_a_command_keeps_worker() {
+    let rig = Rig::new(liveness_config());
+    rig.ssh_session(true);
+    rig.backdate_active(3600);
+    assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
+    // It counts as activity, so the idle clock restarts.
+    let active = fs::metadata(rig.root.join(".active")).unwrap();
+    let age = SystemTime::now()
+        .duration_since(active.modified().unwrap())
+        .unwrap_or_default();
+    assert!(age < Duration::from_secs(60), "{age:?}");
+}
+
+#[test]
+fn delete_refused_falls_back_to_stop() {
+    let rig = Rig::new(liveness_config());
+    rig.backdate_active(3600);
+    fs::write(&rig.del_fails, "").unwrap();
+    assert_eq!(
+        methods(&rig.run(1000)),
+        vec!["DELETE", "DELETE", "DELETE", "PUT"]
+    );
+    assert!(rig.root.join(".stopped-at").is_file());
+    let log = rig.read_log();
+    assert!(log.contains("destroy-failed"), "{log}");
+    assert!(log.contains("403"), "{log}");
+    assert!(log.contains("DELETE refused; fallback stop"), "{log}");
+    assert!(log.contains("stopped; storage bills"), "{log}");
+}
+
+#[test]
+fn hard_cap_destroys_with_ssh_live_and_pending() {
+    // Past max_hours + 10 min a live command session and pending work no
+    // longer matter: DELETE, not the max-hours stop.
+    let rig = Rig::new(Config {
+        idle_minutes: 30,
+        max_hours: 1.0,
+        ..Config::default()
+    });
+    rig.set_stamp(".boot", now() - 3600 - 601);
+    rig.ssh_session(true);
+    rig.pending_job();
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+    let log = rig.read_log();
+    assert!(log.contains("release: hard"), "{log}");
+}
+
+#[test]
+fn hard_cap_ignores_recovery_window_after_stop() {
+    // A restart after a stop gets RECOVERY_MINUTES, but never past the cap.
+    let rig = Rig::new(Config {
+        idle_minutes: 30,
+        max_hours: 1.0,
+        ..Config::default()
+    });
+    rig.set_stamp(".boot", now() - 7200);
+    fs::write(rig.root.join(".stopped-at"), "").unwrap();
+    rig.pending_job();
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+}
+
+#[test]
+fn between_cap_and_hard_cap_pending_still_stops() {
+    // From max_hours to max_hours + 10 min the D2 checkpoint hold still
+    // stops rather than destroys.
+    let rig = Rig::new(Config {
+        idle_minutes: 30,
+        max_hours: 1.0,
+        ..Config::default()
+    });
+    rig.set_stamp(".boot", now() - 3600 - 300);
+    rig.ssh_session(true);
+    rig.pending_job();
+    assert_eq!(methods(&rig.run(400)), vec!["PUT"]);
+    assert!(rig.read_log().contains("release: max-hours"));
 }
 
 #[test]
@@ -363,7 +543,7 @@ fn max_hours_with_pending_issues_put_stop_no_delete() {
         max_hours: 1.0,
         ..Config::default()
     });
-    rig.set_stamp(".boot", now() - 7200);
+    rig.set_stamp(".boot", now() - 3600 - 300);
     let job = rig.job();
     fs::create_dir(job.join("pending")).unwrap();
     fs::write(job.join("pending/0"), "").unwrap();
@@ -380,7 +560,7 @@ fn max_hours_with_pending_stop_fails_then_delete() {
         max_hours: 1.0,
         ..Config::default()
     });
-    rig.set_stamp(".boot", now() - 7200);
+    rig.set_stamp(".boot", now() - 3600 - 300);
     fs::write(&rig.put_fails, "").unwrap();
     let job = rig.job();
     fs::create_dir(job.join("pending")).unwrap();

@@ -12,27 +12,28 @@ for f in /etc/ssh/ssh_host_*_key.pub; do [ -e "$f" ] || continue; echo "VI-HOSTK
 cat >/root/vi-watchdog.sh <<'EOF'
 R=${R:-/root/vi-jobs};. /root/.vi-env 2>/dev/null # ssh restarts lack both
 IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(cat $R/.boot)
-PH=$((${PENDING_HOLD:-120} * 60)) RM=${RECOVERY_MINUTES:-30}
+PH=$((${PENDING_HOLD:-120} * 60)) RM=${RECOVERY_MINUTES:-30} L=/var/log/vi-watchdog.log
+[ $PH -gt 1800 ]&&PH=1800 # a pending hold defers release 30 min at most
 API=https://console.vast.ai/api/v0/instances/$CONTAINER_ID/
 A="Authorization: Bearer $CONTAINER_API_KEY"
-log(){ echo "$(date -u) $*" >>/var/log/vi-watchdog.log; }
-put(){ curl -fsS -X PUT -H "$A" -H 'Content-Type: application/json' -d '{"state":"stopped"}' "$API"; }
-del(){ curl -fsS -X DELETE -H "$A" "$API"; }
+log(){ echo "$(date -u) $*" >>$L; }
+# put is the REST form of `vastai stop instance $CONTAINER_ID`: compute billing ends, storage does not
+put(){ curl -fsS -X PUT -H "$A" -H 'Content-Type: application/json' -d '{"state":"stopped"}' "$API" 2>>$L; }
+del(){ curl -fsS -X DELETE -H "$A" "$API" 2>>$L; }
+stop(){ for _ in 1 2 3; do put&&{ touch $R/.stopped-at; log "stopped; storage bills until home destroys"; exit; }; log stop-failed; sleep 30; done; }
+destroy(){ for _ in 1 2 3; do del&&{ log destroyed; exit; }; log destroy-failed; sleep 30; done; }
 release(){
   log "release: $1"
-  if ls $R/*/pending/* >/dev/null 2>&1; then
-    for _ in 1 2 3; do put&&{ touch $R/.stopped-at; log stopped; exit; }; sleep 30; done
-    log stop-failed; del
-  else
-    for _ in 1 2 3; do del&&{ log destroyed; exit; }; sleep 30; done
-    log destroy-failed; put
-  fi
+  if [ $1 != hard ]&&ls $R/*/pending/* >/dev/null 2>&1;then stop; log "stop refused; fallback DELETE"; destroy
+  else destroy; log "DELETE refused; fallback stop"; stop; fi
   exit
 }
 log start
 while sleep 60; do
   now=$(date +%s); ssh=0; l=0; t=0; p=0; rc=0; g=0
-  pgrep -f 'sshd: [^ ]+@' >/dev/null&&ssh=1
+  [ $MAX -gt 0 ]&&[ $((now-BOOT)) -ge $((MAX+600)) ]&&release hard
+  # Home's tunnel (ssh -N) runs no command, so only a session with a child counts.
+  for s in $(pgrep -f 'sshd[^ ]*: [^ ]+@');do pgrep -P $s >/dev/null&&ssh=1;done
   for d in $R/*/; do
     [ -d "$d" ]||continue
     [ -e "$d/job.lock" ]&&! flock -n "$d/job.lock" true 2>/dev/null&&l=1
