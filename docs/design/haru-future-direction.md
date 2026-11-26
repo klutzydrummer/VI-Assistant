@@ -1,6 +1,6 @@
-# Future direction: Haru and a thinner chat layer
+# Long-term dream: Haru, and a thinner chat layer
 
-Status: **future direction, under consideration.** Nothing here is current work, approved, scheduled or funded. It records Brandon's ideas (2026-11-16) so they are not lost. Current work is in `docs/project-state.md`.
+Status: **long-term dream, under consideration.** Haru is the eventual goal: a full-duplex spoken conversation with Brandon's own personal assistant (Tony Stark or Cortana style), built from commodity open-source models. Nothing here is current work, approved, scheduled or funded. It records Brandon's ideas (2026-11-16, reframed 2026-11-25) so they are not lost. Current work is in `docs/project-state.md`.
 
 ## What Brandon has said
 

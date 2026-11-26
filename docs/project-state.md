@@ -1,6 +1,6 @@
 # VI Assistant: project state and handoff
 
-Last updated 2026-11-02. This page is for an agent or person picking the project up cold. It covers the goal, the rules Brandon (the owner, GitHub `klutzydrummer`) has set, where everything lives, what is done, and what comes next. Live state moves quickly: when this page and GitHub disagree, trust GitHub and ask Brandon.
+Last updated 2026-11-25 (goal wording only; the status below is from 2026-11-02 and is unverified since). This page is for an agent or person picking the project up cold. It covers the goal, the rules Brandon (the owner, GitHub `klutzydrummer`) has set, where everything lives, what is done, and what comes next. Live state moves quickly: when this page and GitHub disagree, trust GitHub and ask Brandon.
 
 ## Where things stand right now
 
@@ -14,7 +14,10 @@ Last updated 2026-11-02. This page is for an agent or person picking the project
 
 ## The goal
 
-A conversational assistant that feels like a friend and an executive assistant while embodying a character, with that character's persona, lore and voice. The pilot is Tali'Zorah from Mass Effect. A second character (Carl from Aqua Teen Hunger Force) comes only after Tali works end to end.
+A personal assistant that feels like a friend and an executive assistant while embodying a character, with that character's persona, lore and voice. This is Brandon's personal project, built on commodity open-source models. It is not an AI studio, and nothing in it aims at studio-grade extras. The pilot is Tali'Zorah from Mass Effect. A second character (Carl from Aqua Teen Hunger Force) comes only after Tali works end to end.
+
+- **Near-term aim (2026-11-25):** the project runs in the background without direct supervision, and Brandon only makes quick, well-informed decisions or asks for more detail.
+- **Long-term dream:** Haru, a full-duplex spoken conversation with his own assistant (think Tony Stark or Cortana).
 
 - **First milestone:** Tali replies in character, in her cloned voice, to typed text (`vi chat`). Not reached yet.
 - **Later:** speech input with emotion and speaker diarization, and Tali sending out tool agents (calendar, email).
@@ -22,7 +25,7 @@ A conversational assistant that feels like a friend and an executive assistant w
   1. **Target:** a fine-tuned TTS that needs no RVC and no reference clips, where the app's mood state drives the mood directly.
   2. No reference clips, with RVC at the end for a consistent voice.
   3. **Worst case:** a library of her reference clips plus RVC. This is roughly the interim voice.
-- **Future direction (Brandon, 2026-11-16; under consideration, not current work):** once Tali's voice and chat model work, generate a large synthetic dataset and fine-tune the Haru speech model with a KL penalty against forgetting. He also wants to consider a smaller chat model, with a thin personality layer over a stronger AI as a possible end goal. This may change the "Later" plans and the model choices below. Details, verified Haru facts and open questions: `docs/design/haru-future-direction.md`.
+- **Long-term dream, Haru (Brandon, 2026-11-16; under consideration, not current work):** once Tali's voice and chat model work, generate a large synthetic dataset and fine-tune the Haru speech model with a KL penalty against forgetting. He also wants to consider a smaller chat model, with a thin personality layer over a stronger AI as a possible end goal. This may change the "Later" plans and the model choices below. Details, verified Haru facts and open questions: `docs/design/haru-future-direction.md`.
 - **Cheap character swaps:** zero-shot voice cloning plus a persona pack. Fine-tuning is an optional upgrade per character.
 
 ## Core design (Brandon's decisions; don't change without his explicit yes)

@@ -1,13 +1,15 @@
 # VI Assistant
 
-A conversational assistant that embodies a character: their persona, lore and voice. Point it at a character pack and it talks like them, with a cloned voice and emotion, and can send out agents to handle tasks. The pilot character is Tali'Zorah from Mass Effect.
+A personal assistant that embodies a character: their persona, lore and voice. It is a one-person project built on commodity open-source models, not a studio or a product. Point it at a character pack and it talks like them, with a cloned voice and emotion, and can send out agents to handle tasks. The pilot character is Tali'Zorah from Mass Effect.
 
 Everything runs on hardware you control: a rented GPU today, your own later. No hosted model APIs.
+
+The long-term dream is Haru: a full-duplex, spoken conversation with your own assistant, in the spirit of Tony Stark's JARVIS or Cortana. The near-term goal is a project that runs in the background without supervision, so the owner only makes quick, informed decisions.
 
 ## Status
 Stage 1 in progress: Tali replies in character, with voice, from typed text.
 
-Future direction, under consideration and not current work: fine-tuning the Haru speech model on synthetic Tali data, and possibly swapping the interim chat model for a smaller one that acts as a thin personality layer over a stronger AI. See `docs/design/haru-future-direction.md`.
+Long-term dream, not current work: Haru, a full-duplex conversation with the assistant, possibly by fine-tuning the Haru speech model on synthetic Tali data. A smaller chat model acting as a thin personality layer over a stronger AI is also under consideration. See `docs/design/haru-future-direction.md`.
 
 ## Character packs
 A character is a folder under `characters/` (see `characters/tali/`):
