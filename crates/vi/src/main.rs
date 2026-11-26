@@ -33,7 +33,7 @@ pub(crate) const USAGE: &str = "usage:
   vi review --channel <corpus-folder> [--port N]
   vi review --listen <set-folder> [--key <key.json>] [--refs <folder>] [--port N]   (blind listening set, any folder)
   (every review mode also takes --host ADDR; default 127.0.0.1)
-  vi cloud offers [--exclude-machine ID]...
+  vi cloud offers [--exclude-machine ID]... [--exclude-host ID]...
   vi cloud up --cap USD --until TIME [--offer ID] [--yes]
   vi cloud start --cap USD --until TIME
   vi cloud refresh

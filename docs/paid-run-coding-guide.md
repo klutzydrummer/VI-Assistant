@@ -14,7 +14,7 @@ The design behind it is the round 32 audit (rental-wait table, validity design C
 | WP4: worker progress counters (`VI-PROGRESS stage counter value`) | Planned |
 | WP2: home dead-man timer (L2), `vi cloud deadman` | **Built** (branch feat/wp2-deadman-timer) |
 | WP6: worker watchdog fixes (L3) | **Built** (branch feat/wp6-watchdog-fixes; DELETE with the instance key still unproven on a real worker) |
-| WP5: host qualification gate in every mode, rental-2 rules, host exclusion | Planned |
+| WP5: host qualification gate in every mode, rental-2 rules, host exclusion | **Built** (branch feat/wp5-host-qualification; thresholds from R30/dbg6 samples, not yet seen on a real worker) |
 
 Until WP3 and WP4 land, progress is still judged by "some file changed" (`on-worker.sh`), and stage limits are still spread across the files listed in "Where limits live today" below.
 

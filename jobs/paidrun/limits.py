@@ -61,3 +61,17 @@ PUSH_PROBE_MAX_MINUTES = 5  # VI_PUSH_PROBE_SECONDS' default in jobs/push-probe.
 
 
 REALPATH_TIMEOUT = {False: 900, True: 1800}
+
+
+# r32 WP5: the host-qualification gate, right after ssh works and before any upload, in every
+# mode. Download: the worker fetches a public test file (jobs/push-probe.sh host-qual) for at
+# most HOST_QUAL_DOWNLOAD_SECONDS and must average HOST_QUAL_MIN_DOWNLOAD_MB_S (this is G,
+# decimal MB/s). Push: the push probe's leg a (worker -> home through the tunnel) must average
+# HOST_QUAL_MIN_PUSH_MB_S. A fail, or a probe that cannot run, is INVALID(host-unqualified).
+# Thresholds from the R30/dbg6 samples only; no real host was measured against them yet.
+HOST_QUAL_MIN_DOWNLOAD_MB_S = 5.0
+HOST_QUAL_DOWNLOAD_SECONDS = 30
+HOST_QUAL_MIN_PUSH_MB_S = 1.0
+# The whole download half, from home: the 30 s window, ssh setup and push-probe.sh's own
+# 15 s kill margin, with room to spare.
+HOST_QUAL_TIMEOUT_SECONDS = 120

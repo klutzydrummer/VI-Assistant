@@ -46,8 +46,10 @@ STUB = textwrap.dedent('''\
         # "offers_after_down" is the relisted market: it applies once a worker has been destroyed.
         lst = sc["offers_after_down"] if st.get("downs") and "offers_after_down" in sc else sc["offers"]
         excl = [args[i + 1] for i in range(2, len(args) - 1) if args[i] == "--exclude-machine"]
+        exclh = [args[i + 1] for i in range(2, len(args) - 1) if args[i] == "--exclude-host"]
         for o in lst:
             if "machine" in o and str(o["machine"]) in excl and not sc.get("ignore_exclude"): continue
+            if "host" in o and str(o["host"]) in exclh and not sc.get("ignore_exclude"): continue
             tail = f"  machine {o['machine']} host {o.get('host', '?')}" if "machine" in o else ""
             print(f"{o['id']:>10}  {o.get('gpu','RTX 3090'):<12} 24 GB  ${o['dph']:.3f}/hr  reliability 0.990  "
                   f"net down   900 / up {o.get('up',800):>5} Mbps   8.0 cores  32 GB ram  disk 500 MB/s  {o.get('loc','US')}{tail}")
@@ -102,6 +104,17 @@ STUB = textwrap.dedent('''\
         else:
             print("no worker rented")
         print(f"credit ${st['credit']:.2f}")
+    elif args[:2] == ["cloud", "ssh"] and "push-probe-down" in " ".join(args):
+        # r32 WP5: the host-qualification download (jobs/push-probe.sh host-qual), per attempt
+        hq = att().get("hostqual", sc.get("hostqual", "fast"))
+        log("hostqual", hq, os.environ.get("VI_HOST_QUAL_MIN_DOWNLOAD_MB_S"))
+        if hq == "fail":
+            print("ssh: connect to host h port 1: Connection refused", file=sys.stderr); sys.exit(255)
+        if hq == "nocurl":
+            print("push-probe-down none 0 0 0 no-curl"); sys.exit(0)
+        if hq == "slow":
+            print("push-probe-down https://fsn1-speed.hetzner.com/100MB.bin 200 30000000 30.0 28"); sys.exit(0)
+        print("push-probe-down https://fsn1-speed.hetzner.com/100MB.bin 200 104857600 4.0 0"); sys.exit(0)
     elif args[:2] == ["cloud", "ssh"]:
         log("ssh")
         if (st["worker"] and st.get("dropped") == st["worker"]["id"]
@@ -171,6 +184,12 @@ STUB = textwrap.dedent('''\
                 print("exit status: 126", file=sys.stderr); sys.exit(1)
             if r == "other":
                 print("on-worker.sh: input upload failed", file=sys.stderr); sys.exit(1)
+            if r == "pushslow":
+                # r32 WP5: push-probe.sh's gate half fails, so on-worker.sh exits 75 before uploads
+                log("preflight_env", os.environ.get("VI_HOST_QUAL_GATE"), os.environ.get("VI_PUSH_PROBE_LEGS"))
+                print("VI-HOST-QUAL push fail mb_s=0.40 min=1 bytes=4000000 seconds=10.00 detail=leg_a_ok", file=sys.stderr)
+                print("on-worker.sh: exiting with 75", file=sys.stderr)
+                print("error: stage omnivoice_preflight failed: exit status: 75", file=sys.stderr); sys.exit(1)
             if r == "drop":
                 st["dropped"] = st["worker"]["id"]; save()
                 print("Connection to 38.34.175.110 closed by remote host.", file=sys.stderr)

@@ -8,7 +8,11 @@ rent the cheapest qualifying offer, run the preflight stage (tunnel, receiver, t
 worker gates), then the train stage, then release the worker and print what it cost. If ONLY the
 cheap worker gate fails (stderr says `worker-preflight: ...`: disk, RAM, CUDA, VRAM, cores, push
 speed; or `worker upload ETA` for a too-slow upload line), the machine is released, that offer is
-excluded, and the next cheapest is tried, up to --max-attempts. Any other failure releases the
+excluded, and the next cheapest is tried, up to --max-attempts. Right after ssh works, and
+before any upload, every mode runs the host-qualification gate (jobs/push-probe.sh host-qual: a
+public download of at least 5 MB/s over 30 s, then a return push of at least 1 MB/s); a fail or a
+probe that cannot run releases the worker as INVALID(host-unqualified), excludes its host and
+machine from the next search, and tries the next offer. Any other failure releases the
 worker and stops. Before renting anything it also checks home's free disk (the stage's
 min_home_gb plus reserve; exit 11) and shows the bundle cache and the pinned base-model revision.
 
@@ -50,7 +54,8 @@ change the cap, hours or attempts):
 (at most 10 minutes), releases the worker and exits 8. `stop --now` sends SIGTERM to the recorded
 paid_run process, which releases the worker at once.
 
-Debug pass (one rental, or two only after a confirmed host drop; every step tried):
+Debug pass (one rental, or two only after a confirmed host drop or a failed host qualification;
+every step tried):
 
     python3 -I jobs/paid_run.py --debug-pass --run-id ID --cap USD --max-hours H [--plan]
 

@@ -22,15 +22,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 JOBS = REPO / "jobs"
 
-EXPECTED_TESTS = 801
+EXPECTED_TESTS = 828
 
 SHARDS = {
     # 283 s on a CI runner
     "1": ["test_worker_return", "test_eq_check", "test_vast_limits", "test_steer"],
-    # about 155 s
+    # about 210 s (test_host_qual adds about 55 s)
     "2": ["test_omnivoice_preflight", "test_fx_detect", "test_confounds",
           "test_venv_build", "test_filter_probe", "test_prep", "test_eq_match",
-          "test_textscore", "test_rehearsal_push", "test_refscreen"],
+          "test_textscore", "test_rehearsal_push", "test_refscreen", "test_host_qual"],
     # about 175 s
     "3": ["test_paid_run", "test_ttstest", "test_suit_fit", "test_classes", "test_worker_preflight_cuda",
           "test_checkpoints", "test_codectrip", "test_embed", "test_voicesteer",

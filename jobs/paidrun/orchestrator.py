@@ -499,8 +499,10 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
             flow = [
                 f"mode            : --debug-pass (up to {DEBUG_MAX_RENTALS} rentals: a second one "
                 "ONLY after a confirmed host drop (ssh lost the host and two Vast status reads "
-                f"{HOST_DROP_RECHECK_SECONDS} s apart agree), never after our own check failing; every stage is tried and a failure "
+                f"{HOST_DROP_RECHECK_SECONDS} s apart agree) or a failed host qualification, "
+                "never after our own check failing; every stage is tried and a failure "
                 "never stops the next one)",
+                self.host_qual_plan_line(),
                 "host drop       : before release, `vastai show instance <id> --raw` and "
                 "`vastai logs <id>` are saved in the run folder; the stage reads HOST-DROP "
                 "(status X) only when ssh lost the host and two Vast reads at least "
@@ -508,7 +510,8 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
                 "say the instance is gone while ssh is still refused); that worker is "
                 f"released and one more offer is rented only if the cap left covers $/hr x "
                 f"{h:g} h (each rental has its own {h:g} h; the $ cap is shared)",
-                "flow            : offers -> cheapest qualifying offer -> up -> 1 host-cuda, "
+                "flow            : offers -> cheapest qualifying offer -> up -> host "
+                "qualification -> 1 host-cuda, "
                 "2 disk-limits (debug-probe.sh over `vi cloud ssh`) -> stage omnivoice_debug "
                 "(3 upload + token handshake, 4 venv + launchers, 5 base-model, 6 tokenise, "
                 "7 cuda-load, 8 train-steps, 9 ckpt-push, 10 listening, 11 resume) -> 12 down "
@@ -539,12 +542,15 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
             ]
         else:
             flow = [
-                "flow            : offers -> cheapest not-failed offer -> up -> preflight stage "
-                "(tunnel, receiver, token push, gates) -> train stage -> verify -> down",
-                "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores) "
-                "or the upload-ETA gate retries on the next offer; a slow push is only a warning "
-                "(measured MB/s and checkpoint push time are printed); every other failure "
-                "releases the worker and stops",
+                "flow            : offers -> cheapest not-failed offer -> up -> host "
+                "qualification -> preflight stage (tunnel, receiver, token push, gates, push "
+                "gate) -> train stage -> verify -> down",
+                self.host_qual_plan_line(),
+                "retry rule      : a failed `worker-preflight:` gate (disk, RAM, CUDA, VRAM, cores), "
+                "the upload-ETA gate or a failed host qualification retries on the next offer "
+                "(a failed host qualification also excludes that host and machine); the "
+                "preflight's own push rate is only a warning (measured MB/s and checkpoint push "
+                "time are printed); every other failure releases the worker and stops",
                 f"keeps at home   : checkpoints {', '.join(map(str, EXPECTED_STEPS))}; listening sets "
                 f"{', '.join(map(str, LISTENING_STEPS))} in {a.platter}",
             ]
@@ -555,7 +561,8 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
              f"{a.max_hours:g} h at most)" if getattr(a, "debug_pass", False)
              else f"max hours (all) : {a.max_hours} h"),
             (f"max attempts    : up to {DEBUG_MAX_RENTALS} rentals (a second only after a "
-             "confirmed host drop, inside the same cap, with its own hours; never a third)"
+             "confirmed host drop or a failed host qualification, inside the same cap, with "
+             "its own hours; never a third)"
              if getattr(a, "debug_pass", False)
              else f"max attempts    : {a.max_attempts} (every attempt counts, including a rental "
                   "that failed to start)"),

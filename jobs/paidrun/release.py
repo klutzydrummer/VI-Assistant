@@ -64,13 +64,16 @@ class ReleaseMixin:
         ssh diagnostics (bounded, DIAG_TIMEOUT_SECONDS) need the live worker and so come first;
         Vast's view, the spend and the debug-marker cleanup come after the destroy.
         r32 WP3: a rental that became INVALID by itself (cap, stalled) skips the ssh diagnostics
-        before the DELETE; its reason class is recorded in the attempt and the run's status."""
+        before the DELETE; its reason class is recorded in the attempt and the run's status.
+        r32 WP5: a host that failed qualification (outcome host-unqualified) skips them too."""
         self.in_teardown = True
         v = getattr(self, "validity", None)
         if v is not None and v.attempt is not None and v.attempt != (at or {}).get("n"):
             v = None  # another rental's (cannot happen today; never mix them up)
         self_invalid = v is not None and v.state == INVALID and v.reason in SELF_REASONS
-        if outcome not in ("done", "up-failed", "train-vanished") and not self_invalid:
+        # r32 WP5: an unqualified host is destroyed at once; its verdict line is the evidence
+        if outcome not in ("done", "up-failed", "train-vanished", "host-unqualified") \
+                and not self_invalid:
             self.fetch_diagnostics(at, outcome)
         ident = (at or {}).get("instance")
         down = ("cloud", "down", "--force", "--verify", *([str(ident)] if ident else []))

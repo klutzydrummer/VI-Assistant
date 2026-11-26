@@ -232,9 +232,9 @@ class StateMachine(unittest.TestCase):
 
 class Rental2Rules(unittest.TestCase):
     def test_rental2_eligibility_table(self):
-        # C.6: host-drop allows rental 2; stalled, our-failure and cap never; host-unqualified
-        # waits for the WP5 hook (False until D3 is decided)
-        want = {V.REASON_HOST_DROP: True, V.REASON_HOST_UNQUALIFIED: False,
+        # C.6 + D3 (WP5): host-drop and host-unqualified allow rental 2; stalled, our-failure
+        # and cap never
+        want = {V.REASON_HOST_DROP: True, V.REASON_HOST_UNQUALIFIED: True,
                 V.REASON_STALLED: False, V.REASON_OUR_FAILURE: False, V.REASON_CAP: False,
                 None: False, "anything-else": False}
         self.assertEqual(set(V.REASONS), set(want) - {None, "anything-else"})
@@ -245,15 +245,17 @@ class Rental2Rules(unittest.TestCase):
     def test_host_unqualified_follows_its_hook(self):
         orig = V.host_unqualified_allows_rental2
         try:
-            V.host_unqualified_allows_rental2 = lambda: True
-            self.assertTrue(V.rental2_allowed(V.REASON_HOST_UNQUALIFIED))
+            V.host_unqualified_allows_rental2 = lambda: False
+            self.assertFalse(V.rental2_allowed(V.REASON_HOST_UNQUALIFIED))
         finally:
             V.host_unqualified_allows_rental2 = orig
-        self.assertFalse(V.rental2_allowed(V.REASON_HOST_UNQUALIFIED))
+        self.assertTrue(V.host_unqualified_allows_rental2())
+        self.assertTrue(V.rental2_allowed(V.REASON_HOST_UNQUALIFIED))
 
     def test_outcome_reason_classes(self):
         self.assertEqual(V.reason_for_outcome("host-drop"), V.REASON_HOST_DROP)
         self.assertEqual(V.reason_for_outcome("worker-gate"), V.REASON_HOST_UNQUALIFIED)
+        self.assertEqual(V.reason_for_outcome("host-unqualified"), V.REASON_HOST_UNQUALIFIED)
         self.assertEqual(V.reason_for_outcome("train-failed"), V.REASON_OUR_FAILURE)
         for good in ("done", "debug-done", "orphan", "interrupted", "train-vanished"):
             self.assertIsNone(V.reason_for_outcome(good), good)

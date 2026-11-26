@@ -20,6 +20,10 @@ pub const VERIFY_SECS: u64 = 120;
 /// at most this often.
 const REDELETE_SECS: u64 = 30;
 
+/// With hosts to exclude, `offers_excluding` asks Vast for this many times the rows it will
+/// list, because the host filter can only be applied to the answer.
+const HOST_EXCLUDE_WIDEN: usize = 4;
+
 /// The outside world, so tests can fake time and ssh.
 pub trait Host {
     /// Unix seconds.
@@ -371,12 +375,28 @@ pub fn newest_hostkey_batch(log: &str, last: Option<u64>) -> Option<HostkeyBatch
 
 impl<V: Vast, H: Host> Cloud<V, H> {
     pub fn offers(&self, limit: usize) -> Result<Vec<Offer>> {
-        self.offers_excluding(limit, &[])
+        self.offers_excluding(limit, &[], &[])
     }
 
-    /// Like `offers`, but never lists the given machines.
-    pub fn offers_excluding(&self, limit: usize, machines: &[u64]) -> Result<Vec<Offer>> {
-        self.vast.offers(&self.cfg.offer_query(limit, machines))
+    /// Like `offers`, but never lists the given machines or hosts (r32 WP5: a host that failed
+    /// its qualification or dropped is not rented again in the same run). Machines go into the
+    /// Vast search itself. Vast documents no `host_id` search filter, so hosts are removed from
+    /// the answer here; the search then asks for more rows so the excluded ones do not use up
+    /// the `limit` slots. An offer without a host id is kept.
+    pub fn offers_excluding(
+        &self,
+        limit: usize,
+        machines: &[u64],
+        hosts: &[u64],
+    ) -> Result<Vec<Offer>> {
+        if hosts.is_empty() {
+            return self.vast.offers(&self.cfg.offer_query(limit, machines));
+        }
+        let wide = limit.saturating_mul(HOST_EXCLUDE_WIDEN).max(limit);
+        let mut list = self.vast.offers(&self.cfg.offer_query(wide, machines))?;
+        list.retain(|o| o.host_id.is_none_or(|h| !hosts.contains(&h)));
+        list.truncate(limit);
+        Ok(list)
     }
 
     /// Rents a worker (or reuses the one we have) and waits until ssh answers.
@@ -1487,6 +1507,54 @@ mod tests {
         let report = c.report().unwrap();
         assert_eq!(report.others.len(), 1);
         assert!(report.tracked.is_none());
+    }
+
+    #[test]
+    fn offers_excluding_skips_failed_machines_and_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_host = |id, machine, host, dph| Offer {
+            host_id: host,
+            ..offer(id, machine, dph)
+        };
+        let vast = FakeVast {
+            offers: vec![
+                on_host(1, 10, Some(500), 0.10), // the failed host, another machine
+                on_host(2, 20, Some(600), 0.12),
+                on_host(3, 30, None, 0.13), // no host id: kept
+                on_host(4, 40, Some(500), 0.14),
+                on_host(5, 50, Some(700), 0.15),
+            ],
+            ..FakeVast::default()
+        };
+        let host = FakeHost::default();
+        let c = cloud(&vast, &host, dir.path());
+
+        // Default: nothing excluded, the whole answer.
+        let all: Vec<u64> = c.offers(10).unwrap().iter().map(|o| o.id).collect();
+        assert_eq!(all, vec![1, 2, 3, 4, 5]);
+        // Every offer of host 500 is gone, the rest keep their order.
+        let ids: Vec<u64> = c
+            .offers_excluding(10, &[], &[500])
+            .unwrap()
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 5]);
+        // The limit counts what is listed after the host filter, not before it.
+        let ids: Vec<u64> = c
+            .offers_excluding(2, &[], &[500])
+            .unwrap()
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+        let ids: Vec<u64> = c
+            .offers_excluding(10, &[], &[500, 600, 700])
+            .unwrap()
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(ids, vec![3]);
     }
 
     #[test]

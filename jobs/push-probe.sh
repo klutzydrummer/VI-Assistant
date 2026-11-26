@@ -26,6 +26,15 @@
 # gate. Output, on stderr: one `push-probe: leg ...` line per leg, then one `push-probe: json {...}`
 # line, which jobs/paid_run.py copies into the debug summary.
 #
+#
+# r32 WP5 host-qualification gate. Two halves, both before any input is uploaded:
+#   download  `bash jobs/push-probe.sh host-qual`, run by jobs/paid_run.py from home right after
+#             ssh works, in every mode: host_qual_download below (a public download over 30 s).
+#   push      push_probe with VI_HOST_QUAL_GATE=1 (paid_run.py sets it, in a full run with
+#             VI_PUSH_PROBE=1 and VI_PUSH_PROBE_LEGS=a): leg a must reach the minimum push rate,
+#             or on-worker.sh ends with exit 75 before the uploads. This half is not fail-soft.
+# The thresholds come from jobs/paidrun/limits.py through the environment.
+#
 # The caller sets: probe_ssh (the command that runs one shell string on the worker: `bash -c` for
 # a local worker, else ssh with its own new connection), work (the worker's work folder), VI_OUT
 # (home's stage output, where vi-out lands) and worker_port (the worker's end of the tunnel).
@@ -126,6 +135,65 @@ probe_leg_b() {
   echo "push-probe: leg b $streams-streams: $(probe_rate "$got" $((t1 - t0))) MB/s in all ($got of $((each * streams)) bytes in $(((t1 - t0) / 1000)) s, $status; per stream ${per// /, } MB/s; limit $cap s)" >&2
 }
 
+# probe_down_script URLS SECONDS STOP_BYTES: the worker-side shell text that downloads each URL in
+# turn with curl (to /dev/null), all inside SECONDS together, and stops after the first one that
+# answers 200 with at least STOP_BYTES. One `push-probe-down URL http_code bytes seconds curl_rc`
+# line per try; a try cut off by the time limit (curl 28) still reports the bytes it got.
+probe_down_script() {
+  local urls=$1 secs=$2 stop=$3
+  printf '%s' "command -v curl >/dev/null 2>&1 || { echo 'push-probe-down none 0 0 0 no-curl'; exit 0; }
+end=\$((\$(date +%s) + $secs)); tried=
+for u in $urls; do
+  left=\$((end - \$(date +%s))); [ \$left -ge 5 ] || { [ -n \"\$tried\" ] || echo \"push-probe-down \$u 0 0 0 no-time\"; break; }; tried=1
+  r=\$(curl -sS -L -o /dev/null --max-time \$left -w '%{http_code} %{size_download} %{time_total}' \"\$u\" 2>/dev/null); rc=\$?; [ -n \"\$r\" ] || r='000 0 0'
+  echo \"push-probe-down \$u \$r \$rc\"
+  set -- \$r; [ \"\${1:-0}\" = 200 ] && [ \"\${2:-0}\" -ge $stop ] && break
+done"
+}
+
+# host_qual_download: r32 WP5's download half of the host-qualification gate, run from home right
+# after ssh works and before anything is uploaded (`push-probe.sh host-qual`). The worker
+# downloads a public test file for at most VI_HOST_QUAL_DOWNLOAD_SECONDS (30); the rate is the
+# bytes it got over the time it took, so a download cut off at the limit still counts. It passes
+# at VI_HOST_QUAL_MIN_DOWNLOAD_MB_S (decimal MB/s; jobs/paidrun/limits.py sets it) or more.
+# Fail-safe: no answer, no curl, a failed ssh or a hung call (killed 15 s after the window) all
+# fail. Prints one `VI-HOST-QUAL download pass|fail ...` line on stdout; returns 0 on pass, else 1.
+host_qual_download() {
+  local window min urls out rc=0
+  window=${VI_HOST_QUAL_DOWNLOAD_SECONDS:-30}
+  case $window in ''|*[!0-9]*|0) window=30 ;; esac
+  min=${VI_HOST_QUAL_MIN_DOWNLOAD_MB_S:-5}
+  urls=${VI_PUSH_PROBE_URLS-$PUSH_PROBE_URLS_DEFAULT}
+  # STOP_BYTES 1: stop at the first URL that answers at all, so the rate is measured on one file.
+  out=$(timeout -k 5 $((window + 15)) "${probe_ssh[@]}" "$(probe_down_script "$urls" "$window" 1)" 2>/dev/null) || rc=$?
+  python3 - "$min" "$rc" "$out" <<'PY'
+import sys
+need, rc, out = float(sys.argv[1]), sys.argv[2], sys.argv[3]
+best = None  # (mb_s, url, bytes, seconds, curl_rc)
+for line in out.splitlines():
+    parts = line.split()
+    if len(parts) < 6 or parts[0] != "push-probe-down" or parts[2] != "200":
+        continue
+    try:
+        size, secs = int(float(parts[3])), float(parts[4])
+    except ValueError:
+        continue
+    if size > 0 and secs > 0:
+        rate = size / secs / 1e6
+        if best is None or rate > best[0]:
+            best = (rate, parts[1], size, secs, parts[5])
+if best is None:
+    why = "no_curl" if "no-curl" in out else ("ssh_or_timeout_exit_" + rc if rc != "0" else "no_download")
+    print(f"VI-HOST-QUAL download fail mb_s=null min={need:g} bytes=0 seconds=0 url=none detail={why}")
+    sys.exit(1)
+rate, url, size, secs, crc = best
+verdict = "pass" if rate >= need else "fail"
+print(f"VI-HOST-QUAL download {verdict} mb_s={rate:.2f} min={need:g} bytes={size} "
+      f"seconds={secs:.2f} url={url} detail=curl_{crc}")
+sys.exit(0 if verdict == "pass" else 1)
+PY
+}
+
 probe_leg_c() {
   local up_bytes=$1 cap_d cap_u urls up_url q_work out rc down_line up_line
   urls=${VI_PUSH_PROBE_URLS-$PUSH_PROBE_URLS_DEFAULT}
@@ -139,14 +207,7 @@ probe_leg_c() {
   q_work=$(printf '%q' "$work")
   # Download: each URL in turn until one gives at least 50 MB (all inside cap_d together).
   rc=0
-  out=$(timeout -k 5 "$cap_d" "${probe_ssh[@]}" "command -v curl >/dev/null 2>&1 || { echo 'push-probe-down none 0 0 0 no-curl'; exit 0; }
-end=\$((\$(date +%s) + $cap_d - 5)); tried=
-for u in $urls; do
-  left=\$((end - \$(date +%s))); [ \$left -ge 5 ] || { [ -n \"\$tried\" ] || echo \"push-probe-down \$u 0 0 0 no-time\"; break; }; tried=1
-  r=\$(curl -sS -L -o /dev/null --max-time \$left -w '%{http_code} %{size_download} %{time_total}' \"\$u\" 2>/dev/null); rc=\$?; [ -n \"\$r\" ] || r='000 0 0'
-  echo \"push-probe-down \$u \$r \$rc\"
-  set -- \$r; [ \"\${1:-0}\" = 200 ] && [ \"\${2:-0}\" -ge 50000000 ] && break
-done" 2>/dev/null) || rc=$?
+  out=$(timeout -k 5 "$cap_d" "${probe_ssh[@]}" "$(probe_down_script "$urls" $((cap_d - 5)) 50000000)" 2>/dev/null) || rc=$?
   down_line=$(printf '%s\n' "$out" | grep -a '^push-probe-down' | tail -n1)
   # Killed at the leg's limit before curl reported: curl's own timeout code (28) stands for it.
   if [ -z "$down_line" ] && { [ "$rc" = 124 ] || [ "$rc" = 137 ]; }; then
@@ -218,8 +279,14 @@ print(f"push-probe: leg c public-curl: {text}", file=sys.stderr)
 PY
 }
 
-# push_probe: run the three legs and print the JSON line. Never fails (fail-soft).
+# push_probe: run the legs VI_PUSH_PROBE_LEGS asks for (default abc) and print the JSON line. On
+# its own it never fails (fail-soft). With VI_HOST_QUAL_GATE=1 (r32 WP5) it is also the push half
+# of the host-qualification gate: leg a must push at VI_HOST_QUAL_MIN_PUSH_MB_S or more, reported
+# as one `VI-HOST-QUAL push pass|fail ...` line. A slow push, a skipped leg a or a probe that could
+# not finish all fail the gate, and then push_probe ends the calling script (jobs/on-worker.sh)
+# with exit 75, before anything is uploaded.
 push_probe() {
+  local rc=0
   (
     set +e
     probe_total=${VI_PUSH_PROBE_SECONDS:-300}
@@ -231,13 +298,21 @@ push_probe() {
     case $bytes in ''|*[!0-9]*|0) bytes=$((200 * 1024 * 1024)) ;; esac
     up_bytes=${VI_PUSH_PROBE_UP_BYTES:-$((50 * 1024 * 1024))}
     case $up_bytes in ''|*[!0-9]*|0) up_bytes=$((50 * 1024 * 1024)) ;; esac
-    echo "push-probe: start (random bytes only; at most $probe_total s; a failed leg never stops the run)" >&2
-    probe_leg_a "$bytes"
-    probe_leg_b "$bytes" 4
-    probe_leg_c "$up_bytes"
-    python3 - "$probe_facts" "$probe_total" "$(( $(date +%s) - probe_start ))" <<'PY'
+    legs=${VI_PUSH_PROBE_LEGS:-abc}
+    gate=${VI_HOST_QUAL_GATE:-0}
+    if [ "$gate" = 1 ]; then
+      echo "push-probe: start (random bytes only; at most $probe_total s; legs $legs; leg a is the host-qualification push gate)" >&2
+    else
+      echo "push-probe: start (random bytes only; at most $probe_total s; a failed leg never stops the run)" >&2
+    fi
+    case $legs in *a*) probe_leg_a "$bytes" ;; esac
+    case $legs in *b*) probe_leg_b "$bytes" 4 ;; esac
+    case $legs in *c*) probe_leg_c "$up_bytes" ;; esac
+    python3 - "$probe_facts" "$probe_total" "$(( $(date +%s) - probe_start ))" "$legs" "$gate" \
+      "${VI_HOST_QUAL_MIN_PUSH_MB_S:-1}" <<'PY'
 import json, sys
 facts, cap, secs = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+asked, gate, min_push = sys.argv[4], sys.argv[5] == "1", float(sys.argv[6])
 legs = {}
 for line in open(facts):
     key, *items = line.split()
@@ -265,12 +340,50 @@ for line in open(facts):
         d["per_stream_mb_s"] = [d["per_stream_mb_s"]]
     legs[key] = d
 for key, name in (("a", "tunnel-rsync"), ("b", "4-streams"), ("c", "public-curl")):
-    legs.setdefault(key, dict(name=name, status="fail", detail="the leg left no result"))
+    if key in asked:
+        legs.setdefault(key, dict(name=name, status="fail", detail="the leg left no result"))
+    else:
+        legs.setdefault(key, dict(name=name, status="skip", detail="not_asked"))
 doc = dict(ran=True, cap_seconds=cap, seconds=secs, legs=legs,
            note="random synthetic bytes only; MB/s is decimal (1e6 bytes/s)")
 print("push-probe: json " + json.dumps(doc, sort_keys=True), file=sys.stderr)
+if gate:
+    a = legs["a"]
+    rate = a.get("mb_s")
+    verdict = "pass" if rate is not None and rate >= min_push else "fail"
+    print(f"VI-HOST-QUAL push {verdict} mb_s={'null' if rate is None else rate} min={min_push:g} "
+          f"bytes={a.get('bytes') or 0} seconds={a.get('seconds') or 0} "
+          f"detail=leg_a_{a.get('status')}", file=sys.stderr)
+    sys.exit(0 if verdict == "pass" else 75)
 PY
+    prc=$?
     rm -f "$probe_facts"
-  ) || echo "push-probe: the probe itself failed (exit $?); carrying on" >&2
+    exit "$prc"
+  ) || rc=$?
+  if [ "${VI_HOST_QUAL_GATE:-0}" = 1 ] && [ "$rc" != 0 ]; then
+    # Fail-safe: a probe that broke before judging leg a fails the gate too.
+    [ "$rc" = 75 ] || echo "VI-HOST-QUAL push fail mb_s=null min=${VI_HOST_QUAL_MIN_PUSH_MB_S:-1} bytes=0 seconds=0 detail=probe_failed_exit_$rc" >&2
+    echo "push-probe: the host failed the host-qualification push gate; nothing was uploaded (exit 75)" >&2
+    rm -rf "$VI_OUT/.push-probe"
+    exit 75
+  fi
+  [ "$rc" = 0 ] || echo "push-probe: the probe itself failed (exit $rc); carrying on" >&2
   return 0
 }
+
+# Standalone: `bash jobs/push-probe.sh host-qual` runs the download half of the gate against the
+# current rental through `vi cloud ssh` (VI_BIN overrides the vi binary). jobs/paid_run.py calls
+# it right after ssh works, in every mode. Exit 0: qualified; 1: not; 2: bad usage.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case ${1:-} in
+    host-qual)
+      probe_ssh=("${VI_BIN:-vi}" cloud ssh)
+      host_qual_download
+      exit $?
+      ;;
+    *)
+      echo "usage: bash jobs/push-probe.sh host-qual   (otherwise source it and call push_probe)" >&2
+      exit 2
+      ;;
+  esac
+fi

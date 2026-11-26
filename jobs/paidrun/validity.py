@@ -113,15 +113,16 @@ def effective_cap_seconds(wall_cap_s, dollar_cap=None, dph=None, storage_dph=0.0
 
 
 def host_unqualified_allows_rental2():
-    """WP5 / fork D3 hook: whether a failed host qualification may buy rental 2. Not decided
-    yet, so False (no automatic rental 2)."""
-    return False
+    """WP5 / fork D3 (decided): a failed host qualification may buy rental 2, like a confirmed
+    host drop. The failed host's host id and machine id are excluded from the next offer search,
+    and rental 2 stays inside DEBUG_MAX_RENTALS and the $ cap left."""
+    return True
 
 
 def rental2_allowed(reason):
     """C.6: whether an INVALID rental with this reason class may be followed by rental 2
-    (still bounded by DEBUG_MAX_RENTALS and the $ cap left). Only a confirmed host drop does;
-    stalled, our-failure and cap never; host-unqualified asks the WP5 hook."""
+    (still bounded by DEBUG_MAX_RENTALS and the $ cap left). A confirmed host drop and a failed
+    host qualification do (D3, through the WP5 hook); stalled, our-failure and cap never."""
     if reason == REASON_HOST_DROP:
         return True
     if reason == REASON_HOST_UNQUALIFIED:
@@ -134,6 +135,7 @@ def rental2_allowed(reason):
 # a worker that vanished without a confirmed host drop).
 OUTCOME_REASONS = {
     "host-drop": REASON_HOST_DROP,
+    "host-unqualified": REASON_HOST_UNQUALIFIED,
     "worker-gate": REASON_HOST_UNQUALIFIED,
     "up-failed": REASON_HOST_UNQUALIFIED,
     "preflight-failed": REASON_OUR_FAILURE,

@@ -143,7 +143,8 @@ impl Config {
 
     /// The Vast.ai offer search for these limits, cheapest first, skipping the
     /// machines in `exclude_machines` (Vast documents `machine_id` as a filter
-    /// field but lists no `host_id` filter, so hosts can't be excluded here).
+    /// field but lists no `host_id` filter, so hosts can't be excluded here;
+    /// `Cloud::offers_excluding` drops them from the answer instead).
     pub fn offer_query(&self, limit: usize, exclude_machines: &[u64]) -> Value {
         let s = &self.search;
         let mut q = json!({

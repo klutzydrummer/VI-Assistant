@@ -84,14 +84,16 @@ fn describe(o: &Offer) -> String {
     )
 }
 
-/// `vi cloud offers [--exclude-machine ID]...`. The machine filter goes into
-/// the Vast search itself, so excluded machines don't use up the ten slots.
+/// `vi cloud offers [--exclude-machine ID]... [--exclude-host ID]...`. The
+/// machine filter goes into the Vast search itself; hosts are dropped from its
+/// answer (Vast has no host filter). Either way excluded offers don't use up
+/// the ten slots.
 fn offers(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
-    let machines = match parse_exclusions(args) {
+    let (machines, hosts) = match parse_exclusions(args) {
         Ok(m) => m,
         Err(code) => return code,
     };
-    match c.offers_excluding(10, &machines) {
+    match c.offers_excluding(10, &machines, &hosts) {
         Ok(list) if list.is_empty() => {
             println!("no offers match; raise search.max_dph in the cloud config");
             ExitCode::SUCCESS
@@ -106,8 +108,11 @@ fn offers(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
     }
 }
 
-fn parse_exclusions(args: &[&str]) -> Result<Vec<u64>, ExitCode> {
+/// The `--exclude-machine` and `--exclude-host` ids, in that order (both may
+/// repeat; both default to none).
+fn parse_exclusions(args: &[&str]) -> Result<(Vec<u64>, Vec<u64>), ExitCode> {
     let mut machines = Vec::new();
+    let mut hosts = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match *arg {
@@ -119,13 +124,21 @@ fn parse_exclusions(args: &[&str]) -> Result<Vec<u64>, ExitCode> {
                     ))
                 }
             },
+            "--exclude-host" => match args.next().and_then(|v| v.parse().ok()) {
+                Some(id) => hosts.push(id),
+                None => {
+                    return Err(fail(
+                        "--exclude-host needs a host id from `vi cloud offers`",
+                    ))
+                }
+            },
             _ => {
                 eprintln!("{}", crate::USAGE);
                 return Err(ExitCode::from(2));
             }
         }
     }
-    Ok(machines)
+    Ok((machines, hosts))
 }
 
 /// Parse the approval Brandon gave this run: the most it may cost, and when it
@@ -619,9 +632,22 @@ mod tests {
     #[test]
     fn exclusions_repeat_and_reject_junk() {
         let m = parse_exclusions(&["--exclude-machine", "5", "--exclude-machine", "6"]).unwrap();
-        assert_eq!(m, vec![5, 6]);
+        assert_eq!(m, (vec![5, 6], vec![]));
+        let m = parse_exclusions(&[
+            "--exclude-host",
+            "55555",
+            "--exclude-machine",
+            "5",
+            "--exclude-host",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(m, (vec![5], vec![55555, 7]));
+        assert_eq!(parse_exclusions(&[]).unwrap(), (vec![], vec![]));
         assert!(parse_exclusions(&["--exclude-machine", "x"]).is_err());
         assert!(parse_exclusions(&["--exclude-machine"]).is_err());
+        assert!(parse_exclusions(&["--exclude-host", "x"]).is_err());
+        assert!(parse_exclusions(&["--exclude-host"]).is_err());
         assert!(parse_exclusions(&["--bogus"]).is_err());
     }
 }

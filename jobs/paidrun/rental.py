@@ -7,14 +7,19 @@ from pathlib import Path
 
 from paidrun.common import EXIT, Stop, StopRequested, clock, nap, rfc3339, say
 from paidrun.limits import (
-    FATAL_QUIET_SECONDS, INPLACE_MAX_RESTARTS, INPLACE_MAX_SECONDS, PREFLIGHT_TIMEOUT_SECONDS,
-    REATTACH_MAX, REATTACH_WAIT_SECONDS, UP_EXTRA_SECONDS,
+    FATAL_QUIET_SECONDS, HOST_QUAL_DOWNLOAD_SECONDS, HOST_QUAL_MIN_DOWNLOAD_MB_S,
+    HOST_QUAL_MIN_PUSH_MB_S, HOST_QUAL_TIMEOUT_SECONDS, INPLACE_MAX_RESTARTS, INPLACE_MAX_SECONDS,
+    PREFLIGHT_TIMEOUT_SECONDS, REATTACH_MAX, REATTACH_WAIT_SECONDS, UP_EXTRA_SECONDS,
 )
-from paidrun.signals import BOOT_FAIL_RE, failure_rc_text, gate_kind, parse_offers, retryable_gate
+from paidrun.signals import (
+    BOOT_FAIL_RE, failure_rc_text, gate_kind, parse_host_qual, parse_offers, retryable_gate,
+)
 from paidrun.config import config_boot_minutes, search_value
+from paidrun.validity import REASON_HOST_UNQUALIFIED, rental2_allowed
 
 
 INPLACE_MIN_DISK_GB = 5.0         # a worker with less free disk than this is treated as ENOSPC
+PUSH_PROBE_SH = Path(__file__).resolve().parents[1] / "push-probe.sh"  # r32 WP5 host-qual gate
 VRAM_FLOOR_STEP_GB = 4.0          # F-OOM-1: how much a memory failure raises the next offer's VRAM floor
 # Worker check for an in-place train restart, run through `vi cloud ssh`.
 INPLACE_SCRIPT = r"""
@@ -36,7 +41,10 @@ echo "inplace: ckpt=${ck:-none}"
 class RentalMixin:
     # ----- the flow ------------------------------------------------------------------------
     def choose_offer(self, hours_left, cap_left):
+        # r32 WP5: failed machines and hosts are left out of the search itself (hosts are
+        # filtered by `vi cloud offers`, Vast has no host filter); failed() below re-checks.
         excl = [x for m in self.s["failed_machines"] for x in ("--exclude-machine", str(m))]
+        excl += [x for h in self.s["failed_hosts"] for x in ("--exclude-host", str(h))]
         rc, out = self.vi_cmd("cloud", "offers", *excl)
         if rc != 0:
             raise Stop(EXIT["up"], f"`vi cloud offers` failed:\n{out.strip()}")
@@ -67,6 +75,74 @@ class RentalMixin:
                        f"{hours_left:.2f} h (cheapest is ${cheapest['dph']:.3f}/hr, worst case "
                        f"${cheapest['dph'] * hours_left:.2f})")
         return affordable[0]
+
+    # ----- r32 WP5: host qualification ----------------------------------------------------
+    def host_qual_env(self):
+        """The thresholds jobs/push-probe.sh reads, from paidrun.limits."""
+        return {"VI_HOST_QUAL_MIN_DOWNLOAD_MB_S": f"{HOST_QUAL_MIN_DOWNLOAD_MB_S:g}",
+                "VI_HOST_QUAL_DOWNLOAD_SECONDS": str(HOST_QUAL_DOWNLOAD_SECONDS),
+                "VI_HOST_QUAL_MIN_PUSH_MB_S": f"{HOST_QUAL_MIN_PUSH_MB_S:g}"}
+
+    def host_qual_plan_line(self):
+        return ("host gate       : right after ssh works, before any upload: a public download "
+                f"of at least {HOST_QUAL_MIN_DOWNLOAD_MB_S:g} MB/s over "
+                f"{HOST_QUAL_DOWNLOAD_SECONDS} s (jobs/push-probe.sh host-qual), then a return "
+                f"push of at least {HOST_QUAL_MIN_PUSH_MB_S:g} MB/s (the push probe's leg a, "
+                "before the uploads); a fail or a probe that cannot run is INVALID "
+                "(host-unqualified): the worker is destroyed and its host and machine are "
+                "excluded from the next search")
+
+    def host_qualify(self, at):
+        """The download half of the host-qualification gate, right after ssh works and before
+        anything is uploaded, in every mode: `bash jobs/push-probe.sh host-qual` has the worker
+        download a public test file for 30 s. Returns None when the host qualifies, else why
+        not. Fail-safe: a probe that cannot start, times out, exits non-zero or prints no
+        verdict counts as unqualified."""
+        self.set_phase(at, "host-qual")
+        saved = getattr(self, "extra_env", {})
+        self.extra_env = {**saved, "VI_BIN": str(self.vi), **self.host_qual_env()}
+        try:
+            rc, out = self.run(["bash", str(PUSH_PROBE_SH), "host-qual"], stream=False,
+                               timeout=HOST_QUAL_TIMEOUT_SECONDS)
+        except OSError as e:
+            rc, out = 127, f"the host-qualification probe could not start: {e}"
+        finally:
+            self.extra_env = saved
+        verdict, rest = parse_host_qual(out).get("download", (None, ""))
+        at["host_qual"] = dict(download=verdict or "none", detail=rest[:300], rc=rc)
+        self.save()
+        if rc == 0 and verdict == "pass":
+            say(f"host qualification: download passed ({rest})")
+            return None
+        if verdict:
+            why = f"public download under {HOST_QUAL_MIN_DOWNLOAD_MB_S:g} MB/s ({rest})"
+        elif self.timed_out:
+            why = f"the download probe did not finish in {HOST_QUAL_TIMEOUT_SECONDS} s"
+        else:
+            last = (out or "").strip().splitlines()[-1:] or ["no output"]
+            why = f"the download probe gave no verdict (exit {rc}: {last[0][:200]})"
+        return why
+
+    def mark_unqualified(self, at, why, half):
+        """Record INVALID(host-unqualified) for this rental (the first reason wins)."""
+        v = self.current_validity()
+        if v is not None:
+            v.invalidate(REASON_HOST_UNQUALIFIED, f"{half}: {why}")
+            self.record_validity(v)
+        at.setdefault("host_qual", {})[half] = "fail"
+        self.save()
+
+    def host_unqualified(self, at, offer_id, why, half="download"):
+        """INVALID(host-unqualified): record it, never rent this host or machine again in this
+        run, and release (destroy + verify, through the usual release path). Returns the spend."""
+        self.mark_unqualified(at, why, half)
+        say(f"offer {offer_id} failed host qualification ({half}): {why}")
+        if offer_id is not None and offer_id not in self.s["failed_offers"]:
+            self.s["failed_offers"].append(offer_id)
+        if at.get("sig") is not None:
+            self.s["failed_sigs"].append(at["sig"])
+        self.mark_machine(at, host_too=True)
+        return self.release(at, "host-unqualified")
 
     # ----- failed machines and memory floors ----------------------------------------------
     def mark_machine(self, at, host_too=False):
@@ -242,11 +318,41 @@ class RentalMixin:
                     self.release(at, "up-failed")
                     at = None
                     continue
+                # r32 WP5: qualify the host before anything is uploaded
+                why = self.host_qualify(at)
+                if why:
+                    spent = self.host_unqualified(at, offer["id"], why)
+                    say(f"attempt {n} cost ${spent:.2f}; total ${self.s['spent_total']:.2f} "
+                        f"of ${a.cap:.2f}, {self.s['hours_total']:.2f} of {a.max_hours} h")
+                    if not rental2_allowed(REASON_HOST_UNQUALIFIED):
+                        raise Stop(EXIT["preflight"], f"the host failed qualification: {why}")
+                    at = None
+                    continue
                 self.set_phase(at, "preflight")
                 quiet = float(os.environ.get("PAID_RUN_FATAL_QUIET_SECONDS", FATAL_QUIET_SECONDS))
-                rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"],
-                                   watch=True, timeout=PREFLIGHT_TIMEOUT_SECONDS, fatal_quiet=quiet)
+                # the push half of the gate: on-worker.sh runs the probe's leg a after its own
+                # preflight and stops (exit 75) before the uploads when the push is too slow
+                saved_env = getattr(self, "extra_env", {})
+                self.extra_env = {**saved_env, "VI_PUSH_PROBE": "1", "VI_HOST_QUAL_GATE": "1",
+                                  "VI_PUSH_PROBE_LEGS": "a", **self.host_qual_env()}
+                try:
+                    rc, out = self.run([self.vi, "dataset", "run", a.stages, "omnivoice_preflight"],
+                                       watch=True, timeout=PREFLIGHT_TIMEOUT_SECONDS,
+                                       fatal_quiet=quiet)
+                finally:
+                    self.extra_env = saved_env
                 fatal = self.fatal_stopped  # release() runs other commands, which reset it
+                push = parse_host_qual(out).get("push")
+                if rc != 0 and push and push[0] == "fail":
+                    spent = self.host_unqualified(
+                        at, offer["id"], f"return push under {HOST_QUAL_MIN_PUSH_MB_S:g} MB/s "
+                        f"({push[1]})", half="push")
+                    say(f"attempt {n} cost ${spent:.2f}; total ${self.s['spent_total']:.2f} "
+                        f"of ${a.cap:.2f}, {self.s['hours_total']:.2f} of {a.max_hours} h")
+                    if not rental2_allowed(REASON_HOST_UNQUALIFIED):
+                        raise Stop(EXIT["preflight"], "the host failed the push qualification")
+                    at = None
+                    continue
                 if rc != 0 and fatal:
                     self.release(at, "preflight-failed")
                     raise Stop(EXIT["preflight"], "the preflight printed a fatal line ("
@@ -272,6 +378,9 @@ class RentalMixin:
                     # A2: name a host drop as one (the full run never rents again for it)
                     dropped, drop_text = (False, None) if self.timed_out else \
                         self.host_drop(at, rc, out)
+                    if dropped:
+                        # r32 WP5: a dropped host is never offered again in this run either
+                        self.mark_machine(at, host_too=True)
                     self.release(at, "host-drop" if dropped else "preflight-failed")
                     if dropped:
                         raise Stop(EXIT["preflight"], f"the preflight lost its worker: {drop_text}; "

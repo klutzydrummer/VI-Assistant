@@ -336,3 +336,18 @@ def debug_excerpt_keep(lines, n=12):
     key = [x for x in lines if x.startswith("key: ")]
     rest = [x for x in lines if not x.startswith("key: ")]
     return key + rest[-n:]
+
+
+# r32 WP5: jobs/push-probe.sh's host-qualification verdicts, one line per half:
+# `VI-HOST-QUAL download|push pass|fail mb_s=... min=... ...`.
+HOST_QUAL_RE = re.compile(r"VI-HOST-QUAL (download|push) (pass|fail)\b(.*)$")
+
+
+def parse_host_qual(text):
+    """{half: (verdict, rest of the line)} from the last VI-HOST-QUAL line of each half."""
+    found = {}
+    for line in (text or "").splitlines():
+        m = HOST_QUAL_RE.search(line)
+        if m:
+            found[m.group(1)] = (m.group(2), m.group(3).strip())
+    return found

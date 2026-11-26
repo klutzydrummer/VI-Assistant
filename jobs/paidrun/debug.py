@@ -13,10 +13,10 @@ from paidrun.limits import (
     VERIFY_EPOCH_TIMEOUT_SECONDS,
 )
 from paidrun.signals import (
-    debug_excerpt_keep, debug_run_key, failure_rc_text, parse_debug_output, parse_push_probe,
-    push_probe_lines,
+    debug_excerpt_keep, debug_run_key, failure_rc_text, parse_debug_output, parse_host_qual,
+    parse_push_probe, push_probe_lines,
 )
-from paidrun.validity import INVALID, REASON_HOST_DROP, rental2_allowed
+from paidrun.validity import INVALID, REASON_HOST_DROP, REASON_HOST_UNQUALIFIED, rental2_allowed
 from paidrun.config import DEBUG_MAX_RENTALS, DEBUG_STAGE, config_boot_minutes, stage_settings
 
 
@@ -96,7 +96,9 @@ class DebugMixin:
                           "VI_HOURS_LEFT": f"{max(left_s, 60) / 3600:.2f}",
                           "VI_DEBUG_PASS": "1", "VI_DEBUG_ROWS": str(self.a.debug_rows),
                           # r21: give up on a lost worker after 5 min, not r9's 30
-                          "VI_LOST_MINUTES": str(DEBUG_LOST_MINUTES)}
+                          "VI_LOST_MINUTES": str(DEBUG_LOST_MINUTES),
+                          # r32 WP5: the probe's leg a is the push half of the host gate
+                          "VI_HOST_QUAL_GATE": "1", **self.host_qual_env()}
         self.set_phase(at, "debug")
         rc, out = self.run([self.vi, "dataset", "run", self.a.stages, DEBUG_STAGE, "--force"],
                            watch=True, timeout=limit)
@@ -106,11 +108,20 @@ class DebugMixin:
             say(ln.strip())
         found = parse_debug_output(out)
         tail = [ln for ln in out.strip().splitlines() if "debug-pass:" not in ln][-10:]
+        push = parse_host_qual(out).get("push")
+        if push and push[0] == "fail" and 3 not in found:
+            # r32 WP5: on-worker.sh stopped before the upload (exit 75); stages 4-11 depend on 3
+            why = f"return push too slow ({push[1]})"
+            self.mark_unqualified(at, why, "push")
+            self.unqualified = why
+            self.debug_record(3, "HOST-UNQUALIFIED", f"({why}; nothing was uploaded)", tail)
         drop = None
         for n in range(3, 12):
             if n in found:
                 res, detail, ex = found[n]
                 self.debug_record(n, res, detail, ex)
+            elif n in self.debug:
+                continue
             elif self.debug_gate(n):
                 # Its prerequisites passed, yet no line: the worker stage stopped or was cut off
                 # first (for stage 3: on-worker.sh never started debug-pass.sh, e.g. the return
@@ -198,12 +209,15 @@ class DebugMixin:
             (self.dir / "debug-worker-summary.json").write_bytes((out / "summary.json").read_bytes())
 
     def rental_reason(self):
-        """The open rental's INVALID reason class. A confirmed host drop (debug_rent_and_run
-        returned its text) always set INVALID(host-drop) through host_drop()."""
+        """The open rental's INVALID reason class. A confirmed host drop always set
+        INVALID(host-drop) through host_drop(), and a failed host qualification
+        INVALID(host-unqualified) through mark_unqualified()."""
         v = getattr(self, "validity", None)
         if v is not None and v.state == INVALID:
             return v.reason
-        return REASON_HOST_DROP if self.dropped else None
+        if self.dropped:
+            return REASON_HOST_DROP
+        return REASON_HOST_UNQUALIFIED if getattr(self, "unqualified", None) else None
 
     def debug_write_summary(self):
         rows = [self.debug.get(n) or dict(stage=n, name=DEBUG_NAMES[n], result="FAIL",
@@ -266,12 +280,14 @@ class DebugMixin:
         return rows
 
     def debug_rent_and_run(self, n):
-        """One debug rental (attempt n): offer -> up -> stages 1-11. Returns the HOST-DROP text
-        when a confirmed host drop (A2) cut it short, else None. The worker is left up. r21: each
+        """One debug rental (attempt n): offer -> up -> host qualification -> stages 1-11.
+        Returns the rental's INVALID reason class (host-drop for a confirmed host drop (A2),
+        host-unqualified for a failed WP5 gate, ...), else None. The worker is left up. r21: each
         rental gets its own --max-hours; only the $ cap is shared, so the offer must fit
         $/hr x max_hours inside the cap left."""
         a = self.a
         self.dropped = None
+        self.unqualified = None
         cap_left, hours_left = self.remaining()[0], a.max_hours
         say(f"===== debug pass rental {n} at {rfc3339(clock())}: ${cap_left:.2f}, "
             f"{hours_left:.2f} h left =====")
@@ -297,23 +313,34 @@ class DebugMixin:
                               f"{', boot timed out' if self.timed_out else ''})",
                               out.strip().splitlines()[-8:])
         else:
-            self.debug_record(0, "PASS", f"(offer {offer['id']} at ${offer['dph']:.3f}/hr"
-                              f"{f', instance {m.group(1)}' if m else ''})")
-            self.set_phase(at, "debug")
-            self.debug_probe()
-            if not self.dropped:  # after a drop in 1-2 the worker stages cannot reach it either
-                self.debug_worker_stages(at)
+            inst = f", instance {m.group(1)}" if m else ""
+            # r32 WP5: qualify the host before anything else runs on it or is uploaded to it
+            why = self.host_qualify(at)
+            if why:
+                self.mark_unqualified(at, why, "download")
+                self.unqualified = why
+                self.debug_record(0, "HOST-UNQUALIFIED", f"(offer {offer['id']} at "
+                                  f"${offer['dph']:.3f}/hr{inst}: {why}; nothing was uploaded)")
+            else:
+                self.debug_record(0, "PASS", f"(offer {offer['id']} at ${offer['dph']:.3f}/hr"
+                                  f"{inst}; host qualified)")
+                self.set_phase(at, "debug")
+                self.debug_probe()
+                if not self.dropped:  # after a drop in 1-2 the worker stages cannot reach it
+                    self.debug_worker_stages(at)
         for k in range(1, 12):
             if k not in self.debug:
                 self.debug_gate(k)
-        return self.dropped
+        return self.rental_reason()
 
     def execute_debug(self):
         """Stages 1-12, each tried; the worker is always released (stage 12). One rental, plus
-        ONE more only after a confirmed host drop (C), inside the same $ cap; each rental has its
-        own --max-hours (r21)."""
+        ONE more only when rental2_allowed says so for rental 1's INVALID reason (a confirmed
+        host drop (C) or a failed host qualification (WP5/D3)), inside the same $ cap; each rental
+        has its own --max-hours (r21)."""
         self.debug = {}
         self.dropped = None
+        self.unqualified = None
         self.debug_note = None
         self.push_probe = None
         failure = None
@@ -328,24 +355,32 @@ class DebugMixin:
                 self.save()
             if self.stop_file.exists():
                 raise StopRequested("stop requested; nothing was rented")
-            if self.debug_rent_and_run(1) and rental2_allowed(self.rental_reason()):
-                # C/C.6: a confirmed host drop on rental 1 -> evidence, release, then at most one
-                # more. rental2_allowed is True for host-drop only (stalled, our-failure and cap
-                # never; host-unqualified waits for WP5)
+            reason = self.debug_rent_and_run(1)
+            if reason and rental2_allowed(reason):
+                # C/C.6: rental 1 INVALID for a reason that allows it -> evidence, release, then
+                # at most one more. rental2_allowed: host-drop and host-unqualified (D3) yes;
+                # stalled, our-failure and cap never. The failed host and machine ids are
+                # excluded from the next search.
+                what = "the host drop" if reason == REASON_HOST_DROP else \
+                    "the failed host qualification"
                 at = self.open_attempt()
                 at["debug_stages"] = [self.debug[k] for k in sorted(self.debug)]
-                self.s["failed_offers"].append(at["offer"])
+                if at["offer"] not in self.s["failed_offers"]:
+                    self.s["failed_offers"].append(at["offer"])
                 self.s["failed_sigs"].append(at["sig"])
                 self.mark_machine(at, host_too=True)
-                spent = self.release(at, "host-drop")
-                say(f"rental 1 released after the host drop: ${spent or 0:.2f} spent; total "
+                spent = self.release(at, reason)
+                say(f"rental 1 released after {what}: ${spent or 0:.2f} spent; total "
                     f"${self.s['spent_total']:.2f} of ${self.s['cap']:.2f}")
                 if self.stop_file.exists():
-                    self.debug_note = "stop requested after the host drop; no second rental"
+                    self.debug_note = f"stop requested after {what}; no second rental"
                 else:
                     try:
-                        if self.debug_rent_and_run(DEBUG_MAX_RENTALS):
-                            self.debug_note = (f"rental {DEBUG_MAX_RENTALS} also lost its host; a "
+                        again = self.debug_rent_and_run(DEBUG_MAX_RENTALS)
+                        if again and rental2_allowed(again):
+                            lost = "also lost its host" if again == REASON_HOST_DROP else \
+                                "also failed host qualification"
+                            self.debug_note = (f"rental {DEBUG_MAX_RENTALS} {lost}; a "
                                                f"debug pass rents at most {DEBUG_MAX_RENTALS} "
                                                "workers, so there is no third")
                     except Stop as e:
@@ -369,6 +404,7 @@ class DebugMixin:
                         at["debug_stages"] = [self.debug[k] for k in sorted(self.debug)]
                     bad = any(r["result"] != "PASS" for r in self.debug.values())
                     outcome = ("host-drop" if self.dropped else
+                               "host-unqualified" if self.unqualified else
                                "debug-failed" if bad or failure is not None else "debug-done")
                     spent = self.release(at, outcome)
                     self.debug_record(12, "PASS", f"(worker released; ${spent or 0:.2f} spent)")
