@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 JOBS = REPO / "jobs"
 
-EXPECTED_TESTS = 853
+EXPECTED_TESTS = 863
 
 SHARDS = {
     # 283 s on a CI runner
@@ -41,7 +41,8 @@ SHARDS = {
           "test_fusion", "test_progress", "test_ft_guards", "test_voicetune",
           "test_bundle_ids", "test_buildset", "test_checks", "test_qtcheck", "test_progress_counters",
           "test_deadman_heartbeat",
-          "test_clean", "test_label", "test_push_probe", "test_bg_watch", "test_parallel_push"],
+          "test_clean", "test_label", "test_push_probe", "test_bg_watch", "test_parallel_push",
+          "test_push_progress"],
 }
 
 # Skips each shard reports on a GitHub ubuntu-latest runner (23 in total; the 21 seen on a

@@ -1206,15 +1206,51 @@ class DriverScript(unittest.TestCase):
         self.assertIn("stage 3 upload: running (limit 60 s", self.output)
 
     def test_f2_stage9_limit_comes_from_the_measured_push_rate(self):
-        # checkpoint-5 of 2 GB (sparse) at the preflight's 1.0 MB/s x 2.0 parallel speedup: 1.5 x 2e9 / 2e6 = 1500 s
+        # checkpoint-5 of 2 GB (sparse) at the preflight's 1.0 MB/s. The parallel speedup through
+        # the one tunnel is unmeasured, so it defaults to 1.0: 1.5 x 2e9 / 1e6 = 3000 s.
         ck = self.probe_run / "checkpoint-5"
         ck.mkdir(parents=True)
         with open(ck / "model.safetensors", "wb") as f:
             f.truncate(2 * 10**9)
         (self.out / "preflight.json").write_text(json.dumps({"push_mb_s": "1.0"}))
         self.run_driver("9", needs='NEEDS=([9]="")')
-        self.assertIn("stage 9 ckpt-push: running (limit 1500 s", self.output)
+        self.assertIn("stage 9 ckpt-push: running (limit 3000 s", self.output)
         self.assertIn("1.0 MB/s", self.output)
+        self.assertIn("x 1.0 parallel-stream speedup", self.output)
+        # a measured speedup of 2.0 (set after the next debug pass) halves it
+        self.run_driver("9", needs='NEEDS=([9]="")', VI_PUSH_SPEEDUP="2.0")
+        self.assertIn("stage 9 ckpt-push: running (limit 1500 s", self.output)
+
+    def test_stage9_holds_the_push_lock_and_pid_while_it_pushes(self):
+        # W16b part 1 (task 15 finding 1): on-worker.sh's poller starts a publish push loop when
+        # VI-PUSH reads 0 (push.pid missing or dead) and push.lock is free. While stage 9 pushes,
+        # both must say "a push is running"; both are cleared when it is over.
+        self.fake_venv("exit 0")
+        ck = self.probe_run / "checkpoint-5"
+        ck.mkdir(parents=True)
+        (ck / "model.safetensors").write_bytes(b"x" * 1000)
+        (ck / "SHA256SUMS").write_text("")
+        seen = self.tmp / "seen"
+        stub = self.jobs / "worker-return.sh"
+        stub.write_text(f"""#!/bin/bash
+# stands in for the real push: records what the poller would see while it runs
+pid=$(cat {self.work}/push.pid 2>/dev/null)
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "pid-alive" >> {seen}; fi
+if ! flock -n {self.work}/push.lock true 2>/dev/null; then echo "lock-held" >> {seen}; fi
+cat {self.work}/push.total >> {seen}; echo >> {seen}
+exit 0
+""")
+        stub.chmod(0o755)
+        res = self.run_driver("9", needs='NEEDS=([9]="")', VI_WEIGHTS_FIRST="0")
+        self.assertEqual(res[9]["result"], "PASS", self.output)
+        text = seen.read_text()
+        self.assertIn("pid-alive", text)
+        self.assertIn("lock-held", text)
+        self.assertRegex(text, r"\n?\d{4,}\n")  # push.total: the bytes pushed
+        self.assertFalse((self.work / "push.pid").exists(), "push.pid left behind")
+        # the poller's two tests now say "nothing running" again
+        r = subprocess.run(["flock", "-n", str(self.work / "push.lock"), "true"])
+        self.assertEqual(r.returncode, 0)
 
     def test_f2_stage9_limit_has_a_600_s_floor_and_falls_back_without_a_rate(self):
         ck = self.probe_run / "checkpoint-5"

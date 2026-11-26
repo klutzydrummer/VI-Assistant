@@ -261,6 +261,17 @@ stage_9() {
   [ -d "$probe_publish/checkpoint-5" ] || { echo "checkpoint-5 was not published" >&2; exit 1; }
   local bytes t0 t1
   bytes=$(du -sb "$probe_publish" | cut -f1)
+  # Hold the push lock and push.pid while this push runs, so on-worker.sh's poller (VI-PUSH 0 and
+  # a free lock) does not start a second publish push loop beside it (dbg8 started 25). A lock
+  # that is already held means a real push loop is running; then this stage still pushes.
+  exec 8>>"$work/push.lock"
+  if flock -n 8; then
+    echo $$ >"$work/push.pid"
+    trap 'rm -f "$work/push.pid"' EXIT
+  else
+    echo "debug-pass: stage 9: $work/push.lock is held by another push loop; pushing anyway" >&2
+  fi
+  echo "$bytes" >"$work/push.total"
   t0=$(date +%s)
   push_publish "$probe_publish"
   t1=$(date +%s)
@@ -350,10 +361,13 @@ if [ -n "${VI_HOURS_LEFT:-}" ]; then
 fi
 
 # Stage 9's limit: 1.5 x the checkpoint's bytes at the expected push rate, >= 600 s. The measured
-# preflight rate is a single stream (2.6 MB/s in dbg8); the push now runs VI_PUSH_STREAMS (4)
-# parallel chunk streams, which reached 6.84 MB/s in the probe (about 2.6x), so the expected rate
-# is the measured one x VI_PUSH_SPEEDUP (default 2.0, deliberately under the observed 2.6x, and
-# never above the stream count). 1.5x margin on top, still clipped by the rental deadline below.
+# preflight rate is a single stream (2.6 MB/s in dbg8). The push runs VI_PUSH_STREAMS (4) parallel
+# chunk streams through the ONE reverse ssh tunnel, and nobody has measured what that gains: the
+# probe's 6.84 MB/s (leg b of jobs/push-probe.sh) used four SEPARATE ssh connections, which the
+# tunnel does not have. So VI_PUSH_SPEEDUP defaults to 1.0 (the old single-stream basis). The next
+# debug pass should measure the real rate (the "received home" lines and the stage-9 seconds);
+# set VI_PUSH_SPEEDUP to that ratio (never above the stream count) to shorten the limit. 1.5x
+# margin on top, still clipped by the rental deadline below.
 # Sets limit and prints how it was found.
 stage9_limit() {
   local bytes rate
@@ -369,7 +383,7 @@ print(r if r > 0 else "")' "$VI_OUT/preflight.json" 2>/dev/null || true)
     echo "debug-pass: stage 9 limit stays ${limit} s (no checkpoint-5 size or no measured push rate)"
     return
   fi
-  local streams=${VI_PUSH_STREAMS:-4} speedup=${VI_PUSH_SPEEDUP:-2.0}
+  local streams=${VI_PUSH_STREAMS:-4} speedup=${VI_PUSH_SPEEDUP:-1.0}
   case $streams in ''|*[!0-9]*|0) streams=4 ;; esac
   limit=$(awk -v b="$bytes" -v r="$rate" -v sp="$speedup" -v n="$streams" 'BEGIN {
     if (sp !~ /^[0-9]*\.?[0-9]+$/ || sp < 1) sp = 1

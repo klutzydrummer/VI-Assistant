@@ -94,6 +94,18 @@ case $upload_limit in ''|*[!0-9]*) upload_limit=30 ;; esac
 
 poll_seconds=${VI_POLL_SECONDS:-30}
 lost_limit=$(( ${VI_LOST_MINUTES:-30} * 60 ))
+# Early host-drop check: after VI_EARLY_DROP_SECONDS (default 75) of polls failing with "Connection
+# refused", run VI_GONE_CHECK_CMD ONCE per outage (paid_run.py sets it to a read-only Vast status
+# check, jobs/paidrun/vast_gone_check.py: exit 0 = Vast says the instance is gone). Gone ends the
+# stage the same way the lost_limit give-up does (nothing is rented again, nothing more is spent);
+# anything else keeps waiting up to lost_limit as before. 0 or no command turns it off. A blip
+# shorter than the threshold never asks Vast. dbg8 lost its host at 22:00:47Z and waited 5 min.
+early_drop_seconds=${VI_EARLY_DROP_SECONDS:-75}
+case $early_drop_seconds in ''|*[!0-9]*) early_drop_seconds=75 ;; esac
+# While a push runs, print how many bytes reached home every VI_PUSH_PROGRESS_SECONDS (default 60).
+push_progress_seconds=${VI_PUSH_PROGRESS_SECONDS:-60}
+case $push_progress_seconds in ''|*[!0-9]*|0) push_progress_seconds=60 ;; esac
+last_push_note=0
 # hs_loop's cap on one return-path proof, so the lost-time check and the endpoint refresh keep
 # running while the host is unreachable. VI_PROVE_CAP_SECONDS overrides it (tests use 2).
 prove_cap=${VI_PROVE_CAP_SECONDS:-60}
@@ -860,6 +872,7 @@ echo VI-JOB-RC \"\$(cat rc 2>/dev/null)\"
 echo VI-TRAIN \$( [ -s train.pid ] && kill -0 \"\$(cat train.pid 2>/dev/null)\" 2>/dev/null && echo 1 || echo 0 )
 echo VI-LOCK \$( [ -e job.lock ] && ! flock -n job.lock true 2>/dev/null && echo 1 || echo 0 )
 echo VI-PUSH \$( [ -s push.pid ] && kill -0 \"\$(cat push.pid 2>/dev/null)\" 2>/dev/null && echo 1 || echo 0 )
+echo VI-PUSH-TOTAL \"\$(cat push.total 2>/dev/null)\"
 echo VI-ACKED \"\$(ls acked 2>/dev/null | tr '\n' ' ')\"
 echo VI-PENDING \"\$(ls pending 2>/dev/null | tr '\n' ' ')\"
 echo VI-REPUSH \"\$(ls repush 2>/dev/null | tr '\n' ' ')\"
@@ -1082,6 +1095,40 @@ need_proof=1
 proven_port=
 rotations=0
 
+# push_progress_note: while a push holds push.pid (VI-PUSH 1), tell how much of it is home, from
+# the durable receive dir (jobs/push_progress.py) and the worker's push.total when known. In a
+# debug pass it reads as the stage's status line.
+push_progress_note() {
+  [ -n "$durable" ] && [ -d "$durable" ] && [ "$(sv VI-PUSH)" = 1 ] || return 0
+  [ $(( $(date +%s) - last_push_note )) -ge "$push_progress_seconds" ] || return 0
+  last_push_note=$(date +%s)
+  local total line
+  total=$(sv VI-PUSH-TOTAL)
+  case $total in ''|*[!0-9]*) total=0 ;; esac
+  line=$(python3 -I "$jobs_dir/push_progress.py" "$durable" "$total" 2>/dev/null) || return 0
+  if [ "${VI_DEBUG_PASS:-}" = 1 ]; then
+    echo "debug-pass: stage 9 ckpt-push: still running ($line)" >&2
+  else
+    echo "on-worker.sh: push progress: $line" >&2
+  fi
+}
+
+# early_drop_check ELAPSED: see early_drop_seconds. Returns 0 when Vast says the instance is gone.
+early_drop_checked=0
+early_drop_check() {
+  [ "$early_drop_checked" = 0 ] || return 1
+  [ "$1" -ge "$early_drop_seconds" ] && [ "$early_drop_seconds" -gt 0 ] || return 1
+  [ -n "${VI_GONE_CHECK_CMD:-}" ] || return 1
+  [ "$VI_WORKER_HOST" != local ] || return 1
+  # poll.err is the last poll's ssh stderr; the tunnel loop retries every 10 s, so the last few
+  # lines of tunnel.log are recent (older outages' lines are further up).
+  { grep -qs "Connection refused" "$return_state/poll.err" ||
+    tail -n 5 "$return_state/tunnel.log" 2>/dev/null | grep -q "Connection refused"; } || return 1
+  early_drop_checked=1
+  echo "on-worker.sh: the worker has refused connections for ${1}s; asking Vast once (read-only) whether the instance is gone" >&2
+  timeout -k 5 90 bash -c "$VI_GONE_CHECK_CMD" </dev/null >&2
+}
+
 hs_loop() {
   local offset now failed rp elapsed last_wd=0 last_refresh=0 lost_since=0 prove_budget prove_left
   local gate_paused=0 alerted_bad= rot_rc=0 progress=none progress_fresh=1 stall_why=
@@ -1149,7 +1196,9 @@ hs_loop() {
       case $offset in ''|*[!0-9]*) offset=0 ;; esac
       if poll_worker "$offset"; then
         lost_since=0
+        early_drop_checked=0
         render_log
+        push_progress_note
         progress=$(note_progress "$offset" "$progress_fresh")
         progress_fresh=0
 
@@ -1253,6 +1302,12 @@ hs_loop() {
     [ "$lost_since" -eq 0 ] && lost_since=$now
     elapsed=$(( $(date +%s) - lost_since ))
     echo "on-worker.sh: poll failed; will retry (lost for ${elapsed}s)" >&2
+    if early_drop_check "$elapsed"; then
+      echo "on-worker.sh: Vast says the instance is gone; giving up after ${elapsed}s without a successful poll (no replacement is rented); keeping $work on the worker for a reattach" >&2
+      keep_work=1
+      stage_finished 1
+      return
+    fi
     if [ "$elapsed" -ge "$lost_limit" ]; then
       echo "on-worker.sh: giving up after $((elapsed / 60)) min without a successful poll; keeping $work on the worker for a reattach" >&2
       keep_work=1

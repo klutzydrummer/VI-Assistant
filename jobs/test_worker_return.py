@@ -925,7 +925,10 @@ for a in "$@"; do
   fi
 done
 # A short link flap: every direct remote command fails while the flag exists.
-if [ -e "${SSH_STUB_FAIL:-/nonexistent-flag}" ]; then exit 255; fi
+if [ -e "${SSH_STUB_FAIL:-/nonexistent-flag}" ]; then
+  echo "ssh: connect to host stub port 22: Connection refused" >&2
+  exit 255
+fi
 # A regenerated worker host key: ssh refuses every direct command with the
 # message a real client prints, until home accepts the new key through the API.
 if [ -e "${SSH_STUB_HOSTKEY:-/nonexistent-hostkey-flag}" ]; then
@@ -1338,6 +1341,77 @@ esac
         self.assertLess(err.index("refreshing the worker endpoint"), err.index("giving up after"))
         self.assertNotEqual(rc, 0)
         self.assertLess(took, 60 + 2 + 30, err)
+
+    # -- early host-drop check (W16b part 3): no network, a stub stands in for the Vast check ----
+    def gone_stub(self, answer_rc):
+        """A VI_GONE_CHECK_CMD that logs each call and exits answer_rc (0 = Vast says gone)."""
+        calls = self.root / "gone-calls"
+        script = self.root / "gone-check.sh"
+        script.write_text(f"#!/bin/bash\necho call >> {shlex.quote(str(calls))}\n"
+                          f"echo 'vast-check: stub answer {answer_rc}'\nexit {answer_rc}\n")
+        script.chmod(0o755)
+        return calls, f"bash {shlex.quote(str(script))}"
+
+    def refuse(self, stage):
+        wait_for("the first tunnel never proved the path", 20,
+                 lambda: "return path re-proved" in self.stderr(stage))
+        self.wait_tunnels(1)
+        self.fail_flag.write_text("")
+        os.kill(self.tunnel_lines()[0][0], 9)
+
+    def test_early_drop_check_stops_early_when_vast_says_gone(self):
+        stage = "early-drop-gone"
+        calls, cmd = self.gone_stub(0)
+        # lost limit 2 min; the early check fires after 3 s of refused connections
+        process = self.start(stage, "sleep 300\n", VI_LOST_MINUTES="2", VI_PROVE_CAP_SECONDS="2",
+                             VI_EARLY_DROP_SECONDS="3", VI_GONE_CHECK_CMD=cmd)
+        self.refuse(stage)
+        t0 = time.time()
+        rc = self.finish(process, 100)
+        err = self.stderr(stage)
+        self.assertNotEqual(rc, 0, err)
+        self.assertLess(time.time() - t0, 60, err)  # well before the 120 s give-up
+        self.assertIn("asking Vast once", err)
+        self.assertIn("Vast says the instance is gone", err)
+        self.assertNotIn("giving up after 2 min", err)
+        self.assertEqual(calls.read_text().count("call"), 1)
+
+    def test_early_drop_check_keeps_waiting_when_vast_says_running(self):
+        stage = "early-drop-alive"
+        calls, cmd = self.gone_stub(1)
+        process = self.start(stage, self.hold(60) + 'echo done > "$VI_OUT/ok.txt"\n',
+                             VI_LOST_MINUTES="2", VI_PROVE_CAP_SECONDS="2",
+                             VI_EARLY_DROP_SECONDS="3", VI_GONE_CHECK_CMD=cmd)
+        self.refuse(stage)
+        wait_for("the early check never ran", 40, lambda: calls.exists())
+        time.sleep(4)  # more failed polls: still waiting, and Vast is asked only once per outage
+        self.assertIsNone(process.poll(), self.stderr(stage))
+        self.fail_flag.unlink()
+        self.wait_tunnels(2)
+        wait_for("the path was not re-proved", 40,
+                 lambda: self.stderr(stage).count("return path re-proved") >= 2)
+        self.release()
+        self.assertEqual(self.finish(process, 90), 0, self.stderr(stage))
+        err = self.stderr(stage)
+        self.assertNotIn("Vast says the instance is gone", err)
+        self.assertEqual(calls.read_text().count("call"), 1)
+
+    def test_a_short_blip_never_asks_vast(self):
+        stage = "early-drop-blip"
+        calls, cmd = self.gone_stub(0)
+        process = self.start(stage, self.hold(30) + 'echo done > "$VI_OUT/ok.txt"\n',
+                             VI_LOST_MINUTES="2", VI_PROVE_CAP_SECONDS="2",
+                             VI_EARLY_DROP_SECONDS="40", VI_GONE_CHECK_CMD=cmd)
+        self.refuse(stage)
+        time.sleep(3)
+        self.fail_flag.unlink()
+        self.wait_tunnels(2)
+        wait_for("the path was not re-proved after the blip", 40,
+                 lambda: self.stderr(stage).count("return path re-proved") >= 2)
+        self.release()
+        self.assertEqual(self.finish(process, 90), 0, self.stderr(stage))
+        self.assertFalse(calls.exists(), "Vast was asked during a short blip")
+        self.assertNotIn("asking Vast", self.stderr(stage))
 
     def test_security_holds_after_reconnect_and_receiver_restart(self):
         stage = "security-after-reconnect"

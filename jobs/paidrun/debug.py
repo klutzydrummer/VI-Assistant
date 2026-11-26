@@ -1,6 +1,7 @@
 """The debug pass (--debug-pass): rent, run the numbered debug stages, check home, write the summary."""
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -86,6 +87,21 @@ class DebugMixin:
                    + (f"; {drop[1]}" if drop and drop[1] else ""))
             self.debug_record(n, "FAIL", f"({why})", out.strip().splitlines()[-8:])
 
+    def gone_check_cmd(self, at):
+        """The command on-worker.sh runs once, read-only, after ~75 s of refused connections: it
+        exits 0 when Vast says this instance is gone (jobs/paidrun/vast_gone_check.py). None when
+        the instance id is unknown, or in a test with a clock but no stub vastai."""
+        if os.environ.get("PAID_RUN_CLOCK_FILE") and not os.environ.get("VI_VASTAI_BIN"):
+            return None
+        try:
+            ident = (at or {}).get("instance") or self.instance_id()
+        except Exception:  # noqa: BLE001
+            ident = None
+        if not ident or not str(ident).isdigit():
+            return None
+        script = Path(__file__).resolve().parent / "vast_gone_check.py"
+        return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {ident}"
+
     def debug_worker_stages(self, at):
         """Stages 3 to 11: the stage omnivoice_debug (on-worker.sh + jobs/debug-pass.sh). r21: the
         time is this rental's own --max-hours since it started, not the hours shared with
@@ -99,6 +115,9 @@ class DebugMixin:
                           "VI_LOST_MINUTES": str(DEBUG_LOST_MINUTES),
                           # r32 WP5: the probe's leg a is the push half of the host gate
                           "VI_HOST_QUAL_GATE": "1", **self.host_qual_env()}
+        gone_cmd = self.gone_check_cmd(at)
+        if gone_cmd:  # on-worker.sh's early host-drop stop (VI_EARLY_DROP_SECONDS, default 75 s)
+            self.extra_env["VI_GONE_CHECK_CMD"] = gone_cmd
         self.set_phase(at, "debug")
         rc, out = self.run([self.vi, "dataset", "run", self.a.stages, DEBUG_STAGE, "--force"],
                            watch=True, timeout=limit)
