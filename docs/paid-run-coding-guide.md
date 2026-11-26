@@ -62,7 +62,7 @@ Three layers each decide on their own whether to destroy a rental. Each one only
 2. `paid_run.py` → `on-worker.sh` → home opens the reverse tunnel and the restricted receiver → the worker pushes a random token → inputs go up → the stage runs.
 3. The worker writes `VI-*` status lines, `on-worker.sh` forwards them, and `paid_run.py` (L1) reads them as evidence and heartbeats L2.
 4. Outputs and checkpoints are pushed from the worker to home through the tunnel. Home verifies them, then acks.
-5. Release: optional ssh diagnostics (≤ 25 s, only while the worker answers), then `vi cloud down --force --verify`, then Vast evidence, spend and markers, then `verify_final`.
+5. Release: optional ssh diagnostics (≤ 25 s, only while the worker answers), then `vi cloud down --force --verify` (exit 2 = stale `vi` binary: falls back at once to plain `down --force` and requires `vi cloud status` to show the worker gone; startup refuses such a binary before any `cloud up`), then Vast evidence, spend and markers, then `verify_final`.
 
 ## Invariants
 

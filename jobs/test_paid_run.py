@@ -35,6 +35,15 @@ STUB = textwrap.dedent('''\
     def att():
         a = sc["attempts"]; i = min(max(st["ups"], 1) - 1, len(a) - 1); return a[i]
     args = sys.argv[1:]
+    OLD_USAGE = "usage:\\n  vi cloud up [--offer ID]\\n  vi cloud down [--force]\\n  vi cloud status"
+    NEW_USAGE = ("usage:\\n  vi cloud up [--offer ID]\\n  vi cloud down --force --verify [id]\\n"
+                 "  vi cloud deadman extend <id>\\n  vi cloud status")
+    if not args or args == ["cloud"]:
+        # the usage text the startup guard probes (STUB_USAGE_PROBE logs that it happened)
+        log("usage")
+        print(OLD_USAGE if sc.get("old_usage") else NEW_USAGE, file=sys.stderr); sys.exit(2)
+    if sc.get("old_binary") and args[:2] == ["cloud", "down"] and "--verify" in args:
+        log("down", args[2:]); print(OLD_USAGE, file=sys.stderr); sys.exit(2)
     cfg = os.environ.get("VI_CLOUD_CONFIG")
     cfgtext = Path(cfg).read_text() if cfg else ""
     if args[:2] == ["cloud", "offers"]:
@@ -81,6 +90,9 @@ STUB = textwrap.dedent('''\
         if st.get("downs_failed", 0) < sc.get("down_fail_times", 0):
             st["downs_failed"] = st.get("downs_failed", 0) + 1; save()
             print("error: vast api timeout", file=sys.stderr); sys.exit(1)
+        if st.get("unverified_polls", 0) < sc.get("unverified_times", 0) and "--verify" in args:
+            st["unverified_polls"] = st.get("unverified_polls", 0) + 1; save()
+            print("DESTROY NOT VERIFIED: Vast still lists the instance", file=sys.stderr); sys.exit(9)
         if sc.get("down_fail") == "always" or (sc.get("down_fail") == "plain" and "--force" not in args):
             print("error: refused", file=sys.stderr); sys.exit(1)
         if sc.get("down_fail") == "unverified" and "--verify" in args:
@@ -882,6 +894,34 @@ class Flow(Base):
         self.assertIn("vi cloud down --force", self.out)
         self.assertIn("instance 101", self.out)
         self.assertIsNotNone(self.worker())
+
+    def test_release_old_binary_falls_back_to_plain_down(self):
+        # w12/w13: a stale `vi` rejects `down --force --verify` (usage, exit 2). The DELETE must
+        # still be sent through plain `down --force`, and the worker must be seen gone.
+        self.scenario([dict(train="fail", spent=0.1)], old_binary=True)
+        self.assertNotEqual(self.run_orch(), 9, self.out)
+        self.assertIsNone(self.worker())
+        verifies = [c for c in self.downs() if "--verify" in c[1]]
+        self.assertEqual(len(verifies), 1, "exit 2 must not be retried")
+        self.assertIn(["--force", "101"], [c[1] for c in self.downs()])
+        self.assertIn("old", self.out)
+        self.assertIn("not verified", self.out)
+
+    def test_release_verify_exit_9_three_times_then_ok(self):
+        # regression guard: Vast lists the worker for 3 polls, then the verified destroy works
+        self.scenario([dict(train="fail", spent=0.1)], unverified_times=3)
+        self.assertEqual(self.run_orch(), 6, self.out)
+        self.assertEqual(len(self.downs()), 4)
+        self.assertIsNone(self.worker())
+
+    def test_startup_guard_refuses_old_binary_before_any_rental(self):
+        self.scenario([dict(train="fail", spent=0.1)], old_usage=True)
+        rc = self.run_orch()
+        self.assertNotEqual(rc, 0, self.out)
+        self.assertIn("rebuild vi: cargo build --release -p vi", self.out)
+        self.assertEqual(self.ups(), [])
+        self.assertEqual(self.downs(), [])
+        self.assertFalse((self.sd / "state.json").exists(), "the stub was never asked to rent")
 
 
 def load_paid_run():

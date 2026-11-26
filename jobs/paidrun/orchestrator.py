@@ -465,6 +465,23 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
             re.search(r"^untracked .* instance (\d+)", out, re.M)
         return m.group(1) if rc == 0 and m else None
 
+    def check_vi_binary(self):
+        """Startup guard: a stale `vi` (older than the verified destroy and dead-man timer) would
+        rent a worker it cannot reliably destroy. Run it with no arguments (it prints its usage)
+        and return an error text if that lacks `down --force --verify` or `deadman`, else None."""
+        try:
+            r = subprocess.run([self.vi], capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL, env=self.env(), cwd=self.a.repo)
+        except (OSError, subprocess.SubprocessError) as e:
+            return (f"the vi binary {self.vi} could not be probed ({e!r}); "
+                    "rebuild vi: cargo build --release -p vi.")
+        usage = r.stdout + r.stderr
+        missing = [w for w in ("down --force --verify", "deadman") if w not in usage]
+        if missing:
+            return (f"the vi binary {self.vi} is too old: its usage lacks "
+                    f"{' and '.join(missing)}; rebuild vi: cargo build --release -p vi.")
+        return None
+
     def worker_present(self):
         """(present, text, tracked): is any vi-worker instance on the account?"""
         rc, out = self.vi_cmd("cloud", "status")
@@ -723,6 +740,11 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
                       "not be confirmed on Hugging Face (the `hf revision` line above says why). "
                       "Nothing was rented.", file=sys.stderr, flush=True)
                 return EXIT["hf"]
+        bad = self.check_vi_binary()
+        if bad:
+            print(f"paid-run: STOPPED (exit {EXIT['args']}): {bad} Nothing was rented.",
+                  file=sys.stderr, flush=True)
+            return EXIT["args"]
         try:
             resumed = self.load_or_create()
         except Stop as e:

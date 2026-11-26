@@ -79,6 +79,8 @@ class ReleaseMixin:
         down = ("cloud", "down", "--force", "--verify", *([str(ident)] if ident else []))
         say(f"releasing the worker (vi {' '.join(down)})")
         rc, out = self.vi_cmd(*down, stream=True)
+        if rc == 2:
+            rc, out = self.release_with_old_binary(ident)
         for wait in RELEASE_BACKOFF:
             if rc == 0:
                 break
@@ -119,6 +121,29 @@ class ReleaseMixin:
             self.abandon_empty_debug_markers()
         self.in_teardown = False
         return spent
+
+    def release_with_old_binary(self, ident):
+        """Exit 2 from `down --force --verify` is a usage error: this `vi` binary predates the
+        flag (a stale target/release/vi), so retrying it can never work and the DELETE was never
+        sent. Fall through at once to plain `down --force`, then require `vi cloud status` to show
+        the worker gone. Returns (rc, out): 0 only when the destroy ran and the worker is gone;
+        otherwise 1, so the caller keeps its backed-off retries and its exit-9 stop."""
+        say("the vi binary is old (it does not know `down --force --verify`, exit 2): the "
+            "destroy will NOT be verified by Vast's instance listing. Rebuild vi: cargo build "
+            "--release -p vi. Falling back to plain `vi cloud down --force` now.")
+        plain = ("cloud", "down", "--force", *([str(ident)] if ident else []))
+        say(f"releasing the worker (vi {' '.join(plain)})")
+        rc, out = self.vi_cmd(*plain, stream=True)
+        if rc != 0:
+            return rc, out
+        self.worker_maybe_up = True
+        present, _text, _tracked = self.worker_present()
+        if present:
+            say("`vi cloud status` still shows a worker after the plain destroy")
+            return 1, out
+        say("`vi cloud status` shows no worker: gone (old-binary fallback, destroy not verified "
+            "by Vast listing)")
+        return 0, out
 
     def record_release_reason(self, at, outcome, v):
         """After a verified destroy: the rental's reason class (C.1) into the attempt record, the
