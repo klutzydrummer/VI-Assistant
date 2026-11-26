@@ -1206,14 +1206,14 @@ class DriverScript(unittest.TestCase):
         self.assertIn("stage 3 upload: running (limit 60 s", self.output)
 
     def test_f2_stage9_limit_comes_from_the_measured_push_rate(self):
-        # checkpoint-5 of 2 GB (sparse) at the preflight's 1.0 MB/s: 1.5 x 2e9 / 1e6 = 3000 s
+        # checkpoint-5 of 2 GB (sparse) at the preflight's 1.0 MB/s x 2.0 parallel speedup: 1.5 x 2e9 / 2e6 = 1500 s
         ck = self.probe_run / "checkpoint-5"
         ck.mkdir(parents=True)
         with open(ck / "model.safetensors", "wb") as f:
             f.truncate(2 * 10**9)
         (self.out / "preflight.json").write_text(json.dumps({"push_mb_s": "1.0"}))
         self.run_driver("9", needs='NEEDS=([9]="")')
-        self.assertIn("stage 9 ckpt-push: running (limit 3000 s", self.output)
+        self.assertIn("stage 9 ckpt-push: running (limit 1500 s", self.output)
         self.assertIn("1.0 MB/s", self.output)
 
     def test_f2_stage9_limit_has_a_600_s_floor_and_falls_back_without_a_rate(self):

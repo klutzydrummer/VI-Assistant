@@ -294,6 +294,43 @@ def _is_weights_only(listed, ck):
     return not any(n in listed or (ck / n).exists() for n in FULL_ONLY_NAMES)
 
 
+def assemble_chunks(ck):
+    """Join parallel-push chunks (jobs/worker-return.sh push_chunked) into their files.
+
+    The worker sends a big file as FILE.vichunk-I-of-N pieces plus a FILE.vichunks marker
+    ("size count chunk_bytes"). A file is joined only when its marker is there and every
+    piece has exactly its expected size; the joined file is built beside the target and
+    renamed in, then the pieces and marker are deleted. Anything incomplete is left as it
+    is (and then fails verify as an unlisted file). Callers run this only once SHA256SUMS
+    exists, so a partial push never gets a manifest and SHA256SUMS over the joined bytes
+    stays the only completeness gate. Returns the files joined."""
+    done = []
+    for marker in sorted(ck.rglob("*.vichunks")):
+        if not marker.is_file():
+            continue
+        try:
+            size, n, chunk = (int(x) for x in marker.read_text().split())
+        except ValueError:
+            continue
+        target = marker.with_name(marker.name[: -len(".vichunks")])
+        pieces = [target.with_name(f"{target.name}.vichunk-{i}-of-{n}") for i in range(n)]
+        want = [min(chunk, size - i * chunk) for i in range(n)]
+        if n < 1 or any(not p.is_file() or p.stat().st_size != w for p, w in zip(pieces, want)):
+            continue
+        tmp = target.with_name(target.name + ".vijoin")
+        with open(tmp, "wb") as out:
+            for p in pieces:
+                with open(p, "rb") as src:
+                    while block := src.read(8 << 20):
+                        out.write(block)
+        os.replace(tmp, target)
+        for p in pieces:
+            p.unlink()
+        marker.unlink()
+        done.append(target)
+    return done
+
+
 def _check_ckpt(ck, min_model_bytes=0, min_optimizer_bytes=0, allow_weights_only=False):
     """Verify one checkpoint dir against its SHA256SUMS: ({relpath: sha256}, [problems]).
 
@@ -308,6 +345,7 @@ def _check_ckpt(ck, min_model_bytes=0, min_optimizer_bytes=0, allow_weights_only
     sums = ck / CHECKSUM_NAME
     if not sums.is_file():
         return {}, [f"{ck.name}/{CHECKSUM_NAME}: missing (a checkpoint is complete only when its manifest exists)"]
+    assemble_chunks(ck)
     listed, problems = _read_sums(sums, ck.name)
     per = _check_listed(ck, listed, problems)
     weights_only = allow_weights_only and _is_weights_only(listed, ck)

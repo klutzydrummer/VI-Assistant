@@ -349,7 +349,11 @@ if [ -n "${VI_HOURS_LEFT:-}" ]; then
   [ -z "$deadline" ] || echo "debug-pass: rental deadline $(date -u -d "@$deadline" +%FT%TZ) (VI_HOURS_LEFT $VI_HOURS_LEFT h); every stage stops ${margin} s before it"
 fi
 
-# Stage 9's limit: 1.5 x the checkpoint's bytes at the push rate the preflight measured, >= 600 s.
+# Stage 9's limit: 1.5 x the checkpoint's bytes at the expected push rate, >= 600 s. The measured
+# preflight rate is a single stream (2.6 MB/s in dbg8); the push now runs VI_PUSH_STREAMS (4)
+# parallel chunk streams, which reached 6.84 MB/s in the probe (about 2.6x), so the expected rate
+# is the measured one x VI_PUSH_SPEEDUP (default 2.0, deliberately under the observed 2.6x, and
+# never above the stream count). 1.5x margin on top, still clipped by the rental deadline below.
 # Sets limit and prints how it was found.
 stage9_limit() {
   local bytes rate
@@ -365,8 +369,13 @@ print(r if r > 0 else "")' "$VI_OUT/preflight.json" 2>/dev/null || true)
     echo "debug-pass: stage 9 limit stays ${limit} s (no checkpoint-5 size or no measured push rate)"
     return
   fi
-  limit=$(awk -v b="$bytes" -v r="$rate" 'BEGIN { x = int(1.5 * b / (r * 1e6) + 0.999); print (x < 600 ? 600 : x) }')
-  echo "debug-pass: stage 9 limit ${limit} s from the measured push: 1.5 x $bytes bytes at $rate MB/s (at least 600 s)"
+  local streams=${VI_PUSH_STREAMS:-4} speedup=${VI_PUSH_SPEEDUP:-2.0}
+  case $streams in ''|*[!0-9]*|0) streams=4 ;; esac
+  limit=$(awk -v b="$bytes" -v r="$rate" -v sp="$speedup" -v n="$streams" 'BEGIN {
+    if (sp !~ /^[0-9]*\.?[0-9]+$/ || sp < 1) sp = 1
+    if (sp > n) sp = n
+    x = int(1.5 * b / (r * sp * 1e6) + 0.999); print (x < 600 ? 600 : x) }')
+  echo "debug-pass: stage 9 limit ${limit} s: 1.5 x $bytes bytes at $rate MB/s measured x ${speedup} parallel-stream speedup (at least 600 s)"
 }
 
 for n in "${order[@]}"; do

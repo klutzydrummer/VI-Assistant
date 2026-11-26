@@ -335,7 +335,8 @@ class WorkerReturnTest(unittest.TestCase):
         self.assertNotIn("lock file", sections["global"])
         for module in ("vi-out", "vi-checkpoint", "vi-publish"):
             with self.subTest(module=module):
-                self.assertEqual(sections[module]["max connections"], "1")
+                # vi-publish alone is relaxed to the parallel-push stream count (4).
+                self.assertEqual(sections[module]["max connections"], "4" if module == "vi-publish" else "1")
                 self.assertEqual(sections[module]["lock file"], str(self.state / f"{module}.lock"))
                 self.assertEqual(sections[module]["exclude"], "/rsyncd-munged/")
 
@@ -350,6 +351,8 @@ class WorkerReturnTest(unittest.TestCase):
         self.assertIn("address = 127.0.0.1\n", conf)
         self.assertIn("hosts allow = 127.0.0.1\n", conf)
         self.assertIn("max connections = 1\n", conf)
+        self.assertEqual(conf.count("max connections = 1\n"), 2)
+        self.assertEqual(conf.count("max connections = 4\n"), 1)
         self.assertIn("munge symlinks = true\n", conf)
         self.assertIn("refuse options = delete\n", conf)
         self.assertIn("list = false\n", conf)

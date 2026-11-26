@@ -97,6 +97,13 @@ case "$cmd" in
     # module default for max connections is 0 (unlimited), so both must be set
     # in every module; there is deliberately no global lock or connection limit.
     # exclude stops a worker-pushed rsyncd-munged dir from wedging a restart.
+    # The ONE relaxation (parallel checkpoint push): vi-publish alone allows
+    # VI_PUBLISH_STREAMS connections (default 4, the worker's VI_PUSH_STREAMS
+    # default), so a checkpoint can be pushed as parallel byte-range chunks.
+    # vi-out and vi-checkpoint stay at 1, and every other rule (loopback, write
+    # only, refuse delete, munged symlinks, hidden, exact path) is unchanged.
+    publish_streams=${VI_PUBLISH_STREAMS:-4}
+    case "$publish_streams" in ''|*[!0-9]*|0) publish_streams=4 ;; esac
     cat >"$state/rsyncd.conf" <<EOF
 address = 127.0.0.1
 port = $port
@@ -137,7 +144,7 @@ write only = true
 refuse options = delete
 list = false
 hosts allow = 127.0.0.1
-max connections = 1
+max connections = $publish_streams
 lock file = $state/vi-publish.lock
 exclude = /rsyncd-munged/
 EOF
@@ -230,7 +237,7 @@ EOF
     push_once() {
       read_port
       [ -n "$last_port" ] || { echo "worker-return: no usable return port yet" >&2; return 10; }
-      rsync -a "$@" "$src" "rsync://127.0.0.1:$last_port/$module/"
+      rsync -a "$@" "${push_src:-$src}" "rsync://127.0.0.1:$last_port/$module/"
     }
     push_retry() {
       local deadline=$(( $(date +%s) + wait_s )) delay=1 rc
@@ -250,6 +257,61 @@ EOF
         [ "$delay" -ge 8 ] || delay=$((delay * 2))
       done
     }
+    # push_chunked: parallel checkpoint push. Each big file (>= VI_PUSH_CHUNK_MIN
+    # bytes, default 64 MiB) is cut into up to VI_PUSH_STREAMS (default 4) byte-range
+    # chunks named FILE.vichunk-I-of-N, pushed at once over separate rsync
+    # connections, then a small FILE.vichunks marker (size, count, chunk bytes) is
+    # pushed. The file itself is NOT sent whole (the caller excludes it afterwards).
+    # Resume: chunks are rebuilt deterministically (fixed offsets, the source's mtime),
+    # so a finished chunk is skipped by rsync's size+mtime check and an interrupted one
+    # continues from its .rsync-partial copy. Home joins the chunks in checkpoints.py
+    # only after SHA256SUMS exists, so a partial push never yields a manifest and never
+    # verifies; SHA256SUMS over the joined bytes is the only completeness gate.
+    # Chunk copies live in a temp dir, one file at a time (transient disk = largest file).
+    chunked=()
+    push_chunked() {
+      local streams=${VI_PUSH_STREAMS:-4} min=${VI_PUSH_CHUNK_MIN:-67108864}
+      case "$streams" in ''|*[!0-9]*|0|1) return 0 ;; esac
+      case "$min" in ''|*[!0-9]*) min=67108864 ;; esac
+      local a
+      for a in "$@"; do case "$a" in --relative|--backup*|--files-from*) return 0 ;; esac; done
+      local empty stage rel size chunk n i off len pids pid rc c
+      empty=$(mktemp -d); stage=$(mktemp -d "${VI_PUSH_STAGE:-${TMPDIR:-/tmp}}/vi-chunks.XXXXXX")
+      while IFS= read -r rel; do
+        # Only omnivoice checkpoint-<step>/ dirs: home joins chunks in checkpoints.py's
+        # checkpoint verify; the legacy epoch-<k>/ layout is pushed whole as before.
+        case $rel in checkpoint-*/*) ;; *) continue ;; esac
+        [ -f "$src$rel" ] || continue
+        size=$(stat -c %s "$src$rel"); [ "$size" -ge "$min" ] || continue
+        chunk=$(( (size + streams - 1) / streams ))
+        chunk=$(( (chunk + 1048575) / 1048576 * 1048576 ))
+        n=$(( (size + chunk - 1) / chunk ))
+        mkdir -p "$stage/$(dirname "$rel")"
+        pids=()
+        for ((i = 0; i < n; i++)); do
+          off=$((i * chunk)); len=$chunk; [ $((off + len)) -le "$size" ] || len=$((size - off))
+          c="$stage/$rel.vichunk-$i-of-$n"
+          dd if="$src$rel" of="$c" iflag=skip_bytes,count_bytes skip="$off" count="$len" bs=4M status=none
+          touch -r "$src$rel" "$c"
+        done
+        for ((i = 0; i < n; i++)); do
+          ( push_src="$stage/./$rel.vichunk-$i-of-$n"; push_retry --relative --partial-dir=.rsync-partial ) &
+          pids+=($!)
+        done
+        rc=0; for pid in "${pids[@]}"; do wait "$pid" || rc=$?; done
+        if [ "$rc" -ne 0 ]; then rm -rf "$empty" "$stage"; return "$rc"; fi
+        printf '%s %s %s\n' "$size" "$n" "$chunk" >"$stage/$rel.vichunks"
+        touch -r "$src$rel" "$stage/$rel.vichunks"
+        ( push_src="$stage/./$rel.vichunks"; push_retry --relative ) || { rc=$?; rm -rf "$empty" "$stage"; return "$rc"; }
+        rm -f "$stage/$rel".vichunk-*
+        chunked+=("--exclude=/$rel")
+      done < <(rsync -an --out-format='%n' "$@" "$src" "$empty/" 2>/dev/null | grep -v '/$' || true)
+      rm -rf "$empty" "$stage"
+    }
+    if [ -n "$is_dir" ] && [ "$module" = vi-publish ]; then
+      push_chunked "$@" || exit $?
+      set -- "$@" "${chunked[@]}"
+    fi
     if [ -n "$is_dir" ] && [ "$module" = vi-publish ]; then
       # Push SHA256SUMS last, so a half-pushed epoch is never mistaken for a
       # complete one by home's verification.
