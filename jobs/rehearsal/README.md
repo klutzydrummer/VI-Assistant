@@ -49,7 +49,8 @@ It runs the real `tokenise` function from `jobs/voicetune-fresh.sh` (its real wa
 `omnivoice.scripts.extract_audio_tokens`, on 8 real home clips, on CPU. Before that it sources
 `jobs/worker-limits.sh` and runs `worker_limits`, exactly as the worker does, so the real limits
 rule picks the thread and worker counts. `voicetune-fresh.sh` is not edited: the script cuts the `tokenise`,
-`tokenise_count_guard` and `audio_tokenizer_dir` functions out of the file by name, so a later fix
+`tokenise_count_guard`, `audio_tokenizer_dir` and progress helper (`vi_progress`, `vi_progress_end`,
+`vi_tree_bytes`, `vi_progress_watch`, `vi_progress_stop`) functions out of the file by name, so a later fix
 to them is rehearsed automatically. If a fix moves logic into another function that `tokenise`
 calls, name it in `EXTRA_FUNCS`.
 

@@ -14,7 +14,7 @@
 # omnivoice.scripts.extract_audio_tokens, on CPU, inside
 # `systemd-run --user --scope -p TasksMax=N` (a cgroup pids.max, like a container's pids limit),
 # with an LD_PRELOAD shim (jobs/rehearsal/fakenproc.c) that makes the process see FAKE_NPROC CPUs.
-# voicetune-fresh.sh is not edited: its three tokenise functions are cut out of the file by name
+# voicetune-fresh.sh is not edited: the tokenise functions and the progress helpers they call are cut out of the file by name
 # (plus any named in EXTRA_FUNCS) and run by this script's stage mode after it sources
 # jobs/worker-limits.sh and runs worker_limits, the same two steps voicetune-fresh.sh takes before
 # any Python. So the rehearsal exercises the real limits rule, the real watched launcher
@@ -259,7 +259,7 @@ if [ "$mode" = inner-stage ]; then
   export VI_AUDIO_TOKENIZER=$VL_TOKENIZER
   src="$repo/jobs/voicetune-fresh.sh"
   defs=
-  for fn in audio_tokenizer_dir tokenise tokenise_count_guard ${EXTRA_FUNCS:-}; do
+  for fn in audio_tokenizer_dir vi_progress vi_progress_end vi_tree_bytes vi_progress_watch vi_progress_stop tokenise tokenise_count_guard ${EXTRA_FUNCS:-}; do
     def=$(awk -v n="$fn" '$0 ~ "^" n "\\(\\) \\{" { p = 1 } p { print } p && /^\}/ { exit }' "$src")
     [ -n "$def" ] || { echo "vast-limits: function $fn not found in $src" >&2; exit 2; }
     defs+="$def"$'\n'
