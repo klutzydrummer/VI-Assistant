@@ -1946,6 +1946,50 @@ fn reattach_refuses_when_two_live_candidates() {
     assert!(a.join("stage.pid").is_file() && b.join("stage.pid").is_file());
 }
 
+/// A pending-only job whose rc is 45 minutes old is past the 30 minute cap the
+/// worker watchdog uses, so `pick_attempt` must not count it as live.
+#[test]
+fn pending_only_hold_is_capped_at_30_minutes() {
+    if !have_rsync() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let probe = "echo \"$VI_RETURN_PORT\" > \"$VI_OUT/port\"; exit 3";
+    let first = run_settings(dir.path(), probe, "expect_epochs = 1", &poll_env());
+    assert!(!first.status.success());
+    let work = wait_for_work(dir.path());
+    let (key, _attempt) = split_attempt(&work);
+    let root = dir.path().join("worker");
+    let d = root.join(format!("on-gpu.{key}.20260101T000005Z"));
+    fs::create_dir_all(d.join("pending")).unwrap();
+    fs::write(d.join("pending/epoch-0"), "x").unwrap();
+    fs::write(d.join("rc"), "0\n").unwrap();
+    assert!(Command::new("touch")
+        .args(["-d", "45 minutes ago"])
+        .arg(d.join("rc"))
+        .status()
+        .unwrap()
+        .success());
+
+    let err_path = dir.path().join("cap.err");
+    // The old behaviour reattaches and waits forever, so bound the run.
+    let mut child = command_settings(dir.path(), probe, "expect_epochs = 1", &poll_env())
+        .stderr(Stdio::from(fs::File::create(&err_path).unwrap()))
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() && start.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let err = err_text(&err_path);
+    assert!(
+        !err.contains(&format!("reattaching to {}", d.display())),
+        "a 45 minute old pending-only job was treated as live: {err}"
+    );
+}
+
 /// Row 7: a live attempt wins over a newer unverified marker, because the
 /// marker only names a dir whose attempt is already dead.
 #[test]

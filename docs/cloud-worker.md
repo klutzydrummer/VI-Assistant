@@ -36,7 +36,7 @@ Three guards, so a forgotten worker can't drain the credit:
 
 The worker-side watchdog hasn't run on a real instance yet. **Open item:** Vast does not document whether the instance key may DELETE (destroy) its own instance; it documents only the self-stop. Proving DELETE on a real worker is left to the next approved debug pass. Until then the stop fallback limits the cost, and the home layers still destroy. On that pass, after the idle timeout on a short `idle_minutes`, run `vi cloud ssh cat /var/log/vi-watchdog.log` (or read Vast's instance list) to see whether `destroyed` or the stop fallback ran.
 
-The watchdog spots home's tunnel because the tunnel's sshd session process has no child process. That holds for the `sshd: root@notty` and `sshd-session: root@notty` process names, and it is tested with a fake `pgrep` only. The `on-worker.sh` reattach check still treats a pending-only job as live for up to `VI_PENDING_HOLD` (120) minutes, while the watchdog now releases after 30.
+The watchdog spots home's tunnel because the tunnel's sshd session process has no child process. That holds for the `sshd: root@notty` and `sshd-session: root@notty` process names, and it is tested with a fake `pgrep` only. The `on-worker.sh` reattach check uses the same rule: a pending-only job is live for up to `VI_PENDING_HOLD` minutes, capped at 30, matching the watchdog.
 
 ## Config
 `~/.config/vi/cloud.toml` (or `$VI_CLOUD_CONFIG`). Every field is optional; these are the defaults:
