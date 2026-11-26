@@ -121,6 +121,20 @@ class StateMachine(unittest.TestCase):
         self.assertAlmostEqual(V.effective_cap_seconds(None, 1.0, 0.5), 7200)
         self.assertIsNone(V.effective_cap_seconds(None, None, 0.5))
 
+    def test_cap_uses_the_full_billed_rate_of_a_listed_017_offer(self):
+        # `vi cloud offers` prints the full billed rate: an offer Vast lists at $0.17/hr whose
+        # fields (dph_base 0.17 + storage 1.022 $/GB/month x 100 GB / 730 h) rebuild to $0.31
+        # is printed as $0.310/hr. The cap math reads that figure (crates/cloud, billed_hourly).
+        from paidrun.signals import parse_offers
+        line = ("  9001  RTX 3090      24 GB  $0.310/hr  reliability 0.990  "
+                "net down   900 / up   500 Mbps  16.0 cores  128 GB ram  disk 1000 MB/s  "
+                "Texas, US  machine 7 host 8")
+        (o,) = parse_offers(line)
+        self.assertEqual(o["dph"], 0.31)
+        # $3.10 at $0.31/hr is exactly 10 h (it would be about 18.2 h at the listed $0.17)
+        self.assertAlmostEqual(V.effective_cap_seconds(None, 3.10, o["dph"]), 10 * 3600)
+        self.assertEqual(round(o["dph"] * 8, 2), 2.48)
+
     def test_cap_wins_over_a_stage_still_making_progress(self):
         v = machine(self.c, wall_cap_s=600)
         v.enter("train", stall_s=600)

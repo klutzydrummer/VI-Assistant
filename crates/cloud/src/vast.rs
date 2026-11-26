@@ -25,9 +25,22 @@ pub struct Offer {
     /// MB.
     #[serde(default)]
     pub gpu_ram: f64,
-    /// Dollars per hour, everything included.
+    /// Dollars per hour the search shows. Vast prices it with the storage the search asked
+    /// for (`allocated_storage`, 8 GB when the query omits it), so it understates a larger
+    /// disk; `billed_hourly` rebuilds the full rate.
     #[serde(default)]
     pub dph_total: f64,
+    /// Compute-only dollars per hour, before storage.
+    #[serde(default)]
+    pub dph_base: f64,
+    /// Storage price in dollars per GB per month.
+    #[serde(default)]
+    pub storage_cost: f64,
+    /// Bandwidth prices in dollars per GB moved (billed per byte, not per hour).
+    #[serde(default)]
+    pub inet_up_cost: f64,
+    #[serde(default)]
+    pub inet_down_cost: f64,
     #[serde(default)]
     pub reliability2: f64,
     /// The searchable reliability score, 0-1. `reliability2` is only the
@@ -61,6 +74,38 @@ pub struct Offer {
     /// Newest CUDA version the driver supports.
     #[serde(default)]
     pub cuda_max_good: f64,
+}
+
+/// Hours Vast's per-month storage price is spread over (the repo's long-standing assumption;
+/// Vast's docs give no month length).
+pub const HOURS_PER_MONTH: f64 = 730.0;
+
+impl Offer {
+    /// The hourly rate actually billed for a `disk_gb` disk: compute (`dph_base`) plus storage
+    /// (`storage_cost` $/GB/month x disk / 730 h). Never below the listed `dph_total`, so a
+    /// missing field can only leave the number as it was, never lower it. Bandwidth is billed per
+    /// GB moved, so it is not in this hourly figure; see `bandwidth_cost`.
+    /// Fields: docs.vast.ai/api-reference/search/search-offers.
+    pub fn billed_hourly(&self, disk_gb: f64) -> f64 {
+        let rebuilt = if self.dph_base > 0.0 && self.storage_cost > 0.0 {
+            self.dph_base + self.storage_cost * disk_gb / HOURS_PER_MONTH
+        } else {
+            0.0
+        };
+        self.dph_total.max(rebuilt)
+    }
+
+    /// Dollars for moving `down_gb` onto and `up_gb` off the worker at this offer's prices.
+    pub fn bandwidth_cost(&self, down_gb: f64, up_gb: f64) -> f64 {
+        self.inet_down_cost * down_gb + self.inet_up_cost * up_gb
+    }
+
+    /// Two-letter country code, the part of `geolocation` after the last comma ("Beijing, CN"),
+    /// or the whole value when it has no comma. Upper-cased.
+    pub fn country(&self) -> Option<String> {
+        let g = self.geolocation.as_deref()?.trim();
+        Some(g.rsplit(',').next().unwrap_or(g).trim().to_uppercase())
+    }
 }
 
 /// One of the account's instances.

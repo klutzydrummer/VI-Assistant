@@ -17,6 +17,10 @@ min_cpu_ram_gb = 30
 min_inet_up_mbps = 200
 min_inet_down_mbps = 100
 min_disk_bw_mbps = 0
-# $/hr ceiling on dph_total (round 27: at 0.31 only 2 verified 24 GB offers were
+# Countries never rented from (Vast geolocation, two-letter codes). The default is ["CN"]; set
+# it to [] to allow every country.
+exclude_countries = ["CN"]
+# $/hr ceiling on the full billed rate: the search asks Vast to price dph_total with the disk we
+# rent (disk_gb), so this includes the disk, not only the GPU (round 27: at 0.31 only 2 verified 24 GB offers were
 # left and none in US/CA; 0.60 leaves about 36). No 48 GB tier.
 max_dph = 0.60

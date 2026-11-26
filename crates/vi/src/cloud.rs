@@ -62,7 +62,7 @@ pub fn run(args: &[&str], force: bool, cap: Option<&str>, until: Option<&str>) -
     }
 }
 
-fn describe(o: &Offer) -> String {
+fn describe(o: &Offer, disk_gb: f64) -> String {
     let host = o.host_id.map_or("?".to_string(), |h| h.to_string());
     format!(
         "{:>10}  {:<12} {:>3.0} GB  ${:.3}/hr  reliability {:.3}  \
@@ -71,7 +71,7 @@ fn describe(o: &Offer) -> String {
         o.id,
         o.gpu_name,
         o.gpu_ram / 1024.0,
-        o.dph_total,
+        o.billed_hourly(disk_gb),
         o.reliability2,
         o.inet_down,
         o.inet_up,
@@ -100,7 +100,7 @@ fn offers(c: &Cloud<HttpVast, SystemHost>, args: &[&str]) -> ExitCode {
         }
         Ok(list) => {
             for o in &list {
-                println!("{}", describe(o));
+                println!("{}", describe(o, c.cfg.disk_gb));
             }
             ExitCode::SUCCESS
         }
@@ -202,16 +202,18 @@ fn up(
         Err(code) => return code,
     };
     let confirm = |o: &Offer, credit: Option<f64>| {
-        println!("{}", describe(o));
-        let worst = c.cfg.max_hours * o.dph_total;
+        println!("{}", describe(o, c.cfg.disk_gb));
+        let rate = o.billed_hourly(c.cfg.disk_gb);
+        let worst = c.cfg.max_hours * rate;
         println!(
-            "worst case ${worst:.2} ({:.1} h at ${:.3}/hr) against the ${cap:.2} cap",
-            c.cfg.max_hours, o.dph_total
+            "worst case ${worst:.2} ({:.1} h at ${rate:.3}/hr, compute plus a {:.0} GB disk) against the ${cap:.2} cap; \
+             bandwidth is extra: ${:.4}/GB down, ${:.4}/GB up",
+            c.cfg.max_hours, c.cfg.disk_gb, o.inet_down_cost, o.inet_up_cost
         );
         if let Some(credit) = credit {
             println!(
                 "credit ${credit:.2}, about {:.0} hours at this price; released after {} idle minutes",
-                credit / o.dph_total.max(0.001),
+                credit / rate.max(0.001),
                 c.cfg.idle_minutes
             );
         }
@@ -622,11 +624,11 @@ mod tests {
             "id": 123, "machine_id": 88888, "host_id": 55555, "gpu_name": "RTX 4090"
         }))
         .unwrap();
-        let line = describe(&o);
+        let line = describe(&o, 60.0);
         assert!(line.contains("machine 88888 host 55555"), "{line}");
         let o: Offer =
             serde_json::from_value(serde_json::json!({"id": 1, "machine_id": 9})).unwrap();
-        assert!(describe(&o).contains("machine 9 host ?"));
+        assert!(describe(&o, 60.0).contains("machine 9 host ?"));
     }
 
     #[test]

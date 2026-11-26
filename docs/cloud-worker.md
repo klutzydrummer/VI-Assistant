@@ -59,9 +59,14 @@ min_cuda = 13.0
 min_compute_cap = 800  # Ampere or newer, for bf16 and flash attention
 verified = true
 countries = []         # e.g. ["US", "CA"]; empty = anywhere
+exclude_countries = ["CN"]   # never rented from; [] allows every country
 ```
 
 `countries` takes two-letter codes (Vast.ai's geolocation). A nearer worker uploads a little faster: one rsync stream slows down as the round trip grows.
+
+`exclude_countries` (default `["CN"]`) is sent to Vast as `geolocation notin [...]`, and `vi cloud up --offer` refuses an offer whose geolocation ends in an excluded code. If `countries` is also set, an excluded code is dropped from it.
+
+**What an hour costs (checked 2026-11-26).** The search's `dph_total` is priced with the storage the query asks for (`allocated_storage`, 8 GB when omitted), so with a 125 GB disk it understated the real rate: an offer listed at $0.17/hr can bill $0.31/hr. The query now sends `allocated_storage = disk_gb`, and `vi` prints and caps on the billed rate `dph_base + storage_cost x disk_gb / 730` (never below the listed `dph_total`; 730 h per month is this repo's assumption, Vast gives no month length). `max_dph` is judged on that full rate. Bandwidth is billed per GB moved (`inet_up_cost`, `inet_down_cost`, $/GB), so it is not in the hourly rate; `vi cloud up` prints the two prices next to the worst case. Unverified: whether Vast's `dph_total` is exactly `dph_base` plus storage (the docs list the fields, not the sum), which is why the rebuilt figure is only ever allowed to raise the rate. Sources: https://docs.vast.ai/api-reference/search/search-offers (fields, `allocated_storage`, geolocation `notin`), https://docs.vast.ai/documentation/instances/pricing (compute, storage and bandwidth components), `vastai search offers --explain --api-key dummy` (its `--storage` default of 5 GiB is sent as `allocated_storage`). The plan's "disk on top" line below stays as an extra margin and now double counts the disk against `max_dph`.
 
 `min_cuda` must cover the CUDA that the jobs' torch was built for. textscore's vLLM brings torch built for CUDA 13, hence the 13.0 default; on an older driver torch sees no GPU, and textscore stops at once rather than crawl on the CPU. Jobs built for CUDA 12 run on these newer drivers too. The boot script also installs gcc, which Triton (inside vLLM) needs at run time; `check-worker.sh` reports whether it's there. For textscore's FP8 LLMs, prefer GPUs with native FP8 (Ada or newer: `"L40S"`, `"RTX 6000Ada"`, `"RTX PRO 5000"`); on Ampere cards such as the A6000, vLLM has to compile a fallback kernel first.
 

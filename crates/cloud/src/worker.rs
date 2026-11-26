@@ -494,7 +494,7 @@ impl<V: Vast, H: Host> Cloud<V, H> {
             id,
             machine_id: first.machine_id,
             gpu_name: first.gpu_name.clone(),
-            dph: first.dph_total,
+            dph: first.billed_hourly(self.cfg.disk_gb),
             credit,
             created: now,
             last_used: now,
@@ -586,11 +586,12 @@ impl<V: Vast, H: Host> Cloud<V, H> {
     /// at this price) must stay under `cap`, and the account must already hold
     /// at least `cap`. Returns the credit for the confirmation and spend report.
     fn check_budget(&self, offer: &Offer, cap: f64) -> Result<f64> {
-        let worst = self.cfg.max_hours * offer.dph_total;
+        let rate = offer.billed_hourly(self.cfg.disk_gb);
+        let worst = self.cfg.max_hours * rate;
         if worst > cap {
             return Err(Error::Worker(format!(
-                "worst case ${worst:.2} ({:.1} h at ${:.3}/hr) exceeds the ${cap:.2} cap",
-                self.cfg.max_hours, offer.dph_total
+                "worst case ${worst:.2} ({:.1} h at ${rate:.3}/hr) exceeds the ${cap:.2} cap",
+                self.cfg.max_hours
             )));
         }
         let credit = self.vast.credit()?;
@@ -1435,6 +1436,10 @@ mod tests {
             disk_bw: 1000.0,
             disk_space: 100.0,
             geolocation: None,
+            dph_base: 0.0,
+            storage_cost: 0.0,
+            inet_up_cost: 0.0,
+            inet_down_cost: 0.0,
             compute_cap: 800,
             cuda_max_good: 13.0,
         }

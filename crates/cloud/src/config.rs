@@ -68,6 +68,9 @@ pub struct Search {
     /// geolocation). Empty means anywhere. Closer machines upload faster,
     /// since one rsync stream slows down with the round trip.
     pub countries: Vec<String>,
+    /// Two-letter country codes never rented from (Vast's geolocation). Defaults to CN.
+    /// Ignored for codes also named in `countries` only in that `countries` wins.
+    pub exclude_countries: Vec<String>,
 }
 
 impl Default for Config {
@@ -107,6 +110,7 @@ impl Default for Search {
             min_compute_cap: 800,
             verified: true,
             countries: Vec::new(),
+            exclude_countries: vec!["CN".into()],
         }
     }
 }
@@ -162,6 +166,9 @@ impl Config {
             "cuda_max_good": {"gte": s.min_cuda},
             "compute_cap": {"gte": s.min_compute_cap},
             "disk_space": {"gte": self.disk_gb},
+            // Vast prices dph_total with this much storage (docs: default 8 GB), so ask for
+            // the disk we will really rent; then dph_total and max_dph include its cost.
+            "allocated_storage": self.disk_gb,
             "order": [["dph_total", "asc"]],
             "type": "on-demand",
             "limit": limit,
@@ -175,15 +182,29 @@ impl Config {
         if !exclude_machines.is_empty() {
             q["machine_id"] = json!({"notin": exclude_machines});
         }
+        let excluded = self.excluded_countries();
         if !s.countries.is_empty() {
             let codes: Vec<String> = s
                 .countries
                 .iter()
                 .map(|c| c.trim().to_uppercase())
+                .filter(|c| !excluded.contains(c))
                 .collect();
             q["geolocation"] = json!({"in": codes});
+        } else if !excluded.is_empty() {
+            q["geolocation"] = json!({"notin": excluded});
         }
         q
+    }
+
+    /// `search.exclude_countries`, trimmed and upper-cased.
+    pub fn excluded_countries(&self) -> Vec<String> {
+        self.search
+            .exclude_countries
+            .iter()
+            .map(|c| c.trim().to_uppercase())
+            .filter(|c| !c.is_empty())
+            .collect()
     }
 
     pub fn max_minutes(&self) -> u64 {
@@ -219,11 +240,17 @@ impl Config {
                 o.cuda_max_good, s.min_cuda
             ));
         }
-        if o.dph_total > s.max_dph {
+        let billed = o.billed_hourly(self.disk_gb);
+        if billed > s.max_dph {
             out.push(format!(
-                "${:.3}/hr is over the ${:.3} maximum",
-                o.dph_total, s.max_dph
+                "${billed:.3}/hr is over the ${:.3} maximum",
+                s.max_dph
             ));
+        }
+        if let Some(c) = o.country() {
+            if self.excluded_countries().contains(&c) {
+                out.push(format!("country {c} is excluded"));
+            }
         }
         // Both scores: the search filters on `reliability`, while `reliability2`
         // is Vast's older enforcement score and some offers carry only it.
@@ -456,7 +483,7 @@ mod tests {
         assert_eq!(q["dph_total"]["lte"], 0.3);
         assert_eq!(q["limit"], 3);
         assert_eq!(q["verified"]["eq"], true);
-        assert!(q.get("geolocation").is_none());
+        assert_eq!(q["geolocation"]["notin"], json!(["CN"]));
     }
 
     #[test]
@@ -466,6 +493,113 @@ mod tests {
         std::fs::write(&path, "[search]\ncountries = [\"us\", \"CA\"]\n").unwrap();
         let q = Config::load(&path).unwrap().offer_query(3, &[]);
         assert_eq!(q["geolocation"]["in"], json!(["US", "CA"]));
+    }
+
+    #[test]
+    fn cn_is_excluded_by_default_and_configurable() {
+        let q = Config::default().offer_query(3, &[]);
+        assert_eq!(q["geolocation"]["notin"], json!(["CN"]));
+        assert_eq!(q["allocated_storage"], 60.0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud.toml");
+        std::fs::write(&path, "[search]\nexclude_countries = [\"cn\", \"RU\"]\n").unwrap();
+        let q = Config::load(&path).unwrap().offer_query(3, &[]);
+        assert_eq!(q["geolocation"]["notin"], json!(["CN", "RU"]));
+        std::fs::write(&path, "[search]\nexclude_countries = []\n").unwrap();
+        assert!(Config::load(&path)
+            .unwrap()
+            .offer_query(3, &[])
+            .get("geolocation")
+            .is_none());
+        // A countries allow-list drops an excluded code from itself.
+        std::fs::write(&path, "[search]\ncountries = [\"US\", \"cn\"]\n").unwrap();
+        let q = Config::load(&path).unwrap().offer_query(3, &[]);
+        assert_eq!(q["geolocation"]["in"], json!(["US"]));
+    }
+
+    #[test]
+    fn a_cn_offer_is_refused_and_others_pass() {
+        let cfg = Config::default();
+        let base = Offer {
+            id: 1,
+            machine_id: 2,
+            host_id: None,
+            gpu_name: "RTX 3090".into(),
+            gpu_ram: 24576.0,
+            dph_total: 0.2,
+            dph_base: 0.0,
+            storage_cost: 0.0,
+            inet_up_cost: 0.0,
+            inet_down_cost: 0.0,
+            reliability: 0.99,
+            reliability2: 0.99,
+            inet_down: 900.0,
+            inet_up: 500.0,
+            cpu_cores_effective: 16.0,
+            cpu_ram: 128000.0,
+            disk_bw: 1000.0,
+            disk_space: 100.0,
+            geolocation: Some("Beijing, CN".into()),
+            compute_cap: 800,
+            cuda_max_good: 13.0,
+        };
+        let why = cfg.offer_violations(&base);
+        assert_eq!(why, vec!["country CN is excluded".to_string()]);
+        for ok in ["Texas, US", "Frankfurt, DE", "SE"] {
+            let o = Offer {
+                geolocation: Some(ok.into()),
+                ..base.clone()
+            };
+            assert!(cfg.offer_violations(&o).is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_listed_017_offer_costs_031_on_the_disk_we_rent() {
+        // Vast listed $0.17/hr (priced at its default 8 GB); the real fields are compute
+        // $0.17 + storage $1.022/GB/month x 100 GB / 730 h = $0.14, so $0.31.
+        let o = Offer {
+            id: 1,
+            machine_id: 2,
+            host_id: None,
+            gpu_name: "RTX 3090".into(),
+            gpu_ram: 24576.0,
+            dph_total: 0.17,
+            dph_base: 0.17,
+            storage_cost: 1.022,
+            inet_up_cost: 0.002,
+            inet_down_cost: 0.001,
+            reliability: 0.99,
+            reliability2: 0.99,
+            inet_down: 900.0,
+            inet_up: 500.0,
+            cpu_cores_effective: 16.0,
+            cpu_ram: 128000.0,
+            disk_bw: 1000.0,
+            disk_space: 200.0,
+            geolocation: None,
+            compute_cap: 800,
+            cuda_max_good: 13.0,
+        };
+        assert!((o.billed_hourly(100.0) - 0.31).abs() < 1e-12);
+        // Missing detail fields leave the listed figure alone.
+        let bare = Offer {
+            dph_base: 0.0,
+            storage_cost: 0.0,
+            ..o.clone()
+        };
+        assert_eq!(bare.billed_hourly(100.0), 0.17);
+        assert!((o.bandwidth_cost(50.0, 10.0) - 0.07).abs() < 1e-12);
+        // The max_dph limit is judged on the billed rate: 0.31 is over a 0.30 ceiling.
+        let mut cfg = Config {
+            disk_gb: 100.0,
+            ..Config::default()
+        };
+        cfg.search.max_dph = 0.30;
+        assert!(cfg
+            .offer_violations(&o)
+            .iter()
+            .any(|w| w.contains("$0.310/hr")));
     }
 
     #[test]
@@ -523,6 +657,10 @@ mod tests {
             disk_bw: 1000.0,
             disk_space: 100.0,
             geolocation: None,
+            dph_base: 0.0,
+            storage_cost: 0.0,
+            inet_up_cost: 0.0,
+            inet_down_cost: 0.0,
             compute_cap: 800,
             cuda_max_good: 13.0,
         };
