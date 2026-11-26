@@ -112,13 +112,19 @@ vi_tree_bytes() {
 # holds a $(...) open). Every VI_PROGRESS_SECONDS (default 10) it reports the most bytes seen so far
 # under the paths: a folder that is cleared and rebuilt repeats the old high mark until it passes it.
 vi_progress_watch() {
-  local stage=$1 counter=$2 best=0 n
+  local stage=$1 counter=$2 best=0 n nap=
   shift 2
+  # The nap runs in the background and is waited on, so a TERM from vi_progress_stop interrupts the
+  # wait and the trap kills the nap too (a foreground sleep would be left behind as an orphan).
+  trap '[ -z "$nap" ] || kill "$nap" 2>/dev/null; exit 0' TERM
   while :; do
     n=$(vi_tree_bytes "$@")
     [ "$n" -le "$best" ] || best=$n
     vi_progress "$stage" "$counter" "$best"
-    sleep "${VI_PROGRESS_SECONDS:-10}"
+    sleep "${VI_PROGRESS_SECONDS:-10}" &
+    nap=$!
+    wait "$nap" 2>/dev/null || true
+    nap=
   done
 }
 
