@@ -503,8 +503,9 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         rent a worker it cannot reliably destroy. Run it with no arguments (it prints its usage)
         and return an error text if that lacks `down --force --verify` or `deadman`, else None."""
         try:
-            r = subprocess.run([self.vi], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
-                               stdin=subprocess.DEVNULL, env=self.env(), cwd=self.a.repo)
+            r = subprocess.run([self.vi], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=30, stdin=subprocess.DEVNULL,
+                               env=self.env(), cwd=self.a.repo)
         except (OSError, subprocess.SubprocessError) as e:
             return (f"the vi binary {self.vi} could not be probed ({e!r}); "
                     "rebuild vi: cargo build --release -p vi.")

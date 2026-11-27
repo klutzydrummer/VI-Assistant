@@ -2252,10 +2252,6 @@ class Resilience(Base):
         self.assertEqual(len({base, pins, rev}), 3)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PumpRobustness(unittest.TestCase):
     """run()'s output reader: non-UTF-8 worker bytes are replaced, and a dead reader fails the
     command loudly instead of hanging the run (omnivoice-ft-dbg10, 2026-11-27)."""
@@ -2321,3 +2317,7 @@ class PumpRobustness(unittest.TestCase):
         rc, out = result["r"]
         self.assertNotEqual(rc, 0)
         self.assertIn("output reader died: UnicodeDecodeError", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
