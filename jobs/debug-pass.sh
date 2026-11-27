@@ -392,6 +392,12 @@ print(r if r > 0 else "")' "$VI_OUT/preflight.json" 2>/dev/null || true)
   echo "debug-pass: stage 9 limit ${limit} s: 1.5 x $bytes bytes at $rate MB/s measured x ${speedup} parallel-stream speedup (at least 600 s)"
 }
 
+# The worker watchdog (worker-onstart.sh) counts a debug pass as live only while this file is
+# fresh: no stage holds job.lock or train.pid. Refresh it every 60 s until the script exits.
+( while :; do : >"$work/debug.alive"; sleep 60; done ) &
+alive_pid=$!
+trap 'kill "$alive_pid" 2>/dev/null; rm -f "$work/debug.alive"' EXIT
+
 for n in "${order[@]}"; do
   name=${NAMES[$n]:-}
   [ -n "$name" ] || { echo "debug-pass: unknown stage $n; skipped"; continue; }

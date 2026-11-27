@@ -309,20 +309,20 @@ fn lock_held_without_change_releases() {
 fn pending_only_holds_until_pending_hold() {
     // Before the hold ends the pending epochs keep the worker even with no
     // lock, trainer or recent change. PENDING_HOLD defaults to 120 min but
-    // is capped at 30, so a job that ended 29 minutes ago is still held.
+    // is capped at 90, so a job that ended 89 minutes ago is still held.
     let rig = Rig::new(liveness_config());
     let job = rig.job();
     fs::create_dir(job.join("pending")).unwrap();
     fs::write(job.join("pending/0"), "").unwrap();
     let rc = job.join("rc");
     fs::write(&rc, "0").unwrap();
-    set_mtime(&rc, now() - 29 * 60);
+    set_mtime(&rc, now() - 89 * 60);
     rig.backdate(&job.join("pending"), 3600);
     rig.backdate(&job.join("pending/0"), 3600);
     rig.backdate_active(3600);
     assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
 
-    // After it (31 min, still inside the old 120), release stops (never
+    // After it (91 min, still inside the old 120), release stops (never
     // destroys) with work still pending.
     let rig = Rig::new(liveness_config());
     let job = rig.job();
@@ -330,7 +330,7 @@ fn pending_only_holds_until_pending_hold() {
     fs::write(job.join("pending/0"), "").unwrap();
     let rc = job.join("rc");
     fs::write(&rc, "0").unwrap();
-    set_mtime(&rc, now() - 31 * 60);
+    set_mtime(&rc, now() - 91 * 60);
     rig.backdate(&job.join("pending"), 3600);
     rig.backdate(&job.join("pending/0"), 3600);
     rig.backdate_active(3600);
@@ -365,7 +365,7 @@ fn nothing_releases() {
 
 #[test]
 fn pending_hold_shorter_than_cap_is_kept() {
-    // PENDING_HOLD below the 30-minute cap still applies as set. The idle
+    // PENDING_HOLD below the 90-minute cap still applies as set. The idle
     // window is shorter than rc's age, so rc is not a recent change.
     let rig = Rig::new(Config {
         idle_minutes: 5,
@@ -386,13 +386,13 @@ fn pending_hold_shorter_than_cap_is_kept() {
 
 #[test]
 fn pending_hold_cap_reached_proceeds_to_destroy_when_stop_fails() {
-    // Even a huge PENDING_HOLD ends at 30 minutes; with stop refused the
+    // Even a huge PENDING_HOLD ends at 90 minutes; with stop refused the
     // watchdog goes on to DELETE.
     let rig = Rig::new(liveness_config());
     let job = rig.pending_job();
     let rc = job.join("rc");
     fs::write(&rc, "0").unwrap();
-    set_mtime(&rc, now() - 31 * 60);
+    set_mtime(&rc, now() - 91 * 60);
     rig.backdate_active(3600);
     fs::write(&rig.put_fails, "").unwrap();
     assert_eq!(
@@ -402,6 +402,85 @@ fn pending_hold_cap_reached_proceeds_to_destroy_when_stop_fails() {
     let log = rig.read_log();
     assert!(log.contains("stop refused; fallback DELETE"), "{log}");
     assert!(log.contains("destroyed"), "{log}");
+}
+
+/// A job dir whose every file is old and whose `.active` is old: idle unless a liveness signal
+/// says otherwise. Returns the job dir.
+fn idle_job(rig: &Rig) -> PathBuf {
+    let job = rig.job();
+    fs::write(job.join("progress"), "step").unwrap();
+    rig.backdate(&job.join("progress"), 3600);
+    rig.backdate_active(3600);
+    job
+}
+
+#[test]
+fn checkpoint_push_longer_than_idle_stays_live() {
+    // l=t=p=0, no ssh, and no job file changed for far longer than idle_minutes: only the
+    // push loop's push.alive says the rsync is still working.
+    let rig = Rig::new(liveness_config());
+    let job = idle_job(&rig);
+    fs::write(job.join("push.pid"), "1").unwrap();
+    fs::write(job.join("push.alive"), "").unwrap();
+    assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
+}
+
+#[test]
+fn stale_push_markers_release_idle() {
+    // A dead push leaves push.pid behind and a push.alive nobody refreshes.
+    let rig = Rig::new(liveness_config());
+    let job = idle_job(&rig);
+    fs::write(job.join("push.pid"), "1").unwrap();
+    fs::write(job.join("push.alive"), "").unwrap();
+    rig.backdate(&job.join("push.alive"), 3600);
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+    assert!(rig.read_log().contains("release: idle"));
+}
+
+#[test]
+fn debug_pass_alone_stays_live() {
+    // A debug pass holds no job.lock, train.pid or pending marker; debug.alive keeps it live.
+    let rig = Rig::new(liveness_config());
+    let job = idle_job(&rig);
+    fs::write(job.join("debug.alive"), "").unwrap();
+    assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
+}
+
+#[test]
+fn stale_debug_alive_releases_idle() {
+    let rig = Rig::new(liveness_config());
+    let job = idle_job(&rig);
+    fs::write(job.join("debug.alive"), "").unwrap();
+    rig.backdate(&job.join("debug.alive"), 3600);
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+}
+
+#[test]
+fn stage_pid_alive_with_recent_change_stays_live() {
+    let rig = Rig::new(liveness_config());
+    let job = rig.job();
+    let mut stage = sleeper();
+    fs::write(job.join("stage.pid"), stage.id().to_string()).unwrap();
+    fs::write(job.join("progress"), "step").unwrap();
+    rig.backdate_active(3600);
+    assert_eq!(methods(&rig.run(400)), Vec::<&str>::new());
+    stop(&mut stage);
+}
+
+#[test]
+fn stale_stage_pid_releases_idle() {
+    // A pid that is not running (and no change) is idle.
+    let rig = Rig::new(liveness_config());
+    let job = idle_job(&rig);
+    fs::write(job.join("stage.pid"), "999999999").unwrap();
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
+}
+
+#[test]
+fn true_idle_still_releases() {
+    let rig = Rig::new(liveness_config());
+    idle_job(&rig);
+    assert_eq!(methods(&rig.run(400)), vec!["DELETE"]);
 }
 
 #[test]

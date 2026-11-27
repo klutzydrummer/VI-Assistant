@@ -129,9 +129,9 @@ case " $* " in
 esac
 case $progress_seconds in ''|*[!0-9]*|0) progress_seconds=600 ;; esac
 # Same rule as the worker watchdog (jobs/worker-onstart.sh): the hold may be
-# set lower, but a pending-only job is never live for more than 30 minutes.
+# set lower, but a pending-only job is never live for more than 90 minutes.
 pending_hold=$(( ${VI_PENDING_HOLD:-120} * 60 ))
-[ "$pending_hold" -gt 1800 ] && pending_hold=1800
+[ "$pending_hold" -gt 5400 ] && pending_hold=5400
 watchdog_script=${VI_WATCHDOG_SCRIPT:-/root/vi-watchdog.sh}
 watchdog_log=${VI_WATCHDOG_LOG:-/var/log/vi-watchdog.log}
 

@@ -1946,10 +1946,10 @@ fn reattach_refuses_when_two_live_candidates() {
     assert!(a.join("stage.pid").is_file() && b.join("stage.pid").is_file());
 }
 
-/// A pending-only job whose rc is 45 minutes old is past the 30 minute cap the
+/// A pending-only job whose rc is 100 minutes old is past the 90 minute cap the
 /// worker watchdog uses, so `pick_attempt` must not count it as live.
 #[test]
-fn pending_only_hold_is_capped_at_30_minutes() {
+fn pending_only_hold_is_capped_at_90_minutes() {
     if !have_rsync() {
         return;
     }
@@ -1965,7 +1965,7 @@ fn pending_only_hold_is_capped_at_30_minutes() {
     fs::write(d.join("pending/epoch-0"), "x").unwrap();
     fs::write(d.join("rc"), "0\n").unwrap();
     assert!(Command::new("touch")
-        .args(["-d", "45 minutes ago"])
+        .args(["-d", "100 minutes ago"])
         .arg(d.join("rc"))
         .status()
         .unwrap()
@@ -1986,7 +1986,7 @@ fn pending_only_hold_is_capped_at_30_minutes() {
     let err = err_text(&err_path);
     assert!(
         !err.contains(&format!("reattaching to {}", d.display())),
-        "a 45 minute old pending-only job was treated as live: {err}"
+        "a 100 minute old pending-only job was treated as live: {err}"
     );
 }
 

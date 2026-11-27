@@ -108,25 +108,25 @@ has_oom=0
 [ -r "$oom_file" ] && has_oom=1
 oom_kill() { awk '$1 == "oom_kill" { print $2; exit }' "$oom_file" 2>/dev/null || true; }
 
-# A published epoch is un-acked work: mark it for the watchdog. The home
-# supervisor acks each epoch after it verifies the copy home; the marker goes
-# away then, and an already-acked epoch never gets a fresh marker.
+# A published epoch or checkpoint is un-acked work: mark it for the watchdog. The home
+# supervisor acks each one after it verifies the copy home; the marker goes
+# away then, and an already-acked one never gets a fresh marker.
 watch= sync=
 if [ -n "$publish" ]; then
   mkdir -p "$work/pending"
   (
     while :; do
-      for e in "$publish"/epoch-*; do
+      for e in "$publish"/epoch-* "$publish"/checkpoint-*; do
         [ -d "$e" ] || continue
         case ${e##*/} in *.part) continue ;; esac
-        n=${e##*/epoch-}
-        [ -e "$work/acked/epoch-$n" ] && continue
-        [ -e "$work/pending/epoch-$n" ] || : >"$work/pending/epoch-$n"
+        k=${e##*/}
+        [ -e "$work/acked/$k" ] && continue
+        [ -e "$work/pending/$k" ] || : >"$work/pending/$k"
       done
-      for p in "$work/pending"/epoch-*; do
+      for p in "$work/pending"/epoch-* "$work/pending"/checkpoint-*; do
         [ -e "$p" ] || continue
-        n=${p##*epoch-}
-        [ -e "$work/acked/epoch-$n" ] && rm -f "$p"
+        k=${p##*/}
+        [ -e "$work/acked/$k" ] && rm -f "$p"
       done
       sleep 5
     done

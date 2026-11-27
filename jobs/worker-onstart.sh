@@ -13,7 +13,7 @@ cat >/root/vi-watchdog.sh <<'EOF'
 R=${R:-/root/vi-jobs};. /root/.vi-env 2>/dev/null # ssh restarts lack both
 IDLE=$((@IDLE_MINUTES@ * 60)) MAX=$((@MAX_MINUTES@ * 60)) BOOT=$(cat $R/.boot)
 PH=$((${PENDING_HOLD:-120} * 60)) RM=${RECOVERY_MINUTES:-30} L=/var/log/vi-watchdog.log
-[ $PH -gt 1800 ]&&PH=1800 # a pending hold defers release 30 min at most
+[ $PH -gt 5400 ]&&PH=5400 # a pending hold defers release 90 min at most
 API=https://console.vast.ai/api/v0/instances/$CONTAINER_ID/
 A="Authorization: Bearer $CONTAINER_API_KEY"
 log(){ echo "$(date -u) $*" >>$L; }
@@ -30,7 +30,7 @@ release(){
 }
 log start
 while sleep 60; do
-  now=$(date +%s); ssh=0; l=0; t=0; p=0; rc=0; g=0
+  now=$(date +%s); ssh=0; l=0; t=0; p=0; rc=0; g=0; a=0
   [ $MAX -gt 0 ]&&[ $((now-BOOT)) -ge $((MAX+600)) ]&&release hard
   # Home's tunnel (ssh -N) runs no command, so only a session with a child counts.
   for s in $(pgrep -f 'sshd[^ ]*: [^ ]+@');do pgrep -P $s >/dev/null&&ssh=1;done
@@ -38,11 +38,14 @@ while sleep 60; do
     [ -d "$d" ]||continue
     [ -e "$d/job.lock" ]&&! flock -n "$d/job.lock" true 2>/dev/null&&l=1
     [ -s "$d/train.pid" ]&&kill -0 "$(cat "$d/train.pid")" 2>/dev/null&&t=1
+    [ -s "$d/stage.pid" ]&&kill -0 "$(cat "$d/stage.pid")" 2>/dev/null&&t=1
     ls "$d"/pending/* >/dev/null 2>&1&&p=1
     [ -s "$d/rc" ]&&{ rc=1; rct=$(stat -c %Y "$d/rc"); }
   done
   find $R -mindepth 2 -newermt "@$((now-IDLE))" -print -quit 2>/dev/null|grep -q .&&g=1
-  live=$ssh
+  # *.alive: touched each minute while a debug pass or a checkpoint push runs
+  find $R -mindepth 2 -name '*.alive' -newermt "@$((now-IDLE))" -print -quit 2>/dev/null|grep -q .&&a=1
+  live=$ssh;[ $a = 1 ]&&live=1
   [ $live = 0 ]&&[ $((l+t+p)) -gt 0 ]&&[ $g = 1 ]&&live=1
   if [ $live = 1 ];then touch $R/.active
   elif [ $l = 0 ]&&[ $t = 0 ]&&[ $p = 1 ]&&[ $rc = 1 ];then
