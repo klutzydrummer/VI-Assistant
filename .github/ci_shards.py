@@ -22,7 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 JOBS = REPO / "jobs"
 
-EXPECTED_TESTS = 863
+EXPECTED_TESTS = 864
 
 SHARDS = {
     # 283 s on a CI runner

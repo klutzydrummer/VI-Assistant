@@ -143,6 +143,9 @@ MIN_SAMPLES = 3
 FATAL_RE = re.compile(r"BrokenProcessPool|pthread_create failed|can't start new thread|Traceback")
 BOOT_FAIL_RE = re.compile(r"no ssh after|disappeared while booting|failed to start|boot (?:timeout|failure)",
                           re.I)
+# Vast refuses `PUT /asks/<id>/` with `no_such_ask` when the offer was taken or withdrawn between
+# the search and the rent: a market/host failure, with nothing rented yet.
+NO_SUCH_ASK_RE = re.compile(r"no[ _]such[ _]ask", re.I)
 
 
 CUDA_GATE_RE = re.compile(r"worker-preflight: .*\b(CUDA|driver)\b", re.I)

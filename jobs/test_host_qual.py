@@ -193,6 +193,15 @@ class DebugPass(tdp.DebugBase):
         self.assertEqual(self.run_debug(), 16, self.out)
         self.assertEqual(len(self.ups()), 1, self.out)
 
+    def test_a_vanished_offer_is_a_host_failure_not_ours(self):
+        # dbg9 rental 2: PUT /asks/<id>/ answered no_such_ask, nothing rented
+        self.scen2(dict(up="gone"), {})
+        self.assertEqual(self.run_debug(), 0, self.out)
+        self.assertEqual(len(self.ups()), 2, self.out)
+        self.assertNotIn("our-failure", self.out)
+        self.assertIn("vanished before it was rented", self.out)
+        self.assertIn("host-unqualified", self.out)
+
     def test_cap_never_rents_again(self):
         self.scenario([dict(spent=0.95, hostqual="slow"), dict(spent=0.1)],
                       corpus=str(self.tmp / "corpus"))

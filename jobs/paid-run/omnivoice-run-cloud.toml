@@ -24,3 +24,6 @@ exclude_countries = ["CN"]
 # rent (disk_gb), so this includes the disk, not only the GPU (round 27: at 0.31 only 2 verified 24 GB offers were
 # left and none in US/CA; 0.60 leaves about 36). No 48 GB tier.
 max_dph = 0.60
+# Rent only from Vast datacenter hosts with reliability >= 0.99 (research 2026-11-27; four
+# community rentals vanished). Adds datacenter=true to the offer search.
+datacenter_only = true

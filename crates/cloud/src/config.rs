@@ -39,6 +39,10 @@ pub struct Config {
     pub search: Search,
 }
 
+/// The reliability floor when `search.datacenter_only` is on (research 2026-11-27: Vast's
+/// `reliability>0.99` with `datacenter=true`).
+pub const DATACENTER_MIN_RELIABILITY: f64 = 0.99;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Search {
@@ -48,6 +52,9 @@ pub struct Search {
     /// Ceiling on the hourly price, in dollars.
     pub max_dph: f64,
     pub min_reliability: f64,
+    /// Rent only from Vast.ai datacenter hosts (the offer field `datacenter` is true) and
+    /// never below `DATACENTER_MIN_RELIABILITY`, whatever `min_reliability` says.
+    pub datacenter_only: bool,
     /// The worker -> home leg of a published epoch's push. Home's uplink and
     /// download cap it (10.9 MB/s down measured at home on 2026-11-04).
     pub min_inet_up_mbps: f64,
@@ -94,6 +101,7 @@ impl Default for Search {
             min_gpu_ram_gb: 24.0,
             max_dph: 0.40,
             min_reliability: 0.98,
+            datacenter_only: false,
             // 100 both ways: home's measured 10.9 MB/s download (~87 Mb/s) caps
             // the worker -> home push and its 15-36 Mb/s uplink caps the input
             // leg, so a 200 floor would hide usable offers.
@@ -149,6 +157,17 @@ impl Config {
     /// machines in `exclude_machines` (Vast documents `machine_id` as a filter
     /// field but lists no `host_id` filter, so hosts can't be excluded here;
     /// `Cloud::offers_excluding` drops them from the answer instead).
+    /// The reliability floor the search applies: `min_reliability`, raised to
+    /// `DATACENTER_MIN_RELIABILITY` when `datacenter_only` is on.
+    pub fn effective_min_reliability(&self) -> f64 {
+        let s = &self.search;
+        if s.datacenter_only {
+            s.min_reliability.max(DATACENTER_MIN_RELIABILITY)
+        } else {
+            s.min_reliability
+        }
+    }
+
     pub fn offer_query(&self, limit: usize, exclude_machines: &[u64]) -> Value {
         let s = &self.search;
         let mut q = json!({
@@ -157,7 +176,7 @@ impl Config {
             "num_gpus": {"eq": 1},
             "gpu_ram": {"gte": s.min_gpu_ram_gb * 1000.0},
             "dph_total": {"lte": s.max_dph},
-            "reliability": {"gte": s.min_reliability},
+            "reliability": {"gte": self.effective_min_reliability()},
             "inet_down": {"gte": s.min_inet_down_mbps},
             "inet_up": {"gte": s.min_inet_up_mbps},
             "cpu_cores_effective": {"gte": s.min_cpu_cores_effective},
@@ -173,6 +192,9 @@ impl Config {
             "type": "on-demand",
             "limit": limit,
         });
+        if s.datacenter_only {
+            q["datacenter"] = json!({"eq": true});
+        }
         if s.verified {
             q["verified"] = json!({"eq": true});
         }
@@ -254,16 +276,18 @@ impl Config {
         }
         // Both scores: the search filters on `reliability`, while `reliability2`
         // is Vast's older enforcement score and some offers carry only it.
-        if o.reliability < s.min_reliability {
+        if o.reliability < self.effective_min_reliability() {
             out.push(format!(
                 "reliability {:.2} is under {:.2}",
-                o.reliability, s.min_reliability
+                o.reliability,
+                self.effective_min_reliability()
             ));
         }
-        if o.reliability2 < s.min_reliability {
+        if o.reliability2 < self.effective_min_reliability() {
             out.push(format!(
                 "reliability2 {:.2} is under {:.2}",
-                o.reliability2, s.min_reliability
+                o.reliability2,
+                self.effective_min_reliability()
             ));
         }
         if o.inet_down < s.min_inet_down_mbps {
@@ -484,6 +508,28 @@ mod tests {
         assert_eq!(q["limit"], 3);
         assert_eq!(q["verified"]["eq"], true);
         assert_eq!(q["geolocation"]["notin"], json!(["CN"]));
+    }
+
+    #[test]
+    fn datacenter_only_adds_the_datacenter_and_reliability_clauses() {
+        let off = Config::default().offer_query(3, &[]);
+        assert!(off.get("datacenter").is_none());
+        assert_eq!(off["reliability"]["gte"], 0.98);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud.toml");
+        std::fs::write(&path, "[search]\ndatacenter_only = true\n").unwrap();
+        let on = Config::load(&path).unwrap().offer_query(3, &[]);
+        assert_eq!(on["datacenter"]["eq"], true);
+        // the default 0.98 is raised to the 0.99 datacenter floor
+        assert_eq!(on["reliability"]["gte"], 0.99);
+        // a stricter configured floor stays
+        std::fs::write(
+            &path,
+            "[search]\ndatacenter_only = true\nmin_reliability = 0.995\n",
+        )
+        .unwrap();
+        let q = Config::load(&path).unwrap().offer_query(3, &[]);
+        assert_eq!(q["reliability"]["gte"], 0.995);
     }
 
     #[test]

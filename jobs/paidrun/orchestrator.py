@@ -26,7 +26,8 @@ from paidrun.signals import ACK_RE, FATAL_RE, parse_progress, parse_progress_end
 from paidrun.config import (
     CKPT_EVERY, DEBUG_MAX_RENTALS, DISK_CEILING_PER_GB_MONTH, DISK_OVERHEAD_GB, EU_COUNTRIES,
     EXPECTED_STEPS, HOURS_PER_MONTH, LISTENING_STEPS, config_max_dph, debug_worst_case, disk_check,
-    disk_cost_line, push_hours_line, set_search_value, set_toml_values, stage_settings,
+    countries_line, datacenter_line, disk_cost_line, push_hours_line, set_search_value,
+    set_toml_values, stage_settings,
 )
 from paidrun.hf import base_model_revision, hf_offline_check, hf_revision_gate
 from paidrun.gates import (
@@ -502,7 +503,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
             a.stages, a.repo, forward=getattr(a, "realpath_forward", False))
         self.rehearsal_ok, rehearsal_line = rehearsal_gate(a.repo)
         self.hf_code_ok, hf_code_line = hf_offline_check()
-        countries = a.countries or "(from the config)"
+        countries = countries_line(self.base_config_text(), a.countries)
         if getattr(a, "debug_pass", False):
             max_dph = config_max_dph(self.base_config_text())
             total, gpu, disk = debug_worst_case(a.cap, disk_gb, a.max_hours, max_dph)
@@ -535,13 +536,17 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
                 "(always, even after a failure)",
                 f"debug data      : the first {a.debug_rows} train rows of omnivoice_data "
                 "(jobs/debug_slice.py, by position only), plus 4 dev, 2 style, 8 replay texts",
-f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
-                f"({disk_gb:g} GB x ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month / "
-                f"{HOURS_PER_MONTH} h x {k} x {h:g} h); cap ${a.cap:.2f} for both rentals "
-                f"together (an offer is rented only if $/hr x {h:g} h <= the cap left)",
-                "                  formula: worst case = min(cap, 2 x max_hours x max_dph) + "
-                "disk_gb x 1.00 / 730 x 2 x max_hours; a typical pass should take under 30 min, "
-                "so it costs about $/hr x 0.5",
+f"worst case      : ${total:.2f} total = {gpu_why}"
+                + (f" (max_dph is the full billed rate, so the {disk_gb:g} GB disk is inside it)"
+                   if max_dph is not None else
+                   f" + disk ${disk:.2f} ({disk_gb:g} GB x ${DISK_CEILING_PER_GB_MONTH:.2f}"
+                   f"/GB/month / {HOURS_PER_MONTH} h x {k} x {h:g} h)")
+                + f"; cap ${a.cap:.2f} for both rentals together (an offer is rented only if "
+                f"$/hr x {h:g} h <= the cap left)",
+                "                  formula: worst case = min(cap, 2 x max_hours x max_dph)"
+                + ("" if max_dph is not None else
+                   " + disk_gb x 1.00 / 730 x 2 x max_hours (no max_dph in the config)")
+                + "; a typical pass should take under 30 min, so it costs about $/hr x 0.5",
                 "push probe      : after the worker preflight passes, at most "
                 f"{PUSH_PROBE_MAX_MINUTES} min of transfer-speed probe (jobs/push-probe.sh: "
                 "200 MiB random through the tunnel, 4 x 50 MiB parallel ssh streams, curl to "
@@ -587,7 +592,10 @@ f"worst case      : ${total:.2f} total = {gpu_why} + disk ${disk:.2f} "
             f"run config      : {a.config}",
             self.disk_line,
             disk_cost_line(disk_gb, a.max_hours * (DEBUG_MAX_RENTALS if getattr(
-                a, "debug_pass", False) else 1)),
+                a, "debug_pass", False) else 1),
+                included=getattr(a, "debug_pass", False)
+                and config_max_dph(self.base_config_text()) is not None),
+            datacenter_line(self.base_config_text()),
             *home_lines,
             *ids_lines,
             *realpath_lines,

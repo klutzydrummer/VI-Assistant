@@ -14,7 +14,7 @@ from paidrun.limits import (
     VERIFY_EPOCH_TIMEOUT_SECONDS,
 )
 from paidrun.signals import (
-    debug_excerpt_keep, debug_run_key, failure_rc_text, parse_debug_output, parse_host_qual,
+    NO_SUCH_ASK_RE, debug_excerpt_keep, debug_run_key, failure_rc_text, parse_debug_output, parse_host_qual,
     parse_push_probe, push_probe_lines,
 )
 from paidrun.validity import INVALID, REASON_HOST_DROP, REASON_HOST_UNQUALIFIED, rental2_allowed
@@ -327,7 +327,15 @@ class DebugMixin:
                             "--yes"], watch=True, timeout=boot_s)
         self.cache_instance(at, out)
         m = re.search(r"^worker (\d+) ready", out, re.M)
-        if rc != 0:
+        if rc != 0 and not m and NO_SUCH_ASK_RE.search(out):
+            # The offer vanished before anything was rented (dbg9 rental 2): a market failure,
+            # not ours, so a second rental stays allowed.
+            why = f"offer {offer['id']} vanished before it was rented (Vast no_such_ask)"
+            self.mark_unqualified(at, why, "offer")
+            self.unqualified = why
+            self.debug_record(0, "HOST-UNQUALIFIED", f"({why}; nothing was rented)",
+                              out.strip().splitlines()[-8:])
+        elif rc != 0:
             self.debug_record(0, "FAIL", f"(`vi cloud up` exited {rc}"
                               f"{', boot timed out' if self.timed_out else ''})",
                               out.strip().splitlines()[-8:])

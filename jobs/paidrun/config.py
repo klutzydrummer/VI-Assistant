@@ -161,14 +161,65 @@ DISK_CEILING_PER_GB_MONTH = 1.00
 HOURS_PER_MONTH = 730
 
 
-def disk_cost_line(disk_gb, hours):
+def search_list(text, key):
+    """The string list `key = [...]` in a cloud config's [search] table; None when it is absent."""
+    in_search = False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("["):
+            in_search = s == "[search]"
+        elif in_search:
+            m = re.match(rf"{re.escape(key)}\s*=\s*\[([^\]]*)\]", s)
+            if m:
+                return re.findall(r"""["']([^"']*)["']""", m.group(1))
+    return None
+
+
+def search_bool(text, key):
+    """`key = true|false` in a cloud config's [search] table; None when it is absent."""
+    in_search = False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("["):
+            in_search = s == "[search]"
+        elif in_search:
+            m = re.match(rf"{re.escape(key)}\s*=\s*(true|false)\b", s)
+            if m:
+                return m.group(1) == "true"
+    return None
+
+
+def countries_line(text, override=None):
+    """The plan's `countries` text: the --countries value, else the config's countries and
+    exclude_countries (the config default excludes CN when it sets neither)."""
+    if override:
+        return override
+    inc = search_list(text, "countries")
+    exc = search_list(text, "exclude_countries")
+    exc = ["CN"] if exc is None else exc
+    left = ", ".join(inc) if inc else "any country"
+    return left + (f"; never {', '.join(exc)}" if exc else "")
+
+
+def datacenter_line(text):
+    """The plan line about the offer search's datacenter filter (search.datacenter_only)."""
+    if search_bool(text, "datacenter_only"):
+        rel = max(search_value(text, "min_reliability", 0.98), 0.99)
+        return (f"offer search    : datacenter=true (Vast datacenter hosts only), "
+                f"reliability >= {rel:g}")
+    return "offer search    : any verified host (datacenter_only is off)"
+
+
+def disk_cost_line(disk_gb, hours, included=False):
     """The plan line about disk billing: Vast charges storage on top of the GPU price, per GB and
     second, until the instance is destroyed (stopping does not end it)."""
     cost = disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours
     return (f"disk billing    : Vast bills disk on top of the GPU price, per GB-hour until the "
             f"instance is destroyed; worst case for {disk_gb:g} GB over {hours:g} h is about "
             f"${cost:.2f} at an assumed ${DISK_CEILING_PER_GB_MONTH:.2f}/GB/month (estimate; "
-            "the real storage_cost is only known from the live offer)")
+            "the real storage_cost is only known from the live offer)"
+            + ("; not added to the worst case, because max_dph is the full billed rate and "
+               "already includes this disk" if included else ""))
 
 
 def debug_worst_case(cap, disk_gb, hours, max_dph=None):
@@ -176,9 +227,12 @@ def debug_worst_case(cap, disk_gb, hours, max_dph=None):
     `hours` each (r21: the hours are per rental). The GPU part is at most 2 x hours x max_dph (the
     config's price ceiling) and never more than the shared cap: an offer is rented only if its
     $/hr x the rental's hours fits the cap left, and `vi cloud up` gets that cap. Disk is billed
-    on top for both rentals' hours (disk_cost_line)."""
+    on top for both rentals' hours (disk_cost_line), but only when the config has no max_dph:
+    the search prices dph_total with the rented disk (allocated_storage), so max_dph already
+    includes the disk and adding it again would count it twice (disk is then 0)."""
     gpu = cap if max_dph is None else min(cap, DEBUG_MAX_RENTALS * hours * max_dph)
-    disk = disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours * DEBUG_MAX_RENTALS
+    disk = 0.0 if max_dph is not None else \
+        disk_gb * DISK_CEILING_PER_GB_MONTH / HOURS_PER_MONTH * hours * DEBUG_MAX_RENTALS
     return gpu + disk, gpu, disk
 
 

@@ -856,8 +856,12 @@ class Plan(DebugBase):
         self.assertIn("max hours       : 1.25 h per rental (2 x 1.25 h at most)", self.out)
         self.assertIn("GPU $1.50 (2 rentals x 1.25 h x $0.600/hr max_dph, inside the $1.75 cap)",
                       self.out)
-        self.assertRegex(self.out, r"worst case      : \$1\.93 total = GPU \$1\.50 \(.*\) "
-                                   r"\+ disk \$0\.43")
+        self.assertRegex(self.out, r"worst case      : \$1\.50 total = GPU \$1\.50 \(.*\) "
+                                   r"\(max_dph is the full billed rate, so the 125 GB disk is "
+                                   r"inside it\)")
+        self.assertNotRegex(self.out, r"worst case.*\+ disk")
+        self.assertIn("offer search    : datacenter=true", self.out)
+        self.assertRegex(self.out, r"countries       : \S.*never CN")
         self.assertNotIn("max hours (all)", self.out)
         self.assertIn("--plan: nothing was called", self.out)
         self.assertFalse((self.tmp / "any-call.log").exists(), "--plan called vi")
@@ -868,11 +872,13 @@ class Plan(DebugBase):
         # two rentals of 1.25 h each: GPU min(cap, 2 x 1.25 x max_dph), disk for 2 x 1.25 h
         total, gpu, disk = pr.debug_worst_case(3.0, 125, 1.25, 0.31)
         self.assertAlmostEqual(gpu, 2 * 1.25 * 0.31)
-        self.assertAlmostEqual(disk, 125 * 1.00 / 730 * 2.5)
-        self.assertAlmostEqual(total, gpu + disk)
-        # no max_dph in the config: the cap is the GPU worst case
+        # max_dph is dph_total, which already prices the rented disk: no second disk charge
+        self.assertAlmostEqual(disk, 0.0)
+        self.assertAlmostEqual(total, gpu)
+        # no max_dph in the config: the cap is the GPU worst case, disk on top
         total, gpu, disk = pr.debug_worst_case(3.0, 125, 1.25, None)
         self.assertAlmostEqual(gpu, 3.0)
+        self.assertAlmostEqual(disk, 125 * 1.00 / 730 * 2.5)
         # a cap under 2 x hours x max_dph still bounds the GPU part
         self.assertAlmostEqual(pr.debug_worst_case(0.5, 125, 1.25, 0.31)[1], 0.5)
 
