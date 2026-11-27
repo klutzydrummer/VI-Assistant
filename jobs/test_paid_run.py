@@ -2254,3 +2254,70 @@ class Resilience(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PumpRobustness(unittest.TestCase):
+    """run()'s output reader: non-UTF-8 worker bytes are replaced, and a dead reader fails the
+    command loudly instead of hanging the run (omnivoice-ft-dbg10, 2026-11-27)."""
+
+    def make(self, tmp):
+        sys.path.insert(0, str(JOBS))
+        from paidrun.orchestrator import PaidRun
+        po = PaidRun.__new__(PaidRun)  # no state file, no vi: only what run() touches
+        po.a = type("A", (), {"repo": tmp})()
+        po.s, po.child, po.in_teardown, po.worker_maybe_up = None, None, False, False
+        po.env = lambda: dict(os.environ)
+        return po
+
+    def test_invalid_utf8_output_is_replaced_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            po = self.make(tmp)
+            code = ("import sys; sys.stdout.buffer.write(b'before\\n\\xff\\xfe mid\\nafter\\n'); "
+                    "sys.stdout.flush()")
+            rc, out = po.run([sys.executable, "-c", code], stream=False, timeout=30)
+        self.assertEqual(rc, 0)
+        self.assertIn("�", out)
+        self.assertIn("before", out)
+        self.assertIn("after", out)
+
+    def test_dead_reader_fails_the_command_promptly(self):
+        import threading
+        import paidrun.orchestrator as orch
+        with tempfile.TemporaryDirectory() as tmp:
+            po = self.make(tmp)
+
+            class Boom:
+                def __iter__(self):
+                    raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+            class FakePopen:
+                pid = 0
+                stdout = Boom()
+                returncode = None
+
+                def __init__(self, *a, **k):
+                    pass
+
+                def kill(self):
+                    FakePopen.returncode = -9
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+                def poll(self):
+                    return self.returncode
+
+            result = {}
+            real = orch.subprocess.Popen
+            orch.subprocess.Popen = FakePopen
+            try:
+                t = threading.Thread(target=lambda: result.update(
+                    r=po.run(["fake"], stream=False)), daemon=True)
+                t.start()
+                t.join(15)  # the guard: a hang here fails the test instead of the suite
+            finally:
+                orch.subprocess.Popen = real
+            self.assertFalse(t.is_alive(), "run() hung on a dead reader")
+        rc, out = result["r"]
+        self.assertNotEqual(rc, 0)
+        self.assertIn("output reader died: UnicodeDecodeError", out)

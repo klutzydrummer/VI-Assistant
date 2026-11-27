@@ -42,6 +42,10 @@ from paidrun.rental import RentalMixin
 from paidrun.debug import DebugMixin
 
 
+class PumpError(str):
+    """Marker queued by run()'s reader thread when it dies; the text is the error."""
+
+
 class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
     def __init__(self, args):
         self.a = args
@@ -131,6 +135,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         last_line_at = time.monotonic()
         deadline = time.monotonic() + limit if limit else None
         p = subprocess.Popen(argv, cwd=self.a.repo, env=self.env(), text=True, bufsize=1,
+                             encoding="utf-8", errors="replace",  # worker output is not always UTF-8
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, start_new_session=bool(limit))
         self.child = p
@@ -138,17 +143,43 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         lines = queue.Queue()
 
         def pump():
-            for ln in p.stdout:
-                lines.put(ln)
-            lines.put(None)
+            # Whatever goes wrong here must reach the main loop: a silent death left the run
+            # hung with the worker idle (omnivoice-ft-dbg10, 2026-11-27).
+            try:
+                for ln in p.stdout:
+                    lines.put(ln)
+            except BaseException as e:  # noqa: BLE001
+                lines.put(PumpError(f"{type(e).__name__}: {e}"))
+            finally:
+                lines.put(None)
 
-        threading.Thread(target=pump, daemon=True).start()
+        pump_thread = threading.Thread(target=pump, daemon=True)
+        pump_thread.start()
         try:
             while True:
                 try:
-                    line = lines.get(timeout=0.2 if (watch or limit) else None)
+                    line = lines.get(timeout=0.2)
                 except queue.Empty:
                     line = ""
+                    if not pump_thread.is_alive():
+                        try:
+                            line = lines.get_nowait()
+                        except queue.Empty:
+                            line = PumpError("reader thread exited without ending the stream")
+                if isinstance(line, PumpError):
+                    msg = f"paid-run: output reader died: {line}; killing the command\n"
+                    buf.append(msg)
+                    if stream:
+                        print(msg, end="", flush=True)
+                    try:
+                        if limit:
+                            os.killpg(p.pid, signal.SIGKILL)
+                        else:
+                            p.kill()
+                    except OSError:
+                        p.kill()
+                    p.wait()
+                    return 125, "".join(buf)
                 if line is None:
                     break
                 if line:
@@ -280,6 +311,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         try:
             p = subprocess.run(argv, cwd=self.a.repo, env=self.env(), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
                                timeout=DEADMAN_EXTEND_TIMEOUT_SECONDS)
             rc, out = p.returncode, (p.stdout + p.stderr).strip()
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -471,7 +503,7 @@ class PaidRun(RentalMixin, DebugMixin, ReleaseMixin):
         rent a worker it cannot reliably destroy. Run it with no arguments (it prints its usage)
         and return an error text if that lacks `down --force --verify` or `deadman`, else None."""
         try:
-            r = subprocess.run([self.vi], capture_output=True, text=True, timeout=30,
+            r = subprocess.run([self.vi], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
                                stdin=subprocess.DEVNULL, env=self.env(), cwd=self.a.repo)
         except (OSError, subprocess.SubprocessError) as e:
             return (f"the vi binary {self.vi} could not be probed ({e!r}); "

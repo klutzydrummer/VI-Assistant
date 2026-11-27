@@ -202,7 +202,7 @@ class DebugMixin:
                 limit = VERIFY_EPOCH_TIMEOUT_SECONDS
                 try:
                     r = subprocess.run(verify_epoch_argv(ck), capture_output=True, text=True,
-                                       timeout=limit)
+                                       encoding="utf-8", errors="replace", timeout=limit)
                 except subprocess.TimeoutExpired as e:  # r32 WP7: never hang home
                     part = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) \
                         else (e.stdout or "")

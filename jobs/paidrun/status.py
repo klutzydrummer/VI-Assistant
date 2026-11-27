@@ -71,7 +71,7 @@ def cmd_status(args):
     st = build_status(s, clock())
     if args.credit:
         r = subprocess.run([resolve_vi_bin(), "cloud", "status"], capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL)
+                           encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
         m = re.search(r"^credit \$([\d.]+)", r.stdout, re.M)
         st["credit"] = float(m.group(1)) if r.returncode == 0 and m else None
     if args.json:
