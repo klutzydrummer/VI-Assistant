@@ -34,6 +34,8 @@ ALLOWLIST = [
     ("jobs/checkpoints.py", r"p\.unlink\(\)", "the state dir's unverified marker for this exact run"),
     ("jobs/checkpoints.py", r"shutil\.rmtree\(p\)", "prune: an epoch dir inside a VERIFIED run dir"),
     ("jobs/checkpoints.py", r"marker\.unlink\(\)", "the .vichunks marker of a checkpoint file whose chunks were just joined and renamed into place"),
+    ("jobs/debug-pass.sh", r'rm -f "\$work/debug\.alive"', "the worker job dir's debug-pass liveness file this script touches (EXIT trap)"),
+    ("jobs/voicetune-fresh.sh", r'rm -f "\$work/push\.alive"', "the worker job dir's push liveness file this script touches"),
     ("jobs/debug-pass.sh", r'rm -f "\$work/push\.pid"', "the worker job dir's push-loop pid file this stage wrote (EXIT trap)"),
     ("jobs/worker-return.sh", r'rm -rf "\$empty" "\$stage"', "the two mktemp -d scratch dirs push_chunked created (empty source and chunk staging)"),
     ("jobs/worker-return.sh", r'rm -f "\$stage/\$rel"\.vichunk-\*', "the staged .vichunk-* copies inside push_chunked's own mktemp staging dir"),

@@ -341,14 +341,32 @@ push_two_part() {
 # push_final DIR: the last push after the trainer exits. A receiver restarting at that moment must
 # not fail a finished run, so it gets 3 tries; VI_FINAL_PUSH_SLEEP (default 20 s) is the pause.
 push_final() {
-  local try
+  local try rc=1
+  start_push_alive
   for try in 1 2 3; do
-    push_publish "$1" && return 0
+    if push_publish "$1"; then rc=0; break; fi
     [ "$try" -lt 3 ] || break
     echo "voicetune-fresh: final push failed (try $try of 3); retrying" >&2
     sleep "${VI_FINAL_PUSH_SLEEP:-20}"
   done
-  return 1
+  stop_push_alive
+  return $rc
+}
+
+# start_push_alive: the worker watchdog (worker-onstart.sh) sees no file change while rsync reads
+# a big checkpoint, so touch $work/push.alive every 60 s while a push runs. The watchdog treats a
+# file not refreshed within its idle limit as idle, so a dead push still releases the worker.
+alive_pid=
+start_push_alive() {
+  stop_push_alive
+  ( while :; do : >"$work/push.alive"; sleep 60; done ) 8>&- &
+  alive_pid=$!
+}
+stop_push_alive() {
+  [ -n "$alive_pid" ] && kill "$alive_pid" 2>/dev/null
+  alive_pid=
+  rm -f "$work/push.alive"
+  return 0
 }
 
 # backlog_check: F-TRN-3. Checkpoints finished here but not yet home pile up on the worker's disk
@@ -427,7 +445,8 @@ if [ "$MODE" = push ]; then
     exit 0
   fi
   echo $$ >"$work/push.pid"
-  trap 'rm -f "$work/push.pid"' EXIT
+  trap 'rm -f "$work/push.pid"; stop_push_alive' EXIT
+  start_push_alive
   push_loop
   exit 0
 fi

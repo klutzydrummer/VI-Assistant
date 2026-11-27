@@ -108,8 +108,8 @@ mod tests {
             script.contains("vastai stop instance $CONTAINER_ID"),
             "{script}"
         );
-        // The pending hold is capped at 30 minutes.
-        assert!(script.contains("[ $PH -gt 1800 ]&&PH=1800"), "{script}");
+        // The pending hold is capped at 90 minutes.
+        assert!(script.contains("[ $PH -gt 5400 ]&&PH=5400"), "{script}");
     }
 
     #[test]

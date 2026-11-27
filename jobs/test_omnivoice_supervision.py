@@ -210,7 +210,7 @@ class ResumeWiringTest(unittest.TestCase):
             self.assertIn("--resume-from-checkpoint", invocations[1])
             self.assertIn("--resume-from-checkpoint", invocations[2])
 
-    def _run_script(self, root, script, retries=2, extra=(), env_extra=None, job=None):
+    def _run_script(self, root, script, retries=2, extra=(), env_extra=None, job=None, publish=None):
         """Run worker-job.sh around a python -c script; returns (proc, arg lists per call)."""
         work, run = root / "work", root / "run"
         run.mkdir(exist_ok=True)
@@ -219,7 +219,8 @@ class ResumeWiringTest(unittest.TestCase):
         log = root / "args.log"
         env = dict(os.environ, LOG=str(log), VI_MEMORY_EVENTS=str(events), **(env_extra or {}))
         args = ["bash", str(job or JOBS / "worker-job.sh"), "--work", str(work), "--run", str(run),
-                "--retries", str(retries), "--", sys.executable, "-c", script, *extra]
+                "--retries", str(retries), *(["--publish", str(publish)] if publish else []),
+                "--", sys.executable, "-c", script, *extra]
         proc = subprocess.run(args, capture_output=True, text=True, timeout=120, env=env)
         calls = [l.split("\x1f") for l in log.read_text().splitlines()] if log.exists() else []
         return proc, calls
@@ -242,6 +243,24 @@ class ResumeWiringTest(unittest.TestCase):
                                         "--resume-from-checkpoint", str(root / "run" / "checkpoint-1000")])
             rows = [json.loads(l) for l in (root / "work" / "retries.jsonl").read_text().splitlines()]
             self.assertEqual(rows[0]["reason"], "oom-halve")
+
+    def test_worker_job_marks_published_checkpoint_pending(self):
+        # The worker watchdog holds the worker for un-acked work, so a published
+        # checkpoint-<n> (omnivoice) needs a pending marker like epoch-<k>; an acked one
+        # gets none.
+        script = ("import os, sys, time; pub = os.environ['PUB']; "
+                  "os.makedirs(pub + '/checkpoint-3'); os.makedirs(pub + '/checkpoint-4'); "
+                  "os.makedirs(pub + '/checkpoint-5.part'); time.sleep(7)")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pub = root / "pub"
+            (root / "work" / "acked").mkdir(parents=True)
+            (root / "work" / "acked" / "checkpoint-4").write_text("")
+            proc, _ = self._run_script(root, script, retries=0, extra=[],
+                                       env_extra={"PUB": str(pub)}, publish=pub)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            marks = sorted(p.name for p in (root / "work" / "pending").iterdir())
+            self.assertEqual(marks, ["checkpoint-3"])
 
     ALWAYS_OOM = ("import os, sys; "
                   "open(os.environ['LOG'], 'a').write('\\x1f'.join(sys.argv[1:]) + '\\n'); sys.exit(76)")
